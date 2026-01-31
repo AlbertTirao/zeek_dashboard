@@ -19,7 +19,7 @@ def get_latest_folder(root: Path, suffix="-CSV"):
     folders.sort(key=folder_date, reverse=True)
     return folders[0]
 
-# =====================================================
+# ======================================================
 # Load latest known_hosts.csv and DHCP CSV
 # =====================================================
 logs_root = Path("logs")
