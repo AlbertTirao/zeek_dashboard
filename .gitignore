@@ -1,0 +1,6 @@
+# --- Logs & Data ---
+logs/
+*.log
+*.csv
+*.json
+!credentials.json  # Remove the '!' if you want to ignore credentials
