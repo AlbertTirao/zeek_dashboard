@@ -4,23 +4,45 @@ import plotly.express as px
 from pathlib import Path
 
 # =====================================================
+# Helper: get latest folder by date in name
+# =====================================================
+def get_latest_folder(root: Path, suffix="-CSV"):
+    folders = [f for f in root.iterdir() if f.is_dir() and f.name.endswith(suffix)]
+    if not folders:
+        return None
+    # Try parsing date from folder name
+    def folder_date(f):
+        try:
+            return pd.to_datetime(f.name.replace(suffix, ""), errors="coerce")
+        except:
+            return pd.Timestamp.min
+    folders.sort(key=folder_date, reverse=True)
+    return folders[0]
+
+# =====================================================
 # Load latest known_hosts.csv and DHCP CSV
 # =====================================================
 logs_root = Path("logs")
+latest_folder = get_latest_folder(logs_root)
+
 known_hosts_file = None
 dhcp_file = None
 
-daily_folders = sorted(
-    [f for f in logs_root.iterdir() if f.is_dir() and f.name.endswith("-CSV")],
-    reverse=True
-)
+if latest_folder:
+    # Pick the most recently modified CSVs inside the folder
+    known_hosts_candidates = list(latest_folder.glob("known_hosts*.csv"))
+    dhcp_candidates = list(latest_folder.glob("dhcp*.csv"))
 
-if daily_folders:
-    latest_folder = daily_folders[0]
-    known_hosts_file = latest_folder / "known_hosts.csv"
-    dhcp_file = latest_folder / "dhcp.csv"
+    if known_hosts_candidates:
+        known_hosts_file = max(known_hosts_candidates, key=lambda f: f.stat().st_mtime)
+    if dhcp_candidates:
+        dhcp_file = max(dhcp_candidates, key=lambda f: f.stat().st_mtime)
+else:
+    st.warning("No daily CSV folders found")
 
+# =====================================================
 # Load known_hosts
+# =====================================================
 known_hosts = pd.DataFrame()
 if known_hosts_file and known_hosts_file.exists():
     known_hosts = pd.read_csv(known_hosts_file)
@@ -30,7 +52,9 @@ if known_hosts_file and known_hosts_file.exists():
 else:
     st.warning("No known_hosts.csv found")
 
+# =====================================================
 # Load DHCP CSV
+# =====================================================
 dhcp = pd.DataFrame()
 if dhcp_file and dhcp_file.exists():
     dhcp = pd.read_csv(dhcp_file)
@@ -40,7 +64,9 @@ if dhcp_file and dhcp_file.exists():
 else:
     st.warning("No DHCP CSV found")
 
+# =====================================================
 # Load authorized MACs
+# =====================================================
 authorized_mac_file = Path("authorized_macs.txt")
 authorized_macs = set()
 if authorized_mac_file.exists():
