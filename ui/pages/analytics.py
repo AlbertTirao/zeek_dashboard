@@ -2,8 +2,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-def render(filtered: pd.DataFrame):
+def render(filtered: pd.DataFrame, get_mac_vendor=None, authorized=None):
     st.title("Network Analytics")
+
+    # Add vendor column if it doesn't exist
+    if "vendor" not in filtered.columns and get_mac_vendor is not None:
+        filtered["vendor"] = filtered["mac"].apply(get_mac_vendor)
 
     # Counts
     total_devices = filtered["mac"].nunique()
@@ -20,12 +24,15 @@ def render(filtered: pd.DataFrame):
 
     with col1:
         st.subheader("Device Vendors")
-        vendor_counts = filtered.groupby("vendor")["mac"].nunique().sort_values(ascending=False).head(10)
+        vendor_counts = filtered.groupby("vendor")["mac"].nunique().sort_values(ascending=False).head(10).reset_index(name="count")  # <- convert Series to DataFrame with column 'count'
         fig_vendor = px.bar(
             vendor_counts,
-            x=vendor_counts.index,
-            y=vendor_counts.values,
-            labels={"x":"Vendor","y":"Count"},
+            # x=vendor_counts.index,
+            # y=vendor_counts.values,
+            #labels={"x":"Vendor","y":"Count"},
+            x="vendor",
+            y="count",
+            labels={"vendor":"Vendor","count":"Count"}, #This avoids the Series + array conflict.
             template="plotly_dark",
             color_discrete_sequence=['#6366f1']
         )

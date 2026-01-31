@@ -112,7 +112,7 @@ def parse_dhcp(file_path: Path, log_dir: Path):
 @st.cache_data
 def load_logs(log_dir: Path, client_secret_path: str, folder_id: str):
     drive = authenticate_drive(client_secret_path)
-    download_csv_logs(drive, folder_id, log_dir)
+    download_logs(drive, folder_id, log_dir)
     df = pd.DataFrame()
     for f in log_dir.rglob("dhcp.log"):
         df = pd.concat([df, parse_dhcp(f, log_dir)], ignore_index=True)
