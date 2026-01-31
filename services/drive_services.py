@@ -22,10 +22,51 @@ def authenticate_drive(client_secret_path: str):
 # =====================================================
 # Download entire folder recursively from Google Drive
 # =====================================================
+# def download_folder(drive: GoogleDrive, folder_id: str, local_path: Path):
+#     """
+#     Download all files and subfolders from a Google Drive folder to local_path,
+#     skipping files that are already up to date.  
+#     """
+#     local_path.mkdir(exist_ok=True, parents=True)
+
+#     query = f"'{folder_id}' in parents and trashed=false"
+#     files = drive.ListFile({"q": query}).GetList()
+
+#     for f in files:
+#         file_name = f["title"]
+#         file_id = f["id"]
+#         dest_path = local_path / file_name
+
+#         # Recurse into subfolders
+#         if f["mimeType"].endswith("folder") or f["mimeType"].endswith("apps-folder"):
+#             download_folder(drive, file_id, dest_path)
+#             continue
+
+#         # Only download CSV or LOG files
+#         if not file_name.lower().endswith((".csv", ".log")):
+#             continue
+
+#         # Remote timestamp
+#         remote_ts = datetime.fromisoformat(f["modifiedDate"].replace("Z", "+00:00")).timestamp()
+
+#         # Skip if local file is newer
+#         if dest_path.exists() and dest_path.stat().st_mtime >= remote_ts:
+#             continue
+
+#         # Download file
+#         try:
+#             f.GetContentFile(str(dest_path))
+#         except Exception as e:
+#             st.warning(f"Failed to download {file_name}: {e}")
+#             continue
+
+#         # Sync timestamp
+#         os.utime(dest_path, (time.time(), remote_ts))
+
 def download_folder(drive: GoogleDrive, folder_id: str, local_path: Path):
     """
-    Download all files and subfolders from a Google Drive folder to local_path,
-    skipping files that are already up to date.  
+    Download all CSV files recursively from a Google Drive folder to local_path,
+    preserving folder structure and skipping up-to-date files.
     """
     local_path.mkdir(exist_ok=True, parents=True)
 
@@ -35,34 +76,39 @@ def download_folder(drive: GoogleDrive, folder_id: str, local_path: Path):
     for f in files:
         file_name = f["title"]
         file_id = f["id"]
+        mime_type = f["mimeType"]
         dest_path = local_path / file_name
 
+        # -----------------------------------------
         # Recurse into subfolders
-        if f["mimeType"].endswith("folder") or f["mimeType"].endswith("apps-folder"):
+        # -----------------------------------------
+        if mime_type == "application/vnd.google-apps.folder":
             download_folder(drive, file_id, dest_path)
             continue
 
-        # Only download CSV or LOG files
-        if not file_name.lower().endswith((".csv", ".log")):
+        # -----------------------------------------
+        # CSV FILES ONLY
+        # -----------------------------------------
+        if not file_name.lower().endswith(".csv"):
             continue
 
-        # Remote timestamp
-        remote_ts = datetime.fromisoformat(f["modifiedDate"].replace("Z", "+00:00")).timestamp()
+        # Remote modified timestamp
+        remote_ts = datetime.fromisoformat(
+            f["modifiedDate"].replace("Z", "+00:00")
+        ).timestamp()
 
-        # Skip if local file is newer
+        # Skip if local file is newer or same
         if dest_path.exists() and dest_path.stat().st_mtime >= remote_ts:
             continue
 
-        # Download file
         try:
             f.GetContentFile(str(dest_path))
         except Exception as e:
             st.warning(f"Failed to download {file_name}: {e}")
             continue
 
-        # Sync timestamp
+        # Sync timestamps
         os.utime(dest_path, (time.time(), remote_ts))
-
 
 # =====================================================
 # Parse DHCP log
