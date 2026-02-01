@@ -2,72 +2,68 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 
-def render(filtered, logs_dir: Path, authorized: set):
-    st.title(" Raw Log Explorer")
+def render(logs_dir: Path, authorized: set):
+    st.title("Raw Log Explorer")
 
-    def list_all_logs(log_dir: Path):
-        files = []
-        for f in sorted(log_dir.rglob("*")):
-            if f.is_file():
-                files.append(str(f.relative_to(log_dir)))
-        return files
+    # -------------------------
+    # Step 1: List all folders
+    # -------------------------
+    # folders = sorted([f for f in logs_dir.iterdir() if f.is_dir()])
+    folders = sorted([
+        f for f in logs_dir.iterdir() 
+        if f.is_dir() and not f.name.endswith("-CSV")
+    ])
 
-    all_log_files = list_all_logs(logs_dir)
+    folder_names = [f.name for f in folders]
 
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        selected_file = st.selectbox("Select Log File", ["-- All Logs --"] + all_log_files)
+    selected_folder_name = st.selectbox("Select Folder", ["-- Select Folder --"] + folder_names)
 
-    logs_to_show = pd.DataFrame()
+    if selected_folder_name == "-- Select Folder --":
+        st.info("Select a folder to see log files")
+        return
 
-    if selected_file == "-- All Logs --":
-        all_rows = []
-        for f_path in logs_dir.rglob("*"):
-            if not f_path.is_file(): 
+    selected_folder = logs_dir / selected_folder_name
+
+    # -------------------------
+    # Step 2: List log files in folder
+    # -------------------------
+    log_files = sorted([f.name for f in selected_folder.glob("*.log")])
+    selected_file_name = st.selectbox("Select Log File", ["-- Select File --"] + log_files)
+
+    if selected_file_name == "-- Select File --":
+        st.info("Select a log file to preview")
+        return
+
+    selected_file_path = selected_folder / selected_file_name
+
+    # -------------------------
+    # Step 3: Load the selected log file
+    # -------------------------
+    data_rows = []
+    with open(selected_file_path, "r", errors="ignore") as f:
+        fields = None
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                if line.startswith("#fields"):
+                    fields = line.split()[1:]  # capture columns
                 continue
-            with open(f_path, "r", errors="ignore") as f:
-                lines = f.readlines()
-                header_line = next((l.strip() for l in lines if l.strip() and not l.startswith("#")), None)
-                if not header_line:
-                    continue
-                cols = header_line.split("\t")
-                for line in lines:
-                    if not line.strip() or line.startswith("#"): 
-                        continue
-                    parts = line.strip().split("\t")
-                    row = {cols[i]: parts[i] if i < len(parts) else "" for i in range(len(cols))}
-                    row["log_file"] = str(f_path.relative_to(logs_dir))
-                    # Optional: mark authorized
-                    if "mac" in row and row["mac"].lower() in authorized:
-                        row["status"] = "Authorized"
-                    else:
-                        row["status"] = row.get("status", "Unknown")
-                    all_rows.append(row)
-        if all_rows:
-            logs_to_show = pd.DataFrame(all_rows)
-    else:
-        file_path = logs_dir / selected_file
-        if file_path.exists():
-            with open(file_path, "r", errors="ignore") as f:
-                lines = f.readlines()
-                header_line = next((l.strip() for l in lines if l.strip() and not l.startswith("#")), None)
-                if header_line:
-                    cols = header_line.split("\t")
-                    rows = []
-                    for line in lines:
-                        if not line.strip() or line.startswith("#"): 
-                            continue
-                        parts = line.strip().split("\t")
-                        row = {cols[i]: parts[i] if i < len(parts) else "" for i in range(len(cols))}
-                        # Optional: mark authorized
-                        if "mac" in row and row["mac"].lower() in authorized:
-                            row["status"] = "Authorized"
-                        else:
-                            row["status"] = row.get("status", "Unknown")
-                        rows.append(row)
-                    logs_to_show = pd.DataFrame(rows)
+            if not fields:
+                continue
+            parts = line.split("\t")
+            row = {fields[i]: parts[i] if i < len(parts) else "" for i in range(len(fields))}
+            row["log_file"] = selected_file_name
+            # mark authorized if MAC exists
+            if "mac" in row and row["mac"].lower() in authorized:
+                row["status"] = "Authorized"
+            else:
+                row["status"] = row.get("status", "Unknown")
+            data_rows.append(row)
 
-    if not logs_to_show.empty:
-        st.dataframe(logs_to_show, use_container_width=True)
-    else:
-        st.warning("No data found in selected log.")
+    if not data_rows:
+        st.warning("No data found in this log file.")
+        return
+
+    df = pd.DataFrame(data_rows)
+
+    st.dataframe(df, use_container_width=True)

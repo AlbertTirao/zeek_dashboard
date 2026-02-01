@@ -26,7 +26,7 @@ elif page == "Devices":
 elif page == "Analytics":
     analytics.render(filtered, get_mac_vendor, authorized)
 elif page == "Zeek Logs":
-    zeek_logs.render(filtered, LOGS_DIR, authorized)
+    zeek_logs.render(LOGS_DIR, authorized)
 elif page == "Alerts":
     alerts.render(filtered)
 elif page == "Authorization":
