@@ -4,10 +4,38 @@ import plotly.express as px
 from pathlib import Path
 
 # =====================================================
+# Helper: read Zeek log file into DataFrame
+# =====================================================
+def read_zeek_log(path: Path) -> pd.DataFrame:
+    fields = None
+    data_lines = []
+
+    with open(path, "r") as f:
+        for line in f:
+            if line.startswith("#fields"):
+                fields = line.strip().split()[1:]
+            elif not line.startswith("#"):
+                data_lines.append(line)
+
+    if not fields or not data_lines:
+        return pd.DataFrame()
+
+    from io import StringIO
+    return pd.read_csv(
+        StringIO("".join(data_lines)),
+        sep="\t",
+        names=fields,
+        low_memory=False
+    )
+
+# =====================================================
 # Helper: get latest folder by date in name
 # =====================================================
-def get_latest_folder(root: Path, suffix="-CSV"):
-    folders = [f for f in root.iterdir() if f.is_dir() and f.name.endswith(suffix)]
+# def get_latest_folder(root: Path, suffix="-CSV"):
+#     folders = [f for f in root.iterdir() if f.is_dir() and f.name.endswith(suffix)]
+def get_latest_folder(root: Path):
+    folders = [f for f in root.iterdir() if f.is_dir()]
+
     if not folders:
         return None
     # Try parsing date from folder name
@@ -30,8 +58,10 @@ dhcp_file = None
 
 if latest_folder:
     # Pick the most recently modified CSVs inside the folder
-    known_hosts_candidates = list(latest_folder.glob("known_hosts*.csv"))
-    dhcp_candidates = list(latest_folder.glob("dhcp*.csv"))
+    # known_hosts_candidates = list(latest_folder.glob("known_hosts*.csv"))
+    known_hosts_candidates = list(latest_folder.glob("known_hosts*.log")) 
+    # dhcp_candidates = list(latest_folder.glob("dhcp*.csv"))
+    dhcp_candidates = list(latest_folder.glob("dhcp*.log"))
 
     if known_hosts_candidates:
         known_hosts_file = max(known_hosts_candidates, key=lambda f: f.stat().st_mtime)
@@ -45,24 +75,36 @@ else:
 # =====================================================
 known_hosts = pd.DataFrame()
 if known_hosts_file and known_hosts_file.exists():
-    known_hosts = pd.read_csv(known_hosts_file)
+    # known_hosts = pd.read_csv(known_hosts_file)
+    known_hosts = read_zeek_log(known_hosts_file)
     if not {"ts", "host", "mac"}.issubset(known_hosts.columns):
         st.warning(f"known_hosts.csv missing expected columns: {known_hosts.columns}")
         known_hosts = pd.DataFrame()
 else:
-    st.warning("No known_hosts.csv found")
+    st.warning("No known_hosts log found")
+    st.write("Known hosts rows:", len(known_hosts))
+    st.write(known_hosts.head())
+
+# =====================================================
+# DEBUG: verify known_hosts loading
+# =====================================================
+st.write("Known hosts file:", known_hosts_file)
+st.write("Known hosts rows:", len(known_hosts))
+st.write("Known hosts columns:", list(known_hosts.columns))
+st.write(known_hosts.head())
 
 # =====================================================
 # Load DHCP CSV
 # =====================================================
 dhcp = pd.DataFrame()
 if dhcp_file and dhcp_file.exists():
-    dhcp = pd.read_csv(dhcp_file)
+    # dhcp = pd.read_csv(dhcp_file)
+    dhcp = read_zeek_log(dhcp_file)
     if not {"client_addr", "host_name", "domain"}.issubset(dhcp.columns):
         st.warning(f"DHCP CSV missing expected columns: {dhcp.columns}")
         dhcp = pd.DataFrame()
 else:
-    st.warning("No DHCP CSV found")
+    st.warning("No DHCP log found")
 
 # =====================================================
 # Load authorized MACs
