@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
+import numpy as np  # Required for optimization
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 import streamlit as st
@@ -59,6 +60,26 @@ def download_folder(drive: GoogleDrive, folder_id: str, local_path: Path):
             continue
 
         os.utime(dest_path, (time.time(), remote_ts))
+
+
+# =====================================================
+# Helper: Optimize Data Types to Save RAM
+# =====================================================
+def optimize_dtypes(df):
+    """
+    Helper to downcast objects to categories to save RAM.
+    """
+    # List of common Zeek fields that are low-cardinality (repeated often)
+    cat_cols = ['proto', 'service', 'conn_state', 'history', 'method', 'status', 'dns_type', 'qtype_name']
+    
+    for col in df.columns:
+        # If the column name is in our list OR if it's an object type
+        if col in cat_cols or df[col].dtype == 'object':
+            # Only convert if unique values are less than 50% of total rows
+            # This prevents overhead on high-cardinality columns like IDs or timestamps
+            if df[col].nunique() < len(df) * 0.5:
+                df[col] = df[col].astype('category')
+    return df
 
 
 # =====================================================
@@ -119,31 +140,72 @@ def load_known_hosts(log_dir: Path):
                 macs.add(parts[1].lower())
     return macs
 
+
 # =====================================================
-# Generic Zeek log parser
+# Generic Zeek log parser (OPTIMIZED)
 # =====================================================
 def parse_zeek_log(file_path: Path, log_dir: Path):
     """
-    Parses a generic Zeek log into a Pandas DataFrame.
-    Skips lines starting with # and handles missing columns.
+    Parses a generic Zeek log into a Pandas DataFrame using chunking
+    to avoid MemoryError on large files.
     """
-    rows = []
+    chunk_size = 50000  # Process 50k rows at a time
+    chunks = []
+    current_chunk = []
+    headers = []
+    
     with open(file_path, "r", errors="ignore") as f:
-        headers = None
         for line in f:
             line = line.strip()
+            
+            # Skip empty lines or close markers
             if not line or line.startswith("#close"):
                 continue
+            
+            # Handle Headers
             if line.startswith("#fields"):
                 headers = line.split("\t")[1:]
                 continue
+            
+            # Ignore other metadata lines
+            if line.startswith("#"):
+                continue
+                
+            # If no headers found yet, skip data
             if not headers:
                 continue
+                
+            # Parse Data
             parts = line.split("\t")
+            
+            # Fill missing columns with None if line is short
             while len(parts) < len(headers):
                 parts.append(None)
-            rows.append(dict(zip(headers, parts)))
-    return pd.DataFrame(rows)
+                
+            # Create dictionary for the row
+            # Note: We slice parts to len(headers) to avoid issues if line is too long
+            row = dict(zip(headers, parts[:len(headers)]))
+            current_chunk.append(row)
+            
+            # --- CHUNK PROCESSING ---
+            if len(current_chunk) >= chunk_size:
+                df_chunk = pd.DataFrame(current_chunk)
+                df_chunk = optimize_dtypes(df_chunk) # Compress to save RAM
+                chunks.append(df_chunk)
+                current_chunk = [] # Clear memory
+    
+    # Process remaining rows
+    if current_chunk:
+        df_chunk = pd.DataFrame(current_chunk)
+        df_chunk = optimize_dtypes(df_chunk)
+        chunks.append(df_chunk)
+        
+    # If file was empty or only headers
+    if not chunks:
+        return pd.DataFrame()
+
+    return pd.concat(chunks, ignore_index=True)
+
 
 # =====================================================
 # Load Zeek logs by type
@@ -168,9 +230,13 @@ def load_zeek_logs(log_dir: Path, client_secret_path: str, folder_id: str):
     for log_type in logs.keys():
         for f in log_dir.rglob(f"{log_type}.log"):
             df = parse_zeek_log(f, log_dir)
-            logs[log_type] = pd.concat([logs[log_type], df], ignore_index=True)
+            
+            # Optimization: Try to concat efficiently
+            if not df.empty:
+                logs[log_type] = pd.concat([logs[log_type], df], ignore_index=True)
 
     return logs["http"], logs["ssl"], logs["dns"], logs["files"], logs["conn"]
+
 
 # =====================================================
 # Helper: get latest folder by today
