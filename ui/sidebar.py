@@ -1,40 +1,55 @@
 import streamlit as st
-from datetime import date
 from streamlit_autorefresh import st_autorefresh
 from streamlit_option_menu import option_menu
 
 def render_sidebar(auto_refresh_interval=3600):
     # -------------------------
-    # Inject CSS for full height, dark grey theme
+    # Inject CSS for uniform dark-grey sidebar
     # -------------------------
     st.markdown(
         """
         <style>
-        /* Sidebar full height and dark grey background */
+        /* Sidebar container */
         [data-testid="stSidebar"] > div:first-child {
             padding-top: 0rem;
-            background-color: #1e1e1e;  /* dark grey */
+            background-color: #191919;
         }
 
-        /* Option menu container pinned top */
+        /* Option menu container */
         .option-menu {
             display: flex;
             flex-direction: column;
             justify-content: flex-start !important;
             align-items: stretch;
+            background-color: #191919;
+            border-radius: 0 !important;
+        }
+
+        /* Nav links */
+        .option-menu .nav-link {
+            transition: all 0.2s ease;
+            border-bottom: 1px solid #191919;
+            background-color: #191919;
+            color: #cccccc;
+            margin: 0 !important;
+            border-radius: 0 !important;
         }
 
         /* Hover effect for nav links */
-        .option-menu .nav-link {
-            transition: all 0.2s ease;
-        }
-
         .option-menu .nav-link:hover {
-            background-color: #2a2a2a; /* slightly darker grey */
+            background-color: #2a2a2a;
             color: #ffffff;
         }
 
-        /* Sidebar title style */
+        /* Selected nav link */
+        .option-menu .nav-link-selected {
+            background-color: #2a2a2a;
+            font-weight: bold;
+            color: #ffffff;
+            border-radius: 0 !important;
+        }
+
+        /* Sidebar title */
         .sidebar-title {
             color: #ffffff;
             font-size: 20px;
@@ -52,63 +67,63 @@ def render_sidebar(auto_refresh_interval=3600):
         # -------------------------
         # Sidebar Title
         # -------------------------
-        st.markdown("<div class='sidebar-title'>Zeek SOC Dashboard</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sidebar-title'>Zeek Dashboard</div>", unsafe_allow_html=True)
 
         # -------------------------
-        # Navigation Drawer (pinned top)
+        # Navigation Drawer
         # -------------------------
+        if "sidebar_page" not in st.session_state:
+            st.session_state.sidebar_page = "Visual"
+
         page = option_menu(
             menu_title=None,
-            options=["Overview", "Devices", "Analytics", "Zeek Logs", "Alerts", "Authorization"],
-            icons=["house", "pc-display", "bar-chart", "folder", "bell", "key"],
+            options=["Visual", "Tables", "Analytics", "Zeek Logs", "Alerts", "Authorization"],
+            icons=["house", "table", "bar-chart", "folder", "bell", "key"],
             menu_icon=None,
             default_index=0,
             orientation="vertical",
             styles={
                 "container": {
                     "padding": "0!important",
-                    "background-color": "#1e1e1e",  # dark grey
+                    "background-color": "#191919",
                     "width": "100%",
+                    "border-radius": "0"
                 },
                 "icon": {"color": "#ffffff", "font-size": "18px"},
                 "nav-link": {
                     "font-size": "16px",
                     "text-align": "left",
-                    "margin": "4px 0px",
-                    "color": "#cccccc",  # light grey text
-                    "--hover-color": "#2a2a2a",
                     "padding": "10px 12px",
-                    "border-radius": "5px",
+                    "margin": "0",
+                    "border-radius": "0",
+                    "border-bottom": "1px solid #191919",
+                    "background-color": "#191919",
+                    "color": "#cccccc",
+                    "--hover-color": "#2a2a2a"
                 },
                 "nav-link-selected": {
-                    "background-color": "#333333",  # medium dark grey
+                    "background-color": "#2a2a2a",
                     "font-weight": "bold",
+                    "color": "#ffffff",
+                    "border-radius": "0"
                 }
             }
         )
 
-        # -------------------------
-        # Date Range Picker
-        # -------------------------
-        with st.expander("Date Range", expanded=True):
-            start_date = st.date_input("Start Date", value=date.today(), key="start_date")
-            end_date = st.date_input("End Date", value=date.today(), key="end_date")
+        # Update session state with current selection
+        st.session_state.sidebar_page = page
 
         # -------------------------
-        # Auto-refresh
+        # Auto-refresh every 1 hour
         # -------------------------
-        with st.expander("Auto-refresh", expanded=False):
-            refresh = st.checkbox(f"Enable auto-refresh every {auto_refresh_interval//3600}h", key="auto_refresh")
-            if refresh:
-                st_autorefresh(interval=auto_refresh_interval*1000, key="auto_refresh_timer")
-            st.button("Force Reload", on_click=lambda: (st.cache_data.clear(), st.experimental_rerun()))
+        st_autorefresh(interval=auto_refresh_interval*1000, key="auto_refresh_timer")
 
         # -------------------------
-        # Footer (clean, dark grey)
+        # Footer
         # -------------------------
         st.markdown(
-            "<div style='color:#888888;font-size:12px;text-align:center;margin-top:20px;'>© 2026 Zeek SOC Dashboard</div>",
+            "<div style='color:#aaaaaa;font-size:12px;text-align:center;margin-top:20px;'>© 2026 Zeek SOC Dashboard</div>",
             unsafe_allow_html=True
         )
 
-    return page, start_date, end_date
+    return st.session_state.sidebar_page

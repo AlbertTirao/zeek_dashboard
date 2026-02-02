@@ -59,7 +59,6 @@ def render(filtered, logs_dir: Path, authorized: set):
                             continue
                         parts = line.strip().split("\t")
                         row = {cols[i]: parts[i] if i < len(parts) else "" for i in range(len(cols))}
-                        # Optional: mark authorized
                         if "mac" in row and row["mac"].lower() in authorized:
                             row["status"] = "Authorized"
                         else:

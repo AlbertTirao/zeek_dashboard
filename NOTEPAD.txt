@@ -1,0 +1,6 @@
+    # # -------------------------
+    # # Optional: show raw table
+    # # -------------------------
+    # st.markdown("---")
+    # st.subheader("Device Details")
+    # st.dataframe(merged, use_container_width=True)
