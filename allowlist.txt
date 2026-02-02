@@ -1,0 +1,78 @@
+# --- Internal & Corporate ---
+internal.example.com
+jira.example.com
+wiki.example.com
+company.cloud
+
+# --- Web Hosting Control Panels & Billing ---
+cpanel.net
+plesk.com
+whmcs.com
+directadmin.com
+
+# --- SSL & Security (Essential for Hosting) ---
+letsencrypt.org
+digicert.com
+sectigo.com
+acme-v02.api.letsencrypt.org
+
+# --- CDNs & DNS Providers ---
+cloudflare.com
+api.cloudflare.com
+akamai.com
+fastly.com
+
+# --- Infrastructure & VPS Providers (Upstreams/Competitors) ---
+digitalocean.com
+linode.com
+vultr.com
+hetzner.com
+ovh.com
+
+# --- Monitoring & Observability ---
+datadoghq.com
+newrelic.com
+grafana.com
+sentry.io
+pagerduty.com
+statuspage.io
+
+# --- Major Cloud Providers ---
+aws.amazon.com
+s3.amazonaws.com
+azure.microsoft.com
+cloud.google.com
+googleapis.com
+
+# --- Development & Repositories ---
+github.com
+raw.githubusercontent.com
+gitlab.com
+bitbucket.org
+stackoverflow.com
+
+# --- SaaS & Productivity ---
+salesforce.com
+force.com
+slack.com
+office.com
+microsoft.com
+sharepoint.com
+google.com
+docs.google.com
+zoom.us
+atlassian.net
+notion.so
+
+# --- Authentication & Identity ---
+okta.com
+auth0.com
+onelogin.com
+
+# --- Package Managers & Registries ---
+pypi.org
+registry.npmjs.org
+docker.com
+hub.docker.com
+quay.io
+gcr.io
