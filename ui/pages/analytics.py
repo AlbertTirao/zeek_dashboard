@@ -21,6 +21,10 @@ def render(filtered: pd.DataFrame, http_logs: pd.DataFrame = None, ssl_logs: pd.
     st.set_page_config(page_title="Network Analytics", layout="wide")
     st.title("Network Analytics")
 
+    # Manual refresh (page-only)
+    if st.button("🔄 Refresh Analytics"):
+        st.rerun()
+
     # -----------------------------
     # Top tabs
     # -----------------------------
@@ -41,6 +45,11 @@ def render(filtered: pd.DataFrame, http_logs: pd.DataFrame = None, ssl_logs: pd.
         # -----------------------------
         if http_logs is not None and "host" in http_logs.columns:
             df_http = http_logs.copy()
+            # Remove Zeek header/type rows accidentally parsed as data
+            df_http = df_http[
+                (~df_http["host"].astype(str).str.lower().isin(["host", "string"]))
+                & (~df_http["host"].astype(str).str.startswith("#"))
+            ]
             df_http["host_lower"] = df_http["host"].str.lower()
             df_http["is_shadow"] = ~df_http["host_lower"].isin([d.lower() for d in APPROVED_DOMAINS])
             df_http_shadow = df_http[df_http["is_shadow"]].copy()

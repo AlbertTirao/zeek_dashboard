@@ -74,7 +74,7 @@ def load_authorized_macs(file_path: Path) -> set:
 # =====================================================
 def render(logs_root: Path, authorized_mac_file: Path):
     st.set_page_config(page_title="Network Overview", layout="wide")
-    st.title("VIsualization Device")
+    st.title("Device Overview")
 
     known_hosts, dhcp = load_all_daily_logs(logs_root)
     authorized_macs = load_authorized_macs(authorized_mac_file)
