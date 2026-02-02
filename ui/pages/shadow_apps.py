@@ -37,16 +37,16 @@ def render_charts(df: pd.DataFrame, ts_col: str, domain_col: str, title_prefix: 
     else:
         df["datetime"] = pd.NaT
 
+    # -----------------------------
+    # Charts
+    # -----------------------------
     col1, col2 = st.columns([3, 1])
 
-    # -----------------------------
-    # Line chart (Allowed + Not Allowed over time)
-    # -----------------------------
+    # Line chart
     with col1:
         if "datetime" in df.columns:
             df_line = df.groupby([pd.Grouper(key="datetime", freq="H"), "Status"]).size().reset_index(name="count")
 
-            # Fill missing combinations to ensure both lines appear
             all_status = ["Allowed", "Not Allowed"]
             all_times = pd.date_range(df_line['datetime'].min(), df_line['datetime'].max(), freq='H')
             full_index = pd.MultiIndex.from_product([all_times, all_status], names=['datetime', 'Status'])
@@ -69,38 +69,38 @@ def render_charts(df: pd.DataFrame, ts_col: str, domain_col: str, title_prefix: 
             )
             st.plotly_chart(fig_line, use_container_width=True)
 
-    # -----------------------------
-    # Pie chart (Not Allowed first, Allowed second)
-    # -----------------------------
+    # Pie chart
     with col2:
-        # Count statuses
         status_counts = df["Status"].value_counts()
 
-        # Ensure both statuses exist
         for status in ["Allowed", "Not Allowed"]:
             if status not in status_counts:
                 status_counts[status] = 0
 
-        # Reorder so Allowed comes first, Not Allowed second
+        # Swap order so Allowed is first, Not Allowed second
         status_counts = status_counts.reindex(["Allowed", "Not Allowed"])
 
-        # Create pie chart with correct colors and labels
         fig_pie = px.pie(
-            names=status_counts.index,     # Text labels
-            values=status_counts.values,   # Slice sizes
+            names=status_counts.index,
+            values=status_counts.values,
             hole=0.4,
             template="plotly_dark",
-            color=status_counts.index,     # Match colors to status
+            color=status_counts.index,
             color_discrete_map={"Allowed": "green", "Not Allowed": "red"},
             title="Status"
         )
         fig_pie.update_traces(
             textposition='inside',
             textinfo='label+percent',
-            sort=False  # Maintain the order we set
+            sort=False
         )
         st.plotly_chart(fig_pie, use_container_width=True)
 
+    # -----------------------------
+    # Table (move outside the columns)
+    # -----------------------------
+    st.markdown("---")
+    st.dataframe(df.head(MAX_ROWS_DISPLAY), use_container_width=True)
     st.markdown(f"Showing {min(MAX_ROWS_DISPLAY, len(df))} of {len(df)} rows")
 
 # -----------------------------
