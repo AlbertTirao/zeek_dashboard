@@ -112,10 +112,10 @@ def render(logs_root: Path, authorized_mac_file: Path):
         "font-size:12px; "
         "box-shadow: 1px 1px 5px rgba(0,0,0,0.3);"
     )
-    m1.markdown(f"<div style='{card_style}'><h4 style='margin:2px'>Active Devices</h4><h3 style='margin:2px'>{total}</h3></div>", unsafe_allow_html=True)
-    m2.markdown(f"<div style='{card_style}'><h4 style='margin:2px'>Authorized</h4><h3 style='margin:2px'>{auth}</h3></div>", unsafe_allow_html=True)
-    m3.markdown(f"<div style='{card_style}'><h4 style='margin:2px'>Unauthorized</h4><h3 style='margin:2px'>{unauth}</h3></div>", unsafe_allow_html=True)
-    m4.markdown(f"<div style='{card_style}'><h4 style='margin:2px'>Risk Ratio</h4><h3 style='margin:2px'>{risk_ratio}%</h3></div>", unsafe_allow_html=True)
+    m1.markdown(f"<div><h4 style='margin:2px'>Active Devices</h4><h3 style='margin:2px'>{total}</h3></div>", unsafe_allow_html=True)
+    m2.markdown(f"<div><h4 style='margin:2px'>Authorized</h4><h3 style='margin:2px'>{auth}</h3></div>", unsafe_allow_html=True)
+    m3.markdown(f"<div><h4 style='margin:2px'>Unauthorized</h4><h3 style='margin:2px'>{unauth}</h3></div>", unsafe_allow_html=True)
+    m4.markdown(f"<div><h4 style='margin:2px'>Risk Ratio</h4><h3 style='margin:2px'>{risk_ratio}%</h3></div>", unsafe_allow_html=True)
 
     st.markdown("---")
 
