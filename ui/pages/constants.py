@@ -3,7 +3,7 @@ from pathlib import Path
 import streamlit as st
 
 
-MAX_ROWS_DISPLAY = 100000000
+MAX_ROWS_DISPLAY = 320
 
 # Path to the allowlist file (relative to this file)
 ALLOWLIST_FILE = Path(__file__).resolve().parent.parent / "allowlist.txt"
