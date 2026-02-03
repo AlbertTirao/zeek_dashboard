@@ -5,7 +5,14 @@ from utils.helpers import get_mac_vendor
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, tables, visual, zeek_logs, alerts, authorization
 from pathlib import Path
+from services.drive_services import build_parquet_cache, load_today_parquet
 
+
+build_parquet_cache(LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID)
+
+if "zeek_logs" not in st.session_state:
+    st.session_state.zeek_logs = load_today_parquet()
+    
 # -------------------------
 # Load DHCP / device logs (cached)
 # -------------------------
