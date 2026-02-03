@@ -9,24 +9,30 @@ from urllib.parse import urlparse
 # Config
 # -----------------------------
 MAX_ROWS_DISPLAY = 500
-ALLOWLIST_FILE = Path(__file__).parent.parent / "allowlist.txt"
-
-# -----------------------------
+ALLOWLIST_FILE = Path(__file__).resolve().parents[2] / "allowlist.txt"
+#--------------------------
 # Load allowlist
 # -----------------------------
 def load_allowlist():
-    """Load domains from allowlist.txt, ignoring comments and blank lines."""
+    """Load and normalize domains from allowlist.txt."""
     if not ALLOWLIST_FILE.exists():
+        st.error(f"Allowlist not found: {ALLOWLIST_FILE}")
         return []
-    approved = []
+
+    approved = set()
     with open(ALLOWLIST_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
+            line = line.strip().lower()
             if not line or line.startswith("#"):
                 continue
-            approved.append(line.lower())
-    return approved
 
+            domain = extract_domain(line)
+            if domain:
+                approved.add(domain)
+
+    st.caption(f"Loaded {len(approved)} allowlisted domains")
+    return list(approved)
+    
 # -----------------------------
 # Extract domain from URL or hostname
 # -----------------------------

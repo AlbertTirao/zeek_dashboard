@@ -25,6 +25,20 @@ www.googleapis.cn
 device-api.palmplaystore.com
 otyfastapi.dangsfly.com
 
+ocsp.globalsign.com
+settings-win.data.microsoft.com:443
+www.google-analytics.com:443
+tas02.sls.update.microsoft.com:443
+sadownload.mcafee.com:443
+v10.events.data.microsoft.com:443
+web.vortex.data.microsoft.com
+sdx.microsoft.com
+www.msftncsi.com
+www.msftconnecttest.com
+192.168.201.50:1900
+us05web.zoom.us:443
+us05das.zoom.us:443
+
 
 # --- Cloud & Hosting Providers ---
 aws.amazon.com
