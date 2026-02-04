@@ -29,20 +29,20 @@ if not WARMUP_FLAG.exists():
 else:
     st.write("⚡ Parquet cache already initialized — skipping Drive parse")
 
-# -------------------------
-# Load & verify Parquet cache (PRINT ON EVERY RERUN)
-# -------------------------
-from services.drive_services import load_all_parquets
-from pathlib import Path
+# # -------------------------
+# # Load & verify Parquet cache (PRINT ON EVERY RERUN)
+# # -------------------------
+# from services.drive_services import load_all_parquets
+# from pathlib import Path
 
-PARQUET_DIR = Path("data/parquet")
+# PARQUET_DIR = Path("data/parquet")
 
-# Always load from Streamlit cache (fast, no re-read if unchanged)
-parquet_cache = load_all_parquets(PARQUET_DIR)
+# # Always load from Streamlit cache (fast, no re-read if unchanged)
+# parquet_cache = load_all_parquets(PARQUET_DIR)
 
-# 🔁 ALWAYS print on every script execution (refresh, rerun, auto-refresh)
-st.write("🔎 Verifying Parquet cache on this run:")
-debug_print_parquet_cache(parquet_cache)
+# # 🔁 ALWAYS print on every script execution (refresh, rerun, auto-refresh)
+# st.write("🔎 Verifying Parquet cache on this run:")
+# debug_print_parquet_cache(parquet_cache)
 
 # # -------------------------
 # # One-time Parquet → Pickle warm-up (DISK GUARDED)
