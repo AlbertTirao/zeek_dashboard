@@ -77,7 +77,7 @@ def render_sidebar(auto_refresh_interval=3600):
 
         page = option_menu(
             menu_title=None,
-            options=["Visual", "Tables", "Analytics", "Zeek Logs", "Alerts", "Authorization"],
+            options=["Visual", "Analytics", "Zeek Logs", "Alerts", "Authorization"],
             icons=["house", "table", "bar-chart", "folder", "bell", "key"],
             menu_icon=None,
             default_index=0,

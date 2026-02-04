@@ -14,4 +14,4 @@ __pycache__/
 # --- Parquet and Pickle files ---
 data/parquet/
 data/parquet/pickle/
-
+data/
