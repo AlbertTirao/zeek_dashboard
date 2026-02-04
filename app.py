@@ -1,10 +1,61 @@
 import streamlit as st
-from config.settings import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL
-from services.drive_services import load_logs, load_zeek_logs
+from config.settings import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL, PICKLE_DIR
+from services.drive_services import debug_print_parquet_cache, load_logs, load_zeek_logs, save_parquet_as_pickle
 from utils.helpers import get_mac_vendor
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, tables, visual, zeek_logs, alerts, authorization
 from pathlib import Path
+
+# -------------------------
+# One-time Zeek log → Parquet warm-up (DISK GUARDED)
+# -------------------------
+from pathlib import Path
+from services.drive_services import parse_drive_logs_to_parquet
+
+PARQUET_DIR = Path("data/parquet")
+WARMUP_FLAG = PARQUET_DIR / ".WARMED"
+
+if not WARMUP_FLAG.exists():
+    st.write("🔥 Initializing Parquet cache from ALL Zeek logs...")
+
+    parse_drive_logs_to_parquet(
+        client_secret_path=CLIENT_SECRET_FILE,
+        folder_id=FOLDER_ID,
+        parquet_root=PARQUET_DIR,
+    )
+
+    WARMUP_FLAG.touch()
+    st.write("✅ Parquet cache ready (raw logs untouched)")
+else:
+    st.write("⚡ Parquet cache already initialized — skipping Drive parse")
+
+# -------------------------
+# Load & verify Parquet cache (PRINT ON EVERY RERUN)
+# -------------------------
+from services.drive_services import load_all_parquets
+from pathlib import Path
+
+PARQUET_DIR = Path("data/parquet")
+
+# Always load from Streamlit cache (fast, no re-read if unchanged)
+parquet_cache = load_all_parquets(PARQUET_DIR)
+
+# 🔁 ALWAYS print on every script execution (refresh, rerun, auto-refresh)
+st.write("🔎 Verifying Parquet cache on this run:")
+debug_print_parquet_cache(parquet_cache)
+
+# -------------------------
+# One-time Parquet → Pickle warm-up (DISK GUARDED)
+# -------------------------
+PICKLE_DIR = PARQUET_DIR / "pickle"
+PICKLE_WARMUP_FLAG = PICKLE_DIR / ".WARMED"
+
+if not PICKLE_WARMUP_FLAG.exists():
+    save_parquet_as_pickle(PARQUET_DIR, PICKLE_DIR)
+    PICKLE_WARMUP_FLAG.touch()
+    st.write("💾 Pickle cache ready")
+else:
+    st.write("⚡ Pickle cache already initialized — skipping conversion")
 
 # -------------------------
 # Load DHCP / device logs (cached)
@@ -57,7 +108,7 @@ selected_page = render_sidebar(auto_refresh_interval=AUTO_REFRESH_INTERVAL)
 st.session_state.current_page = selected_page
 
 # -------------------------
-# Render only the page stored in session
+# Render only the page stored in sessiont
 # -------------------------
 def render_current_page():
     page = st.session_state.current_page

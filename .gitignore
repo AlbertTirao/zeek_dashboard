@@ -10,3 +10,8 @@ logs/
 
 __pycache__/
 *.pyc
+
+# --- Parquet and Pickle files ---
+data/parquet/
+data/parquet/pickle/
+
