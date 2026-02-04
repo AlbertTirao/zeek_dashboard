@@ -133,7 +133,7 @@ def mac_selector_table(df, table_name="Table"):
 # Apply global MAC filter
 # -----------------------------
 def apply_global_mac_filter(df):
-    if st.session_state.selected_mac:
+    if st.session_state.get("selected_mac"):
         df = df[df["mac"] == st.session_state.selected_mac]
     return df
 

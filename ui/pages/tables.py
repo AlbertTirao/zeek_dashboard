@@ -33,14 +33,14 @@ def load_zeek_log(path: Path) -> pd.DataFrame:
                     continue
                 if headers:
                     parts = line.split("\t")
-                    rows.append(parts[:len(headers)])  # truncate extra columns
+                    rows.append(parts[:len(headers)])
 
         if not headers or not rows:
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=headers)
 
-        # Convert ts to datetime (Zeek ts is usually Unix epoch)
+        # Convert ts to datetime
         if "ts" in df.columns:
             df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
             df["ts"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
@@ -106,12 +106,18 @@ if not known_hosts.empty:
         known_hosts["date_only"] = known_hosts["ts"].dt.date
 
 # =====================================================
-# Normalize DHCP (optional enrichment)
+# Normalize DHCP (THE FIX Part 1)
 # =====================================================
 def normalize_dhcp(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    cols = ["client_addr", "host_name", "domain"]
+    
+    # Clean MAC for robust merging
+    if "mac" in df.columns:
+        df["mac"] = df["mac"].astype(str).str.strip().str.lower()
+        
+    # We grab MAC instead of client_addr (IP)
+    cols = ["mac", "host_name", "domain"]
     return df[[c for c in cols if c in df.columns]]
 
 # =====================================================
@@ -158,15 +164,18 @@ def render(authorized: set[str]):
         st.info("No devices for the selected date(s)")
         return
 
-    # Merge DHCP info if available
+    # Merge DHCP info if available (THE FIX Part 2)
     if not dhcp.empty:
         dhcp_norm = normalize_dhcp(dhcp)
+        
+        # Deduplicate: Get the LATEST hostname for each MAC
+        dhcp_unique = dhcp_norm.drop_duplicates(subset=["mac"], keep="last")
+        
         merged = pd.merge(
             filtered_hosts,
-            dhcp_norm,
+            dhcp_unique,
             how="left",
-            left_on="host",
-            right_on="client_addr"
+            on="mac"  # <--- FIXED: Merging by MAC, not IP
         )
     else:
         merged = filtered_hosts.copy()
