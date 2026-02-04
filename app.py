@@ -1,6 +1,6 @@
 import streamlit as st
 from config.settings import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL, PICKLE_DIR
-from services.drive_services import debug_print_parquet_cache, load_logs, load_zeek_logs, save_parquet_as_pickle
+from services.drive_services import debug_print_parquet_cache, load_logs, load_zeek_logs
 from utils.helpers import get_mac_vendor
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, tables, visual, zeek_logs, alerts, authorization
@@ -44,18 +44,18 @@ parquet_cache = load_all_parquets(PARQUET_DIR)
 st.write("🔎 Verifying Parquet cache on this run:")
 debug_print_parquet_cache(parquet_cache)
 
-# -------------------------
-# One-time Parquet → Pickle warm-up (DISK GUARDED)
-# -------------------------
-PICKLE_DIR = PARQUET_DIR / "pickle"
-PICKLE_WARMUP_FLAG = PICKLE_DIR / ".WARMED"
+# # -------------------------
+# # One-time Parquet → Pickle warm-up (DISK GUARDED)
+# # -------------------------
+# PICKLE_DIR = PARQUET_DIR / "pickle"
+# PICKLE_WARMUP_FLAG = PICKLE_DIR / ".WARMED"
 
-if not PICKLE_WARMUP_FLAG.exists():
-    save_parquet_as_pickle(PARQUET_DIR, PICKLE_DIR)
-    PICKLE_WARMUP_FLAG.touch()
-    st.write("💾 Pickle cache ready")
-else:
-    st.write("⚡ Pickle cache already initialized — skipping conversion")
+# if not PICKLE_WARMUP_FLAG.exists():
+#     save_parquet_as_pickle(PARQUET_DIR, PICKLE_DIR)
+#     PICKLE_WARMUP_FLAG.touch()
+#     st.write("💾 Pickle cache ready")
+# else:
+#     st.write("⚡ Pickle cache already initialized — skipping conversion")
 
 # -------------------------
 # Load DHCP / device logs (cached)
