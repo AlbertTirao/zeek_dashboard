@@ -1,16 +1,9 @@
 import streamlit as st
-from config.settings import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL, PICKLE_DIR
-from services.drive_services import debug_print_parquet_cache, load_logs, load_zeek_logs
-from utils.helpers import get_mac_vendor
+from config.settings import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL
+from services.drive_services import parse_drive_logs_to_parquet
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, tables, visual, zeek_logs, alerts, authorization
 from pathlib import Path
-
-# -------------------------
-# One-time Zeek log → Parquet warm-up (DISK GUARDED)
-# -------------------------
-from pathlib import Path
-from services.drive_services import parse_drive_logs_to_parquet
 
 PARQUET_DIR = Path("data/parquet")
 WARMUP_FLAG = PARQUET_DIR / ".WARMED"
@@ -18,16 +11,6 @@ WARMUP_FLAG = PARQUET_DIR / ".WARMED"
 if not WARMUP_FLAG.exists():
     st.write("🔥 Initializing Parquet cache from ALL Zeek logs...")
 
-    parse_drive_logs_to_parquet(
-        client_secret_path=CLIENT_SECRET_FILE,
-        folder_id=FOLDER_ID,
-        parquet_root=PARQUET_DIR,
-    )
-
-    WARMUP_FLAG.touch()
-    st.write("✅ Parquet cache ready (raw logs untouched)")
-else:
-    st.write("⚡ Parquet cache already initialized — skipping Drive parse")
 
 # # -------------------------
 # # Load & verify Parquet cache (PRINT ON EVERY RERUN)
@@ -57,82 +40,70 @@ else:
 # else:
 #     st.write("⚡ Pickle cache already initialized — skipping conversion")
 
-# -------------------------
-# Load DHCP / device logs (cached)
-# -------------------------
-if "data" not in st.session_state:
-    st.session_state.data = load_logs(LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID)
-df = st.session_state.data
 
-# -------------------------
-# Load authorized MACs from authorized_macs.txt
-# -------------------------
+# =====================================================
+# CONFIGURATION
+# =====================================================
+PARQUET_ROOT = Path("data/parquet")
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
-if AUTHORIZED_MACS_FILE.exists():
-    with open(AUTHORIZED_MACS_FILE, "r") as f:
-        authorized = {line.strip().lower() for line in f if line.strip()}
-else:
-    authorized = set()
 
-# -------------------------
-# Assign status to device logs
-# -------------------------
-df["status"] = df["mac"].apply(lambda m: "Authorized" if m.lower() in authorized else "Unauthorized")
-filtered = df.copy()
+# =====================================================
+# AUTOMATIC DATA LOADING (The "Magic" Part)
+# =====================================================
+# This block runs AUTOMATICALLY once per session (when you first open the tab)
+if "data_synced" not in st.session_state:
+    # Run the download/conversion process
+    # It will now print "👍 Local cache is up to date" if nothing new exists
+    parse_drive_logs_to_parquet(
+        client_secret_path=CLIENT_SECRET_FILE,
+        folder_id=FOLDER_ID,
+        parquet_root=PARQUET_ROOT,
+    )
+    
+    st.session_state.data_synced = True
+    st.rerun()
 
-# -------------------------
-# Lazy-load Zeek logs (NOT for Visual)
-# -------------------------
-if st.session_state.get("current_page") in {"Analytics", "Zeek Logs"}:
-    if "zeek_logs" not in st.session_state:
-        http_logs, ssl_logs, dns_logs, files_logs, conn_logs = load_zeek_logs(
-            LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID
-        )
-        st.session_state.zeek_logs = {
-            "http": http_logs,
-            "ssl": ssl_logs,
-            "dns": dns_logs,
-            "files": files_logs,
-            "conn": conn_logs
-        }
-
-# -------------------------
-# Force only Visual on first startup
-# -------------------------
+# =====================================================
+# STATE MANAGEMENT
+# =====================================================
 if "initialized" not in st.session_state:
     st.session_state.current_page = "Visual"
     st.session_state.initialized = True
 
-# -------------------------
-# Sidebar
-# -------------------------
+# =====================================================
+# NAVIGATION & ROUTING
+# =====================================================
+# We keep a manual refresh button in the sidebar just in case you want to force it later
 selected_page = render_sidebar(auto_refresh_interval=AUTO_REFRESH_INTERVAL)
+if st.sidebar.button("🔄 Force Refresh Data"):
+    # Remove the flag to trigger the automatic loader again
+    del st.session_state.data_synced
+    st.rerun()
+
 st.session_state.current_page = selected_page
 
-# -------------------------
-# Render only the page stored in sessiont
-# -------------------------
 def render_current_page():
     page = st.session_state.current_page
+    
     if page == "Visual":
-        visual.render(LOGS_DIR, AUTHORIZED_MACS_FILE)
+        visual.render(PARQUET_ROOT, AUTHORIZED_MACS_FILE)
+    
     elif page == "Tables":
-        tables.render(authorized)
+        tables.render(PARQUET_ROOT, AUTHORIZED_MACS_FILE)
+        
     elif page == "Analytics":
-        analytics.render(
-            filtered,
-            http_logs=zeek_logs_data["http"],
-            ssl_logs=zeek_logs_data["ssl"],
-            dns_logs=zeek_logs_data["dns"]
-        )
+        analytics.render(PARQUET_ROOT)
+        
     elif page == "Zeek Logs":
-        zeek_logs.render(filtered, LOGS_DIR, authorized)
+        zeek_logs.render(PARQUET_ROOT)
+        
     elif page == "Alerts":
-        alerts.render(filtered)
+        alerts.render(PARQUET_ROOT, AUTHORIZED_MACS_FILE)
+        
     elif page == "Authorization":
         authorization.render(AUTHORIZED_MACS_FILE)
 
-# -------------------------
-# Call render
-# -------------------------
+# =====================================================
+# MAIN EXECUTION
+# =====================================================
 render_current_page()
