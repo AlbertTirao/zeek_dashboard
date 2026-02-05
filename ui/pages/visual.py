@@ -44,6 +44,82 @@ def load_visual_metrics_from_parquet(parquet_root: Path):
     return known_hosts, dhcp
 
 # =====================================================
+# Drill-Down Log Loader
+# =====================================================
+@st.cache_data(show_spinner=False)
+def get_device_activity(parquet_root: Path, target_mac: str, target_ip: str, selected_date_str: str):
+    """
+    Searches DNS, HTTP, and SSL logs for a specific MAC or IP.
+    """
+    activity_log = []
+    
+    # Format: (filename_prefix, service_name, detail_column)
+    log_types = [
+        ("dns", "DNS", "query"),
+        ("http", "HTTP", "host"),
+        ("ssl", "SSL", "server_name")
+    ]
+
+    # Filter for specific date if selected
+    if selected_date_str and selected_date_str != "All Dates":
+        day_dirs = [parquet_root / selected_date_str]
+    else:
+        # Scan all date folders
+        day_dirs = sorted(p for p in parquet_root.iterdir() if p.is_dir())
+
+    for day_dir in day_dirs:
+        if not day_dir.exists(): continue
+        
+        for file_prefix, service, detail_col in log_types:
+            pq_file = day_dir / f"{file_prefix}.parquet"
+            if not pq_file.exists(): continue
+            
+            try:
+                # Optimized load
+                df = pd.read_parquet(pq_file)
+                
+                # Filter by MAC (priority) or IP
+                filtered = pd.DataFrame()
+                if "mac" in df.columns:
+                    filtered = df[df["mac"].str.lower() == target_mac.lower()]
+                elif "id.orig_h" in df.columns:
+                    filtered = df[df["id.orig_h"] == target_ip]
+                
+                if filtered.empty: continue
+
+                # Normalize columns
+                if detail_col not in filtered.columns: filtered[detail_col] = "-"
+                
+                norm = pd.DataFrame()
+                norm["ts"] = filtered["ts"]
+                norm["Service"] = service
+                norm["Destination"] = filtered[detail_col]
+                
+                # Add context details
+                if service == "HTTP" and "uri" in filtered.columns:
+                    norm["Details"] = filtered["uri"]
+                elif service == "DNS" and "qtype_name" in filtered.columns:
+                    norm["Details"] = filtered["qtype_name"]
+                elif service == "SSL" and "version" in filtered.columns:
+                    norm["Details"] = filtered["version"]
+                else:
+                    norm["Details"] = "-"
+
+                activity_log.append(norm)
+
+            except Exception:
+                continue
+
+    if not activity_log:
+        return pd.DataFrame()
+
+    final_df = pd.concat(activity_log, ignore_index=True)
+    final_df["ts"] = pd.to_numeric(final_df["ts"], errors='coerce')
+    final_df["ts"] = pd.to_datetime(final_df["ts"], unit="s")
+    
+    return final_df.sort_values("ts", ascending=False)
+
+# =====================================================
 # MAC vendor lookup
 # =====================================================
 @st.cache_data(show_spinner=False)
@@ -55,40 +131,6 @@ def get_mac_vendor(mac: str) -> str:
         return r.text if r.status_code == 200 else "Unknown"
     except Exception:
         return "Unknown"
-
-# =====================================================
-# Zeek log loader
-# =====================================================
-# def load_zeek_log(path: Path) -> pd.DataFrame:
-#     headers, rows = None, []
-#     try:
-#         with open(path, "r", encoding="utf-8") as f:
-#             for line in f:
-#                 line = line.strip()
-#                 if not line:
-#                     continue
-#                 if line.startswith("#"):
-#                     if line.startswith("#fields"):
-#                         headers = line.split("\t")[1:]
-#                     continue
-#                 if headers:
-#                     parts = line.split("\t")
-#                     row = {col: parts[i] if i < len(parts) else None for i, col in enumerate(headers)}
-#                     rows.append(row)
-#         if not headers or not rows:
-#             return pd.DataFrame()
-#         df = pd.DataFrame(rows)
-#         if "ts" in df.columns:
-#             df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-#             df["ts"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
-#         if "mac" in df.columns:
-#             df["mac"] = df["mac"].astype(str).str.lower().str.strip()
-#         if "host" in df.columns:
-#             df["host"] = df["host"].astype(str).str.strip()
-#         return df
-#     except Exception as e:
-#         st.warning(f"Failed to load {path.name}: {e}")
-#         return pd.DataFrame()
 
 # =====================================================
 # Load authorized MACs
@@ -130,18 +172,13 @@ def render(logs_root: Path, authorized_mac_file: Path):
     merged["status"] = merged["mac"].apply(lambda m: "Authorized" if m in authorized_macs else "Unauthorized")
 
     # ---------------------------------------------------------
-    # ROBUST FIX: Force 'ts' to datetime
+    # Force 'ts' to datetime
     # ---------------------------------------------------------
     if "ts" in merged.columns and not merged.empty:
-        # 1. Force convert to numeric first (handles strings that look like numbers)
-        #    'coerce' turns non-parseable data into NaN
         merged["ts"] = pd.to_numeric(merged["ts"], errors='coerce')
-        
-        # 2. Convert numeric to datetime (assuming Unix timestamp in seconds)
         merged["ts"] = pd.to_datetime(merged["ts"], unit="s", errors='coerce')
-
-        # 3. Drop rows where timestamp conversion failed (NaN/NaT)
         merged = merged.dropna(subset=["ts"])
+        merged["date"] = merged["ts"].dt.date
 
     # Metrics
     total_unique = merged["mac"].nunique()
@@ -162,7 +199,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.subheader("Activity Overview")
     
     hourly = pd.DataFrame()
-    # Now that 'ts' is guaranteed to be datetime, set_index will work for resampling
     if not merged.empty and "ts" in merged.columns:
         try:
             hourly = merged.set_index("ts").groupby("status").resample("1H").size().reset_index(name="events")
@@ -172,7 +208,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if not hourly.empty:
         line_fig = px.line(
             hourly, x="ts", y="events", color="status",
-            color_discrete_map={"Authorized":"#00F7FF","Unauthorized":"#F63049"},
+            color_discrete_map={"Authorized":"#39CF0B","Unauthorized":"#F63049"},
             template="plotly_dark"
         )
         line_fig.update_layout(
@@ -198,7 +234,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
             "threshold":{"line":{"color":"white","width":2},"thickness":0.75,"value":50}
         }
     ))
-    # Dummy traces for legend
     for label, color in [('Current Level','#30C1F6'), ('Safe (0-20%)','#6CA651'), ('Warning (20-50%)','#F3AE4B'), ('High Risk (50%+)','#D63447')]:
         gauge_fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=10, color=color), name=label))
 
@@ -214,59 +249,56 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.markdown("<h2 style='color:white; text-align:left;'>Device Count</h2>", unsafe_allow_html=True)
     
     if "ts" in merged.columns and not merged.empty:
-        merged["date"] = merged["ts"].dt.date
         daily_count = merged.drop_duplicates(subset=["mac","date"]).groupby(["date","status"]).size().reset_index(name="devices")
         bar_fig = px.bar(
             daily_count, x="date", y="devices", color="status", barmode="stack",
-            color_discrete_map={"Authorized":"#00F7FF","Unauthorized":"#F63049"},
+            color_discrete_map={"Authorized":"#07c53d","Unauthorized":"#F63049"},
             template="plotly_dark", labels={"devices":"Devices","date":"Date"}
         )
         bar_fig.update_layout(height=500, margin=dict(l=20, r=20, t=50, b=100), xaxis={"tickfont":{"size":14}}, yaxis={"tickfont":{"size":14}}, legend={"font":{"size":14}})
         st.plotly_chart(bar_fig, use_container_width=True)
 
     # =====================================================
-    # DEVICE INVENTORY TABLE (BOTTOM PART)
+    # DEVICE INVENTORY TABLE
     # =====================================================
     st.markdown("---")
     st.title("Device Inventory")
 
-    # 1. Prepare Date Options
+    # 1. Prepare Date Options (Used for both inventory and drill-down)
     available_dates = []
     if "date" in merged.columns:
         available_dates = sorted([d for d in merged["date"].unique() if pd.notnull(d)], reverse=True)
     date_options = ["All Dates"] + [str(d) for d in available_dates]
 
     # 2. Main Filter Row
-    master_col1, master_col2 = st.columns([1, 3], gap="medium", vertical_alignment="bottom")
+    master_col1, master_col2, master_col3 = st.columns([1, 1.5, 2.5], gap="medium", vertical_alignment="bottom")
 
     with master_col1:
-        selected_date_str = st.selectbox(
-            "Select Date", 
-            options=date_options, 
-            index=1 if len(date_options) > 1 else 0
+        selected_date_str = st.selectbox("Select Date", options=date_options, index=0)
+    
+    with master_col2:
+        status_filter = st.radio(
+            "Show Access:",
+            ["Authorized", "Unauthorized"],
+            horizontal=True,
+            index=0
         )
 
-    # 3. Apply Date Filter
+    # 3. Apply Date Filter to INVENTORY
     if selected_date_str == "All Dates":
         table_df = merged.copy()
     else:
         table_df = merged[merged["date"].astype(str) == selected_date_str]
 
-    with master_col2:
-        # 4. Search Form
+    with master_col3:
         with st.form(key="search_form", border=False):
-            s_input_col, s_btn_col = st.columns([5, 1], gap="small", vertical_alignment="bottom")
-            
+            s_input_col, s_btn_col = st.columns([4, 1], gap="small", vertical_alignment="bottom")
             with s_input_col:
-                search_term = st.text_input(
-                    "Search", 
-                    placeholder="🔍 Search MAC / IP / Host / Domain...", 
-                    label_visibility="visible"
-                )
+                search_term = st.text_input("Search", placeholder="🔍 Search MAC / IP / Host...", label_visibility="visible")
             with s_btn_col:
                 submit_button = st.form_submit_button("Search", use_container_width=True)
 
-    # 5. Data Processing & Table Display
+    # 5. Table Display
     if not table_df.empty:
         inventory = (
             table_df.groupby("mac")
@@ -283,6 +315,11 @@ def render(logs_root: Path, authorized_mac_file: Path):
         
         inventory["vendor"] = inventory["mac"].apply(get_mac_vendor)
 
+        if status_filter == "Authorized":
+            inventory = inventory[inventory["status"] == "Authorized"]
+        else:
+            inventory = inventory[inventory["status"] == "Unauthorized"]
+
         if search_term:
             inventory = inventory[
                 inventory.astype(str)
@@ -290,8 +327,17 @@ def render(logs_root: Path, authorized_mac_file: Path):
                 .any(axis=1)
             ]
 
+        def color_status(val):
+            if val == "Authorized":
+                return 'color: #81c995; font-weight: bold'
+            elif val == "Unauthorized":
+                return 'color: #ff6666; font-weight: bold'
+            return ''
+
+        styled_inventory = inventory.style.map(color_status, subset=['status'])
+
         st.dataframe(
-            inventory.sort_values("last_seen", ascending=False),
+            styled_inventory,
             column_config={
                 "mac": "MAC Address",
                 "ip": "IP Address",
@@ -305,5 +351,133 @@ def render(logs_root: Path, authorized_mac_file: Path):
             use_container_width=True,
             hide_index=True
         )
+
+        # =====================================================
+        # NEW FEATURE: DRILL DOWN (Below the table)
+        # =====================================================
+        st.markdown("---")
+        st.subheader("Device Forensics")
+        
+        # 1. Selection Dropdown (MACs)
+        inventory["display_label"] = inventory["mac"]
+        selected_device_mac = st.selectbox(
+            "1. Select a device to investigate:",
+            options=inventory["display_label"].tolist(),
+            index=None,
+            placeholder="Select a MAC address..."
+        )
+
+        if selected_device_mac:
+            target_mac = selected_device_mac
+            target_ip = ""
+            try:
+                target_ip = inventory[inventory["mac"] == target_mac]["ip"].values[0]
+            except IndexError:
+                pass 
+
+            # Layout: Date Selection & Service Filter
+            c_date, c_filter = st.columns([1, 2], gap="large")
+            with c_date:
+                drill_down_date = st.selectbox(
+                    "2. Select Activity Date:",
+                    options=date_options,
+                    index=0 
+                )
+            
+            with c_filter:
+                service_view = st.radio(
+                    "3. Filter View by Service:",
+                    ["All Services", "DNS", "HTTP", "SSL"],
+                    horizontal=True,
+                    index=0
+                )
+
+            with st.spinner(f"Fetching logs for {target_mac} on {drill_down_date}..."):
+                activity_df = get_device_activity(PARQUET_ROOT, target_mac, target_ip, drill_down_date)
+
+            if not activity_df.empty:
+                # --- FILTERING LOGIC ---
+                filtered_activity = activity_df.copy()
+                
+                if service_view != "All Services":
+                    filtered_activity = filtered_activity[filtered_activity["Service"] == service_view]
+
+                # --- TOP DESTINATIONS TABLE (Full Width) ---
+                top_sites = filtered_activity["Destination"].value_counts().head(5)
+                
+                st.markdown(f"#### Top Destinations ({service_view})")
+                if not top_sites.empty:
+                    st.dataframe(top_sites, use_container_width=True)
+                else:
+                    st.info("No activity for this service.")
+                
+                # --- DYNAMIC CHART (Full Width, Below Table) ---
+                st.markdown("#### Traffic Activity Graph")
+                color_map = {"DNS": "#F63049", "HTTP": "#00F7FF", "SSL": "#F3AE4B"}
+                
+                if service_view == "All Services":
+                    # DEFAULT: Detailed Scatter
+                    fig = px.scatter(
+                        filtered_activity, x="ts", y="Service", color="Service",
+                        hover_data=["Destination", "Details"],
+                        color_discrete_map=color_map,
+                        title=f"Activity Timeline: {target_mac}"
+                    )
+                    fig.update_traces(marker=dict(size=14, opacity=0.8)) 
+                else:
+                    # SPECIFIC SERVICE: Volume Area Chart
+                    volume_df = (
+                        filtered_activity.set_index("ts")
+                        .resample("10min")
+                        .size()
+                        .reset_index(name="Events")
+                    )
+                    
+                    fig = px.area(
+                        volume_df, x="ts", y="Events",
+                        title=f"{service_view} Traffic Volume (Events / 10min)",
+                        template="plotly_dark"
+                    )
+                    fig.update_traces(line_color=color_map.get(service_view, "#ffffff"))
+
+                # Increased Font Sizes
+                fig.update_layout(
+                    template="plotly_dark", 
+                    height=400, # Taller graph
+                    font=dict(size=16), # Bigger general font
+                    legend=dict(font=dict(size=16)),
+                    xaxis=dict(tickfont=dict(size=14), title="Time"),
+                    yaxis=dict(tickfont=dict(size=14), title="Events")
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Detailed Log Table (Unique Events)
+                with st.expander("View Full Log Details (Unique Events)"):
+                    if not filtered_activity.empty:
+                        unique_logs = (
+                            filtered_activity.groupby(["Service", "Destination", "Details"])
+                            .agg(
+                                Last_Seen=("ts", "max"),
+                                Count=("ts", "count")
+                            )
+                            .reset_index()
+                            .sort_values("Last_Seen", ascending=False)
+                        )
+
+                        st.dataframe(
+                            unique_logs,
+                            column_config={
+                                "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss"),
+                                "Destination": "Query / Host / Server",
+                                "Count": st.column_config.NumberColumn("Events", help="Number of times this event occurred"),
+                            },
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("No logs found for this filter.")
+            else:
+                st.info(f"No detailed activity found for {target_mac} on {drill_down_date}.")
+
     else:
-        st.info("No devices for the selected date")
+        st.info("No logs found for this selection.")
