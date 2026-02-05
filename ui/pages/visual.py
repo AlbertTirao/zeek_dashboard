@@ -6,6 +6,44 @@ from pathlib import Path
 import requests
 
 # =====================================================
+# Load Visual Metrics from Parquet
+# =====================================================
+@st.cache_data(show_spinner=False)
+def load_visual_metrics_from_parquet(parquet_root: Path):
+    """
+    Load ONLY the data needed by Visual metrics
+    from Parquet instead of raw Zeek logs.
+    """
+    known_hosts_all = []
+    dhcp_all = []
+
+    if not parquet_root.exists():
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Expect structure: data/parquet/YYYY-MM-DD/*.parquet
+    for day_dir in sorted(p for p in parquet_root.iterdir() if p.is_dir()):
+        kh = day_dir / "known_hosts.parquet"
+        dh = day_dir / "dhcp.parquet"
+
+        if kh.exists():
+            known_hosts_all.append(pd.read_parquet(kh))
+
+        if dh.exists():
+            dhcp_all.append(pd.read_parquet(dh))
+
+    known_hosts = (
+        pd.concat(known_hosts_all, ignore_index=True)
+        if known_hosts_all else pd.DataFrame()
+    )
+
+    dhcp = (
+        pd.concat(dhcp_all, ignore_index=True)
+        if dhcp_all else pd.DataFrame()
+    )
+
+    return known_hosts, dhcp
+
+# =====================================================
 # MAC vendor lookup
 # =====================================================
 @st.cache_data(show_spinner=False)
@@ -89,7 +127,11 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.set_page_config(page_title="Network Overview", layout="wide")
     st.title("Device Overview")
 
-    known_hosts, dhcp = load_all_daily_logs(logs_root)
+    # known_hosts, dhcp = load_all_daily_logs(logs_root)
+    # USE PARQUET INSTEAD
+    PARQUET_ROOT = Path("data/parquet")
+
+    known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
     authorized_macs = load_authorized_macs(authorized_mac_file)
     
     if known_hosts.empty:

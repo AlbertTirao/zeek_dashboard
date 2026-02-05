@@ -81,18 +81,20 @@ df["status"] = df["mac"].apply(lambda m: "Authorized" if m.lower() in authorized
 filtered = df.copy()
 
 # -------------------------
-# Load Zeek logs (HTTP, SSL, DNS, FILES, CONN)
+# Lazy-load Zeek logs (NOT for Visual)
 # -------------------------
-if "zeek_logs" not in st.session_state:
-    http_logs, ssl_logs, dns_logs, files_logs, conn_logs = load_zeek_logs(LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID)
-    st.session_state.zeek_logs = {
-        "http": http_logs,
-        "ssl": ssl_logs,
-        "dns": dns_logs,
-        "files": files_logs,
-        "conn": conn_logs
-    }
-zeek_logs_data = st.session_state.zeek_logs
+if st.session_state.get("current_page") in {"Analytics", "Zeek Logs"}:
+    if "zeek_logs" not in st.session_state:
+        http_logs, ssl_logs, dns_logs, files_logs, conn_logs = load_zeek_logs(
+            LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID
+        )
+        st.session_state.zeek_logs = {
+            "http": http_logs,
+            "ssl": ssl_logs,
+            "dns": dns_logs,
+            "files": files_logs,
+            "conn": conn_logs
+        }
 
 # -------------------------
 # Force only Visual on first startup
