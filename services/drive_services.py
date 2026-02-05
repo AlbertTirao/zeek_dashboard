@@ -14,55 +14,6 @@ import os
 import pandas as pd
 from pathlib import Path
 
-# def save_parquet_as_pickle(parquet_root: Path, pickle_root: Path):
-#     """
-#     Convert all parquet files under parquet_root to pickle files under pickle_root.
-#     Directory structure is preserved.
-#     """
-#     pickle_root.mkdir(parents=True, exist_ok=True)
-
-#     for date_dir in sorted(parquet_root.iterdir()):
-#         if not date_dir.is_dir():
-#             continue
-
-#         pickle_date_dir = pickle_root / date_dir.name
-#         pickle_date_dir.mkdir(parents=True, exist_ok=True)
-
-#         for pq_file in date_dir.glob("*.parquet"):
-#             df = pd.read_parquet(pq_file)
-#             pickle_file = pickle_date_dir / f"{pq_file.stem}.pkl"
-#             df.to_pickle(pickle_file)
-#             print(f"💾 Saved {pq_file} → {pickle_file}")
-
-
-# def load_pickles(pickle_root: Path, dates: list[str] = None, log_types: list[str] = None):
-#     """
-#     Load pickle files from disk into memory.
-#     - dates: list of date strings (YYYY-MM-DD) to load. None = all dates
-#     - log_types: list of log types (http, conn, dns, etc) to load. None = all logs
-#     Returns dict[date][log_type] = DataFrame
-#     """
-#     result = {}
-
-#     for date_dir in sorted(pickle_root.iterdir()):
-#         if not date_dir.is_dir():
-#             continue
-
-#         date_key = date_dir.name
-#         if dates and date_key not in dates:
-#             continue
-
-#         result[date_key] = {}
-
-#         for pkl_file in date_dir.glob("*.pkl"):
-#             log_type = pkl_file.stem
-#             if log_types and log_type not in log_types:
-#                 continue
-
-#             df = pd.read_pickle(pkl_file)
-#             result[date_key][log_type] = df
-
-#     return result
 
 @st.cache_data(show_spinner=False)
 def load_all_parquets(parquet_root: Path):
