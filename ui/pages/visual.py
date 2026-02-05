@@ -59,56 +59,36 @@ def get_mac_vendor(mac: str) -> str:
 # =====================================================
 # Zeek log loader
 # =====================================================
-def load_zeek_log(path: Path) -> pd.DataFrame:
-    headers, rows = None, []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("#"):
-                    if line.startswith("#fields"):
-                        headers = line.split("\t")[1:]
-                    continue
-                if headers:
-                    parts = line.split("\t")
-                    row = {col: parts[i] if i < len(parts) else None for i, col in enumerate(headers)}
-                    rows.append(row)
-        if not headers or not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows)
-        if "ts" in df.columns:
-            df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-            df["ts"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
-        if "mac" in df.columns:
-            df["mac"] = df["mac"].astype(str).str.lower().str.strip()
-        if "host" in df.columns:
-            df["host"] = df["host"].astype(str).str.strip()
-        return df
-    except Exception as e:
-        st.warning(f"Failed to load {path.name}: {e}")
-        return pd.DataFrame()
-
-# =====================================================
-# Load all daily Zeek logs
-# =====================================================
-def load_all_daily_logs(logs_root: Path):
-    if not logs_root.exists():
-        return pd.DataFrame(), pd.DataFrame()
-    daily_folders = sorted([f for f in logs_root.iterdir() if f.is_dir() and not f.name.endswith("-CSV")])
-    all_known_hosts, all_dhcp = pd.DataFrame(), pd.DataFrame()
-    for folder in daily_folders:
-        kh_log, dhcp_log = folder / "known_hosts.log", folder / "dhcp.log"
-        if kh_log.exists():
-            df = load_zeek_log(kh_log)
-            if not df.empty:
-                all_known_hosts = pd.concat([all_known_hosts, df], ignore_index=True)
-        if dhcp_log.exists():
-            df = load_zeek_log(dhcp_log)
-            if not df.empty:
-                all_dhcp = pd.concat([all_dhcp, df], ignore_index=True)
-    return all_known_hosts, all_dhcp
+# def load_zeek_log(path: Path) -> pd.DataFrame:
+#     headers, rows = None, []
+#     try:
+#         with open(path, "r", encoding="utf-8") as f:
+#             for line in f:
+#                 line = line.strip()
+#                 if not line:
+#                     continue
+#                 if line.startswith("#"):
+#                     if line.startswith("#fields"):
+#                         headers = line.split("\t")[1:]
+#                     continue
+#                 if headers:
+#                     parts = line.split("\t")
+#                     row = {col: parts[i] if i < len(parts) else None for i, col in enumerate(headers)}
+#                     rows.append(row)
+#         if not headers or not rows:
+#             return pd.DataFrame()
+#         df = pd.DataFrame(rows)
+#         if "ts" in df.columns:
+#             df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+#             df["ts"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
+#         if "mac" in df.columns:
+#             df["mac"] = df["mac"].astype(str).str.lower().str.strip()
+#         if "host" in df.columns:
+#             df["host"] = df["host"].astype(str).str.strip()
+#         return df
+#     except Exception as e:
+#         st.warning(f"Failed to load {path.name}: {e}")
+#         return pd.DataFrame()
 
 # =====================================================
 # Load authorized MACs
@@ -127,8 +107,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.set_page_config(page_title="Network Overview", layout="wide")
     st.title("Device Overview")
 
-    # known_hosts, dhcp = load_all_daily_logs(logs_root)
-    # USE PARQUET INSTEAD
     PARQUET_ROOT = Path("data/parquet")
 
     known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
@@ -151,6 +129,20 @@ def render(logs_root: Path, authorized_mac_file: Path):
     merged["mac"] = merged["mac"].str.lower().str.strip()
     merged["status"] = merged["mac"].apply(lambda m: "Authorized" if m in authorized_macs else "Unauthorized")
 
+    # ---------------------------------------------------------
+    # ROBUST FIX: Force 'ts' to datetime
+    # ---------------------------------------------------------
+    if "ts" in merged.columns and not merged.empty:
+        # 1. Force convert to numeric first (handles strings that look like numbers)
+        #    'coerce' turns non-parseable data into NaN
+        merged["ts"] = pd.to_numeric(merged["ts"], errors='coerce')
+        
+        # 2. Convert numeric to datetime (assuming Unix timestamp in seconds)
+        merged["ts"] = pd.to_datetime(merged["ts"], unit="s", errors='coerce')
+
+        # 3. Drop rows where timestamp conversion failed (NaN/NaT)
+        merged = merged.dropna(subset=["ts"])
+
     # Metrics
     total_unique = merged["mac"].nunique()
     auth_unique = merged[merged["status"]=="Authorized"]["mac"].nunique()
@@ -168,7 +160,15 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     # ---------- Activity Overview ----------
     st.subheader("Activity Overview")
-    hourly = merged.set_index("ts").groupby("status").resample("1H").size().reset_index(name="events")
+    
+    hourly = pd.DataFrame()
+    # Now that 'ts' is guaranteed to be datetime, set_index will work for resampling
+    if not merged.empty and "ts" in merged.columns:
+        try:
+            hourly = merged.set_index("ts").groupby("status").resample("1H").size().reset_index(name="events")
+        except TypeError as e:
+            st.error(f"Error resampling data (Check timestamp format): {e}")
+
     if not hourly.empty:
         line_fig = px.line(
             hourly, x="ts", y="events", color="status",
@@ -183,7 +183,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
         st.plotly_chart(line_fig, use_container_width=True)
 
     # ---------- Unauthorized Device Ratio Gauge ----------
-    # CHANGED: text-align:left
     st.markdown("<h2 style='color:white; text-align:left;'>Unauthorized Device Ratio</h2>", unsafe_allow_html=True)
     
     warning_text, warning_color, warning_icon = "STATUS: SAFE", "#6CA651", "✅"
@@ -212,18 +211,18 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.plotly_chart(gauge_fig, use_container_width=True)
 
     # ---------- Device Count Bar Chart ----------
-    # CHANGED: text-align:left
     st.markdown("<h2 style='color:white; text-align:left;'>Device Count</h2>", unsafe_allow_html=True)
     
-    merged["date"] = merged["ts"].dt.date
-    daily_count = merged.drop_duplicates(subset=["mac","date"]).groupby(["date","status"]).size().reset_index(name="devices")
-    bar_fig = px.bar(
-        daily_count, x="date", y="devices", color="status", barmode="stack",
-        color_discrete_map={"Authorized":"#00F7FF","Unauthorized":"#F63049"},
-        template="plotly_dark", labels={"devices":"Devices","date":"Date"}
-    )
-    bar_fig.update_layout(height=500, margin=dict(l=20, r=20, t=50, b=100), xaxis={"tickfont":{"size":14}}, yaxis={"tickfont":{"size":14}}, legend={"font":{"size":14}})
-    st.plotly_chart(bar_fig, use_container_width=True)
+    if "ts" in merged.columns and not merged.empty:
+        merged["date"] = merged["ts"].dt.date
+        daily_count = merged.drop_duplicates(subset=["mac","date"]).groupby(["date","status"]).size().reset_index(name="devices")
+        bar_fig = px.bar(
+            daily_count, x="date", y="devices", color="status", barmode="stack",
+            color_discrete_map={"Authorized":"#00F7FF","Unauthorized":"#F63049"},
+            template="plotly_dark", labels={"devices":"Devices","date":"Date"}
+        )
+        bar_fig.update_layout(height=500, margin=dict(l=20, r=20, t=50, b=100), xaxis={"tickfont":{"size":14}}, yaxis={"tickfont":{"size":14}}, legend={"font":{"size":14}})
+        st.plotly_chart(bar_fig, use_container_width=True)
 
     # =====================================================
     # DEVICE INVENTORY TABLE (BOTTOM PART)
@@ -232,11 +231,12 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.title("Device Inventory")
 
     # 1. Prepare Date Options
-    available_dates = sorted([d for d in merged["date"].unique() if pd.notnull(d)], reverse=True)
+    available_dates = []
+    if "date" in merged.columns:
+        available_dates = sorted([d for d in merged["date"].unique() if pd.notnull(d)], reverse=True)
     date_options = ["All Dates"] + [str(d) for d in available_dates]
 
     # 2. Main Filter Row
-    # vertical_alignment="bottom" aligns the dropdown and the search box perfectly
     master_col1, master_col2 = st.columns([1, 3], gap="medium", vertical_alignment="bottom")
 
     with master_col1:
@@ -254,7 +254,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     with master_col2:
         # 4. Search Form
-        # border=False keeps it clean; vertical_alignment="bottom" aligns the input and button inside the form
         with st.form(key="search_form", border=False):
             s_input_col, s_btn_col = st.columns([5, 1], gap="small", vertical_alignment="bottom")
             

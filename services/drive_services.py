@@ -1,18 +1,37 @@
 import os
 import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
-from pydrive2.auth import GoogleAuth
-from pydrive2.drive import GoogleDrive
-import streamlit as st
 import pyarrow as pa
 import pyarrow.parquet as pq
-import tempfile
-import tempfile
-import os
-import pandas as pd
-from pathlib import Path
+import streamlit as st
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from pydrive2.files import ApiRequestError  # Required for error handling
+
+# =====================================================
+# Helper: Retry Logic for Google Drive API 500 Errors
+# =====================================================
+def list_files_with_retry(drive, query, max_retries=8):
+    """
+    Attempts to list files with exponential backoff for 500/503 errors.
+    """
+    for n in range(max_retries):
+        try:
+            return drive.ListFile({"q": query}).GetList()
+        except ApiRequestError as e:
+            error_str = str(e)
+            # Retry on Internal Error (500) or Service Unavailable (503)
+            if '500' in error_str or '503' in error_str:
+                wait_time = (2 ** n)  # 1s, 2s, 4s, 8s...
+                print(f"⚠️ Google Drive API Error ({error_str}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise e  # Raise other errors immediately
+    
+    raise Exception("Max retries exceeded: Google Drive API continues to fail.")
 
 # =====================================================
 # Zeek log → Parquet streaming parser   
@@ -62,13 +81,15 @@ def debug_print_parquet_cache(parquet_cache: dict):
 
 # =====================================================
 # Zeek log → Parquet streaming parser
-# ====================================================
+# =====================================================
 def walk_drive_folder(drive, folder_id):
     """
     Recursively yield all files under a Drive folder.
     """
     query = f"'{folder_id}' in parents and trashed=false"
-    items = drive.ListFile({"q": query}).GetList()
+    
+    # UPDATED: Use retry logic here
+    items = list_files_with_retry(drive, query)
 
     for item in items:
         if item["mimeType"].endswith("folder"):
@@ -136,11 +157,12 @@ def stream_zeek_log_to_parquet(
             writer.close()
 
     finally:
-        os.remove(tmp_path)  # ✅ cleanup temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)  # ✅ cleanup temp file
 
 # =====================================================
 # Main: Parse all Zeek logs from Drive to Parquet
-# ====================================================
+# =====================================================
 def parse_drive_logs_to_parquet(
     client_secret_path: str,
     folder_id: str,
@@ -197,7 +219,9 @@ def download_folder(drive: GoogleDrive, folder_id: str, local_path: Path):
     local_path.mkdir(exist_ok=True, parents=True)
 
     query = f"'{folder_id}' in parents and trashed=false"
-    files = drive.ListFile({"q": query}).GetList()
+    
+    # UPDATED: Use retry logic here instead of direct GetList()
+    files = list_files_with_retry(drive, query)
 
     for f in files:
         file_name = f["title"]
