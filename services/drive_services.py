@@ -14,7 +14,9 @@ import os
 import pandas as pd
 from pathlib import Path
 
-
+# =====================================================
+# Zeek log → Parquet streaming parser   
+# =====================================================
 @st.cache_data(show_spinner=False)
 def load_all_parquets(parquet_root: Path):
     """
@@ -37,6 +39,9 @@ def load_all_parquets(parquet_root: Path):
 
     return result
 
+# =====================================================
+# Debug helper: print parquet cache structure and sample data
+# =====================================================
 def debug_print_parquet_cache(parquet_cache: dict):
     for date, logs in parquet_cache.items():
         st.write(f"📁 **{date}/**")
@@ -55,6 +60,9 @@ def debug_print_parquet_cache(parquet_cache: dict):
             st.write("    🧪 sample row:")
             st.json(sample)
 
+# =====================================================
+# Zeek log → Parquet streaming parser
+# ====================================================
 def walk_drive_folder(drive, folder_id):
     """
     Recursively yield all files under a Drive folder.
@@ -130,6 +138,9 @@ def stream_zeek_log_to_parquet(
     finally:
         os.remove(tmp_path)  # ✅ cleanup temp file
 
+# =====================================================
+# Main: Parse all Zeek logs from Drive to Parquet
+# ====================================================
 def parse_drive_logs_to_parquet(
     client_secret_path: str,
     folder_id: str,
