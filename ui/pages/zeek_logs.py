@@ -4,153 +4,124 @@ from pathlib import Path
 from datetime import datetime
 
 # -------------------------
-# Cached helpers
+# Helper: Get available dates from Parquet folders
 # -------------------------
 @st.cache_data(show_spinner=False)
-def get_log_folders(logs_dir: Path):
-    """Return immediate subfolders under logs_dir"""
-    return sorted([p for p in logs_dir.iterdir() if p.is_dir()])
-
-@st.cache_data(show_spinner=False)
-def get_log_files(logs_dir: Path, selected_folders: tuple):
-    """Return log files under selected folders"""
-    files = []
-    for folder in selected_folders:
-        folder_path = logs_dir / folder
-        if folder_path.exists():
-            files.extend([f for f in folder_path.rglob("*") if f.is_file()])
-    return sorted(files)
-
-@st.cache_data(show_spinner=False)
-def parse_log_file(file_path: Path, logs_dir: Path, authorized: set):
-    rows = []
-    cols = None
-
-    with open(file_path, "r", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+def get_available_dates(parquet_root: Path):
+    """
+    Scans the parquet_root for date directories (YYYY-MM-DD).
+    Returns a sorted list of date strings (descending).
+    """
+    if not parquet_root.exists():
+        return []
+        
+    dates = []
+    for p in parquet_root.iterdir():
+        if p.is_dir():
+            # Basic validation: try to parse the folder name as date
+            try:
+                datetime.strptime(p.name, "%Y-%m-%d")
+                dates.append(p.name)
+            except ValueError:
                 continue
-
-            # Zeek header
-            if line.startswith("#fields"):
-                cols = line.split("\t")[1:]
-                continue
-
-            # Skip other comments
-            if line.startswith("#"):
-                continue
-
-            # No header yet → can't parse
-            if not cols:
-                continue
-
-            parts = line.split("\t")
-            row = {cols[i]: parts[i] if i < len(parts) else "" for i in range(len(cols))}
-
-            # Convert ts → date
-            if "ts" in row:
-                try:
-                    row["date"] = datetime.utcfromtimestamp(float(row["ts"])).date()
-                except Exception:
-                    row["date"] = None
-
-            row["log_file"] = str(file_path.relative_to(logs_dir))
-
-            if "mac" in row and row["mac"].lower() in authorized:
-                row["status"] = "Authorized"
-            else:
-                row["status"] = row.get("status", "Unknown")
-
-            rows.append(row)
-
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+                
+    return sorted(dates, reverse=True)
 
 # -------------------------
-# Main page render
+# Helper: Get available log types for a specific date
 # -------------------------
-def render(filtered, logs_dir: Path, authorized: set):
-    st.title("Raw Log Explorer")
+@st.cache_data(show_spinner=False)
+def get_log_types_for_date(parquet_root: Path, selected_date: str):
+    """
+    Returns a list of log types (e.g., 'conn', 'http') found in the date folder.
+    """
+    date_path = parquet_root / selected_date
+    if not date_path.exists():
+        return []
+        
+    # Find all .parquet files
+    files = sorted(date_path.glob("*.parquet"))
+    return [f.stem for f in files]
 
-    # -------------------------
-    # Refresh
-    # -------------------------
-    if st.button("🔄 Refresh Logs"):
-        get_log_folders.clear()
-        get_log_files.clear()
-        parse_log_file.clear()
-        st.rerun()
+# -------------------------
+# Helper: Load specific log file
+# -------------------------
+@st.cache_data(show_spinner=False)
+def load_parquet_log(parquet_root: Path, selected_date: str, log_type: str):
+    """
+    Loads a specific parquet file into a DataFrame.
+    """
+    file_path = parquet_root / selected_date / f"{log_type}.parquet"
+    if not file_path.exists():
+        return pd.DataFrame()
+        
+    try:
+        df = pd.read_parquet(file_path)
+        
+        # Human readable timestamp if 'ts' exists
+        if "ts" in df.columns:
+            # Convert to numeric, coerce errors
+            ts_numeric = pd.to_numeric(df["ts"], errors="coerce")
+            # Create a readable datetime column
+            df.insert(0, "time", pd.to_datetime(ts_numeric, unit="s", errors="coerce"))
+            
+        return df
+    except Exception as e:
+        st.error(f"Error loading {file_path.name}: {e}")
+        return pd.DataFrame()
 
-    # -------------------------
-    # Folder selection
-    # -------------------------
-    folders = get_log_folders(logs_dir)
-    folder_names = [f.name for f in folders]
+# -------------------------
+# Main Render Function
+# -------------------------
+def render(parquet_root: Path):
+    st.title("Raw Log Explorer (Parquet)")
 
-    selected_folders = st.multiselect(
-        "Select Log Folder(s)",
-        options=folder_names
-    )
-
-    if not selected_folders:
-        st.info("Please select one or more log folders.")
+    # 1. Get Dates
+    available_dates = get_available_dates(parquet_root)
+    
+    if not available_dates:
+        st.warning(f"No parquet data found in `{parquet_root}`")
+        st.info("Try running 'Update Data from Drive' in the sidebar.")
         return
 
-    # -------------------------
-    # File selection
-    # -------------------------
-    files = get_log_files(logs_dir, tuple(selected_folders))
-
-    if not files:
-        st.warning("No log files found in selected folders.")
+    # 2. Sidebar Filters (or Top Bar)
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        selected_date = st.selectbox("Select Date", available_dates)
+        
+    # 3. Get Log Types for that date
+    log_types = get_log_types_for_date(parquet_root, selected_date)
+    
+    if not log_types:
+        st.info(f"No logs found for {selected_date}")
         return
 
-    # Map display name → full path
-    file_map = {f.name: f for f in files}
+    with col2:
+        selected_log = st.selectbox("Select Log Type", log_types)
 
-    selected_file_name = st.selectbox(
-        "Select Log File",
-        options=sorted(file_map.keys())
-    )
-
-    selected_file_path = file_map[selected_file_name]
-
-    # -------------------------
-    # Date filter (from selected file only)
-    # -------------------------
-    df_preview = parse_log_file(selected_file_path, logs_dir, authorized)
-
-    if df_preview.empty or "date" not in df_preview:
-        st.warning("No parsable data found in selected log file.")
+    # 4. Load Data
+    df = load_parquet_log(parquet_root, selected_date, selected_log)
+    
+    if df.empty:
+        st.warning("File is empty or could not be loaded.")
         return
 
-    available_dates = (
-        df_preview["date"]
-        .dropna()
-        .sort_values()
-        .unique()
-        .tolist()
-    )
+    st.write(f"### 📄 {selected_log}.log ({len(df)} rows)")
+    
+    # 5. Search / Filter
+    search_term = st.text_input("🔍 Filter records (search all columns)", "")
+    
+    if search_term:
+        # Simple case-insensitive string match across all columns
+        mask = df.astype(str).apply(lambda x: x.str.contains(search_term, case=False, na=False)).any(axis=1)
+        df_display = df[mask]
+    else:
+        df_display = df
 
-    selected_dates = st.multiselect(
-        "Select Date(s)",
-        options=available_dates
-    )
-
-    if not selected_dates:
-        st.info("Please select one or more dates.")
-        return
-
-    # -------------------------
-    # Load & display
-    # -------------------------
-    df_final = df_preview[df_preview["date"].isin(selected_dates)]
-
-    if df_final.empty:
-        st.warning("No logs found for selected date(s).")
-        return
-
+    # 6. Display Table
     st.dataframe(
-        df_final.drop(columns=["date"], errors="ignore"),
-        use_container_width=True
+        df_display,
+        use_container_width=True,
+        height=600  # Give it plenty of height
     )

@@ -1,4 +1,3 @@
-# ui/pages/shadow_apps.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -8,7 +7,6 @@ from urllib.parse import urlparse
 # -----------------------------
 # Config
 # -----------------------------
-MAX_ROWS_DISPLAY = 500
 ALLOWLIST_FILE = Path(__file__).resolve().parents[2] / "allowlist.txt"
 
 # -----------------------------
@@ -21,10 +19,30 @@ LICENSE_REGISTRY = {
 }
 
 # -----------------------------
+# Load Parquet Helper
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def load_shadow_logs(parquet_root: Path, log_type: str):
+    """Load all parquet files of a specific log type."""
+    if not parquet_root.exists():
+        return pd.DataFrame()
+        
+    dfs = []
+    for date_dir in sorted(parquet_root.iterdir()):
+        if date_dir.is_dir():
+            file_path = date_dir / f"{log_type}.parquet"
+            if file_path.exists():
+                dfs.append(pd.read_parquet(file_path))
+                
+    if not dfs:
+        return pd.DataFrame()
+        
+    return pd.concat(dfs, ignore_index=True)
+
+# -----------------------------
 # Load allowlist
 # -----------------------------
 def load_allowlist():
-    """Load and normalize domains from allowlist.txt."""
     if not ALLOWLIST_FILE.exists():
         st.error(f"Allowlist not found: {ALLOWLIST_FILE}")
         return []
@@ -38,15 +56,13 @@ def load_allowlist():
             domain = extract_domain(line)
             if domain:
                 approved.add(domain)
-    st.caption(f"Loaded {len(approved)} allowlisted domains")
     return list(approved)
 
 # -----------------------------
-# Extract domain from URL or hostname
+# Extract domain
 # -----------------------------
 def extract_domain(url: str):
-    if not url:
-        return ""
+    if not url: return ""
     url = str(url).strip().lower()
     if "://" in url:
         parsed = urlparse(url)
@@ -66,361 +82,142 @@ def is_allowed(domain: str, approved: list):
     return any(domain == a or domain.endswith("." + a) for a in approved)
 
 # -----------------------------
-# Helper: Device columns
+# Helper: Normalize Columns
 # -----------------------------
-def get_device_columns(df: pd.DataFrame):
-    ip_col = "id.orig_h" if "id.orig_h" in df.columns else None
-    mac_col = None
-    for c in ["mac", "orig_mac", "id.orig_mac"]:
-        if c in df.columns:
-            mac_col = c
-            break
-    return ip_col, mac_col
-
-# -----------------------------
-# Session state: selected MAC
-# -----------------------------
-if "selected_mac" not in st.session_state:
-    st.session_state.selected_mac = None
-
-# -----------------------------
-# Cross-filter UI by day
-# -----------------------------
-def render_filters(df, title_prefix):
-    if "datetime" not in df.columns:
-        return df
-
-    st.markdown("### Global Filters")
-    df["day"] = df["datetime"].dt.date
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        selected_day = st.selectbox(
-            "Filter by day",
-            ["All"] + sorted(df["day"].dropna().unique().tolist()),
-            key=f"day_filter_{title_prefix}"
-        )
-
-    if selected_day != "All":
-        df = df[df["day"] == selected_day]
-
-    return df
+def normalize_log_df(df, log_type, domain_col):
+    """Standardize column names for merging."""
+    if df.empty or domain_col not in df.columns:
+        return pd.DataFrame()
+    
+    # Select relevant cols
+    cols = {domain_col: "app_identifier", "ts": "ts"}
+    
+    # Map IP/MAC columns if they exist
+    if "id.orig_h" in df.columns: cols["id.orig_h"] = "ip"
+    elif "orig_h" in df.columns: cols["orig_h"] = "ip"
+    
+    if "mac" in df.columns: cols["mac"] = "mac"
+    elif "orig_mac" in df.columns: cols["orig_mac"] = "mac"
+    elif "id.orig_mac" in df.columns: cols["id.orig_mac"] = "mac"
+    
+    df = df.rename(columns=cols)
+    
+    # Ensure required columns exist
+    if "ip" not in df.columns: df["ip"] = "Unknown"
+    if "mac" not in df.columns: df["mac"] = "Unknown"
+    
+    df["source_log"] = log_type.upper()
+    return df[["ts", "app_identifier", "ip", "mac", "source_log"]]
 
 # -----------------------------
-# Table MAC selector
+# Render Main Page
 # -----------------------------
-def mac_selector_table(df, table_name="Table"):
-    """Display table and allow MAC selection for cross-filtering."""
-    st.markdown(f"### {table_name}")
-    st.dataframe(df, use_container_width=True)
-
-    if "mac" in df.columns:
-        macs = df["mac"].dropna().unique()
-        if len(macs) > 0:
-            mac_choice = st.selectbox(
-                f"Filter by MAC in {table_name}",
-                ["All"] + sorted(macs),
-                key=f"mac_filter_{table_name}"
-            )
-            if mac_choice != "All":
-                st.session_state.selected_mac = mac_choice
-                df = df[df["mac"] == mac_choice]
-
-    return df
-
-# -----------------------------
-# Apply global MAC filter
-# -----------------------------
-def apply_global_mac_filter(df):
-    if st.session_state.selected_mac:
-        df = df[df["mac"] == st.session_state.selected_mac]
-    return df
-
-# -----------------------------
-# Render charts, metrics, and tables
-# -----------------------------
-# -----------------------------
-# Render charts, metrics, and tables
-# -----------------------------
-def render_charts(df: pd.DataFrame, ts_col: str, domain_col: str, title_prefix: str, approved: list):
-    if df.empty:
-        st.info(f"No {title_prefix} detected.")
-        return
-
-    # Normalize domains
-    df["domain_clean"] = df[domain_col].apply(extract_domain)
-    df["Status"] = df["domain_clean"].apply(lambda x: "Allowed" if is_allowed(x, approved) else "Not Allowed")
-
-    # Convert timestamp robustly
-    if ts_col in df.columns:
-        # Try numeric (epoch seconds)
-        df["datetime"] = pd.to_datetime(df[ts_col], unit='s', errors='coerce')
-        # If all NaT, try parsing as string
-        if df["datetime"].isna().all():
-            df["datetime"] = pd.to_datetime(df[ts_col], errors='coerce')
-        # Drop rows where datetime is NaT
-        df = df.dropna(subset=["datetime"])
-    else:
-        df["datetime"] = pd.NaT
-
-    # Device info
-    ip_col, mac_col = get_device_columns(df)
-    df["ip"] = df[ip_col] if ip_col else "Unknown"
-    df["mac"] = df[mac_col] if mac_col else "Unknown"
-
-    # Cross-filter by day
-    df = render_filters(df, title_prefix=title_prefix)
-
-    # -----------------------------
-    # Separate tables: Allowed vs Not Allowed
-    # -----------------------------
-    allowed_df = df[df["Status"] == "Allowed"]
-    blocked_df = df[df["Status"] == "Not Allowed"]
-
-    allowed_table = allowed_df.groupby(["domain_clean", "mac", "ip", "Status"]) \
-        .agg(
-            executions=("domain_clean", "count"),
-            first_seen=("datetime", "min"),
-            last_seen=("datetime", "max")
-        ).reset_index()
-
-    blocked_table = blocked_df.groupby(["domain_clean", "mac", "ip", "Status"]) \
-        .agg(
-            executions=("domain_clean", "count"),
-            first_seen=("datetime", "min"),
-            last_seen=("datetime", "max")
-        ).reset_index()
-
-    # Apply global MAC filter for charts
-    df_combined = pd.concat([allowed_table, blocked_table], ignore_index=True)
-    df_combined = apply_global_mac_filter(df_combined)
-
-    # -----------------------------
-    # Metrics on top
-    # -----------------------------
-    total = len(df_combined)
-    allowed_count = (df_combined["Status"] == "Allowed").sum()
-    not_allowed_count = (df_combined["Status"] == "Not Allowed").sum()
-    allowed_pct = round((allowed_count / total) * 100, 2) if total else 0
-    not_allowed_pct = round((not_allowed_count / total) * 100, 2) if total else 0
-    total_raw_logs = len(df)  # New metric for all raw logs
-
-    col_metrics = st.columns(5)
-    col_metrics[0].metric("Total Requests", total)
-    col_metrics[1].metric("Allowed Requests", allowed_count, f"{allowed_pct}%")
-    col_metrics[2].metric("Not Allowed Requests", not_allowed_count, f"{not_allowed_pct}%")
-    col_metrics[3].metric("Allowed %", f"{allowed_pct}%")
-    col_metrics[4].metric("Total Raw Logs", total_raw_logs)
-
-    # -----------------------------
-    # Charts below metrics
-    # -----------------------------
-    chart_col1, chart_col2 = st.columns([3, 1])
-
-    # Line chart
-    with chart_col1:
-        if not df.empty and "datetime" in df.columns and not df["datetime"].isna().all():
-            # Group by hour and status
-            df_line = df.groupby([pd.Grouper(key="datetime", freq="H"), "Status"]).size().reset_index(name="count")
-
-            # Ensure both statuses exist for all time points
-            all_status = ["Allowed", "Not Allowed"]
-            min_time = df_line['datetime'].min()
-            max_time = df_line['datetime'].max()
-            all_times = pd.date_range(min_time, max_time, freq='H')
-            full_index = pd.MultiIndex.from_product([all_times, all_status], names=['datetime', 'Status'])
-            df_line = df_line.set_index(['datetime', 'Status']).reindex(full_index, fill_value=0).reset_index()
-
-            # Plot line chart
-            fig_line = px.line(
-                df_line,
-                x="datetime",
-                y="count",
-                color="Status",
-                color_discrete_map={"Allowed": "green", "Not Allowed": "red"},
-                markers=True,
-                template="plotly_dark",
-                title=f"{title_prefix} Over Time"
-            )
-            fig_line.update_layout(
-                legend_title_text="Status",
-                yaxis_title="Number of Requests",
-                xaxis_title="Time"
-            )
-            st.plotly_chart(fig_line, use_container_width=True)
-        else:
-            st.info("No timestamped data available to plot line chart.")
-
-    # Pie chart
-    with chart_col2:
-        status_counts = df_combined["Status"].value_counts()
-        for status in ["Allowed", "Not Allowed"]:
-            if status not in status_counts:
-                status_counts[status] = 0
-        status_counts = status_counts.reindex(["Allowed", "Not Allowed"])
-
-        fig_pie = px.pie(
-            names=status_counts.index,
-            values=status_counts.values,
-            hole=0.4,
-            template="plotly_dark",
-            color=status_counts.index,
-            color_discrete_map={"Allowed": "green", "Not Allowed": "red"},
-            title="Status"
-        )
-        fig_pie.update_traces(textposition='inside', textinfo='label+percent', sort=False)
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    # -----------------------------
-    # Tables side by side below charts
-    # -----------------------------
-    table_col1, table_col2 = st.columns(2)
-    with table_col1:
-        st.markdown(f"### Allowed Applications")
-        st.dataframe(allowed_table, use_container_width=True)
-
-        # Line + Pie charts for Allowed Applications
-        if not allowed_df.empty:
-            chart_line_col, chart_pie_col = st.columns([3, 1])
-
-            # Line chart: allowed mac addresses over time
-            with chart_line_col:
-                df_allowed_line = allowed_df.groupby([pd.Grouper(key="datetime", freq="H"), "mac"]).size().reset_index(name="count")
-                if not df_allowed_line.empty:
-                    all_macs = df_allowed_line['mac'].unique()
-                    all_times = pd.date_range(df_allowed_line['datetime'].min(), df_allowed_line['datetime'].max(), freq='H')
-                    full_index = pd.MultiIndex.from_product([all_times, all_macs], names=['datetime', 'mac'])
-                    df_allowed_line = df_allowed_line.set_index(['datetime', 'mac']).reindex(full_index, fill_value=0).reset_index()
-
-                    fig_allowed_line = px.line(
-                        df_allowed_line,
-                        x='datetime',
-                        y='count',
-                        color='mac',
-                        markers=True,
-                        template='plotly_dark',
-                        title="Allowed: MAC Activity Over Time"
-                    )
-                    fig_allowed_line.update_layout(yaxis_title="Requests", xaxis_title="Time", legend_title="MAC")
-                    st.plotly_chart(fig_allowed_line, use_container_width=True)
-
-            # Pie chart: allowed MAC distribution
-            with chart_pie_col:
-                df_allowed_pie = allowed_df['mac'].value_counts().reset_index()
-                df_allowed_pie.columns = ['mac', 'count']
-                fig_allowed_pie = px.pie(
-                    df_allowed_pie,
-                    names='mac',
-                    values='count',
-                    hole=0.4,
-                    template='plotly_dark',
-                    title="Allowed: MAC Distribution"
-                )
-                fig_allowed_pie.update_traces(textposition='inside', textinfo='label+percent', sort=False)
-                st.plotly_chart(fig_allowed_pie, use_container_width=True)
-
-    with table_col2:
-        st.markdown(f"### Unauthorized Applications")
-        st.dataframe(blocked_table, use_container_width=True)
-
-        # Line + Pie charts for Not Allowed Applications
-        if not blocked_df.empty:
-            chart_line_col, chart_pie_col = st.columns([3, 1])
-
-            # Line chart: blocked mac addresses over time
-            with chart_line_col:
-                df_blocked_line = blocked_df.groupby([pd.Grouper(key="datetime", freq="H"), "mac"]).size().reset_index(name="count")
-                if not df_blocked_line.empty:
-                    all_macs = df_blocked_line['mac'].unique()
-                    all_times = pd.date_range(df_blocked_line['datetime'].min(), df_blocked_line['datetime'].max(), freq='H')
-                    full_index = pd.MultiIndex.from_product([all_times, all_macs], names=['datetime', 'mac'])
-                    df_blocked_line = df_blocked_line.set_index(['datetime', 'mac']).reindex(full_index, fill_value=0).reset_index()
-
-                    fig_blocked_line = px.line(
-                        df_blocked_line,
-                        x='datetime',
-                        y='count',
-                        color='mac',
-                        markers=True,
-                        template='plotly_dark',
-                        title="Unauthorized: MAC Activity Over Time"
-                    )
-                    fig_blocked_line.update_layout(yaxis_title="Requests", xaxis_title="Time", legend_title="MAC")
-                    st.plotly_chart(fig_blocked_line, use_container_width=True)
-
-            # Pie chart: blocked MAC distribution
-            with chart_pie_col:
-                df_blocked_pie = blocked_df['mac'].value_counts().reset_index()
-                df_blocked_pie.columns = ['mac', 'count']
-                fig_blocked_pie = px.pie(
-                    df_blocked_pie,
-                    names='mac',
-                    values='count',
-                    hole=0.4,
-                    template='plotly_dark',
-                    title="Unauthorized: MAC Distribution"
-                )
-                fig_blocked_pie.update_traces(textposition='inside', textinfo='label+percent', sort=False)
-                st.plotly_chart(fig_blocked_pie, use_container_width=True)
-
-    # -----------------------------
-    # License compliance below tables
-    # -----------------------------
-    st.markdown("## License Compliance")
-    license_rows = []
-    for app, licenses in LICENSE_REGISTRY.items():
-        usage = allowed_df[allowed_df["domain_clean"].str.endswith(app)]["mac"].nunique()
-        license_rows.append({
-            "Software": app,
-            "Licenses Purchased": licenses,
-            "Unique Devices Detected": usage,
-            "Overused By": max(0, usage - licenses),
-            "Status": "EXCEPTION" if usage > licenses else "OK"
-        })
-    license_df = pd.DataFrame(license_rows)
-    st.dataframe(license_df, use_container_width=True)
-
-    # -----------------------------
-    # Raw log table at the bottom
-    # -----------------------------
-    st.markdown("### Raw Logs")
-    st.dataframe(df, use_container_width=True)
-
-# -----------------------------
-# Main renderer
-# -----------------------------
-def render_shadow_apps(http_logs=None, ssl_logs=None, dns_logs=None):
-    st.subheader("Shadow Apps Overview")
+def render_shadow_apps(parquet_root: Path):
+    st.subheader("Shadow Apps Overview (Unified)")
     approved = load_allowlist()
 
-    tabs = []
-    data_mapping = {}
+    # 1. Load ALL 5 Log Types
+    logs = [
+        ("http", "host"),
+        ("ssl", "server_name"),
+        ("dns", "query"),
+        ("files", "filename"),  # Using filename as identifier
+        ("conn", "service")     # Using service as identifier
+    ]
+    
+    combined_frames = []
+    
+    for log_type, domain_col in logs:
+        raw_df = load_shadow_logs(parquet_root, log_type)
+        norm_df = normalize_log_df(raw_df, log_type, domain_col)
+        if not norm_df.empty:
+            combined_frames.append(norm_df)
 
-    if http_logs is not None and "host" in http_logs.columns:
-        tabs.append("HTTP")
-        data_mapping["HTTP"] = (http_logs, "host", "HTTP Shadow Apps")
-    if ssl_logs is not None and "server_name" in ssl_logs.columns:
-        tabs.append("SSL")
-        data_mapping["SSL"] = (ssl_logs, "server_name", "SSL Shadow Apps")
-    if dns_logs is not None and "query" in dns_logs.columns:
-        tabs.append("DNS")
-        data_mapping["DNS"] = (dns_logs, "query", "DNS Shadow Apps")
-
-    if not tabs:
-        st.info("No Shadow App logs available to display.")
+    if not combined_frames:
+        st.info("No Shadow App logs available (HTTP, SSL, DNS, Files, or Conn).")
         return
 
-    selected_tab = st.tabs(tabs)
-    for idx, tab_name in enumerate(tabs):
-        with selected_tab[idx]:
-            df, domain_col, title_prefix = data_mapping[tab_name]
-            df = df.copy()
-            df[f"{domain_col}_lower"] = df[domain_col].astype(str).str.strip().str.lower()
-            render_charts(
-                df,
-                ts_col="ts",
-                domain_col=f"{domain_col}_lower",
-                title_prefix=title_prefix,
-                approved=approved
+    # 2. Combine into One DataFrame
+    df = pd.concat(combined_frames, ignore_index=True)
+    
+    # 3. Process Data
+    # Convert TS
+    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+    df["datetime"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
+    df = df.dropna(subset=["datetime"])
+    
+    # Extract Domains & Check Status
+    df["domain_clean"] = df["app_identifier"].apply(extract_domain)
+    # Filter out empty domains (often happens in conn/files logs)
+    df = df[df["domain_clean"] != ""]
+    
+    df["Status"] = df["domain_clean"].apply(lambda x: "Allowed" if is_allowed(x, approved) else "Not Allowed")
+
+    # 4. Metrics
+    total = len(df)
+    unauth_df = df[df["Status"] == "Not Allowed"]
+    auth_df = df[df["Status"] == "Allowed"]
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Events", total)
+    col2.metric("Authorized Events", len(auth_df))
+    col3.metric("Unauthorized Events", len(unauth_df), delta_color="inverse")
+    
+    st.divider()
+
+    # 5. Charts (Unified)
+    c1, c2 = st.columns([2, 1])
+    
+    with c1:
+        st.markdown("### Activity Over Time")
+        if not df.empty:
+            df_line = df.groupby([pd.Grouper(key="datetime", freq="H"), "Status"]).size().reset_index(name="count")
+            fig = px.line(df_line, x="datetime", y="count", color="Status", 
+                          color_discrete_map={"Allowed": "#00FF00", "Not Allowed": "#FF0000"},
+                          template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+            
+    with c2:
+        st.markdown("### Source Distribution")
+        fig_pie = px.pie(df, names="source_log", template="plotly_dark", hole=0.4)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    # 6. Tables
+    t1, t2 = st.tabs(["✅ Allowed Applications", "🚫 Unauthorized Applications"])
+    
+    with t1:
+        st.markdown("### Authorized Apps")
+        if not auth_df.empty:
+            allowed_summary = auth_df.groupby(["domain_clean", "source_log"]).size().reset_index(name="Count")
+            st.dataframe(allowed_summary, use_container_width=True)
+        else:
+            st.info("No authorized apps found.")
+
+    with t2:
+        st.markdown("### Unauthorized Apps Summary")
+        if not unauth_df.empty:
+            # Summary Table
+            unauth_summary = unauth_df.groupby(["domain_clean", "source_log"]).size().reset_index(name="Count")
+            st.dataframe(unauth_summary, use_container_width=True)
+            
+            st.divider()
+            
+            # DETAILED TABLE (Requested)
+            st.markdown("### 🚨 Unauthorized Details (Who installed/ran it?)")
+            st.write("List of devices (IP/MAC) that accessed unauthorized applications.")
+            
+            detail_table = unauth_df[["datetime", "mac", "ip", "domain_clean", "source_log"]].sort_values("datetime", ascending=False)
+            
+            st.dataframe(
+                detail_table,
+                column_config={
+                    "datetime": st.column_config.DatetimeColumn("Time", format="YYYY-MM-DD HH:mm:ss"),
+                    "mac": "MAC Address",
+                    "ip": "IP Address",
+                    "domain_clean": "Application / Domain",
+                    "source_log": "Source"
+                },
+                use_container_width=True
             )
+        else:
+            st.success("No unauthorized applications detected.")
