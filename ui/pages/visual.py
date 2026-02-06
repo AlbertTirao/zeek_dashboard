@@ -294,7 +294,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         with st.form(key="search_form", border=False):
             s_input_col, s_btn_col = st.columns([4, 1], gap="small", vertical_alignment="bottom")
             with s_input_col:
-                search_term = st.text_input("Search", placeholder="🔍 Search MAC / IP / Host...", label_visibility="visible")
+                search_term = st.text_input("Search", placeholder="Search MAC / IP / Host...", label_visibility="visible")
             with s_btn_col:
                 submit_button = st.form_submit_button("Search", use_container_width=True)
 
