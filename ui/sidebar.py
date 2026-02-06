@@ -75,10 +75,11 @@ def render_sidebar(auto_refresh_interval=3600):
         if "sidebar_page" not in st.session_state:
             st.session_state.sidebar_page = "Visual"
 
+        # CORRECTED ICONS HERE
         page = option_menu(
             menu_title=None,
             options=["Visual", "Analytics", "Zeek Logs", "Alerts", "Authorization"],
-            icons=["house", "table", "bar-chart", "folder", "bell", "key"],
+            icons=["house", "bar-chart-line", "file-earmark-text", "bell", "shield-lock"], 
             menu_icon=None,
             default_index=0,
             orientation="vertical",
