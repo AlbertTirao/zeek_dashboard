@@ -158,17 +158,41 @@ def render(logs_root: Path, authorized_mac_file: Path):
         st.info("No device data available")
         return
 
-    # Merge DHCP Data
+    # ---------------------------------------------------------
+    # 1. Normalize MACs in known_hosts first
+    # ---------------------------------------------------------
+    # We do this before merging to ensure the keys match perfectly
+    if "mac" in known_hosts.columns:
+        known_hosts["mac"] = known_hosts["mac"].str.lower().str.strip()
+
+    # ---------------------------------------------------------
+    # 2. Merge DHCP Data (UPDATED: Merging on MAC Address)
+    # ---------------------------------------------------------
     if not dhcp.empty:
-        dhcp_cols = [c for c in ["client_addr","host_name","domain"] if c in dhcp.columns]
-        dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"])
-        merged = pd.merge(known_hosts, dhcp_norm, how="left", left_on="host", right_on="client_addr")
+        # Normalize MACs in DHCP to match known_hosts
+        if "mac" in dhcp.columns:
+            dhcp["mac"] = dhcp["mac"].str.lower().str.strip()
+            
+            # Select columns to merge. We prioritize MAC matching.
+            dhcp_cols = [c for c in ["mac", "host_name", "domain"] if c in dhcp.columns]
+            
+            # Remove duplicates based on MAC so we get the most recent/relevant hostname
+            dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"])
+            
+            # MERGE ON MAC: This guarantees the Host Name matches the Device ID
+            merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
+        else:
+            # Fallback if DHCP logs somehow rely on IP (less accurate for Hostnames)
+            dhcp_cols = [c for c in ["client_addr","host_name","domain"] if c in dhcp.columns]
+            dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"])
+            merged = pd.merge(known_hosts, dhcp_norm, how="left", left_on="host", right_on="client_addr")
     else:
         merged = known_hosts.copy()
         merged["host_name"], merged["domain"] = "-", None
 
     merged["host_name"] = merged.get("host_name","-").fillna("-")
-    merged["mac"] = merged["mac"].str.lower().str.strip()
+    
+    # Calculate Status
     merged["status"] = merged["mac"].apply(lambda m: "Authorized" if m in authorized_macs else "Unauthorized")
 
     # ---------------------------------------------------------

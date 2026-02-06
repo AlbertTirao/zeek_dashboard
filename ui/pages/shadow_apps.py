@@ -24,7 +24,6 @@ LICENSE_REGISTRY = {
 @st.cache_data(show_spinner=False)
 def load_shadow_logs(parquet_root: Path, log_type: str, selected_date: str):
     """Load parquet file for a specific log type and specific date."""
-    # selected_date should match the directory name (e.g., "2023-10-27")
     date_dir = parquet_root / selected_date
     
     if not date_dir.exists():
@@ -37,7 +36,7 @@ def load_shadow_logs(parquet_root: Path, log_type: str, selected_date: str):
     return pd.DataFrame()
 
 # -----------------------------
-# Load DHCP MAC to identify the user
+# Load DHCP MAC
 # -----------------------------
 def get_dhcp_mapping(parquet_root: Path, selected_date: str):
     """Creates a dictionary mapping IP addresses to MAC addresses from DHCP logs."""
@@ -47,16 +46,23 @@ def get_dhcp_mapping(parquet_root: Path, selected_date: str):
     
     try:
         df_dhcp = pd.read_parquet(dhcp_path)
-        # Zeek DHCP logs typically use 'assigned_addr' or 'client_addr' for the IP
-        # and 'mac' or 'chaddr' for the hardware address.
-        ip_col = 'assigned_addr' if 'assigned_addr' in df_dhcp.columns else 'client_addr'
         
-        if ip_col in df_dhcp.columns and 'mac' in df_dhcp.columns:
-            # We take the latest MAC assigned to an IP to handle renewals
-            mapping = df_dhcp.dropna(subset=[ip_col, 'mac']).set_index(ip_col)['mac'].to_dict()
+        ip_candidates = ['assigned_addr', 'client_addr', 'lease_addr', 'yiaddr', 'ip']
+        ip_col = next((col for col in ip_candidates if col in df_dhcp.columns), None)
+        
+        mac_candidates = ['chaddr', 'client_chaddr', 'mac', 'hardware_address', 'src_mac']
+        mac_col = next((col for col in mac_candidates if col in df_dhcp.columns), None)
+
+        if ip_col and mac_col:
+            clean_df = df_dhcp.dropna(subset=[ip_col, mac_col]).copy()
+            clean_df[ip_col] = clean_df[ip_col].astype(str).str.strip()
+            clean_df[mac_col] = clean_df[mac_col].astype(str).str.strip().str.lower()
+            mapping = clean_df.set_index(ip_col)[mac_col].to_dict()
             return mapping
-    except Exception:
+            
+    except Exception as e:
         pass
+        
     return {}
 
 # -----------------------------
@@ -64,18 +70,20 @@ def get_dhcp_mapping(parquet_root: Path, selected_date: str):
 # -----------------------------
 def load_allowlist():
     if not ALLOWLIST_FILE.exists():
-        st.error(f"Allowlist not found: {ALLOWLIST_FILE}")
         return []
 
     approved = set()
-    with open(ALLOWLIST_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip().lower()
-            if not line or line.startswith("#"):
-                continue
-            domain = extract_domain(line)
-            if domain:
-                approved.add(domain)
+    try:
+        with open(ALLOWLIST_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip().lower()
+                if not line or line.startswith("#"):
+                    continue
+                domain = extract_domain(line)
+                if domain:
+                    approved.add(domain)
+    except Exception:
+        pass
     return list(approved)
 
 # -----------------------------
@@ -102,10 +110,10 @@ def is_allowed(domain: str, approved: list):
     return any(domain == a or domain.endswith("." + a) for a in approved)
 
 # -----------------------------
-# Helper: Normalize Columns
+# Helper: Normalize Columns (UPDATED for BYTES)
 # -----------------------------
 def normalize_log_df(df, log_type, domain_col):
-    """Standardize column names for merging."""
+    """Standardize column names and extract context + BYTES info."""
     if df.empty or domain_col not in df.columns:
         return pd.DataFrame()
     
@@ -113,34 +121,131 @@ def normalize_log_df(df, log_type, domain_col):
     cols = {domain_col: "app_identifier", "ts": "ts"}
     
     # Mapping IP
-    ip_options = ["id.orig_h", "orig_h", "ip"]
+    ip_options = ["id.orig_h", "orig_h", "src_ip", "ip", "c_ip"]
     for opt in ip_options:
         if opt in df.columns:
             cols[opt] = "ip"
             break
 
-    # Mapping MAC - Added more potential Zeek/Parquet column names
-    mac_options = ["mac", "orig_mac", "id.orig_mac", "src_mac", "endpoint_mac"]
+    # Mapping MAC
+    mac_options = ["mac", "orig_mac", "id.orig_mac", "src_mac", "endpoint_mac", "ethernet_source"]
     for opt in mac_options:
         if opt in df.columns:
             cols[opt] = "mac"
             break
+            
+    # --- Capture Context Columns ---
+    context_col = "Info"
     
+    if log_type == "notice":
+        if "msg" in df.columns: df[context_col] = df["msg"]
+        elif "note" in df.columns: df[context_col] = df["note"]
+    elif log_type == "weird":
+        if "addl" in df.columns: df[context_col] = df["addl"]
+        else: df[context_col] = df["name"]
+    elif "method" in df.columns:
+        df[context_col] = df["method"] + " " + df.get("uri", "")
+    elif "proto" in df.columns and "id.resp_p" in df.columns:
+         df[context_col] = df["proto"] + "/" + df["id.resp_p"].astype(str)
+    elif "mime_type" in df.columns:
+        df[context_col] = df["mime_type"]
+    elif "version.major" in df.columns:
+         df[context_col] = df["unparsed_version"]
+    else:
+        df[context_col] = "-"
+
+    # Keep destination port
+    if "id.resp_p" in df.columns: cols["id.resp_p"] = "dst_port"
+    elif "dst_port" in df.columns: cols["dst_port"] = "dst_port"
+    
+    # --- NEW: CAPTURE BYTES FOR EXFILTRATION ANALYSIS ---
+    # orig_bytes = Upload, resp_bytes = Download
+    if "orig_bytes" in df.columns: cols["orig_bytes"] = "bytes_sent"
+    if "resp_bytes" in df.columns: cols["resp_bytes"] = "bytes_received"
+    if "id.orig_bytes" in df.columns: cols["id.orig_bytes"] = "bytes_sent"
+    if "id.resp_bytes" in df.columns: cols["id.resp_bytes"] = "bytes_received"
+
     df = df.rename(columns=cols)
     
-    # 2. Ensure columns exist and handle "None" values
-    if "ip" not in df.columns: 
-        df["ip"] = "Unknown"
-    if "mac" not in df.columns: 
-        df["mac"] = "Unknown"
-    else:
-        # Fill actual NaNs or empty strings with "Unknown"
-        df["mac"] = df["mac"].fillna("Unknown").replace("", "Unknown")
+    # 2. Ensure columns exist
+    if "ip" not in df.columns: df["ip"] = "Unknown"
+    else: df["ip"] = df["ip"].astype(str).fillna("Unknown")
+
+    if "mac" not in df.columns: df["mac"] = "Unknown"
+    else: 
+        df["mac"] = df["mac"].fillna("Unknown").replace("", "Unknown").astype(str).str.lower()
+        df.loc[df["mac"].isin(["none", "nan"]), "mac"] = "Unknown"
+        
+    if "dst_port" not in df.columns: df["dst_port"] = 0
+    else: df["dst_port"] = pd.to_numeric(df["dst_port"], errors='coerce').fillna(0).astype(int)
     
+    # Ensure Bytes are Numeric
+    if "bytes_sent" not in df.columns: df["bytes_sent"] = 0
+    df["bytes_sent"] = pd.to_numeric(df["bytes_sent"], errors='coerce').fillna(0).astype(int)
+    
+    if "bytes_received" not in df.columns: df["bytes_received"] = 0
+    df["bytes_received"] = pd.to_numeric(df["bytes_received"], errors='coerce').fillna(0).astype(int)
+
     df["source_log"] = log_type.upper()
     
-    # Return only the needed columns
-    return df[["ts", "app_identifier", "ip", "mac", "source_log"]]
+    # Return specific columns (ADDED BYTES)
+    return df[["ts", "app_identifier", "ip", "mac", "source_log", "Info", "dst_port", "bytes_sent", "bytes_received"]]
+
+# -----------------------------
+# Calculate Risk Level
+# -----------------------------
+def calculate_risk(row):
+    """Assigns a simple risk level based on Port and Log Type."""
+    port = row.get("dst_port", 0)
+    log = row.get("source_log", "")
+    status = row.get("App Status", "")
+    
+    # 1. Critical Logs (Anomalies)
+    if log == "WEIRD" or log == "NOTICE":
+        return "Critical"
+    
+    # 2. Remote Access Ports (SSH, Telnet, RDP, VNC)
+    if port in [22, 23, 3389, 5900]:
+        return "High"
+        
+    # 3. Database Ports
+    if port in [1433, 3306, 5432]:
+        return "Medium"
+        
+    # 4. Unauthorized Application
+    if status == "Unauthorized":
+        return "Low"
+        
+    return "Safe"
+
+# -----------------------------
+# NEW: Categorize Threat Behavior (Exfiltration Logic)
+# -----------------------------
+def categorize_threat(row):
+    sent = row.get("bytes_sent", 0)
+    recv = row.get("bytes_received", 0)
+    
+    if sent > 10_000_000: # > 10MB Upload
+        return "🚨 Potential Exfiltration"
+    if recv > 100_000_000: # > 100MB Download
+        return "Heavy Download"
+    if row["source_log"] == "WEIRD":
+        return "Protocol Anomaly"
+    return "Unauthorized Usage"
+
+# -----------------------------
+# Styling Function (Colors)
+# -----------------------------
+def color_risk(val):
+    """Returns CSS styles for the Risk Level column."""
+    color_map = {
+        "Critical": "color: #FF0000; font-weight: bold;",   # Red
+        "High": "color: #FF4500; font-weight: bold;",       # OrangeRed
+        "Medium": "color: #FFA500;",                        # Orange
+        "Low": "color: #FFD700;",                           # Gold
+        "Safe": "color: #00FF00;"                           # Green
+    }
+    return color_map.get(val, "")
 
 # -----------------------------
 # Render Main Page
@@ -159,300 +264,450 @@ def render_shadow_apps(parquet_root: Path):
         st.error("Log root directory not found.")
         return
 
-    # 2. Load DHCP Mapping (Look-up table for MAC addresses)
-    ip_to_mac = get_dhcp_mapping(parquet_root, selected_date)
+    # 2. Load DHCP Mapping
+    with st.spinner("Loading DHCP Mapping..."):
+        ip_to_mac = get_dhcp_mapping(parquet_root, selected_date)
+    
     approved = load_allowlist()
 
-    # 3. Load and Normalize Logs
+    # 3. Load logs
     logs = [
         ("http", "host"),
         ("ssl", "server_name"),
         ("dns", "query"),
         ("files", "filename"),
         ("conn", "service"),
-        ("software", "unparsed_version")
+        ("software", "unparsed_version"),
+        ("weird", "name"),
+        ("notice", "note")
     ]
     
     combined_frames = []
-    for log_type, domain_col in logs:
-        raw_df = load_shadow_logs(parquet_root, log_type, selected_date)
-        norm_df = normalize_log_df(raw_df, log_type, domain_col)
-        if not norm_df.empty:
-            combined_frames.append(norm_df)
+    with st.spinner("Processing logs..."):
+        for log_type, domain_col in logs:
+            raw_df = load_shadow_logs(parquet_root, log_type, selected_date)
+            norm_df = normalize_log_df(raw_df, log_type, domain_col)
+            if not norm_df.empty:
+                combined_frames.append(norm_df)
 
-    # 4. Check if we actually found any data
     if not combined_frames:
         st.info(f"No Shadow App logs available for {selected_date}.")
         return
 
-    # 5. Create the 'df' variable
+    # 5. Create DF
     df = pd.concat(combined_frames, ignore_index=True)
     
-    # 6. ENRICH DATA: Match IP to MAC using DHCP mapping
-    # Only try to map if the MAC is currently "Unknown"
-    df.loc[df["mac"] == "Unknown", "mac"] = df["ip"].map(ip_to_mac)
+    # 6. Enrich Data
+    df["ip"] = df["ip"].astype(str)
+    mask_unknown = (df["mac"] == "Unknown") | (df["mac"].isna())
+    mapped_macs = df.loc[mask_unknown, "ip"].map(ip_to_mac)
+    df.loc[mask_unknown, "mac"] = mapped_macs.fillna("Unknown")
     df["mac"] = df["mac"].fillna("Unknown")
 
-    # 7. Process Data for UI
+    # 7. Process UI Data
     df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
     df["datetime"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
     df = df.dropna(subset=["datetime"])
     
-    # Attempt to extract domain
+    # Domain cleanup
     df["domain_clean"] = df["app_identifier"].apply(extract_domain)
-    
-    # --- FIX: Prevent CONN, FILES, and SOFTWARE from being filtered out ---
-    # If it's one of these types and domain_clean is empty, use the raw identifier
-    special_logs = ["CONN", "FILES", "SOFTWARE"]
+    special_logs = ["CONN", "FILES", "SOFTWARE", "WEIRD", "NOTICE"] 
     mask = (df["source_log"].isin(special_logs)) & (df["domain_clean"] == "")
     df.loc[mask, "domain_clean"] = df["app_identifier"]
-    
-    # Final Fallback: If it's still empty (e.g., CONN with no service), label it
     df.loc[df["domain_clean"] == "", "domain_clean"] = "unidentified_activity"
-    # ----------------------------------------------------------------------
 
-    df["Status"] = df["domain_clean"].apply(lambda x: "Allowed" if is_allowed(x, approved) else "Not Allowed")
+    # Status Check
+    df["App Status"] = df["domain_clean"].apply(lambda x: "Authorized" if is_allowed(x, approved) else "Unauthorized")
     
+    # Calculate Risk GLOBALLY
+    df["Risk Level"] = df.apply(calculate_risk, axis=1)
+    
+    # Calculate Threat Type (Exfiltration)
+    df["Behavior"] = df.apply(categorize_threat, axis=1)
 
     # Metrics
     total = len(df)
-    unauth_df = df[df["Status"] == "Not Allowed"]
-    auth_df = df[df["Status"] == "Allowed"]
+    unauth_df = df[df["App Status"] == "Unauthorized"]
+    critical_df = df[df["Risk Level"].isin(["Critical", "High"])]
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Events", total)
-    col2.metric("Authorized Events", len(auth_df))
+    col2.metric("Authorized Events", len(df[df["App Status"] == "Authorized"]))
     col3.metric("Unauthorized Events", len(unauth_df), delta_color="inverse")
+    col4.metric("Critical / High Risk", len(critical_df), delta_color="inverse")
     
     st.divider()
 
-    # Charts (Unified)
+    # Charts
     c1, c2 = st.columns([2, 1])
-    
     with c1:
         st.markdown("### Activity Over Time")
         if not df.empty:
-            df_line = df.groupby([pd.Grouper(key="datetime", freq="H"), "Status"]).size().reset_index(name="count")
-            fig = px.line(df_line, x="datetime", y="count", color="Status", 
-                          color_discrete_map={"Allowed": "#00FF00", "Not Allowed": "#FF0000"},
+            df_line = df.groupby([pd.Grouper(key="datetime", freq="H"), "App Status"]).size().reset_index(name="count")
+            fig = px.line(df_line, x="datetime", y="count", color="App Status", 
+                          color_discrete_map={"Authorized": "#00FF00", "Unauthorized": "#FF0000"},
                           template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
             
     with c2:
         st.markdown("### Source Distribution")
-        # Group by source to ensure Plotly has the counts ready for the hover label
         df_pie = df.groupby("source_log").size().reset_index(name="Log Count")
-        
         fig_pie = px.pie(
-            df_pie, 
-            values="Log Count", 
-            names="source_log", 
-            template="plotly_dark", 
-            hole=0.4,
-            # This ensures the count is shown on hover
-            hover_data=["Log Count"]
+            df_pie, values="Log Count", names="source_log", template="plotly_dark", hole=0.4
         )
-        
-        # Update traces to show both label, percentage, and the actual value
-        fig_pie.update_traces(
-            hovertemplate="<b>%{label}</b><br>Logs: %{value}<br>Percentage: %{percent}"
-        )
-        
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # Tables
-    t1, t2 = st.tabs(["Allowed Applications", "Unauthorized Applications"])
+    # --------------------------------------------------------
+    # TABS: The distinct UI Experience
+    # --------------------------------------------------------
+    t1, t2 = st.tabs(["Authorized Applications", "Unauthorized Applications"])
     
+    # --- AUTHORIZED TAB (Standard View) ---
     with t1:
-        # 1. Create three columns: Title, Search, and Source Filter
         tab_col1, tab_col2, tab_col3 = st.columns([2, 2, 1])
-        
-        with tab_col1:
-            st.markdown("### Authorized Apps")
-            
-        with tab_col2:
-            # Added Search Bar for MAC or IP
-            search_query = st.text_input(
-                "Search MAC/IP", 
-                placeholder="Enter MAC or IP...", 
-                key="auth_search"
-            ).strip().lower()
-            
+        with tab_col1: st.markdown("### Authorized Apps")
+        with tab_col2: 
+            search_query_auth = st.text_input("Search MAC/IP", placeholder="Enter MAC or IP...", key="auth_search").strip().lower()
         with tab_col3:
             raw_sources = sorted(df["source_log"].unique().tolist()) if not df.empty else []
-            all_options = ["All"] + raw_sources
-            selected_source = st.selectbox(
-                "Select Source", 
-                options=all_options, 
-                key="auth_source_filter_all"
-            )
+            selected_source_auth = st.selectbox("Select Source", options=["All"] + raw_sources, key="auth_source_filter")
+        
+        # Filter Authorized
+        auth_df = df[df["App Status"] == "Authorized"]
         
         if not auth_df.empty:
-            # 2. Apply Filters (Source + Search)
-            filtered_auth = auth_df.copy()
-            
-            # Filter by Source
-            if selected_source != "All":
-                filtered_auth = filtered_auth[filtered_auth["source_log"] == selected_source]
-            
-            # Filter by Search Query (Checking both MAC and IP columns)
-            if search_query:
-                filtered_auth = filtered_auth[
-                    (filtered_auth["mac"].str.contains(search_query, case=False, na=False)) | 
-                    (filtered_auth["ip"].str.contains(search_query, case=False, na=False))
+            if selected_source_auth != "All": auth_df = auth_df[auth_df["source_log"] == selected_source_auth]
+            if search_query_auth:
+                auth_df = auth_df[
+                    (auth_df["mac"].str.contains(search_query_auth, case=False, na=False)) | 
+                    (auth_df["ip"].str.contains(search_query_auth, case=False, na=False))
                 ]
 
-            if not filtered_auth.empty:
-                # 3. Aggregation and Styling
+            if not auth_df.empty:
                 allowed_summary = (
-                    filtered_auth.sort_values("datetime")
-                    .groupby(["domain_clean", "mac", "ip", "source_log", "Status"])
-                    .agg(
-                        First_Seen=("datetime", "min"),
-                        Last_Seen=("datetime", "max"),
-                        Count=("datetime", "count")
-                    )
+                    auth_df.sort_values("datetime")
+                    .groupby(["domain_clean", "mac", "ip", "source_log", "App Status"])
+                    .agg(First_Seen=("datetime", "min"), Last_Seen=("datetime", "max"), Count=("datetime", "count"))
                     .reset_index()
                 )
-
-                # Apply green text color styling
-                def color_status_green(val):
-                    return 'color: #6CA651; font-weight: bold;' # Bright green for dark theme
-
-                styled_df = allowed_summary.style.applymap(color_status_green, subset=['Status'])
-
-                st.dataframe(
-                    styled_df,
-                    column_config={
-                        "domain_clean": "Application/Domain",
-                        "Status": "Status",
-                        "First_Seen": st.column_config.DatetimeColumn("First Seen", format="HH:mm:ss"),
-                        "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="HH:mm:ss"),
-                        "mac": "MAC Address",
-                        "ip": "IP Address",
-                        "source_log": "Source",
-                        "Count": "Total Hits"
-                    },
-                    use_container_width=True,
-                    hide_index=True
-                )
+                
+                # --- FIX: Limit to 1000 rows to prevent crash ---
+                allowed_summary = allowed_summary.head(1000)
+                
+                def color_status_green(val): return 'color: #6CA651; font-weight: bold;'
+                styled_df = allowed_summary.style.applymap(color_status_green, subset=['App Status'])
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
             else:
-                st.info("No matching authorized logs found.")
+                st.info("No matching Authorized logs found.")
         else:
-            st.info("No authorized applications detected.")
+            st.info("No Authorized applications detected.")
 
+        # -----------------------------
+        # Shadow App Forensics Section (INSIDE TAB 1)
+        # -----------------------------
+        st.divider()
+        st.header("Shadow App Forensics")
+
+        search_query = st.text_input("Global Forensic Search", placeholder="Enter specific MAC or IP to start deep dive...", key="global_forensic_search").strip().lower()
+
+        if search_query:
+            st.info(f"Showing deep forensics for: **{search_query}**")
+            
+            f_col1, f_col2 = st.columns(2)
+            with f_col1:
+                view_type = st.radio(
+                    "Forensic View", 
+                    ["App Run (Connectivity)", "App Usage (Interaction)", "App Install (Files)", "Suspicious Behavior"],
+                    horizontal=True
+                )
+            with f_col2:
+                f_raw_sources = sorted(df["source_log"].unique().tolist()) if not df.empty else []
+                selected_f_source = st.selectbox("Filter Forensic Source", options=["All"] + f_raw_sources, key="forensic_source_single")
+
+            # Base Filter
+            forensic_df = df[
+                (df["mac"].str.contains(search_query, case=False, na=False)) | 
+                (df["ip"].str.contains(search_query, case=False, na=False))
+            ].copy()
+
+            if selected_f_source != "All":
+                forensic_df = forensic_df[forensic_df["source_log"] == selected_f_source]
+
+            if not forensic_df.empty:
+                
+                # --- DISTINCT LOGIC IMPLEMENTATION ---
+                if "App Run" in view_type:
+                    display_df = forensic_df[forensic_df["source_log"].isin(["CONN", "DNS"])]
+                    color_graph = ["#00CCFF"] 
+                elif "App Usage" in view_type:
+                    display_df = forensic_df[forensic_df["source_log"].isin(["HTTP", "SSL"])]
+                    color_graph = ["#00FF99"] 
+                elif "App Install" in view_type:
+                    display_df = forensic_df[forensic_df["source_log"].isin(["FILES", "SOFTWARE"])]
+                    color_graph = ["#FFFF00"] 
+                elif "Suspicious" in view_type:
+                    display_df = forensic_df[
+                        (forensic_df["App Status"] == "Unauthorized") | 
+                        (forensic_df["Risk Level"].isin(["Critical", "High", "Medium"]))
+                    ]
+                    color_graph = ["#FF0000"] 
+                else:
+                    display_df = forensic_df
+                    color_graph = ["#888888"]
+
+                # --- Activity Graph ---
+                st.markdown("### Traffic Activity Graph")
+                if not display_df.empty:
+                    f_line = display_df.groupby([pd.Grouper(key="datetime", freq="10min")]).size().reset_index(name="hits")
+                    fig_f = px.area(f_line, x="datetime", y="hits", template="plotly_dark", 
+                                    color_discrete_sequence=color_graph, title=f"Activity: {view_type}")
+                    st.plotly_chart(fig_f, use_container_width=True)
+                else:
+                    st.warning(f"No events found for {view_type} category.")
+
+                # --- Top Destinations & Table ---
+                low_col1, low_col2 = st.columns([1, 2])
+                
+                with low_col1:
+                    st.markdown("### Top Destinations")
+                    if not display_df.empty:
+                        top_dest = display_df["domain_clean"].value_counts().head(10).reset_index()
+                        top_dest.columns = ["Destination", "Count"]
+                        st.table(top_dest)
+                    else:
+                        st.write("No data.")
+
+                with low_col2:
+                    title_col, opt_col, status_col = st.columns([1.5, 1.2, 1])
+                    with title_col: st.markdown(f"### {view_type}")
+                    with opt_col:
+                        table_mode = st.selectbox(
+                            "View Mode",
+                            options=["Detailed Logs", "Unique Rows", "Group by App", "Group by Source"],
+                            label_visibility="collapsed" 
+                        )
+                    with status_col:
+                        allow_status = st.radio(
+                            " ", ["Authorized", "Unauthorized", "All"],
+                            horizontal=True, key="allow_filter", label_visibility="collapsed"
+                        )
+                    
+                    if allow_status == "Authorized":
+                        display_df = display_df[display_df["App Status"] == "Authorized"]
+                    elif allow_status == "Unauthorized":
+                        display_df = display_df[display_df["App Status"] == "Unauthorized"]
+                    
+                    if table_mode == "Unique Rows":
+                        final_df = display_df.drop_duplicates(subset=["domain_clean", "ip", "mac", "source_log", "Info"]).sort_values("datetime", ascending=False)
+                    elif table_mode == "Group by App":
+                        final_df = display_df.groupby(["domain_clean", "App Status"]).size().reset_index(name='Count').sort_values(by="Count", ascending=False)
+                    elif table_mode == "Group by Source":
+                        final_df = display_df.groupby(["source_log", "App Status"]).size().reset_index(name='Count').sort_values(by="Count", ascending=False)
+                    else:
+                        final_df = display_df.sort_values("datetime", ascending=False)
+
+                    # --- FIX: Limit to 1000 rows to prevent crash ---
+                    final_df = final_df.head(1000)
+
+                    if "Risk Level" in final_df.columns:
+                        styled_final_df = final_df.style.applymap(color_risk, subset=["Risk Level"])
+                    else:
+                        styled_final_df = final_df
+
+                    st.dataframe(
+                        styled_final_df,
+                        column_config={
+                            "datetime": st.column_config.DatetimeColumn("Timestamp", format="HH:mm:ss"),
+                            "Info": "Context Info",
+                            "domain_clean": "Destination",
+                            "dst_port": "Port",
+                            "Risk Level": "Risk"
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    if not final_df.empty:
+                        st.download_button(
+                            label="Download Evidence (CSV)",
+                            data=final_df.to_csv(index=False).encode('utf-8'),
+                            file_name=f"forensics_{search_query}_{view_type}.csv",
+                            mime='text/csv'
+                        )
+                
+                # -------------------------------------------
+                # Device Analytics
+                # -------------------------------------------
+                st.divider()
+                st.subheader("Device Analytics")
+                
+                g_col1, g_col2, g_col3, g_col4 = st.columns(4)
+                
+                with g_col1:
+                    st.markdown("#### Total Activity")
+                    if not forensic_df.empty:
+                        forensic_df["hour"] = forensic_df["datetime"].dt.hour
+                        hourly_counts = forensic_df.groupby("hour").size().reset_index(name="count")
+                        fig1 = px.bar(hourly_counts, x="hour", y="count", template="plotly_dark", color_discrete_sequence=["#3366CC"])
+                        st.plotly_chart(fig1, use_container_width=True)
+
+                with g_col2:
+                    st.markdown("#### Auth vs Unauth")
+                    if not forensic_df.empty:
+                        status_counts = forensic_df["App Status"].value_counts().reset_index()
+                        status_counts.columns = ["App Status", "count"]
+                        fig2 = px.pie(
+                            status_counts, names="App Status", values="count", color="App Status",
+                            color_discrete_map={"Authorized": "#00FF00", "Unauthorized": "#FF0000"},
+                            template="plotly_dark", hole=0.5
+                        )
+                        st.plotly_chart(fig2, use_container_width=True)
+
+                with g_col3:
+                    st.markdown("#### Source Dist.")
+                    if not forensic_df.empty:
+                        source_counts = forensic_df["source_log"].value_counts().reset_index()
+                        source_counts.columns = ["Source", "count"]
+                        fig3 = px.bar(source_counts, x="Source", y="count", template="plotly_dark", color="Source")
+                        st.plotly_chart(fig3, use_container_width=True)
+
+                with g_col4:
+                    st.markdown("#### Top Ports")
+                    if not forensic_df.empty:
+                        port_df = forensic_df[forensic_df["dst_port"] > 0]
+                        if not port_df.empty:
+                            port_counts = port_df["dst_port"].value_counts().head(5).reset_index()
+                            port_counts.columns = ["Port", "count"]
+                            port_counts["Port"] = port_counts["Port"].astype(str)
+                            fig4 = px.bar(port_counts, x="Port", y="count", template="plotly_dark", color_discrete_sequence=["#FF9900"])
+                            st.plotly_chart(fig4, use_container_width=True)
+                        else:
+                            st.write("No port data.")
+                    else:
+                        st.write("No data.")
+        else:
+            st.write("Please enter a MAC or IP address in the search bar above to begin forensics.")
+
+    # --- UNAUTHORIZED TAB (Advanced Threat Dashboard) ---
     with t2:
-        st.markdown("### Unauthorized Apps Summary")
+        st.markdown("## Unauthorized Threat Dashboard")
+        
         if not unauth_df.empty:
-            # Summary Table (Already grouped, so no duplicates here)
-            unauth_summary = unauth_df.groupby(["domain_clean", "source_log"]).size().reset_index(name="Count")
-            st.dataframe(unauth_summary, use_container_width=True)
+            # 1. Threat Metrics
+            u_metrics1, u_metrics2, u_metrics3 = st.columns(3)
+            with u_metrics1:
+                st.metric("Active Unauthorized Apps", unauth_df["domain_clean"].nunique())
+            with u_metrics2:
+                top_offender = unauth_df["mac"].value_counts().idxmax()
+                offender_count = unauth_df["mac"].value_counts().max()
+                st.metric("Top Offender (MAC)", top_offender, delta=f"{offender_count} Events", delta_color="inverse")
+            with u_metrics3:
+                crit_count = len(unauth_df[unauth_df["Risk Level"].isin(["Critical", "High"])])
+                st.metric("Critical Risks Detected", crit_count, delta="Requires Attention", delta_color="inverse")
             
             st.divider()
             
-            # DETAILED TABLE (The one that usually looks "spammy")
-            st.markdown("### Unauthorized Details (Unique Device Access)")
-            st.write("Unique list of devices (IP/MAC) per application today.")
+            # --- NEW: DATA EXFILTRATION MONITOR ---
+            with st.expander("Data Exfiltration Monitor (High Volume Traffic)", expanded=True):
+                exfil_c1, exfil_c2 = st.columns(2)
+                
+                # Calculate Totals
+                total_sent_gb = unauth_df["bytes_sent"].sum() / 1_000_000_000
+                total_recv_gb = unauth_df["bytes_received"].sum() / 1_000_000_000
+                
+                with exfil_c1:
+                    st.metric("Total Unauthorized Upload", f"{total_sent_gb:.2f} GB", delta="Potential Leak", delta_color="inverse")
+                    st.metric("Total Unauthorized Download", f"{total_recv_gb:.2f} GB")
+                    
+                with exfil_c2:
+                    # Scatter Plot: Bytes Sent vs Port
+                    fig_exfil = px.scatter(
+                        unauth_df[unauth_df["bytes_sent"] > 0], 
+                        x="dst_port", y="bytes_sent", 
+                        size="bytes_sent", color="Behavior",
+                        hover_data=["domain_clean", "mac"],
+                        title="Outbound Data Volume by Port",
+                        template="plotly_dark"
+                    )
+                    st.plotly_chart(fig_exfil, use_container_width=True)
+
+            st.divider()
+
+            # 2. Risk Distribution Chart
+            u_chart1, u_chart2 = st.columns([2, 1])
+            with u_chart1:
+                st.markdown("#### Top Unauthorized Domains")
+                top_unauth_domains = unauth_df["domain_clean"].value_counts().head(10).reset_index()
+                top_unauth_domains.columns = ["Domain", "Hits"]
+                fig_u1 = px.bar(top_unauth_domains, x="Hits", y="Domain", orientation='h', template="plotly_dark", color_discrete_sequence=["#FF4500"])
+                fig_u1.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_u1, use_container_width=True)
             
-            # REMOVE DUPLICATES: 
-            # We drop duplicates so we only see ONE entry per MAC/IP per App.
-            # We keep the 'last' occurrence to show the most recent time.
+            with u_chart2:
+                st.markdown("#### Risk Distribution")
+                risk_counts = unauth_df["Risk Level"].value_counts().reset_index()
+                risk_counts.columns = ["Risk", "Count"]
+                
+                risk_colors = {
+                    "Critical": "#FF0000", "High": "#FF4500", 
+                    "Medium": "#FFA500", "Low": "#FFD700", "Safe": "#00FF00"
+                }
+                
+                fig_u2 = px.pie(risk_counts, values="Count", names="Risk", 
+                                color="Risk", color_discrete_map=risk_colors,
+                                template="plotly_dark", hole=0.6)
+                st.plotly_chart(fig_u2, use_container_width=True)
+
+            st.divider()
+            
+            # 3. Advanced Filtering & Table
+            st.markdown("### Threat Details")
+            
+            af_1, af_2, af_3 = st.columns([1, 1, 2])
+            with af_1:
+                filter_risk = st.multiselect("Filter by Risk", ["Critical", "High", "Medium", "Low"], default=["Critical", "High", "Medium", "Low"])
+            with af_2:
+                filter_source = st.multiselect("Filter by Log Source", unauth_df["source_log"].unique(), default=unauth_df["source_log"].unique())
+            with af_3:
+                search_query_unauth = st.text_input("Search (IP, MAC, Domain)", placeholder="Search threat details...", key="unauth_search")
+
+            filtered_unauth = unauth_df.copy()
+            if filter_risk: filtered_unauth = filtered_unauth[filtered_unauth["Risk Level"].isin(filter_risk)]
+            if filter_source: filtered_unauth = filtered_unauth[filtered_unauth["source_log"].isin(filter_source)]
+            if search_query_unauth:
+                q = search_query_unauth.lower()
+                filtered_unauth = filtered_unauth[
+                    (filtered_unauth["mac"].str.contains(q, case=False, na=False)) | 
+                    (filtered_unauth["ip"].str.contains(q, case=False, na=False)) |
+                    (filtered_unauth["domain_clean"].str.contains(q, case=False, na=False))
+                ]
+
             detail_table = (
-                unauth_df[["datetime", "mac", "ip", "domain_clean", "source_log"]]
-                .sort_values("datetime", ascending=True)
-                .drop_duplicates(subset=["mac", "ip", "domain_clean"], keep="last")
+                filtered_unauth[["datetime", "mac", "ip", "domain_clean", "source_log", "Info", "dst_port", "bytes_sent", "Behavior", "Risk Level"]]
                 .sort_values("datetime", ascending=False)
             )
             
+            # --- FIX: Limit to 1000 rows to prevent crash ---
+            detail_table = detail_table.head(1000)
+            
+            styled_unauth = detail_table.style.applymap(color_risk, subset=["Risk Level"])
+
             st.dataframe(
-                detail_table,
+                styled_unauth,
                 column_config={
-                    "datetime": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss"),
+                    "datetime": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
                     "mac": "MAC Address",
                     "ip": "IP Address",
-                    "domain_clean": "Application / Domain",
-                    "source_log": "Source"
+                    "domain_clean": "Unauthorized Domain",
+                    "source_log": "Source",
+                    "Info": "Context",
+                    "dst_port": "Port",
+                    "bytes_sent": "Upload (Bytes)",
+                    "Behavior": "Behavior Tag",
+                    "Risk Level": "Threat Risk"
                 },
-                use_container_width=True
+                use_container_width=True,
+                hide_index=True
             )
         else:
-            st.success("No unauthorized applications detected.")
-
-            # -----------------------------
-    # Shadow App Forensics Section
-    # -----------------------------
-    st.divider()
-    st.header("🔍 Shadow App Forensics")
-
-    if search_query:
-        st.info(f"Showing deep forensics for: **{search_query}**")
-        
-        f_col1, f_col2 = st.columns(2)
-        with f_col1:
-            view_type = st.radio(
-                "Forensic View", 
-                ["App Run", "App Install", "App Usage", "Suspicious Behavior"],
-                horizontal=True
-            )
-        with f_col2:
-            # Change: Single Selectbox instead of Multiselect
-            f_raw_sources = sorted(df["source_log"].unique().tolist()) if not df.empty else []
-            f_options = ["All"] + f_raw_sources
-            
-            selected_f_source = st.selectbox(
-                "Filter Forensic Source", 
-                options=f_options, 
-                key="forensic_source_single"
-            )
-
-        # Filter data for the searched device
-        forensic_df = df[
-            (df["mac"].str.contains(search_query, case=False, na=False)) | 
-            (df["ip"].str.contains(search_query, case=False, na=False))
-        ].copy()
-
-        # Apply the single source filter
-        if selected_f_source != "All":
-            forensic_df = forensic_df[forensic_df["source_log"] == selected_f_source]
-
-        if not forensic_df.empty:
-            # --- Traffic Activity Graph ---
-            st.markdown("### Traffic Activity Graph")
-            f_line = forensic_df.groupby([pd.Grouper(key="datetime", freq="10min")]).size().reset_index(name="hits")
-            fig_f = px.area(f_line, x="datetime", y="hits", template="plotly_dark", 
-                            color_discrete_sequence=["#00CCFF"], title=f"Activity for {view_type}")
-            st.plotly_chart(fig_f, use_container_width=True)
-
-            low_col1, low_col2 = st.columns([1, 2])
-            
-            with low_col1:
-                st.markdown("### Top Destinations")
-                top_dest = forensic_df["domain_clean"].value_counts().head(10).reset_index()
-                top_dest.columns = ["Destination", "Count"]
-                st.table(top_dest)
-
-            with low_col2:
-                st.markdown(f"### Full View Log Detail: {view_type}")
-                
-                # Logic to filter logs based on the Forensic View selected
-                view_map = {
-                    "App Run": ["CONN", "DNS", "SSL", "HTTP", "SOFTWARE"],
-                    "App Install": ["HTTP", "FILES", "CONN", "SOFTWARE"],
-                    "App Usage": ["CONN", "DNS", "SSL", "HTTP"],
-                    "Suspicious Behavior": ["WEIRD", "NOTICE"] 
-                }
-                
-                log_filter = view_map.get(view_type, [])
-                
-                # Further filter the already source-filtered dataframe by the View Type requirements
-                display_df = forensic_df[forensic_df["source_log"].isin(log_filter)]
-                
-                st.dataframe(
-                    display_df.sort_values("datetime", ascending=False),
-                    use_container_width=True,
-                    hide_index=True
-                )
-        else:
-            st.warning(f"No forensic data found for {selected_f_source} under the current search.")
-    else:
-        st.write("Please enter a MAC or IP address in the search bar above to begin forensics.")
+            st.success("No Unauthorized applications detected. System is clean.")
