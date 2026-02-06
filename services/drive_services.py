@@ -1,3 +1,4 @@
+# drive_services.py
 import os
 import time
 import tempfile
@@ -97,6 +98,9 @@ def walk_drive_folder(drive, folder_id):
         else:
             yield item
 
+# =====================================================
+# Stream a single Zeek log file from Drive to Parquet in chunks
+# ===================================================== 
 def stream_zeek_log_to_parquet(
     drive,
     file_obj,
@@ -116,6 +120,7 @@ def stream_zeek_log_to_parquet(
         rows = []
         headers = None
         writer = None
+        raw_lines = [] # Fallback for non-Zeek logs (stdout/stderr)
 
         with open(tmp_path, "r", errors="ignore") as f:
             for line in f:
@@ -128,6 +133,8 @@ def stream_zeek_log_to_parquet(
                     continue
 
                 if not headers:
+                    # Keep track of raw lines in case this isn't a standard Zeek log
+                    raw_lines.append(line)
                     continue
 
                 parts = line.split("\t")
@@ -153,8 +160,18 @@ def stream_zeek_log_to_parquet(
                 writer = pq.ParquetWriter(parquet_path, table.schema)
             writer.write_table(table)
 
+        # 🛑 FALLBACK: If no Zeek headers were found, but there is text (stdout/stderr)
+        if writer is None and raw_lines:
+            df = pd.DataFrame({"raw_message": raw_lines})
+            df.to_parquet(parquet_path)
+        
+        # 🛑 PLACEHOLDER: If the file was completely empty (0 bytes)
+        elif writer is None and not parquet_path.exists():
+            df = pd.DataFrame({"status": ["empty_log"]})
+            df.to_parquet(parquet_path)
+
         if writer:
-            writer.close()
+            writer.close()  
 
     finally:
         if os.path.exists(tmp_path):
@@ -169,14 +186,24 @@ def parse_drive_logs_to_parquet(
     parquet_root: Path,
 ):
     drive = authenticate_drive(client_secret_path)
-    
     # Track if we actually downloaded anything to show/hide messages
     files_processed = 0
+
+    # Generator to walk Drive
+    def walk_drive_folder(drive, folder_id):
+        query = f"'{folder_id}' in parents and trashed=false"
+        items = list_files_with_retry(drive, query)
+        for item in items:
+            if item["mimeType"].endswith("folder"):
+                yield from walk_drive_folder(drive, item["id"])
+            else:
+                yield item
 
     for f in walk_drive_folder(drive, folder_id):
         name = f["title"]
 
-        if not name.endswith(".log"):
+        # 1. Totally ignore conn-summary and non-log files
+        if not name.endswith(".log") or "conn-summary" in name:
             continue
 
         log_type = name.replace(".log", "")
@@ -186,23 +213,16 @@ def parse_drive_logs_to_parquet(
             log_date = datetime.fromisoformat(
                 f["modifiedDate"].replace("Z", "+00:00")
             ).strftime("%Y-%m-%d")
-        except ValueError:
-            # Fallback if date format is weird
+        except:
             log_date = datetime.now().strftime("%Y-%m-%d")
 
         parquet_path = parquet_root / log_date / f"{log_type}.parquet"
 
-        # ---------------------------------------------------------
-        # 🛑 THE FIX: CHECK IF FILE EXISTS BEFORE DOWNLOADING
-        # ---------------------------------------------------------
+        # 2. Skip if already exists locally
         if parquet_path.exists():
-            # Optional: Check if the Drive file is newer than local file?
-            # For now, we assume if it exists, we have it.
-            # print(f"⏭️ Skipping {name} (already exists)") 
-            continue 
-        # ---------------------------------------------------------
+            continue
 
-        st.write(f"🚀 Streaming {name} → {parquet_path}")
+        st.write(f"🚀 Processing {name}...")
 
         try:
             stream_zeek_log_to_parquet(
@@ -210,14 +230,12 @@ def parse_drive_logs_to_parquet(
                 file_obj=f,
                 parquet_path=parquet_path,
             )
-            st.write("✅ done")
             files_processed += 1
-
         except Exception as e:
-            st.write(f"❌ failed {name}: {e}")
+            st.write(f"❌ Error processing {name}: {e}")
             
     if files_processed == 0:
-        st.info("👍 Local cache is up to date. No new logs found.")
+        st.info("👍 Local cache is up to date.")
 
 # =====================================================
 # Google Drive Authentication

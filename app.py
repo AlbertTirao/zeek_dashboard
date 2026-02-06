@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 from config.client import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL
 from services.drive_services import parse_drive_logs_to_parquet
