@@ -226,7 +226,7 @@ def categorize_threat(row):
     recv = row.get("bytes_received", 0)
     
     if sent > 10_000_000: # > 10MB Upload
-        return "🚨 Potential Exfiltration"
+        return "Potential Exfiltration"
     if recv > 100_000_000: # > 100MB Download
         return "Heavy Download"
     if row["source_log"] == "WEIRD":
