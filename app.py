@@ -1,15 +1,33 @@
 import streamlit as st
-from config.settings import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL
+from config.client import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL
 from services.drive_services import parse_drive_logs_to_parquet
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, tables, visual, zeek_logs, alerts, authorization
 from pathlib import Path
+
+# -------------------------
+# One-time Zeek log → Parquet warm-up (DISK GUARDED)
+# -------------------------
+from pathlib import Path
+from services.drive_services import parse_drive_logs_to_parquet
 
 PARQUET_DIR = Path("data/parquet")
 WARMUP_FLAG = PARQUET_DIR / ".WARMED"
 
 if not WARMUP_FLAG.exists():
     st.write("🔥 Initializing Parquet cache from ALL Zeek logs...")
+
+    parse_drive_logs_to_parquet(
+        client_secret_path=CLIENT_SECRET_FILE,
+        folder_id=FOLDER_ID,
+        parquet_root=PARQUET_DIR,
+    )
+
+    WARMUP_FLAG.touch()
+    st.write("✅ Parquet cache ready (raw logs untouched)")
+else:
+    st.write("⚡ Parquet cache already initialized — skipping Drive parse")
+
 
 
 # # -------------------------

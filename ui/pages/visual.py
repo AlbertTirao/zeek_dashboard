@@ -208,7 +208,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if not hourly.empty:
         line_fig = px.line(
             hourly, x="ts", y="events", color="status",
-            color_discrete_map={"Authorized":"#39CF0B","Unauthorized":"#F63049"},
+            color_discrete_map={"Authorized":"#00F7FF","Unauthorized":"#F63049"},
             template="plotly_dark"
         )
         line_fig.update_layout(
@@ -252,7 +252,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         daily_count = merged.drop_duplicates(subset=["mac","date"]).groupby(["date","status"]).size().reset_index(name="devices")
         bar_fig = px.bar(
             daily_count, x="date", y="devices", color="status", barmode="stack",
-            color_discrete_map={"Authorized":"#07c53d","Unauthorized":"#F63049"},
+            color_discrete_map={"Authorized":"#00F7FF","Unauthorized":"#F63049"},
             template="plotly_dark", labels={"devices":"Devices","date":"Date"}
         )
         bar_fig.update_layout(height=500, margin=dict(l=20, r=20, t=50, b=100), xaxis={"tickfont":{"size":14}}, yaxis={"tickfont":{"size":14}}, legend={"font":{"size":14}})
