@@ -3,7 +3,7 @@ import streamlit as st
 from config.client import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL
 from services.drive_services import parse_drive_logs_to_parquet
 from ui.sidebar import render_sidebar
-from ui.pages import analytics, tables, visual, zeek_logs, alerts, authorization
+from ui.pages import analytics, devices, tables, zeek_logs, alerts, authorization
 from pathlib import Path
 import os
 
@@ -108,8 +108,8 @@ st.session_state.current_page = selected_page
 def render_current_page():
     page = st.session_state.current_page
     
-    if page == "Visual":
-        visual.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
+    if page == "Devices":
+        devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
     
     elif page == "Tables":
         tables.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)

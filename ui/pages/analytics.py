@@ -79,4 +79,4 @@ def render(parquet_root: Path):
         if filtered.empty:
             st.info("No device data available for AI analysis.")
         else:
-            render_shadow_ai(filtered)
+            render_shadow_ai(parquet_root)
