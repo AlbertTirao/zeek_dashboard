@@ -13,6 +13,43 @@ from pydrive2.drive import GoogleDrive
 from pydrive2.files import ApiRequestError  # Required for error handling
 
 # =====================================================
+# Debug helper: print parquet cache structure and sample data
+# =====================================================
+def debug_print_parquet_cache(parquet_cache: dict):
+    """Prints a clean summary of folders, files, row counts, and field names."""
+    if not parquet_cache:
+        st.warning("The Parquet cache is currently empty.")
+        return
+
+    # Sort dates descending (newest first)
+    sorted_dates = sorted(parquet_cache.keys(), reverse=True)
+
+    for date in sorted_dates:
+        logs = parquet_cache[date]
+        st.markdown(f"### 📁 Folder: {date}")
+        
+        file_details = []
+        for log_type, df in logs.items():
+            row_count = len(df)
+            
+            # Get field names or show "no fields"
+            if not df.empty and len(df.columns) > 0:
+                fields_str = ", ".join(df.columns.tolist())
+                fields_display = f"[{fields_str}]"
+            else:
+                fields_display = "[no fields]"
+                
+            file_details.append(f"📄 `{log_type}.parquet` — **{row_count}** rows {fields_display}")
+        
+        if file_details:
+            # Join with double newlines for proper Markdown list spacing
+            st.markdown("\n".join([f"* {item}" for item in file_details]))
+        else:
+            st.write("  *(No parquet files found)*")
+        
+        st.divider()
+
+# =====================================================
 # Helper: Retry Logic for Google Drive API 500 Errors
 # =====================================================
 def list_files_with_retry(drive, query, max_retries=8):
