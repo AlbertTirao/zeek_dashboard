@@ -128,9 +128,17 @@ def render(parquet_root, authorized_macs_file):
 
     # --- NORMALIZE COLUMNS ---
     df["_final_ts"] = get_col(df, ["ts", "timestamp", "time"], pd.NaT)
-    df["_final_mac"] = get_col(df, ["MAC Address", "mac", "orig_l2_addr", "hardware_address"], "Unknown MAC")
-    df["_final_ip"] = get_col(df, ["id.orig_h", "IP Address", "src_ip", "source_ip", "ip"], "Unknown IP")
-    df["_final_host"] = get_col(df, ["host_name", "Host Name", "computer_name"], "Unknown Host")
+    
+    # UPDATED: Added 'client_chaddr' commonly found in DHCP logs
+    df["_final_mac"] = get_col(df, ["MAC Address", "mac", "orig_l2_addr", "hardware_address", "client_chaddr"], "Unknown MAC")
+    
+    # UPDATED: Added 'assigned_addr' and 'client_addr' for DHCP support
+    df["_final_ip"] = get_col(df, [
+        "assigned_addr", "client_addr", "id.orig_h", "IP Address", 
+        "src_ip", "source_ip", "ip"
+    ], "Unknown IP")
+    
+    df["_final_host"] = get_col(df, ["host_name", "Host Name", "computer_name", "client_fqdn"], "Unknown Host")
 
     # --- MERGE WITH KNOWN HOSTS ---
     known_macs_map = {} 
@@ -162,6 +170,7 @@ def render(parquet_root, authorized_macs_file):
     def fill_details(row):
         current_ip = str(row["_final_ip"])
         mac = row["_final_mac"]
+        # Only overwrite if current_ip is actually missing
         if current_ip in ["Unknown IP", "none", "-", "None", "nan", "0.0.0.0"] and mac in known_macs_map:
             row["_final_ip"] = known_macs_map[mac]
         row["_final_vendor"] = resolve_vendor(mac)
@@ -238,11 +247,17 @@ def render(parquet_root, authorized_macs_file):
             "_final_status": "Status"
         })
 
-        def highlight_security(row):
-            return ['background-color: #ff4b4b; color: white; font-weight: bold'] * len(row)
+        # --- STYLE FUNCTION: Text Red & Bold if "Unauthorized" ---
+        def style_status_column(val):
+            if str(val) == "Unauthorized":
+                return "color: #ff4b4b; font-weight: bold;"
+            return ""
+
+        # Apply the style only to the 'Status' column
+        styled_df = display_table.style.map(style_status_column, subset=["Status"])
 
         st.dataframe(
-            display_table.style.apply(highlight_security, axis=1),
+            styled_df,
             use_container_width=True,
             hide_index=True,
             column_config={

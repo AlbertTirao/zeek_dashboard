@@ -107,10 +107,10 @@ def render(parquet_root: Path):
         st.warning("File is empty or could not be loaded.")
         return
 
-    st.write(f"### 📄 {selected_log}.log ({len(df)} rows)")
+    st.write(f"### {selected_log}.log ({len(df)} rows)")
     
     # 5. Search / Filter
-    search_term = st.text_input("🔍 Filter records (search all columns)", "")
+    search_term = st.text_input(" Filter records (search all columns)", "")
     
     if search_term:
         # Simple case-insensitive string match across all columns
