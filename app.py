@@ -58,19 +58,19 @@ else:
 # else:
 #     st.write("⚡ Pickle cache already initialized — skipping conversion")
 
-# =====================================================
-# CONFIGURATION
-# =====================================================
-PARQUET_ROOT = Path("data/parquet")
+# # =====================================================
+# # CONFIGURATION
+# # =====================================================
+# PARQUET_ROOT = Path("data/parquet")
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
 
-# Ensure Parquet Root Exists
-os.makedirs(PARQUET_ROOT, exist_ok=True)
+# # Ensure Parquet Root Exists
+# os.makedirs(PARQUET_ROOT, exist_ok=True)
 
-WARMUP_FLAG = PARQUET_ROOT / ".WARMED"
+# WARMUP_FLAG = PARQUET_ROOT / ".WARMED"
 
-if not WARMUP_FLAG.exists():
-    st.write("🔥 Initializing Parquet cache...")
+# if not WARMUP_FLAG.exists():
+#     st.write("🔥 Initializing Parquet cache...")
 
 # =====================================================
 # AUTOMATIC DATA LOADING (The "Magic" Part)
@@ -82,7 +82,7 @@ if "data_synced" not in st.session_state:
     parse_drive_logs_to_parquet(
         client_secret_path=CLIENT_SECRET_FILE,
         folder_id=FOLDER_ID,
-        parquet_root=PARQUET_ROOT,
+        parquet_root=PARQUET_DIR,
     )
 
     st.session_state.data_synced = True
@@ -109,19 +109,19 @@ def render_current_page():
     page = st.session_state.current_page
     
     if page == "Visual":
-        visual.render(PARQUET_ROOT, AUTHORIZED_MACS_FILE)
+        visual.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
     
     elif page == "Tables":
-        tables.render(PARQUET_ROOT, AUTHORIZED_MACS_FILE)
+        tables.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
         
     elif page == "Analytics":
-        analytics.render(PARQUET_ROOT)
+        analytics.render(PARQUET_DIR)
         
     elif page == "Zeek Logs":
-        zeek_logs.render(PARQUET_ROOT)
+        zeek_logs.render(PARQUET_DIR)
         
     elif page == "Alerts":  
-        alerts.render(PARQUET_ROOT, AUTHORIZED_MACS_FILE)
+        alerts.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
         
     elif page == "Authorization":
         authorization.render(AUTHORIZED_MACS_FILE)
