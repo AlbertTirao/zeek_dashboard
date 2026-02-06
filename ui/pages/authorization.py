@@ -154,7 +154,7 @@ def render(authorized_macs_file: Path):
         df["_selected"] = False 
 
     # 3. Page Header
-    st.title("🛡️ Authorization Manager")
+    st.title(" Authorization Manager")
     st.markdown("Manage whitelist access for network devices.")
     
     # 4. Metrics & Add Section
@@ -169,7 +169,7 @@ def render(authorized_macs_file: Path):
     with col_title:
         st.subheader("Device Database")
     with col_search:
-        search_query = st.text_input("🔍 Search MAC Address", placeholder="Filter list...", label_visibility="collapsed")
+        search_query = st.text_input("🔍 Search MAC Address", placeholder="Search list...", label_visibility="collapsed")
 
     if search_query:
         df_display = df[df["MAC Address"].str.contains(search_query.lower())].copy()
@@ -181,7 +181,7 @@ def render(authorized_macs_file: Path):
         df_display,
         column_config={
             "_selected": st.column_config.CheckboxColumn(
-                "Select",
+                "Delete",
                 help="Select rows to delete",
                 default=False,
                 width="small"

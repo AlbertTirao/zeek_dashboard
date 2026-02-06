@@ -62,12 +62,15 @@ def get_latest_data(parquet_root):
         return None, None, None
 
 def load_authorized_macs(auth_file):
-    """Loads allowed MAC addresses into a set."""
+    """
+    Loads allowed MAC addresses into a set.
+    Forces lowercase to prevent case-sensitive mismatches.
+    """
     allowed = set()
     if os.path.exists(auth_file):
         try:
             with open(auth_file, "r") as f:
-                allowed = {line.strip() for line in f if line.strip()}
+                allowed = {line.strip().lower() for line in f if line.strip()}
         except Exception:
             pass
     return allowed
@@ -83,7 +86,6 @@ def get_col(df, candidates, default_val):
 def get_vendor_lookup_instance():
     """
     Initializes the MacLookup object once. 
-    It caches the vendor database locally so it doesn't download every time.
     """
     if VENDOR_LIB_AVAILABLE:
         try:
@@ -101,22 +103,24 @@ def render(parquet_root, authorized_macs_file):
     Main function called by app.py.
     """
     
-    # --- CONSTANTS ---
-    AUTO_REFRESH = True
+    # --- AUTO REFRESH CONTROLS ---
+    col1, col2 = st.columns([0.8, 0.2])
+    with col2:
+        # User can now toggle this ON/OFF to stop the "constant rendering"
+        auto_refresh = st.checkbox("Auto-Refresh", value=True)
+    
     REFRESH_RATE = 3 
 
-   
     # --- DATA LOADING ---
     df, target_file, known_hosts_df = get_latest_data(parquet_root)
     allowed_macs = load_authorized_macs(authorized_macs_file)
 
     if df is None or df.empty:
         st.warning(f"No traffic logs found in {parquet_root}. Waiting for Zeek data...")
-        if AUTO_REFRESH:
+        if auto_refresh:
             time.sleep(REFRESH_RATE)
             st.rerun()
         return
-
 
     # --- CLEANING DATA ---
     if not df.empty:
@@ -124,13 +128,11 @@ def render(parquet_root, authorized_macs_file):
 
     # --- NORMALIZE COLUMNS ---
     df["_final_ts"] = get_col(df, ["ts", "timestamp", "time"], pd.NaT)
-    
-    # Normalize MAC & IP & Host
     df["_final_mac"] = get_col(df, ["MAC Address", "mac", "orig_l2_addr", "hardware_address"], "Unknown MAC")
     df["_final_ip"] = get_col(df, ["id.orig_h", "IP Address", "src_ip", "source_ip", "ip"], "Unknown IP")
     df["_final_host"] = get_col(df, ["host_name", "Host Name", "computer_name"], "Unknown Host")
 
-    # --- MERGE WITH KNOWN HOSTS (IP & Vendor) ---
+    # --- MERGE WITH KNOWN HOSTS ---
     known_macs_map = {} 
     known_vendor_map = {} 
 
@@ -150,34 +152,18 @@ def render(parquet_root, authorized_macs_file):
 
     def resolve_vendor(mac):
         mac = str(mac).strip()
-        # 1. Check known_hosts first
-        if mac in known_vendor_map:
-            return known_vendor_map[mac]
-        
-        # 2. Use Library Lookup
+        if mac in known_vendor_map: return known_vendor_map[mac]
         if mac_lookup and len(mac) >= 8: 
-            try:
-                return mac_lookup.lookup(mac)
-            except KeyError:
-                return "Unknown Vendor"
-            except Exception:
-                return "Lookup Error"
-        
-        # 3. Fallback
-        if not VENDOR_LIB_AVAILABLE:
-            return "Unknown (Install 'mac-vendor-lookup')"
+            try: return mac_lookup.lookup(mac)
+            except: pass
+        if not VENDOR_LIB_AVAILABLE: return "Unknown (Install 'mac-vendor-lookup')"
         return "Unknown Vendor"
 
-    # Fill IPs and Vendors
     def fill_details(row):
-        # Fix IP
         current_ip = str(row["_final_ip"])
         mac = row["_final_mac"]
-        
         if current_ip in ["Unknown IP", "none", "-", "None", "nan", "0.0.0.0"] and mac in known_macs_map:
             row["_final_ip"] = known_macs_map[mac]
-            
-        # Get Vendor
         row["_final_vendor"] = resolve_vendor(mac)
         return row
 
@@ -191,43 +177,34 @@ def render(parquet_root, authorized_macs_file):
     else:
         unique_df = df.copy()
 
-    # ... inside render() in alerts.py ...
-
-    # Check Status
+    # --- STATUS CHECK ---
     def check_status(row):
-        # 1. Convert log MAC to string
         raw_mac = str(row["_final_mac"])
-        
-        # 2. Normalize to lowercase for comparison
         mac_lower = raw_mac.lower()
-        
-        # 3. Check for invalid/empty MACs using the lowercase version
-        if mac_lower in ["unknown mac", "none", "addr", "-", "nan", "empty"]: 
-            return "Unknown"
-            
-        # 4. Check against the whitelist (which is already lowercase from authorization.py)
-        if mac_lower in allowed_macs: 
-            return "Verified"
-            
+        if mac_lower in ["unknown mac", "none", "addr", "-", "nan", "empty"]: return "Unknown"
+        if mac_lower in allowed_macs: return "Verified"
         return "Unauthorized"
 
     unique_df["_final_status"] = unique_df.apply(check_status, axis=1)
 
-    # --- METRICS ---
+    # --- METRICS & ALERTS ---
     unauth_users = unique_df[unique_df["_final_status"] == "Unauthorized"]
     unauth_count = len(unauth_users)
-    st.metric("Unauthorized Devices", unauth_count, delta_color="inverse")
+    verifiable_devices = len(unique_df[unique_df["_final_status"] != "Unknown"])
+
     st.divider()
 
     if unauth_count > 0:
         st.error(f"SECURITY ALERT: {unauth_count} UNAUTHORIZED DEVICE(S) DETECTED!")
+    elif verifiable_devices == 0 and not unique_df.empty:
+        st.warning("Data received, but no verifiable MAC addresses found.")
     elif unique_df.empty:
         st.info("Waiting for traffic...")
     else:
-        st.success("System Secure. All devices verified.")
+        st.success("System Secure. All visible devices verified.")
 
     # --- TABLE DISPLAY ---
-    st.subheader("Live Threat Analysis (Unauthorized Only)")
+    st.subheader("Live Threat Analysis (Unauthorized)")
 
     invalid_macs = ["Unknown MAC", "none", "None", "addr", "-", "00:00:00:00:00:00", "nan"]
     
@@ -242,7 +219,7 @@ def render(parquet_root, authorized_macs_file):
         threats_df["_sort_weight"] = 0 
         sorted_df = threats_df.sort_values(by=["_final_ts"], ascending=False)
 
-        # Convert Timestamp
+        # Time Conversion
         try:
             if pd.api.types.is_numeric_dtype(sorted_df["_final_ts"]):
                 sorted_df["Display Time"] = pd.to_datetime(sorted_df["_final_ts"], unit='s')
@@ -251,7 +228,6 @@ def render(parquet_root, authorized_macs_file):
         except:
             sorted_df["Display Time"] = sorted_df["_final_ts"]
 
-        # SELECT COLUMNS INCLUDING VENDOR
         display_table = sorted_df[[
             "Display Time", "_final_ip", "_final_mac", "_final_vendor", "_final_host", "_final_status"
         ]].rename(columns={
@@ -270,12 +246,11 @@ def render(parquet_root, authorized_macs_file):
             use_container_width=True,
             hide_index=True,
             column_config={
-                # CHANGED HERE: Added date to the format string
                 "Display Time": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss")
             }
         )
 
-    # --- AUTO REFRESH ---
-    if AUTO_REFRESH:
+    # --- AUTO REFRESH LOOP ---
+    if auto_refresh:
         time.sleep(REFRESH_RATE)
         st.rerun()
