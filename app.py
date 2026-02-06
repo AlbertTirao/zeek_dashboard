@@ -4,6 +4,7 @@ from services.drive_services import parse_drive_logs_to_parquet
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, tables, visual, zeek_logs, alerts, authorization
 from pathlib import Path
+import os
 
 # -------------------------
 # One-time Zeek log → Parquet warm-up (DISK GUARDED)
@@ -27,8 +28,6 @@ if not WARMUP_FLAG.exists():
     st.write("✅ Parquet cache ready (raw logs untouched)")
 else:
     st.write("⚡ Parquet cache already initialized — skipping Drive parse")
-
-
 
 # # -------------------------
 # # Load & verify Parquet cache (PRINT ON EVERY RERUN)
@@ -58,12 +57,19 @@ else:
 # else:
 #     st.write("⚡ Pickle cache already initialized — skipping conversion")
 
-
 # =====================================================
 # CONFIGURATION
 # =====================================================
 PARQUET_ROOT = Path("data/parquet")
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
+
+# Ensure Parquet Root Exists
+os.makedirs(PARQUET_ROOT, exist_ok=True)
+
+WARMUP_FLAG = PARQUET_ROOT / ".WARMED"
+
+if not WARMUP_FLAG.exists():
+    st.write("🔥 Initializing Parquet cache...")
 
 # =====================================================
 # AUTOMATIC DATA LOADING (The "Magic" Part)
@@ -77,7 +83,7 @@ if "data_synced" not in st.session_state:
         folder_id=FOLDER_ID,
         parquet_root=PARQUET_ROOT,
     )
-    
+
     st.session_state.data_synced = True
     st.rerun()
 
@@ -91,10 +97,8 @@ if "initialized" not in st.session_state:
 # =====================================================
 # NAVIGATION & ROUTING
 # =====================================================
-# We keep a manual refresh button in the sidebar just in case you want to force it later
 selected_page = render_sidebar(auto_refresh_interval=AUTO_REFRESH_INTERVAL)
-if st.sidebar.button("🔄 Force Refresh Data"):
-    # Remove the flag to trigger the automatic loader again
+if st.sidebar.button("🔄 Force Refresh Data"):  
     del st.session_state.data_synced
     st.rerun()
 
@@ -115,7 +119,7 @@ def render_current_page():
     elif page == "Zeek Logs":
         zeek_logs.render(PARQUET_ROOT)
         
-    elif page == "Alerts":
+    elif page == "Alerts":  
         alerts.render(PARQUET_ROOT, AUTHORIZED_MACS_FILE)
         
     elif page == "Authorization":
