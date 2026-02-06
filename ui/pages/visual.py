@@ -413,19 +413,30 @@ def render(logs_root: Path, authorized_mac_file: Path):
                 
                 # --- DYNAMIC CHART (Full Width, Below Table) ---
                 st.markdown("#### Traffic Activity Graph")
+                # Define colors to match your theme
                 color_map = {"DNS": "#F63049", "HTTP": "#00F7FF", "SSL": "#F3AE4B"}
                 
                 if service_view == "All Services":
-                    # DEFAULT: Detailed Scatter
-                    fig = px.scatter(
-                        filtered_activity, x="ts", y="Service", color="Service",
-                        hover_data=["Destination", "Details"],
-                        color_discrete_map=color_map,
-                        title=f"Activity Timeline: {target_mac}"
+                    # Resample data for a multi-line graph (Event count over time)
+                    # We use a 10-minute frequency to avoid overflowing and keep lines distinct
+                    line_data = (
+                        filtered_activity.set_index("ts")
+                        .groupby("Service")
+                        .resample("10min")
+                        .size()
+                        .reset_index(name="Events")
                     )
-                    fig.update_traces(marker=dict(size=14, opacity=0.8)) 
+                    
+                    fig = px.line(
+                        line_data, x="ts", y="Events", color="Service",
+                        color_discrete_map=color_map,
+                        title=f"Activity Timeline (All Services): {target_mac}",
+                        template="plotly_dark"
+                    )
+                    # Add area fill to match your "on fire" look
+                    fig.update_traces(mode="lines", fill='tozeroy') 
                 else:
-                    # SPECIFIC SERVICE: Volume Area Chart
+                    # SPECIFIC SERVICE: Volume Area/Line Chart for just one color
                     volume_df = (
                         filtered_activity.set_index("ts")
                         .resample("10min")
@@ -440,44 +451,31 @@ def render(logs_root: Path, authorized_mac_file: Path):
                     )
                     fig.update_traces(line_color=color_map.get(service_view, "#ffffff"))
 
-                # Increased Font Sizes
+                # Increased Font Sizes and Layout adjustments to prevent overflow
                 fig.update_layout(
                     template="plotly_dark", 
-                    height=400, # Taller graph
-                    font=dict(size=16), # Bigger general font
-                    legend=dict(font=dict(size=16)),
-                    xaxis=dict(tickfont=dict(size=14), title="Time"),
-                    yaxis=dict(tickfont=dict(size=14), title="Events")
+                    height=450, 
+                    font=dict(size=16), 
+                    legend=dict(
+                        orientation="h",    # Horizontal legend to prevent side overflow
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="right",
+                        x=1,
+                        font=dict(size=14)
+                    ),
+                    margin=dict(l=50, r=50, t=80, b=50), # Add padding
+                    xaxis=dict(
+                        tickfont=dict(size=14), 
+                        title="Timestamp",
+                        showgrid=True,
+                        gridcolor='rgba(255,255,255,0.1)'
+                    ),
+                    yaxis=dict(
+                        tickfont=dict(size=14), 
+                        title="Events Count",
+                        showgrid=True,
+                        gridcolor='rgba(255,255,255,0.1)'
+                    )
                 )
                 st.plotly_chart(fig, use_container_width=True)
-
-                # Detailed Log Table (Unique Events)
-                with st.expander("View Full Log Details (Unique Events)"):
-                    if not filtered_activity.empty:
-                        unique_logs = (
-                            filtered_activity.groupby(["Service", "Destination", "Details"])
-                            .agg(
-                                Last_Seen=("ts", "max"),
-                                Count=("ts", "count")
-                            )
-                            .reset_index()
-                            .sort_values("Last_Seen", ascending=False)
-                        )
-
-                        st.dataframe(
-                            unique_logs,
-                            column_config={
-                                "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss"),
-                                "Destination": "Query / Host / Server",
-                                "Count": st.column_config.NumberColumn("Events", help="Number of times this event occurred"),
-                            },
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                    else:
-                        st.info("No logs found for this filter.")
-            else:
-                st.info(f"No detailed activity found for {target_mac} on {drill_down_date}.")
-
-    else:
-        st.info("No logs found for this selection.")
