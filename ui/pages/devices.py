@@ -147,6 +147,35 @@ def load_authorized_macs(file_path: Path) -> set:
 # =====================================================
 def render(logs_root: Path, authorized_mac_file: Path):
     st.set_page_config(page_title="Network Overview", layout="wide")
+    
+    # ---------------------------------------------------------
+    # CSS: Force Metric Value and Delta to be on the same row
+    # ---------------------------------------------------------
+    st.markdown("""
+    <style>
+    /* Target the container for the metric value and delta */
+    [data-testid="stMetric"] > div {
+        width: fit-content;
+        margin-right: auto;
+    }
+
+    /* Force the value and delta into a single row using a grid */
+    [data-testid="stMetricValue"] {
+        display: grid !important;
+        grid-template-columns: auto auto; /* Number first, then Delta */
+        align-items: baseline;
+        column-gap: 15px; /* Adjust spacing between number and delta */
+        width: max-content;
+    }
+
+    /* Adjust delta text size and ensure it doesn't wrap */
+    [data-testid="stMetricDelta"] {
+        white-space: nowrap !important;
+        font-size: 16px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     st.title("Device Overview")
 
     PARQUET_ROOT = Path("data/parquet")
@@ -161,28 +190,19 @@ def render(logs_root: Path, authorized_mac_file: Path):
     # ---------------------------------------------------------
     # 1. Normalize MACs in known_hosts first
     # ---------------------------------------------------------
-    # We do this before merging to ensure the keys match perfectly
     if "mac" in known_hosts.columns:
         known_hosts["mac"] = known_hosts["mac"].str.lower().str.strip()
 
     # ---------------------------------------------------------
-    # 2. Merge DHCP Data (UPDATED: Merging on MAC Address)
+    # 2. Merge DHCP Data
     # ---------------------------------------------------------
     if not dhcp.empty:
-        # Normalize MACs in DHCP to match known_hosts
         if "mac" in dhcp.columns:
             dhcp["mac"] = dhcp["mac"].str.lower().str.strip()
-            
-            # Select columns to merge. We prioritize MAC matching.
             dhcp_cols = [c for c in ["mac", "host_name", "domain"] if c in dhcp.columns]
-            
-            # Remove duplicates based on MAC so we get the most recent/relevant hostname
             dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"])
-            
-            # MERGE ON MAC: This guarantees the Host Name matches the Device ID
             merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
         else:
-            # Fallback if DHCP logs somehow rely on IP (less accurate for Hostnames)
             dhcp_cols = [c for c in ["client_addr","host_name","domain"] if c in dhcp.columns]
             dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"])
             merged = pd.merge(known_hosts, dhcp_norm, how="left", left_on="host", right_on="client_addr")
@@ -191,8 +211,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
         merged["host_name"], merged["domain"] = "-", None
 
     merged["host_name"] = merged.get("host_name","-").fillna("-")
-    
-    # Calculate Status
     merged["status"] = merged["mac"].apply(lambda m: "Authorized" if m in authorized_macs else "Unauthorized")
 
     # ---------------------------------------------------------
@@ -204,18 +222,75 @@ def render(logs_root: Path, authorized_mac_file: Path):
         merged = merged.dropna(subset=["ts"])
         merged["date"] = merged["ts"].dt.date
 
-    # Metrics
+    # ---------------------------------------------------------
+    # METRICS & TRENDS
+    # ---------------------------------------------------------
     total_unique = merged["mac"].nunique()
     auth_unique = merged[merged["status"]=="Authorized"]["mac"].nunique()
     unauth_unique = merged[merged["status"]=="Unauthorized"]["mac"].nunique()
     risk_ratio = round((unauth_unique/total_unique*100),2) if total_unique else 0
 
-    # ---------- Metrics Cards ----------
+    # Initialize State if missing
+    if 'metrics_history' not in st.session_state:
+        st.session_state.metrics_history = {
+            'total': total_unique, 'auth': auth_unique, 'unauth': unauth_unique, 'risk': risk_ratio
+        }
+
+    if 'risk' not in st.session_state.metrics_history:
+        st.session_state.metrics_history['risk'] = risk_ratio
+
+    # Calculate Deltas
+    d_total = total_unique - st.session_state.metrics_history['total']
+    d_auth = auth_unique - st.session_state.metrics_history['auth']
+    d_unauth = unauth_unique - st.session_state.metrics_history['unauth']
+    d_risk = round(risk_ratio - st.session_state.metrics_history['risk'], 2)
+
+    # Helper function to format delta text with increase/decrease and + sign
+    def format_delta(val, is_percent=False):
+        if val == 0:
+            return None
+        suffix = "%" if is_percent else ""
+        
+        # Add Logic for + sign and Label
+        if val > 0:
+            label = "(Increase)"
+            prefix = "+"
+        else:
+            label = "(Decrease)"
+            prefix = "" # Negative numbers already have '-'
+            
+        return f"{prefix}{val}{suffix} {label}"
+
+    # Display Metrics
     m1, m2, m3, m4 = st.columns(4)
-    m1.markdown(f"<div><h4 style='margin:2px'>Active Devices</h4><h3 style='margin:2px'>{total_unique}</h3></div>", unsafe_allow_html=True)
-    m2.markdown(f"<div><h4 style='margin:2px'>Authorized</h4><h3 style='margin:2px'>{auth_unique}</h3></div>", unsafe_allow_html=True)
-    m3.markdown(f"<div><h4 style='margin:2px'>Unauthorized</h4><h3 style='margin:2px'>{unauth_unique}</h3></div>", unsafe_allow_html=True)
-    m4.markdown(f"<div><h4 style='margin:2px'>Risk Ratio</h4><h3 style='margin:2px'>{risk_ratio}%</h3></div>", unsafe_allow_html=True)
+    
+    m1.metric(
+        "Active Devices", 
+        total_unique, 
+        delta=format_delta(d_total),
+        delta_color="normal"
+    )
+    
+    m2.metric(
+        "Authorized", 
+        auth_unique, 
+        delta=format_delta(d_auth),
+        delta_color="normal"
+    )
+    
+    m3.metric(
+        "Unauthorized", 
+        unauth_unique, 
+        delta=format_delta(d_unauth),
+        delta_color="inverse"
+    )
+    
+    m4.metric(
+        "Risk Ratio", 
+        f"{risk_ratio}%", 
+        delta=format_delta(d_risk, is_percent=True),
+        delta_color="off"
+    )
 
     st.markdown("---")
 
@@ -227,7 +302,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         try:
             hourly = merged.set_index("ts").groupby("status").resample("1H").size().reset_index(name="events")
         except TypeError as e:
-            st.error(f"Error resampling data (Check timestamp format): {e}")
+            st.error(f"Error resampling data: {e}")
 
     if not hourly.empty:
         line_fig = px.line(
@@ -246,19 +321,23 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.markdown("<h2 style='color:white; text-align:left;'>Unauthorized Device Ratio</h2>", unsafe_allow_html=True)
     
     warning_text, warning_color, warning_icon = "STATUS: SAFE", "#6CA651", "✅"
-    if risk_ratio > 20: warning_text, warning_color, warning_icon = "STATUS: WARNING", "#F3AE4B", "⚠️"
-    if risk_ratio > 50: warning_text, warning_color, warning_icon = "STATUS: HIGH RISK", "#D63447", "🛑"
+    if risk_ratio >= 50: warning_text, warning_color, warning_icon = "STATUS: WARNING", "#F3AE4B", "⚠️"
+    if risk_ratio >= 80: warning_text, warning_color, warning_icon = "STATUS: HIGH RISK", "#D63447", "🛑"
 
     gauge_fig = go.Figure()
     gauge_fig.add_trace(go.Indicator(
         mode="gauge+number", value=risk_ratio, number={"suffix":"%", "font":{"size":48}}, 
         gauge={
             "axis":{"range":[0,100], "tickfont":{"size":16}}, "bar":{"color":"#30C1F6"},
-            "steps":[{"range":[0,20],"color":"#6CA651"},{"range":[20,50],"color":"#F3AE4B"},{"range":[50,100],"color":"#D63447"}],
+            "steps":[
+                {"range":[0,50],"color":"#6CA651"},
+                {"range":[50,80],"color":"#F3AE4B"},
+                {"range":[80,100],"color":"#D63447"}
+            ],
             "threshold":{"line":{"color":"white","width":2},"thickness":0.75,"value":50}
         }
     ))
-    for label, color in [('Current Level','#30C1F6'), ('Safe (0-20%)','#6CA651'), ('Warning (20-50%)','#F3AE4B'), ('High Risk (50%+)','#D63447')]:
+    for label, color in [('Current Level','#30C1F6'), ('Safe (0-50%)','#6CA651'), ('Warning (50-80%)','#F3AE4B'), ('High Risk (80-100%+)','#D63447')]:
         gauge_fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=10, color=color), name=label))
 
     gauge_fig.add_annotation(x=0.5, y=0.15, text=f"<b>{warning_icon} {warning_text}</b>", showarrow=False, font=dict(size=20, color=warning_color))
@@ -288,7 +367,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.markdown("---")
     st.title("Device Inventory")
 
-    # 1. Prepare Date Options (Used for both inventory and drill-down)
+    # 1. Prepare Date Options
     available_dates = []
     if "date" in merged.columns:
         available_dates = sorted([d for d in merged["date"].unique() if pd.notnull(d)], reverse=True)
@@ -308,7 +387,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             index=0
         )
 
-    # 3. Apply Date Filter to INVENTORY
+    # 3. Apply Date Filter
     if selected_date_str == "All Dates":
         table_df = merged.copy()
     else:
@@ -427,22 +506,35 @@ def render(logs_root: Path, authorized_mac_file: Path):
                     filtered_activity = filtered_activity[filtered_activity["Service"] == service_view]
 
                 # --- TOP DESTINATIONS TABLE (Full Width) ---
-                top_sites = filtered_activity["Destination"].value_counts().head(5)
+                top_sites = filtered_activity["Destination"].value_counts().head(5).reset_index()
+                top_sites.columns = ["Destination", "Count"] # Rename columns
                 
                 st.markdown(f"#### Top Destinations ({service_view})")
+                
                 if not top_sites.empty:
-                    st.dataframe(top_sites, use_container_width=True)
+                    # Style: Big Fonts
+                    large_font_style = top_sites.style.set_properties(**{
+                        'font-size': '20px', 
+                        'height': '50px'
+                    }).set_table_styles([
+                        {'selector': 'th', 'props': [('font-size', '20px'), ('font-weight', 'bold')]},
+                        {'selector': 'td', 'props': [('font-size', '20px')]}
+                    ])
+
+                    st.dataframe(
+                        large_font_style, 
+                        use_container_width=True, 
+                        hide_index=True,
+                        height=300
+                    )
                 else:
                     st.info("No activity for this service.")
                 
                 # --- DYNAMIC CHART (Full Width, Below Table) ---
                 st.markdown("#### Traffic Activity Graph")
-                # Define colors to match your theme
                 color_map = {"DNS": "#F63049", "HTTP": "#00F7FF", "SSL": "#F3AE4B"}
                 
                 if service_view == "All Services":
-                    # Resample data for a multi-line graph (Event count over time)
-                    # We use a 10-minute frequency to avoid overflowing and keep lines distinct
                     line_data = (
                         filtered_activity.set_index("ts")
                         .groupby("Service")
@@ -457,10 +549,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
                         title=f"Activity Timeline (All Services): {target_mac}",
                         template="plotly_dark"
                     )
-                    # Add area fill to match your "on fire" look
                     fig.update_traces(mode="lines", fill='tozeroy') 
                 else:
-                    # SPECIFIC SERVICE: Volume Area/Line Chart for just one color
                     volume_df = (
                         filtered_activity.set_index("ts")
                         .resample("10min")
@@ -475,31 +565,52 @@ def render(logs_root: Path, authorized_mac_file: Path):
                     )
                     fig.update_traces(line_color=color_map.get(service_view, "#ffffff"))
 
-                # Increased Font Sizes and Layout adjustments to prevent overflow
+                # Chart Layout
                 fig.update_layout(
                     template="plotly_dark", 
                     height=450, 
                     font=dict(size=16), 
                     legend=dict(
-                        orientation="h",    # Horizontal legend to prevent side overflow
+                        orientation="h",
                         yanchor="bottom",
                         y=1.02,
                         xanchor="right",
                         x=1,
                         font=dict(size=14)
                     ),
-                    margin=dict(l=50, r=50, t=80, b=50), # Add padding
-                    xaxis=dict(
-                        tickfont=dict(size=14), 
-                        title="Timestamp",
-                        showgrid=True,
-                        gridcolor='rgba(255,255,255,0.1)'
-                    ),
-                    yaxis=dict(
-                        tickfont=dict(size=14), 
-                        title="Events Count",
-                        showgrid=True,
-                        gridcolor='rgba(255,255,255,0.1)'
-                    )
+                    margin=dict(l=50, r=50, t=80, b=50),
+                    xaxis=dict(tickfont=dict(size=14), title="Timestamp", showgrid=True, gridcolor='rgba(255,255,255,0.1)'),
+                    yaxis=dict(tickfont=dict(size=14), title="Events Count", showgrid=True, gridcolor='rgba(255,255,255,0.1)')
                 )
                 st.plotly_chart(fig, use_container_width=True)
+
+                # Detailed Log Table
+                with st.expander("View Full Log Details (Unique Events)"):
+                    if not filtered_activity.empty:
+                        unique_logs = (
+                            filtered_activity.groupby(["Service", "Destination", "Details"])
+                            .agg(
+                                Last_Seen=("ts", "max"),
+                                Count=("ts", "count")
+                            )
+                            .reset_index()
+                            .sort_values("Last_Seen", ascending=False)
+                        )
+
+                        st.dataframe(
+                            unique_logs,
+                            column_config={
+                                "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss"),
+                                "Destination": "Query / Host / Server",
+                                "Count": st.column_config.NumberColumn("Events", help="Number of times this event occurred"),
+                            },
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("No logs found for this filter.")
+            else:
+                st.info(f"No detailed activity found for {target_mac} on {drill_down_date}.")
+
+    else:
+        st.info("No logs found for this selection.")
