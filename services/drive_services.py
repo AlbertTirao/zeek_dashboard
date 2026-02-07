@@ -259,7 +259,7 @@ def parse_drive_logs_to_parquet(
         if parquet_path.exists():
             continue
 
-        st.write(f"🚀 Processing {name}...")
+        st.write(f"Processing {name}...")
 
         try:
             stream_zeek_log_to_parquet(

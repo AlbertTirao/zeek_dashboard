@@ -28,7 +28,7 @@ if not WARMUP_FLAG.exists():
     WARMUP_FLAG.touch()
     st.write("✅ Parquet cache ready (raw logs untouched)")
 else:
-    st.write("⚡ Parquet cache already initialized — skipping Drive parse")
+    st.write("Parquet cache already initialized — skipping Drive parse")
 
 # # -------------------------
 # # Load & verify Parquet cache (PRINT ON EVERY RERUN)
