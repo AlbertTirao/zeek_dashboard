@@ -1,22 +1,19 @@
 import streamlit as st
 from pathlib import Path
 import pandas as pd
-import re
+import datetime
 
 # -----------------------------
 # Configuration & Constants
 # -----------------------------
-# MAC Regex: Standard format XX:XX:XX:XX:XX:XX
 MAC_REGEX_PATTERN = r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
-
-# Domain Regex: basic hostname validation (e.g., example.com, sub.site.org)
 DOMAIN_REGEX_PATTERN = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
 
 # -----------------------------
 # Styling & Assets
 # -----------------------------
 def inject_custom_css():
-    """Injects modern CSS tailored for Dark Mode and custom metric box."""
+    """Injects modern CSS tailored for Dark Mode with BORDERS REMOVED."""
     st.markdown("""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -26,7 +23,7 @@ def inject_custom_css():
         }
 
         :root {
-            --custom-border: 1px solid #464b5f;
+            --custom-border: none; 
             --custom-radius: 8px;
             --card-bg: #262730;
         }
@@ -39,7 +36,7 @@ def inject_custom_css():
             text-align: center;
             width: 100%;
             margin-bottom: 25px;
-            border: 1px solid #30333d;
+            border: none; 
         }
         .metric-label {
             color: #b0b3b8;
@@ -99,6 +96,51 @@ def save_data(filepath: Path, item_list: list[str]) -> None:
         f.write("\n".join(clean_list))
 
 # -----------------------------
+# History / Logging Logic
+# -----------------------------
+def log_activity(filepath: Path, action: str, item_type: str, items: list[str]):
+    """
+    Logs an action to a CSV file.
+    """
+    if not items:
+        return
+
+    log_file = filepath.parent / "activity_log.csv"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    new_rows = []
+    for item in items:
+        new_rows.append({
+            "Timestamp": timestamp,
+            "Action": action,
+            "Type": item_type,
+            "Item": item
+        })
+    
+    df_new = pd.DataFrame(new_rows)
+    
+    # Append to existing CSV or create new if headers needed
+    header_needed = not log_file.exists()
+    df_new.to_csv(log_file, mode='a', header=header_needed, index=False)
+
+def load_history(filepath: Path) -> pd.DataFrame:
+    """Loads the activity log CSV and removes duplicates."""
+    log_file = filepath.parent / "activity_log.csv"
+    if not log_file.exists():
+        return pd.DataFrame(columns=["Timestamp", "Action", "Type", "Item"])
+    
+    try:
+        df = pd.read_csv(log_file)
+        # Ensure no duplicate log entries exist
+        df = df.drop_duplicates()
+        # Sort by timestamp descending (newest first)
+        if "Timestamp" in df.columns:
+            df = df.sort_values(by="Timestamp", ascending=False)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["Timestamp", "Action", "Type", "Item"])
+
+# -----------------------------
 # Reusable Component: Manager
 # -----------------------------
 def render_generic_manager(
@@ -110,12 +152,12 @@ def render_generic_manager(
     placeholder_example: str
 ):
     """
-    A generic function to render the UI for adding, searching, and editing 
-    either MACs or Domains.
+    A generic function to render the UI for adding, searching, and editing.
     """
     
     # --- Add Section ---
-    with st.expander(f"➕ Add New {item_name}", expanded=False):
+    # UPDATED: Removed emoji from expander title
+    with st.expander(f"Add New {item_name}", expanded=False):
         st.markdown(f"Enter {column_label}s below. You can paste multiple entries.")
         with st.form(f"bulk_add_{item_name.lower()}"):
             col_input, col_btn = st.columns([4, 1])
@@ -133,12 +175,26 @@ def render_generic_manager(
                 submitted = st.form_submit_button("Add", type="primary", use_container_width=True)
             
             if submitted and new_text:
-                new_entries = [m.strip().lower() for m in new_text.splitlines() if m.strip()]
-                if new_entries:
-                    updated_list = data_list + new_entries
+                # 1. Parse Input
+                entries_to_process = [m.strip().lower() for m in new_text.splitlines() if m.strip()]
+                
+                # 2. Filter Duplicates (Only add what isn't already there)
+                existing_set = set(data_list)
+                actually_new_items = [item for item in entries_to_process if item not in existing_set]
+                
+                if actually_new_items:
+                    # Update List
+                    updated_list = data_list + actually_new_items
                     save_data(filepath, updated_list)
-                    st.toast(f"✅ Added {len(new_entries)} {item_name.lower()}s!", icon="🚀")
+                    
+                    # Log History (Only for truly new items)
+                    log_activity(filepath, "Added", item_name, actually_new_items)
+                    
+                    st.toast(f"Added {len(actually_new_items)} new {item_name.lower()}s!", icon="✅")
                     st.rerun()
+                elif entries_to_process:
+                    # User entered data, but it all existed already
+                    st.warning(f"All entered {item_name.lower()}s already exist.")
 
     st.divider()
 
@@ -149,18 +205,12 @@ def render_generic_manager(
     with col_search:
         search_query = st.text_input("🔍 Search", placeholder=f"Search {item_name.lower()}...", label_visibility="collapsed", key=f"search_{item_name}")
 
-    # --- Prepare DataFrame (FIXED) ---
-    # We explicitly force dtype="str" for the data column.
+    # --- Prepare DataFrame ---
     df = pd.DataFrame({column_label: pd.Series(data_list, dtype="str")})
-    
-    # [FIX APPLIED HERE]
-    # Initialize _selected with False, then STRICTLY cast to boolean.
-    # This prevents Pandas from using 'object' or 'float' (NaN) which crashes Streamlit checkboxes.
     df["_selected"] = False
     df["_selected"] = df["_selected"].astype(bool)
 
     if search_query:
-        # Ensure we are searching string values, handling potential NaN edge cases safely
         df_display = df[df[column_label].astype(str).str.contains(search_query.lower())].copy()
     else:
         df_display = df.copy()
@@ -184,7 +234,6 @@ def render_generic_manager(
     )
 
     # --- Actions (Delete/Save) ---
-    # Since we forced boolean types, this comparison is now safe
     rows_to_delete = edited_df[edited_df["_selected"] == True]
     
     current_display_items = set(df_display[column_label])
@@ -195,19 +244,26 @@ def render_generic_manager(
 
     with col_actions_left:
         if not rows_to_delete.empty:
-            if st.button(f"🗑️ Delete {len(rows_to_delete)}", type="secondary", use_container_width=True, key=f"del_{item_name}"):
+            if st.button(f"Delete {len(rows_to_delete)}", type="secondary", use_container_width=True, key=f"del_{item_name}"):
                 items_to_delete = rows_to_delete[column_label].tolist()
+                
+                # 1. Update List
                 remaining_items = [m for m in data_list if m not in items_to_delete]
                 save_data(filepath, remaining_items)
+                
+                # 2. Log History
+                log_activity(filepath, "Deleted", item_name, items_to_delete)
+                
                 st.rerun()
 
     with col_actions_right:
         if has_text_changes:
-            if st.button("💾 Save Changes", type="primary", use_container_width=True, key=f"save_{item_name}"):
-                # If searching, we must preserve hidden items
+            if st.button("Save Changes", type="primary", use_container_width=True, key=f"save_{item_name}"):
                 hidden_items = df[~df[column_label].isin(current_display_items)][column_label].tolist() if search_query else []
                 final_items = hidden_items + edited_df[column_label].tolist()
                 save_data(filepath, final_items)
+                # We log a generic bulk update for inline text edits
+                log_activity(filepath, "Edited", item_name, ["Bulk Update via Table"])
                 st.rerun()
 
 # -----------------------------
@@ -216,14 +272,9 @@ def render_generic_manager(
 def render(mac_file: Path):
     """
     Renders the authorization page.
-    Args:
-        mac_file (Path): The path to the MAC address file.
-    
-    NOTE: The Domain file is automatically created in the same directory as the mac_file.
     """
     inject_custom_css()
     
-    # Automatically define domain file path relative to the mac file
     domain_file = mac_file.parent / "whitelist_domains.txt"
 
     # 1. Load Data
@@ -232,9 +283,8 @@ def render(mac_file: Path):
     
     st.title("Authorization Manager")
     
-    # 2. Metrics (Side by Side)
+    # 2. Metrics
     m_col1, m_col2 = st.columns(2)
-    
     with m_col1:
         st.markdown(f"""
             <div class="metric-container">
@@ -242,7 +292,6 @@ def render(mac_file: Path):
                 <div class="metric-value">{len(saved_macs)}</div>
             </div>
         """, unsafe_allow_html=True)
-        
     with m_col2:
         st.markdown(f"""
             <div class="metric-container">
@@ -251,8 +300,8 @@ def render(mac_file: Path):
             </div>
         """, unsafe_allow_html=True)
 
-    # 3. Tabs for separation
-    tab_mac, tab_domain = st.tabs([" MAC Addresses", " Whitelisted Domains"])
+    # 3. Tabs (UPDATED: Removed emojis)
+    tab_mac, tab_domain, tab_history = st.tabs([" MAC Addresses", " Whitelisted Domains", " Activity Log"])
 
     with tab_mac:
         render_generic_manager(
@@ -273,6 +322,35 @@ def render(mac_file: Path):
             regex_pattern=DOMAIN_REGEX_PATTERN,
             placeholder_example="example.com\napi.service.org"
         )
+        
+    with tab_history:
+        st.subheader("Action History")
+        history_df = load_history(mac_file)
+        
+        if not history_df.empty:
+            # Simple color styling for actions
+            def color_action(val):
+                if val == 'Added':
+                    return 'color: #4CAF50; font-weight: bold'
+                elif val == 'Deleted':
+                    return 'color: #FF5252; font-weight: bold'
+                else:
+                    return 'color: #FFC107; font-weight: bold'
+
+            st.dataframe(
+                history_df.style.map(color_action, subset=['Action']),
+                use_container_width=True,
+                hide_index=True,
+                height=500
+            )
+            
+            if st.button("Clear History", type="secondary"):
+                log_path = mac_file.parent / "activity_log.csv"
+                if log_path.exists():
+                    log_path.unlink()
+                    st.rerun()
+        else:
+            st.info("No activity recorded yet.")
 
 if __name__ == "__main__":
     st.set_page_config(page_title="Auth Manager", layout="wide")
