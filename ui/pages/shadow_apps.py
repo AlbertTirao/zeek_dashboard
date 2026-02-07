@@ -10,12 +10,14 @@ from urllib.parse import urlparse
 ALLOWLIST_FILE = Path(__file__).resolve().parents[2] / "allowlist.txt"
 
 # -----------------------------
-# License registry (example)
+# License registry (User Configured)
 # -----------------------------
 LICENSE_REGISTRY = {
-    "office.com": 10,
-    "microsoft.com": 10,
-    "github.com": 50,
+    "office.com": None,
+    "microsoft.com": None,
+    "github.com": None,
+    "zoom.us": None,        # Example
+    "slack.com": None       # Example
 }
 
 # -----------------------------
@@ -31,39 +33,52 @@ def load_shadow_logs(parquet_root: Path, log_type: str, selected_date: str):
         
     file_path = date_dir / f"{log_type}.parquet"
     if file_path.exists():
-        return pd.read_parquet(file_path)
+        try:
+            return pd.read_parquet(file_path)
+        except Exception:
+            return pd.DataFrame()
                 
     return pd.DataFrame()
 
 # -----------------------------
-# Load DHCP MAC
+# Load DHCP MAC (Aggregated)
 # -----------------------------
-def get_dhcp_mapping(parquet_root: Path, selected_date: str):
-    """Creates a dictionary mapping IP addresses to MAC addresses from DHCP logs."""
-    dhcp_path = parquet_root / selected_date / "dhcp.parquet"
-    if not dhcp_path.exists():
-        return {}
+@st.cache_data(show_spinner=False)
+def get_dhcp_mapping(parquet_root: Path, target_dates: list):
+    """
+    Creates a dictionary mapping IP addresses to MAC addresses.
+    Iterates through all provided dates to build a comprehensive map.
+    """
+    full_mapping = {}
     
-    try:
-        df_dhcp = pd.read_parquet(dhcp_path)
-        
-        ip_candidates = ['assigned_addr', 'client_addr', 'lease_addr', 'yiaddr', 'ip']
-        ip_col = next((col for col in ip_candidates if col in df_dhcp.columns), None)
-        
-        mac_candidates = ['chaddr', 'client_chaddr', 'mac', 'hardware_address', 'src_mac']
-        mac_col = next((col for col in mac_candidates if col in df_dhcp.columns), None)
-
-        if ip_col and mac_col:
-            clean_df = df_dhcp.dropna(subset=[ip_col, mac_col]).copy()
-            clean_df[ip_col] = clean_df[ip_col].astype(str).str.strip()
-            clean_df[mac_col] = clean_df[mac_col].astype(str).str.strip().str.lower()
-            mapping = clean_df.set_index(ip_col)[mac_col].to_dict()
-            return mapping
+    # Process oldest to newest so the latest IP assignment overwrites older ones
+    for date_str in sorted(target_dates):
+        dhcp_path = parquet_root / date_str / "dhcp.parquet"
+        if not dhcp_path.exists():
+            continue
+    
+        try:
+            df_dhcp = pd.read_parquet(dhcp_path)
             
-    except Exception as e:
-        pass
-        
-    return {}
+            ip_candidates = ['assigned_addr', 'client_addr', 'lease_addr', 'yiaddr', 'ip']
+            ip_col = next((col for col in ip_candidates if col in df_dhcp.columns), None)
+            
+            mac_candidates = ['chaddr', 'client_chaddr', 'mac', 'hardware_address', 'src_mac']
+            mac_col = next((col for col in mac_candidates if col in df_dhcp.columns), None)
+
+            if ip_col and mac_col:
+                clean_df = df_dhcp.dropna(subset=[ip_col, mac_col]).copy()
+                clean_df[ip_col] = clean_df[ip_col].astype(str).str.strip()
+                clean_df[mac_col] = clean_df[mac_col].astype(str).str.strip().str.lower()
+                
+                # Update mapping (newest overwrite assumes we processed sorted dates)
+                current_map = clean_df.set_index(ip_col)[mac_col].to_dict()
+                full_mapping.update(current_map)
+                
+        except Exception:
+            continue
+            
+    return full_mapping
 
 # -----------------------------
 # Load allowlist
@@ -92,6 +107,9 @@ def load_allowlist():
 def extract_domain(url: str):
     if not url: return ""
     url = str(url).strip().lower()
+    # Handle 'nan' string or non-string
+    if url == 'nan' or url == 'none': return ""
+    
     if "://" in url:
         parsed = urlparse(url)
         url = parsed.hostname or ""
@@ -107,18 +125,23 @@ def extract_domain(url: str):
 # -----------------------------
 def is_allowed(domain: str, approved: list):
     domain = domain.lower().strip().rstrip(".")
+    if not domain: return False
     return any(domain == a or domain.endswith("." + a) for a in approved)
 
 # -----------------------------
-# Helper: Normalize Columns (UPDATED for BYTES)
+# Helper: Normalize Columns (UPDATED for BYTES & ERRORS)
 # -----------------------------
 def normalize_log_df(df, log_type, domain_col):
     """Standardize column names and extract context + BYTES info."""
-    if df.empty or domain_col not in df.columns:
+    if df.empty:
         return pd.DataFrame()
     
-    # 1. Define possible mappings
-    cols = {domain_col: "app_identifier", "ts": "ts"}
+    # 1. Standardize Domain Column
+    if domain_col not in df.columns:
+        # If the expected domain column is missing, try to find a fallback or return empty
+        return pd.DataFrame()
+    
+    cols = {domain_col: "app_identifier"}
     
     # Mapping IP
     ip_options = ["id.orig_h", "orig_h", "src_ip", "ip", "c_ip"]
@@ -137,16 +160,18 @@ def normalize_log_df(df, log_type, domain_col):
     # --- Capture Context Columns ---
     context_col = "Info"
     
+    # Ensure columns used for context actually exist before combining
     if log_type == "notice":
         if "msg" in df.columns: df[context_col] = df["msg"]
         elif "note" in df.columns: df[context_col] = df["note"]
     elif log_type == "weird":
         if "addl" in df.columns: df[context_col] = df["addl"]
-        else: df[context_col] = df["name"]
+        elif "name" in df.columns: df[context_col] = df["name"]
     elif "method" in df.columns:
-        df[context_col] = df["method"] + " " + df.get("uri", "")
+        uri = df["uri"] if "uri" in df.columns else ""
+        df[context_col] = df["method"].astype(str) + " " + uri.astype(str)
     elif "proto" in df.columns and "id.resp_p" in df.columns:
-         df[context_col] = df["proto"] + "/" + df["id.resp_p"].astype(str)
+         df[context_col] = df["proto"].astype(str) + "/" + df["id.resp_p"].astype(str)
     elif "mime_type" in df.columns:
         df[context_col] = df["mime_type"]
     elif "version.major" in df.columns:
@@ -165,9 +190,15 @@ def normalize_log_df(df, log_type, domain_col):
     if "id.orig_bytes" in df.columns: cols["id.orig_bytes"] = "bytes_sent"
     if "id.resp_bytes" in df.columns: cols["id.resp_bytes"] = "bytes_received"
 
+    # Make sure 'ts' exists for the rename
+    if "ts" in df.columns:
+        cols["ts"] = "ts"
+
     df = df.rename(columns=cols)
     
-    # 2. Ensure columns exist
+    # 2. Ensure columns exist and fill missing
+    if "ts" not in df.columns: return pd.DataFrame() # Cannot proceed without timestamp
+    
     if "ip" not in df.columns: df["ip"] = "Unknown"
     else: df["ip"] = df["ip"].astype(str).fillna("Unknown")
 
@@ -179,7 +210,7 @@ def normalize_log_df(df, log_type, domain_col):
     if "dst_port" not in df.columns: df["dst_port"] = 0
     else: df["dst_port"] = pd.to_numeric(df["dst_port"], errors='coerce').fillna(0).astype(int)
     
-    # Ensure Bytes are Numeric
+    # Ensure Bytes are Numeric (Clean bad strings)
     if "bytes_sent" not in df.columns: df["bytes_sent"] = 0
     df["bytes_sent"] = pd.to_numeric(df["bytes_sent"], errors='coerce').fillna(0).astype(int)
     
@@ -189,7 +220,11 @@ def normalize_log_df(df, log_type, domain_col):
     df["source_log"] = log_type.upper()
     
     # Return specific columns (ADDED BYTES)
-    return df[["ts", "app_identifier", "ip", "mac", "source_log", "Info", "dst_port", "bytes_sent", "bytes_received"]]
+    required_cols = ["ts", "app_identifier", "ip", "mac", "source_log", "Info", "dst_port", "bytes_sent", "bytes_received"]
+    # Only select columns that actually exist to prevent KeyErrors
+    final_cols = [c for c in required_cols if c in df.columns]
+    
+    return df[final_cols]
 
 # -----------------------------
 # Calculate Risk Level
@@ -253,25 +288,34 @@ def color_risk(val):
 def render_shadow_apps(parquet_root: Path):
     st.subheader("Shadow Apps Overview")
     
-    # 1. Date Selection
+    # 1. Date Selection with "All" option
     if parquet_root.exists():
         available_dates = sorted([d.name for d in parquet_root.iterdir() if d.is_dir()], reverse=True)
         if not available_dates:
             st.warning("No log directories found.")
             return
-        selected_date = st.selectbox("Select Date to View Logs", available_dates)
+            
+        # Add 'All Available Dates' to the options
+        date_options = ["All Available Dates"] + available_dates
+        selected_option = st.selectbox("Select Date Range", date_options, index=1 if len(date_options) > 1 else 0)
+        
+        if selected_option == "All Available Dates":
+            target_dates = available_dates
+            st.toast(f"Loading data from all {len(target_dates)} days. This may take a moment...", icon="⏳")
+        else:
+            target_dates = [selected_option]
     else:
         st.error("Log root directory not found.")
         return
 
-    # 2. Load DHCP Mapping
-    with st.spinner("Loading DHCP Mapping..."):
-        ip_to_mac = get_dhcp_mapping(parquet_root, selected_date)
+    # 2. Load DHCP Mapping (Iterates all target dates)
+    with st.spinner("Loading Network Identity (DHCP)..."):
+        ip_to_mac = get_dhcp_mapping(parquet_root, target_dates)
     
     approved = load_allowlist()
 
     # 3. Load logs
-    logs = [
+    logs_config = [
         ("http", "host"),
         ("ssl", "server_name"),
         ("dns", "query"),
@@ -283,32 +327,48 @@ def render_shadow_apps(parquet_root: Path):
     ]
     
     combined_frames = []
-    with st.spinner("Processing logs..."):
-        for log_type, domain_col in logs:
-            raw_df = load_shadow_logs(parquet_root, log_type, selected_date)
+    
+    # Progress bar if loading many dates
+    progress_text = "Processing logs..."
+    my_bar = st.progress(0, text=progress_text)
+    total_steps = len(target_dates)
+    
+    for i, date_str in enumerate(target_dates):
+        # Update progress
+        my_bar.progress((i + 1) / total_steps, text=f"Processing {date_str}...")
+        
+        for log_type, domain_col in logs_config:
+            raw_df = load_shadow_logs(parquet_root, log_type, date_str)
             norm_df = normalize_log_df(raw_df, log_type, domain_col)
             if not norm_df.empty:
                 combined_frames.append(norm_df)
+                
+    my_bar.empty()
 
     if not combined_frames:
-        st.info(f"No Shadow App logs available for {selected_date}.")
+        st.info(f"No Shadow App logs available for selected range.")
         return
 
-    # 5. Create DF
+    # 5. Create Master DF
     df = pd.concat(combined_frames, ignore_index=True)
     
-    # 6. Enrich Data
+    # 6. FIX: Robust Type Conversion to prevent "Unknown datetime string" error
+    # This turns strings like "#types" or "#fields" into NaN, effectively filtering bad headers
+    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+    
+    # Create Datetime Object
+    df["datetime"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
+    
+    # Drop rows where datetime failed (this removes the corrupt header rows)
+    df = df.dropna(subset=["datetime"])
+    
+    # 7. Enrich Data
     df["ip"] = df["ip"].astype(str)
     mask_unknown = (df["mac"] == "Unknown") | (df["mac"].isna())
     mapped_macs = df.loc[mask_unknown, "ip"].map(ip_to_mac)
     df.loc[mask_unknown, "mac"] = mapped_macs.fillna("Unknown")
     df["mac"] = df["mac"].fillna("Unknown")
 
-    # 7. Process UI Data
-    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-    df["datetime"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
-    df = df.dropna(subset=["datetime"])
-    
     # Domain cleanup
     df["domain_clean"] = df["app_identifier"].apply(extract_domain)
     special_logs = ["CONN", "FILES", "SOFTWARE", "WEIRD", "NOTICE"] 
@@ -332,8 +392,27 @@ def render_shadow_apps(parquet_root: Path):
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Events", total)
-    col2.metric("Authorized Events", len(df[df["App Status"] == "Authorized"]))
-    col3.metric("Unauthorized Events", len(unauth_df), delta_color="inverse")
+    # Calculate counts
+    authorized_count = len(df[df["App Status"] == "Authorized"])
+    unauthorized_count = len(unauth_df)
+    total_events = authorized_count + unauthorized_count
+
+    # Calculate percentage of unauthorized events
+    unauth_pct = (unauthorized_count / total_events * 100) if total_events > 0 else 0
+
+    # Display metrics in columns
+    col2.metric(
+        label="Authorized Events",
+        value=authorized_count,
+        delta=f"{100 - int(unauth_pct)}% of total",
+    )
+
+    col3.metric(
+        label="Unauthorized Events",
+        value=unauthorized_count,
+        delta=f"{int(unauth_pct)}% of total",
+        delta_color="inverse"
+    )
     col4.metric("Critical / High Risk", len(critical_df), delta_color="inverse")
     
     st.divider()
@@ -343,6 +422,7 @@ def render_shadow_apps(parquet_root: Path):
     with c1:
         st.markdown("### Activity Over Time")
         if not df.empty:
+            # Group by hour for clean graph
             df_line = df.groupby([pd.Grouper(key="datetime", freq="H"), "App Status"]).size().reset_index(name="count")
             fig = px.line(df_line, x="datetime", y="count", color="App Status", 
                           color_discrete_map={"Authorized": "#00FF00", "Unauthorized": "#FF0000"},
@@ -360,12 +440,15 @@ def render_shadow_apps(parquet_root: Path):
     # --------------------------------------------------------
     # TABS: The distinct UI Experience
     # --------------------------------------------------------
-    t1, t2 = st.tabs(["Authorized Applications", "Unauthorized Applications"])
+    t1, t2 = st.tabs(["Authorized Applications & License Audit", "Unauthorized Applications"])
     
-    # --- AUTHORIZED TAB (Standard View) ---
+    # --- AUTHORIZED TAB ---
     with t1:
+        # ==============================================================================
+        # 1. AUTHORIZED APPS LOG (MOVED TO TOP)
+        # ==============================================================================
         tab_col1, tab_col2, tab_col3 = st.columns([2, 2, 1])
-        with tab_col1: st.markdown("### Authorized Apps")
+        with tab_col1: st.markdown("### Authorized Apps Log")
         with tab_col2: 
             search_query_auth = st.text_input("Search MAC/IP", placeholder="Enter MAC or IP...", key="auth_search").strip().lower()
         with tab_col3:
@@ -391,7 +474,7 @@ def render_shadow_apps(parquet_root: Path):
                     .reset_index()
                 )
                 
-                # --- FIX: Limit to 1000 rows to prevent crash ---
+                # Limit to 1000 rows to prevent crash
                 allowed_summary = allowed_summary.head(1000)
                 
                 def color_status_green(val): return 'color: #6CA651; font-weight: bold;'
@@ -402,10 +485,91 @@ def render_shadow_apps(parquet_root: Path):
         else:
             st.info("No Authorized applications detected.")
 
+        st.divider()
+
+        # ==============================================================================
+        # 2. LICENSE COMPLIANCE AUDIT (Usage-Only Mode)
+        # ==============================================================================
+        st.markdown("## License Compliance Audit (Usage Only)")
+        st.caption("Detected active devices for each monitored software. Paid license count unknown.")
+
+        usage_data = []
+
+        # -----------------------------
+        # Usage Detection Logic
+        # -----------------------------
+        for software in LICENSE_REGISTRY.keys():
+            software_usage = df[
+                df["domain_clean"].astype(str).str.contains(software, case=False, na=False)
+            ]
+
+            # Unique MAC addresses
+            mac_list = software_usage["mac"].dropna().unique().tolist()
+            unique_users = len(mac_list)
+
+            # Status
+            status = "Usage Detected" if unique_users > 0 else "No Usage"
+
+            usage_data.append({
+                "Software": software,
+                "Active Devices Count": unique_users,
+                "Active Device MACs": ", ".join(mac_list),
+                "Status": status
+            })
+
+        # -----------------------------
+        # Table and Visualization
+        # -----------------------------
+        if usage_data:
+            usage_df = pd.DataFrame(usage_data)
+
+            table_col, chart_col = st.columns([1.7, 1])
+
+            with table_col:
+                st.subheader("Detected Software Usage")
+
+                # Style the Status column
+                def style_status(val):
+                    return "color: #FF4B4B; font-weight: 600;" if val == "Usage Detected" else "color: #00CC96; font-weight: 600;"
+
+                st.dataframe(
+                    usage_df.style.applymap(style_status, subset=["Status"]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            with chart_col:
+                st.subheader("Active Devices per Software")
+
+                chart_df = usage_df[["Software", "Active Devices Count"]]
+
+                fig = px.bar(
+                    chart_df,
+                    x="Software",
+                    y="Active Devices Count",
+                    text_auto=True,
+                    template="plotly_dark",
+                    color="Active Devices Count",
+                    color_continuous_scale="RdYlGn_r"
+                )
+
+                fig.update_layout(
+                    xaxis_title=None,
+                    yaxis_title="Active Devices",
+                    height=420,
+                    showlegend=False
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.info("No active usage detected for monitored software.")
+
+        st.divider()
+
         # -----------------------------
         # Shadow App Forensics Section (INSIDE TAB 1)
         # -----------------------------
-        st.divider()
         st.header("Shadow App Forensics")
 
         search_query = st.text_input("Global Forensic Search", placeholder="Enter specific MAC or IP to start deep dive...", key="global_forensic_search").strip().lower()
@@ -506,7 +670,7 @@ def render_shadow_apps(parquet_root: Path):
                     else:
                         final_df = display_df.sort_values("datetime", ascending=False)
 
-                    # --- FIX: Limit to 1000 rows to prevent crash ---
+                    # Limit to 1000 rows to prevent crash
                     final_df = final_df.head(1000)
 
                     if "Risk Level" in final_df.columns:
@@ -621,15 +785,18 @@ def render_shadow_apps(parquet_root: Path):
                     
                 with exfil_c2:
                     # Scatter Plot: Bytes Sent vs Port
-                    fig_exfil = px.scatter(
-                        unauth_df[unauth_df["bytes_sent"] > 0], 
-                        x="dst_port", y="bytes_sent", 
-                        size="bytes_sent", color="Behavior",
-                        hover_data=["domain_clean", "mac"],
-                        title="Outbound Data Volume by Port",
-                        template="plotly_dark"
-                    )
-                    st.plotly_chart(fig_exfil, use_container_width=True)
+                    if not unauth_df.empty and unauth_df["bytes_sent"].max() > 0:
+                        fig_exfil = px.scatter(
+                            unauth_df[unauth_df["bytes_sent"] > 0], 
+                            x="dst_port", y="bytes_sent", 
+                            size="bytes_sent", color="Behavior",
+                            hover_data=["domain_clean", "mac"],
+                            title="Outbound Data Volume by Port",
+                            template="plotly_dark"
+                        )
+                        st.plotly_chart(fig_exfil, use_container_width=True)
+                    else:
+                        st.info("No significant outbound traffic detected.")
 
             st.divider()
 
@@ -687,7 +854,7 @@ def render_shadow_apps(parquet_root: Path):
                 .sort_values("datetime", ascending=False)
             )
             
-            # --- FIX: Limit to 1000 rows to prevent crash ---
+            # Limit to 1000 rows to prevent crash
             detail_table = detail_table.head(1000)
             
             styled_unauth = detail_table.style.applymap(color_risk, subset=["Risk Level"])

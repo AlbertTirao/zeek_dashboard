@@ -74,7 +74,7 @@ def list_files_with_retry(drive, query, max_retries=8):
 # =====================================================
 # Zeek log → Parquet streaming parser   
 # =====================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=600)
 def load_all_parquets(parquet_root: Path):
     """
     Load all parquet files from disk into memory (cached).
@@ -255,9 +255,21 @@ def parse_drive_logs_to_parquet(
 
         parquet_path = parquet_root / log_date / f"{log_type}.parquet"
 
-        # 2. Skip if already exists locally
+        # --- FIX: ALLOW RE-DOWNLOAD FOR CURRENT DAY ---
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
         if parquet_path.exists():
-            continue
+            # If it's a historical file (yesterday or older), skip it.
+            if log_date != today_str:
+                continue
+            
+            # If it IS today's file, we must overwrite it to get new data.
+            # We delete the old partial file so the new one can replace it.
+            try:
+                os.remove(parquet_path)
+            except OSError:
+                pass # File might be open/locked, skip for now
+        # ----------------------------------------------
 
         st.write(f"Processing {name}...")
 
