@@ -15,6 +15,7 @@ from services.drive_services import parse_drive_logs_to_parquet
 
 PARQUET_DIR = Path("data/parquet")
 WARMUP_FLAG = PARQUET_DIR / ".WARMED"
+status_placeholder = st.empty()
 
 if not WARMUP_FLAG.exists():
     st.write("🔥 Initializing Parquet cache from ALL Zeek logs...")
@@ -28,7 +29,13 @@ if not WARMUP_FLAG.exists():
     WARMUP_FLAG.touch()
     st.write("✅ Parquet cache ready (raw logs untouched)")
 else:
-    st.write("Parquet cache already initialized — skipping Drive parse")
+    if "warmup_notice_shown" not in st.session_state:
+        status_placeholder.write(
+            "Parquet cache already initialized — skipping Drive parse"
+        )
+        st.session_state.warmup_notice_shown = True
+    else:
+        status_placeholder.empty()
 
 # # -------------------------
 # # Load & verify Parquet cache (PRINT ON EVERY RERUN)
