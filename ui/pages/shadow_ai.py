@@ -93,9 +93,14 @@ def normalize_severity_label(score):
 def load_shadow_ai_data(parquet_root: Path):
     ai_events = []
     
-    # --- 1. DHCP Correlation Map ---
+    if not parquet_root.exists():
+        return pd.DataFrame()
+
+    # --- 1. DHCP Correlation Map (Recursive) ---
     dhcp_map = pd.DataFrame()
-    dhcp_files = sorted(parquet_root.glob("**/dhcp.parquet"))
+    # rglob finds files in ALL subdirectories
+    dhcp_files = sorted(parquet_root.rglob("dhcp.parquet"))
+    
     if dhcp_files:
         try:
             raw_dhcp = pd.concat([pd.read_parquet(f) for f in dhcp_files], ignore_index=True)
@@ -105,22 +110,29 @@ def load_shadow_ai_data(parquet_root: Path):
                 dhcp_map = raw_dhcp.sort_values("ts").drop_duplicates(subset=["mac"], keep="last")[["mac", "client_addr", "host_name"]]
         except: pass
 
-    # --- 2. Log Scanning Loop ---
-    if not parquet_root.exists():
-        return pd.DataFrame()
-
-    for day_dir in sorted(p for p in parquet_root.iterdir() if p.is_dir()):
+    # --- 2. Log Scanning Loop (Recursive) ---
+    # We iterate over ALL parquet files found recursively
+    all_files = list(parquet_root.rglob("*.parquet"))
+    
+    for f in all_files:
+        fname = f.name.lower()
         
-        # [A] HTTP LOGS
-        if (day_dir / "http.parquet").exists():
-            try:
-                df = pd.read_parquet(day_dir / "http.parquet")
-                if "host" in df.columns:
-                    target_col = "host"
-                elif "id.resp_h" in df.columns:
-                    target_col = "id.resp_h"
+        try:
+            # Read the file
+            df = pd.read_parquet(f)
+            if df.empty: continue
+
+            # [CRITICAL FIX] Normalize Timestamp IMMEDIATELY per file
+            # This prevents mixed-type errors when concatenating later
+            if "ts" in df.columns:
+                if pd.api.types.is_numeric_dtype(df["ts"]):
+                    df["ts"] = pd.to_datetime(df["ts"], unit="s")
                 else:
-                    target_col = None
+                    df["ts"] = pd.to_datetime(df["ts"], errors='coerce')
+
+            # [A] HTTP LOGS
+            if "http" in fname:
+                target_col = "host" if "host" in df.columns else ("id.resp_h" if "id.resp_h" in df.columns else None)
 
                 if target_col:
                     for provider, regexes in AI_SIGNATURES.items():
@@ -140,12 +152,9 @@ def load_shadow_ai_data(parquet_root: Path):
                             matches["Detail"] = method + " " + uri
                             matches["Destination"] = matches[target_col]
                             ai_events.append(matches)
-            except: pass
 
-        # [B] SSL LOGS
-        if (day_dir / "ssl.parquet").exists():
-            try:
-                df = pd.read_parquet(day_dir / "ssl.parquet")
+            # [B] SSL LOGS
+            elif "ssl" in fname:
                 target_col = "server_name" if "server_name" in df.columns else ("id.resp_h" if "id.resp_h" in df.columns else None)
                 if target_col:
                     for provider, regexes in AI_SIGNATURES.items():
@@ -160,12 +169,9 @@ def load_shadow_ai_data(parquet_root: Path):
                             matches["Detail"] = "SNI: " + matches[target_col].astype(str)
                             matches["Destination"] = matches[target_col]
                             ai_events.append(matches)
-            except: pass
 
-        # [C] CONN LOGS
-        if (day_dir / "conn.parquet").exists():
-            try:
-                df = pd.read_parquet(day_dir / "conn.parquet")
+            # [C] CONN LOGS
+            elif "conn" in fname:
                 if "id.resp_p" in df.columns:
                     for port, tool_name in LOCAL_AI_PORTS.items():
                         matches = df[df["id.resp_p"] == port].copy()
@@ -177,7 +183,9 @@ def load_shadow_ai_data(parquet_root: Path):
                             matches["Detail"] = f"Port {port} Traffic"
                             matches["Destination"] = matches["id.resp_h"] if "id.resp_h" in matches.columns else "Unknown"
                             ai_events.append(matches)
-            except: pass
+        except Exception as e:
+            # Silently skip bad files
+            pass
             
     if not ai_events: return pd.DataFrame()
     final_df = pd.concat(ai_events, ignore_index=True)
@@ -186,10 +194,11 @@ def load_shadow_ai_data(parquet_root: Path):
     if "mac" not in final_df.columns: final_df["mac"] = None
     if "id.orig_h" in final_df.columns and not dhcp_map.empty:
         final_df = pd.merge(final_df, dhcp_map, how="left", left_on="id.orig_h", right_on="client_addr")
-        final_df["mac"] = final_df["mac_x"].fillna(final_df["mac_y"])
-        final_df = final_df.drop(columns=["mac_x", "mac_y", "client_addr"])
+        if "mac_x" in final_df.columns:
+            final_df["mac"] = final_df["mac_x"].fillna(final_df["mac_y"])
+            final_df = final_df.drop(columns=["mac_x", "mac_y", "client_addr"])
 
-    final_df["ts"] = pd.to_datetime(final_df["ts"], unit="s")
+    # Final Cleanup
     final_df["host_name"] = final_df.get("host_name", "Unknown").fillna("Unknown")
     final_df["mac"] = final_df.get("mac", "Unknown").fillna("Unknown")
     final_df["Upload_Bytes"] = final_df.get("Upload_Bytes", 0).fillna(0)
@@ -209,10 +218,8 @@ def render_shadow_ai(parquet_root: Path):
         df = load_shadow_ai_data(parquet_root)
 
     # --- 0. HANDLING EMPTY STATE ---
-    # If no data found, initialize an empty DataFrame with expected schema
-    # This allows the UI to render (showing 0s) instead of crashing or hiding.
     if df.empty:
-        st.info("ℹNo AI signatures detected in logs. Dashboard active in monitoring mode.")
+        st.info("ℹ No AI signatures detected in logs. Dashboard active in monitoring mode.")
         required_cols = [
             "ts", "AI_Provider", "Risk_Score", "Severity", "mac", "host_name", 
             "Detail", "Client_Type", "Policy_Verdict", "Upload_Bytes", 
@@ -224,18 +231,20 @@ def render_shadow_ai(parquet_root: Path):
     # --- FILTERS SECTION ---
     st.markdown("### Global Threat Filters")
     
-    # Date filter logic (Handle empty TS for fallback)
+    # [FIX] Generate Dropdown Options including "All History"
     if not df.empty:
-        min_date = df["ts"].min().date()
-        max_date = df["ts"].max().date()
+        # Get unique dates from the timestamp column, ensure they are dropna
+        unique_dates = sorted(df["ts"].dropna().dt.date.unique(), reverse=True)
+        date_options = ["All History"] + [str(d) for d in unique_dates]
     else:
-        min_date = datetime.now().date()
-        max_date = datetime.now().date()
+        date_options = ["All History", str(datetime.now().date())]
     
     with st.container(border=True):
         f1, f2, f3 = st.columns([2, 2, 2])
         with f1:
-            date_range = st.date_input("Filter by Date Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+            # Dropdown Selection
+            selected_date_str = st.selectbox("Select Date", date_options, index=0)
+
         with f2:
             selected_verdict = st.multiselect("Policy Verdict", ["Shadow AI", "Allowed"], default=["Shadow AI", "Allowed"])
         with f3:
@@ -243,7 +252,6 @@ def render_shadow_ai(parquet_root: Path):
             
         f4, f5 = st.columns([3, 3])
         with f4:
-            # Handle empty case for unique values
             if not df.empty:
                 all_clients = sorted([str(x) for x in df["Client_Type"].unique()])
             else:
@@ -252,15 +260,17 @@ def render_shadow_ai(parquet_root: Path):
         with f5:
             search_q = st.text_input("Search Logs (Host, MAC, Provider, or Detail)", placeholder="Enter keywords...")
 
-    # Apply Filter Logic
+    # --- APPLY FILTERS ---
     filtered = df.copy()
     
-    # 1. Date Range Filter
-    if not filtered.empty and isinstance(date_range, tuple) and len(date_range) == 2:
-        start_dt, end_dt = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1]) + pd.Timedelta(days=1)
-        filtered = filtered[(filtered["ts"] >= start_dt) & (filtered["ts"] < end_dt)]
+    # [FIX] Filter by Date String (if not "All History")
+    if not filtered.empty and selected_date_str != "All History":
+        # Create a temp string column to match the dropdown value exactly
+        filtered["date_str"] = filtered["ts"].dt.date.astype(str)
+        filtered = filtered[filtered["date_str"] == selected_date_str]
+        filtered = filtered.drop(columns=["date_str"])
     
-    # 2. Category Filters
+    # Apply other filters
     if not filtered.empty:
         if selected_verdict:
             filtered = filtered[filtered["Policy_Verdict"].isin(selected_verdict)]
@@ -269,7 +279,7 @@ def render_shadow_ai(parquet_root: Path):
         if client_filter:
             filtered = filtered[filtered["Client_Type"].isin(client_filter)]
             
-    # 3. Global Search Filter
+    # Search Filter
     if not filtered.empty and search_q:
         q = search_q.lower()
         search_mask = (
@@ -285,7 +295,6 @@ def render_shadow_ai(parquet_root: Path):
     st.markdown("---")
     m1, m2, m3, m4 = st.columns(4)
     
-    # Safe calculation for empty filtered df
     total_leakage_mb = filtered["Upload_Bytes"].sum() / 1024 / 1024 if not filtered.empty else 0
     critical_events = len(filtered[filtered["Severity"] == "CRITICAL"]) if not filtered.empty else 0
     automations = len(filtered[filtered["Client_Type"] == "Automation / SDK"]) if not filtered.empty else 0
@@ -299,14 +308,16 @@ def render_shadow_ai(parquet_root: Path):
     st.markdown("### Posture Analysis")
     g1, g2 = st.columns([2, 1])
     with g1:
-        # Plotly handles empty DFs by showing empty axes, which is what we want
+        # Dynamic Chart Title
+        chart_title = f"Incident Timeline ({selected_date_str})"
+        
         fig_scatter = px.scatter(
             filtered, x="ts", y="AI_Provider", 
             size="Risk_Score" if not filtered.empty else None, 
             color="Severity" if not filtered.empty else None,
             color_discrete_map={"LOW": "#00CC96", "MEDIUM": "#FFA15A", "HIGH": "#EF553B", "CRITICAL": "#B80000"},
             hover_data=["mac", "host_name", "Detail"] if not filtered.empty else None,
-            title="Incident Timeline",
+            title=chart_title,
             template="plotly_dark"
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
@@ -359,7 +370,6 @@ def render_shadow_ai(parquet_root: Path):
         
         cols = ["ts", "mac", "host_name", "Severity", "AI_Provider", "Detail", "Policy_Verdict"]
         
-        # Handle styling on empty DF
         if filtered.empty:
              st.dataframe(pd.DataFrame(columns=cols), use_container_width=True)
         else:
