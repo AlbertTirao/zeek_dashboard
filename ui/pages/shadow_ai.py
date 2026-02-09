@@ -209,16 +209,29 @@ def render_shadow_ai(parquet_root: Path):
     with st.spinner("Correlating network telemetry..."):
         df = load_shadow_ai_data(parquet_root)
 
+    # --- 0. HANDLING EMPTY STATE ---
+    # If no data found, initialize an empty DataFrame with expected schema
+    # This allows the UI to render (showing 0s) instead of crashing or hiding.
     if df.empty:
-        st.success("Clean Network: No AI signatures detected.")
-        return
+        st.info("ℹ️ No AI signatures detected in logs. Dashboard active in monitoring mode.")
+        required_cols = [
+            "ts", "AI_Provider", "Risk_Score", "Severity", "mac", "host_name", 
+            "Detail", "Client_Type", "Policy_Verdict", "Upload_Bytes", 
+            "Detection_Source", "user_agent", "id.orig_h"
+        ]
+        df = pd.DataFrame(columns=required_cols)
+        df["ts"] = pd.to_datetime([])
 
     # --- FILTERS SECTION ---
     st.markdown("### Global Threat Filters")
     
-    # Date filter logic
-    min_date = df["ts"].min().date()
-    max_date = df["ts"].max().date()
+    # Date filter logic (Handle empty TS for fallback)
+    if not df.empty:
+        min_date = df["ts"].min().date()
+        max_date = df["ts"].max().date()
+    else:
+        min_date = datetime.now().date()
+        max_date = datetime.now().date()
     
     with st.container(border=True):
         f1, f2, f3 = st.columns([2, 2, 2])
@@ -231,7 +244,11 @@ def render_shadow_ai(parquet_root: Path):
             
         f4, f5 = st.columns([3, 3])
         with f4:
-            all_clients = sorted([str(x) for x in df["Client_Type"].unique()])
+            # Handle empty case for unique values
+            if not df.empty:
+                all_clients = sorted([str(x) for x in df["Client_Type"].unique()])
+            else:
+                all_clients = []
             client_filter = st.multiselect("Client Type", all_clients, placeholder="All Clients")
         with f5:
             search_q = st.text_input("Search Logs (Host, MAC, Provider, or Detail)", placeholder="Enter keywords...")
@@ -240,23 +257,22 @@ def render_shadow_ai(parquet_root: Path):
     filtered = df.copy()
     
     # 1. Date Range Filter
-    if isinstance(date_range, tuple) and len(date_range) == 2:
+    if not filtered.empty and isinstance(date_range, tuple) and len(date_range) == 2:
         start_dt, end_dt = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1]) + pd.Timedelta(days=1)
         filtered = filtered[(filtered["ts"] >= start_dt) & (filtered["ts"] < end_dt)]
     
     # 2. Category Filters
-    if selected_verdict:
-        filtered = filtered[filtered["Policy_Verdict"].isin(selected_verdict)]
-    if selected_severity:
-        filtered = filtered[filtered["Severity"].isin(selected_severity)]
-    if client_filter:
-        filtered = filtered[filtered["Client_Type"].isin(client_filter)]
-        
+    if not filtered.empty:
+        if selected_verdict:
+            filtered = filtered[filtered["Policy_Verdict"].isin(selected_verdict)]
+        if selected_severity:
+            filtered = filtered[filtered["Severity"].isin(selected_severity)]
+        if client_filter:
+            filtered = filtered[filtered["Client_Type"].isin(client_filter)]
+            
     # 3. Global Search Filter
-    # 3. Global Search Filter
-    if search_q:
+    if not filtered.empty and search_q:
         q = search_q.lower()
-        # Note the double .str usage: .str.lower().str.contains()
         search_mask = (
             filtered["host_name"].str.lower().str.contains(q, na=False) |
             filtered["mac"].str.lower().str.contains(q, na=False) |
@@ -266,16 +282,14 @@ def render_shadow_ai(parquet_root: Path):
         )
         filtered = filtered[search_mask]
 
-    if filtered.empty:
-        st.warning("No events match the current filters.")
-        return
-
     # --- METRICS ROW ---
     st.markdown("---")
     m1, m2, m3, m4 = st.columns(4)
-    total_leakage_mb = filtered["Upload_Bytes"].sum() / 1024 / 1024
-    critical_events = len(filtered[filtered["Severity"] == "CRITICAL"])
-    automations = len(filtered[filtered["Client_Type"] == "🤖 Automation / SDK"])
+    
+    # Safe calculation for empty filtered df
+    total_leakage_mb = filtered["Upload_Bytes"].sum() / 1024 / 1024 if not filtered.empty else 0
+    critical_events = len(filtered[filtered["Severity"] == "CRITICAL"]) if not filtered.empty else 0
+    automations = len(filtered[filtered["Client_Type"] == "Automation / SDK"]) if not filtered.empty else 0
     
     m1.metric("Selected Events", len(filtered))
     m2.metric("Data Leakage", f"{total_leakage_mb:.2f} MB")
@@ -286,17 +300,23 @@ def render_shadow_ai(parquet_root: Path):
     st.markdown("### Posture Analysis")
     g1, g2 = st.columns([2, 1])
     with g1:
+        # Plotly handles empty DFs by showing empty axes, which is what we want
         fig_scatter = px.scatter(
             filtered, x="ts", y="AI_Provider", 
-            size="Risk_Score", color="Severity",
+            size="Risk_Score" if not filtered.empty else None, 
+            color="Severity" if not filtered.empty else None,
             color_discrete_map={"LOW": "#00CC96", "MEDIUM": "#FFA15A", "HIGH": "#EF553B", "CRITICAL": "#B80000"},
-            hover_data=["mac", "host_name", "Detail"],
+            hover_data=["mac", "host_name", "Detail"] if not filtered.empty else None,
             title="Incident Timeline",
             template="plotly_dark"
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
     with g2:
-        risk_vectors = filtered.groupby("Client_Type")["Risk_Score"].mean().reset_index()
+        if not filtered.empty:
+            risk_vectors = filtered.groupby("Client_Type")["Risk_Score"].mean().reset_index()
+        else:
+            risk_vectors = pd.DataFrame(columns=["Risk_Score", "Client_Type"])
+            
         fig_bar = px.bar(
             risk_vectors, x="Risk_Score", y="Client_Type", orientation='h',
             title="Avg Risk by Client", color="Risk_Score", color_continuous_scale="Reds", template="plotly_dark"
@@ -310,22 +330,28 @@ def render_shadow_ai(parquet_root: Path):
     tab_list = st.tabs(["Priority Alerts", "Client/MAC Mapping", "Full Traffic Log", "Top Data Exfiltrators"])
 
     with tab_list[0]: # Critical/High
-        high_sev = filtered[filtered["Severity"].isin(["CRITICAL", "HIGH"])]
-        if high_sev.empty:
-            st.success("No High severity incidents in filtered view.")
+        if filtered.empty:
+            st.info("No data to display.")
         else:
-            st.dataframe(
-                high_sev[["ts", "Severity", "mac", "host_name", "AI_Provider", "Detail", "Upload_Bytes"]],
-                use_container_width=True, hide_index=True,
-                column_config={"Upload_Bytes": st.column_config.NumberColumn("Upload Size", format="%d Bytes")}
-            )
+            high_sev = filtered[filtered["Severity"].isin(["CRITICAL", "HIGH"])]
+            if high_sev.empty:
+                st.success("No High severity incidents in filtered view.")
+            else:
+                st.dataframe(
+                    high_sev[["ts", "Severity", "mac", "host_name", "AI_Provider", "Detail", "Upload_Bytes"]],
+                    use_container_width=True, hide_index=True,
+                    column_config={"Upload_Bytes": st.column_config.NumberColumn("Upload Size", format="%d Bytes")}
+                )
 
     with tab_list[1]: # Scripts/MACs
-        scripts = filtered[filtered["Client_Type"] == "🤖 Automation / SDK"]
-        st.dataframe(
-            filtered[["ts", "mac", "host_name", "AI_Provider", "Client_Type", "user_agent"]].drop_duplicates(subset=["mac", "AI_Provider"]),
-            use_container_width=True, hide_index=True
-        )
+        if filtered.empty:
+             st.info("No data to display.")
+        else:
+            scripts = filtered[filtered["Client_Type"] == "Automation / SDK"]
+            st.dataframe(
+                filtered[["ts", "mac", "host_name", "AI_Provider", "Client_Type", "user_agent"]].drop_duplicates(subset=["mac", "AI_Provider"]),
+                use_container_width=True, hide_index=True
+            )
 
     with tab_list[2]: # All
         def style_severity(v):
@@ -333,25 +359,33 @@ def render_shadow_ai(parquet_root: Path):
             return f"color: {colors.get(v, 'white')}; font-weight: bold"
         
         cols = ["ts", "mac", "host_name", "Severity", "AI_Provider", "Detail", "Policy_Verdict"]
-        st.dataframe(
-            filtered[cols].style.map(style_severity, subset=["Severity"]),
-            use_container_width=True, height=500,
-            column_config={"ts": st.column_config.DatetimeColumn("Time", format="MM-DD HH:mm")}
-        )
+        
+        # Handle styling on empty DF
+        if filtered.empty:
+             st.dataframe(pd.DataFrame(columns=cols), use_container_width=True)
+        else:
+            st.dataframe(
+                filtered[cols].style.map(style_severity, subset=["Severity"]),
+                use_container_width=True, height=500,
+                column_config={"ts": st.column_config.DatetimeColumn("Time", format="MM-DD HH:mm")}
+            )
 
     with tab_list[3]: # Top Leakers
-        leakers = filtered.groupby(["host_name", "mac", "AI_Provider"]).agg(
-            Total_Upload_MB=("Upload_Bytes", lambda x: x.sum() / 1024 / 1024),
-            Event_Count=("ts", "count")
-        ).reset_index().sort_values("Total_Upload_MB", ascending=False)
-        
-        max_val = int(leakers["Total_Upload_MB"].max()) if not leakers.empty else 100
-        st.dataframe(
-            leakers, 
-            use_container_width=True, hide_index=True,
-            column_config={
-                "Total_Upload_MB": st.column_config.ProgressColumn(
-                    "Data Exfiltrated (MB)", format="%.2f MB", min_value=0, max_value=max_val
-                )
-            }
-        )
+        if filtered.empty:
+            st.info("No data to display.")
+        else:
+            leakers = filtered.groupby(["host_name", "mac", "AI_Provider"]).agg(
+                Total_Upload_MB=("Upload_Bytes", lambda x: x.sum() / 1024 / 1024),
+                Event_Count=("ts", "count")
+            ).reset_index().sort_values("Total_Upload_MB", ascending=False)
+            
+            max_val = int(leakers["Total_Upload_MB"].max()) if not leakers.empty else 100
+            st.dataframe(
+                leakers, 
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Total_Upload_MB": st.column_config.ProgressColumn(
+                        "Data Exfiltrated (MB)", format="%.2f MB", min_value=0, max_value=max_val
+                    )
+                }
+            )
