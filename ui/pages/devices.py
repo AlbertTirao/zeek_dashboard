@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 import requests
-import yaml # ADDED: Required for YAML parsing
+import yaml 
 
 # =====================================================
 # Load Visual Metrics from Parquet
@@ -135,12 +135,15 @@ def get_mac_vendor(mac: str) -> str:
         return "Unknown"
 
 # =====================================================
-# Load authorized MACs (UPDATED FOR YAML)
+# Load authorized MACs (FIXED FOR DICTIONARY STRUCTURE)
 # =====================================================
 def load_authorized_macs(file_path: Path) -> set:
     """
     Loads authorized MACs from YAML.
-    Handles both direct lists and dictionary keys (e.g. authorized_macs: [...]).
+    Handles:
+    1. Simple Lists: ["mac1", "mac2"]
+    2. Dict with List: {"filename": ["mac1", ...]}
+    3. List of Dicts (NEW STRUCTURE): [{"mac": "...", "ip": "..."}, ...]
     """
     # Auto-fix extension: If .txt is passed but .yaml exists, switch to .yaml
     if file_path.suffix == ".txt":
@@ -149,7 +152,7 @@ def load_authorized_macs(file_path: Path) -> set:
             file_path = yaml_path
 
     if not file_path.exists():
-        # Fallback: Create empty if missing so it doesn't crash
+        # Fallback: Create empty if missing
         try:
             file_path.parent.mkdir(exist_ok=True, parents=True)
             with open(file_path, "w") as f:
@@ -165,22 +168,39 @@ def load_authorized_macs(file_path: Path) -> set:
         if data is None: 
             return set()
 
-        # Case 1: List
-        if isinstance(data, list):
-            return {str(line).strip().lower() for line in data if line}
+        raw_list = []
 
-        # Case 2: Dictionary
-        if isinstance(data, dict):
+        # Case A: Data is a List (Could be list of strings OR list of dicts)
+        if isinstance(data, list):
+            raw_list = data
+
+        # Case B: Data is a Dict (Look for the list inside)
+        elif isinstance(data, dict):
             # Try to find list by filename key
             if file_path.stem in data and isinstance(data[file_path.stem], list):
-                return {str(line).strip().lower() for line in data[file_path.stem] if line}
-            
-            # Fallback: Scan values for any list
-            for val in data.values():
-                if isinstance(val, list):
-                    return {str(line).strip().lower() for line in val if line}
+                raw_list = data[file_path.stem]
+            else:
+                # Fallback: Scan values for any list
+                for val in data.values():
+                    if isinstance(val, list):
+                        raw_list = val
+                        break
+        
+        # Process the raw list to extract just the MAC strings
+        final_macs = set()
+        for item in raw_list:
+            if isinstance(item, str):
+                # Old format: just a string
+                if item.strip():
+                    final_macs.add(item.strip().lower())
+            elif isinstance(item, dict):
+                # New format: Dict with 'mac' key
+                mac_val = item.get("mac")
+                if mac_val and isinstance(mac_val, str) and mac_val.strip():
+                    final_macs.add(mac_val.strip().lower())
 
-        return set()
+        return final_macs
+
     except Exception as e:
         st.error(f"Error reading YAML: {e}")
         return set()
