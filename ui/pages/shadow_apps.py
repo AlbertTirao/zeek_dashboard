@@ -314,7 +314,7 @@ def color_risk(val):
 # Render Main Page
 # -----------------------------
 def render_shadow_apps(parquet_root: Path):
-    st.subheader("Shadow Apps Overview")
+    st.markdown("#### Shadow Apps Overview")
     
     # 1. Date Selection with "All" option
     if parquet_root.exists():

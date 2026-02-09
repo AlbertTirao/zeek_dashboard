@@ -204,8 +204,7 @@ def load_shadow_ai_data(parquet_root: Path):
 # 4. DASHBOARD RENDERER
 # ==============================================================================
 def render_shadow_ai(parquet_root: Path):
-    st.markdown("<h1 style='font-size:30px; margin-bottom:16px;'>Shadow AI & Data Leakage</h1>", unsafe_allow_html=True)
-    
+    st.markdown("#### Shadow AI & Data Leakage")
     with st.spinner("Correlating network telemetry..."):
         df = load_shadow_ai_data(parquet_root)
 
@@ -213,7 +212,7 @@ def render_shadow_ai(parquet_root: Path):
     # If no data found, initialize an empty DataFrame with expected schema
     # This allows the UI to render (showing 0s) instead of crashing or hiding.
     if df.empty:
-        st.info("ℹ️ No AI signatures detected in logs. Dashboard active in monitoring mode.")
+        st.info("ℹNo AI signatures detected in logs. Dashboard active in monitoring mode.")
         required_cols = [
             "ts", "AI_Provider", "Risk_Score", "Severity", "mac", "host_name", 
             "Detail", "Client_Type", "Policy_Verdict", "Upload_Bytes", 
