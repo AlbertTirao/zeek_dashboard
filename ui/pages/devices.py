@@ -555,7 +555,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
                 top_sites = filtered_activity["Destination"].value_counts().head(5).reset_index()
                 top_sites.columns = ["Destination", "Count"] # Rename columns
                 
-                st.markdown(f"#### Top Destinations ({service_view})")
+                st.markdown(f"#### Top 5 Destinations ({service_view})")
                 
                 if not top_sites.empty:
                     # Style: Big Fonts
