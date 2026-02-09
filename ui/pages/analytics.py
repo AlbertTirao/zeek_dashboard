@@ -53,30 +53,27 @@ def load_device_data(parquet_root: Path):
 # Main Render
 # ---------------------------------------------------------
 def render(parquet_root: Path):
-    st.set_page_config(page_title="Network Analytics", layout="wide")
+    # REMOVED st.set_page_config() - This must be at the very top of app.py, not here
     st.title("Network Analytics")
 
     if st.button("Refresh Analytics"):
         st.rerun()
 
-    # 1. Load Device Data (for Uploads/AI tabs)
+    # 1. Load Device Data (Optional usage)
     filtered = load_device_data(parquet_root)
 
     # 2. Tabs
-    tab = st.radio("Select Section", ["Shadow Apps", "Shadow Uploads", "Shadow AI"], horizontal=True)
+    tab = st.radio("Select Section", ["Shadow Apps", "Shadow Sharings", "Shadow AI"], horizontal=True)
 
     if tab == "Shadow Apps":
-        # Pass the ROOT PATH, not the dataframes
+        # Correct: Passes Path
         render_shadow_apps(parquet_root)
         
-    elif tab == "Shadow Uploads":
-        if filtered.empty:
-            st.info("No device data available for Uploads analysis.")
-        else:
-            render_shadow_uploads(filtered)
+    elif tab == "Shadow Sharings":
+        # --- FIXED HERE ---
+        # Was passing 'filtered' (DataFrame), now passing 'parquet_root' (Path)
+        render_shadow_uploads(parquet_root)
             
     elif tab == "Shadow AI":
-        if filtered.empty:
-            st.info("No device data available for AI analysis.")
-        else:
-            render_shadow_ai(parquet_root)
+        # Correct: Passes Path
+        render_shadow_ai(parquet_root)

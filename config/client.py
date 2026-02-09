@@ -1,3 +1,4 @@
+#config/client.py
 from pathlib import Path
 
 DATA_DIR = Path("data")

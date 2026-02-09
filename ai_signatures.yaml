@@ -1,0 +1,49 @@
+ai_signatures:
+  "OpenAI / ChatGPT":
+    [
+      "openai\\.com",
+      "chatgpt\\.com",
+      "api\\.openai",
+      "chat\\.openai",
+      "oaistatic\\.com",
+    ]
+
+  "Microsoft Copilot":
+    [
+      "copilot\\.microsoft\\.com",
+      "githubcopilot\\.com",
+      "bing\\.com/chat",
+      "edgeservices\\.bing\\.com",
+    ]
+
+  "Google Gemini":
+    ["gemini\\.google\\.com", "generativelanguage\\.googleapis", "gemini\\.ai"]
+
+  "Google Bard": ["bard\\.google\\.com", "bard\\.ai"]
+
+  "Anthropic Claude":
+    ["anthropic\\.com", "claude\\.ai", "cdn\\.anthropic\\.com"]
+
+  "Hugging Face": ["huggingface\\.co", "hf\\.co", "huggingface\\.tech"]
+
+  "Perplexity": ["perplexity\\.ai", "pplx\\.ai"]
+
+  "Midjourney": ["midjourney\\.com", "discord\\.com/invite/midjourney"]
+
+  "Ollama (Local/Cloud)":
+    ["ollama\\.ai", "localhost:11434", "127\\.0\\.0\\.1:11434"]
+
+  "LM Studio": ["lmstudio\\.ai", "localhost:1234"]
+
+  "Generic AI API":
+    ["api\\.[\\w-]+\\.ai", "v1/chat/completions", "v1/embeddings"]
+
+local_ai_ports:
+  11434: Ollama
+  1234: LM Studio
+  7860: HuggingFace Gradio
+  8000: FastAPI LLM Server
+  5000: Local Flask AI
+  8080: Open WebUI
+  3000: Local AI Web App
+authorized_providers: []

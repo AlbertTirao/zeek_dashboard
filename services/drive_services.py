@@ -267,6 +267,7 @@ def parse_drive_logs_to_parquet(
             # We delete the old partial file so the new one can replace it.
             try:
                 os.remove(parquet_path)
+                st.toast(f"♻️ Updating current day log: {name}")
             except OSError:
                 pass # File might be open/locked, skip for now
         # ----------------------------------------------

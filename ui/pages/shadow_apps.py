@@ -1,13 +1,16 @@
+#ui/pages/shadow_app.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 from pathlib import Path
 from urllib.parse import urlparse
+import yaml
 
 # -----------------------------
 # Config
 # -----------------------------
-ALLOWLIST_FILE = Path(__file__).resolve().parents[2] / "allowlist.txt"
+# Updated to point to the YAML file in the root directory
+WHITELIST_FILE = Path(__file__).resolve().parents[2] / "whitelist_domains.yaml"
 
 # -----------------------------
 # License registry (User Configured)
@@ -81,24 +84,49 @@ def get_dhcp_mapping(parquet_root: Path, target_dates: list):
     return full_mapping
 
 # -----------------------------
-# Load allowlist
+# Load allowlist (UPDATED FOR YAML)
 # -----------------------------
 def load_allowlist():
-    if not ALLOWLIST_FILE.exists():
+    """Loads authorized domains from whitelist_domains.yaml"""
+    if not WHITELIST_FILE.exists():
         return []
 
     approved = set()
     try:
-        with open(ALLOWLIST_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip().lower()
-                if not line or line.startswith("#"):
-                    continue
-                domain = extract_domain(line)
+        with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            
+            if data is None:
+                return []
+            
+            raw_list = []
+            
+            # Case 1: Simple List
+            if isinstance(data, list):
+                raw_list = data
+            
+            # Case 2: Dictionary (e.g. whitelist_domains: [...])
+            elif isinstance(data, dict):
+                # Try to find by filename key first
+                target_key = WHITELIST_FILE.stem
+                if target_key in data and isinstance(data[target_key], list):
+                    raw_list = data[target_key]
+                else:
+                    # Fallback: grab the first list found
+                    for val in data.values():
+                        if isinstance(val, list):
+                            raw_list = val
+                            break
+            
+            # Process the list using extract_domain
+            for item in raw_list:
+                domain = extract_domain(str(item))
                 if domain:
                     approved.add(domain)
+                    
     except Exception:
         pass
+        
     return list(approved)
 
 # -----------------------------
@@ -308,9 +336,10 @@ def render_shadow_apps(parquet_root: Path):
         st.error("Log root directory not found.")
         return
 
-    # 2. Load DHCP Mapping (Iterates all target dates)
+    # 2. Load DHCP Mapping (Iterates ALL dates to find historical leases)
+    # --- FIX: We pass 'available_dates' instead of 'target_dates' so we find ALL MAC addresses ---
     with st.spinner("Loading Network Identity (DHCP)..."):
-        ip_to_mac = get_dhcp_mapping(parquet_root, target_dates)
+        ip_to_mac = get_dhcp_mapping(parquet_root, available_dates)
     
     approved = load_allowlist()
 
@@ -364,10 +393,14 @@ def render_shadow_apps(parquet_root: Path):
     
     # 7. Enrich Data
     df["ip"] = df["ip"].astype(str)
+    
+    # --- FIX: MAC Address Enrichment ---
+    # Map unknown MACs using the global dictionary we built from ALL DHCP logs
     mask_unknown = (df["mac"] == "Unknown") | (df["mac"].isna())
     mapped_macs = df.loc[mask_unknown, "ip"].map(ip_to_mac)
     df.loc[mask_unknown, "mac"] = mapped_macs.fillna("Unknown")
     df["mac"] = df["mac"].fillna("Unknown")
+    # -----------------------------------
 
     # Domain cleanup
     df["domain_clean"] = df["app_identifier"].apply(extract_domain)
@@ -442,55 +475,115 @@ def render_shadow_apps(parquet_root: Path):
     # --------------------------------------------------------
     t1, t2 = st.tabs(["Authorized Applications & License Audit", "Unauthorized Applications"])
     
-    # --- AUTHORIZED TAB ---
+    # --- AUTHORIZED & UNAUTHORIZED TAB ---
     with t1:
         # ==============================================================================
-        # 1. AUTHORIZED APPS LOG (MOVED TO TOP)
+        # 1. APPLICATION AUDIT LOG (ENHANCED WITH DE-DUPLICATION)
         # ==============================================================================
-        tab_col1, tab_col2, tab_col3 = st.columns([2, 2, 1])
-        with tab_col1: st.markdown("### Authorized Apps Log")
-        with tab_col2: 
-            search_query_auth = st.text_input("Search MAC/IP", placeholder="Enter MAC or IP...", key="auth_search").strip().lower()
-        with tab_col3:
-            raw_sources = sorted(df["source_log"].unique().tolist()) if not df.empty else []
-            selected_source_auth = st.selectbox("Select Source", options=["All"] + raw_sources, key="auth_source_filter")
         
-        # Filter Authorized
-        auth_df = df[df["App Status"] == "Authorized"]
+        st.markdown("### Application Audit Log")
         
-        if not auth_df.empty:
-            if selected_source_auth != "All": auth_df = auth_df[auth_df["source_log"] == selected_source_auth]
-            if search_query_auth:
-                auth_df = auth_df[
-                    (auth_df["mac"].str.contains(search_query_auth, case=False, na=False)) | 
-                    (auth_df["ip"].str.contains(search_query_auth, case=False, na=False))
-                ]
+        # Row 1: Primary Search and Status Toggle
+        filter_col1, filter_col2 = st.columns([3, 2])
+        with filter_col1: 
+            search_query_audit = st.text_input("Search (MAC, IP, Domain)", placeholder="Search...", key="audit_search").strip().lower()
+        with filter_col2:
+            status_filter = st.radio(
+                "Filter Status", 
+                ["All", "Authorized", "Unauthorized"], 
+                horizontal=True, 
+                key="audit_status_filter"
+            )
 
-            if not auth_df.empty:
-                allowed_summary = (
-                    auth_df.sort_values("datetime")
+        # Row 2: Source Filter and De-duplication Toggle
+        filter_col3, filter_col4 = st.columns([3, 2])
+        with filter_col3:
+            raw_sources = sorted(df["source_log"].unique().tolist()) if not df.empty else []
+            selected_source_audit = st.selectbox("Source Log Type", ["All"] + raw_sources, key="audit_source_filter")
+        with filter_col4:
+            # --- NEW: DE-DUPLICATION SELECTION ---
+            dedup_enabled = st.toggle("Remove Duplications (Summary View)", value=True, help="Combine multiple hits from the same device into a single summary row.")
+
+        # --- Data Filtering Logic ---
+        audit_df = df.copy()
+
+        if status_filter != "All":
+            audit_df = audit_df[audit_df["App Status"] == status_filter]
+            
+        if selected_source_audit != "All":
+            audit_df = audit_df[audit_df["source_log"] == selected_source_audit]
+
+        if search_query_audit:
+            q = search_query_audit
+            audit_df = audit_df[
+                (audit_df["mac"].str.contains(q, case=False, na=False)) | 
+                (audit_df["ip"].str.contains(q, case=False, na=False)) |
+                (audit_df["domain_clean"].str.contains(q, case=False, na=False))
+            ]
+
+        if not audit_df.empty:
+            # --- RENDER LOGIC ---
+            if dedup_enabled:
+                # Grouped Summary View
+                display_df = (
+                    audit_df.sort_values("datetime")
                     .groupby(["domain_clean", "mac", "ip", "source_log", "App Status"])
-                    .agg(First_Seen=("datetime", "min"), Last_Seen=("datetime", "max"), Count=("datetime", "count"))
+                    .agg(
+                        First_Seen=("datetime", "min"), 
+                        Last_Seen=("datetime", "max"), 
+                        Hits=("datetime", "count")
+                    )
                     .reset_index()
+                    .sort_values("Hits", ascending=False)
                 )
-                
-                # Limit to 1000 rows to prevent crash
-                allowed_summary = allowed_summary.head(1000)
-                
-                def color_status_green(val): return 'color: #6CA651; font-weight: bold;'
-                styled_df = allowed_summary.style.applymap(color_status_green, subset=['App Status'])
-                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                col_config = {
+                    "domain_clean": "Application",
+                    "mac": "MAC Address",
+                    "ip": "IP Address",
+                    "source_log": "Source",
+                    "First_Seen": st.column_config.DatetimeColumn("First Seen", format="MM-DD HH:mm"),
+                    "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"),
+                    "Hits": st.column_config.NumberColumn("Total Hits"),
+                }
             else:
-                st.info("No matching Authorized logs found.")
+                # Detailed Raw View
+                display_df = audit_df.sort_values("datetime", ascending=False)
+                col_config = {
+                    "datetime": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
+                    "domain_clean": "Application",
+                    "mac": "MAC Address",
+                    "ip": "IP Address",
+                    "source_log": "Source",
+                }
+
+            # Limit rows for performance
+            display_df = display_df.head(1000)
+            
+            # Dynamic Coloring
+            def color_status(val):
+                if val == "Authorized": return 'color: #6CA651; font-weight: bold;'
+                if val == "Unauthorized": return 'color: #FF4B4B; font-weight: bold;'
+                return ''
+
+            styled_audit = display_df.style.map(color_status, subset=['App Status'])
+            
+            st.dataframe(
+                styled_audit, 
+                column_config=col_config,
+                use_container_width=True, 
+                hide_index=True
+            )
+            
+            st.caption(f"Showing {len(display_df)} results. Use filters to narrow down data.")
         else:
-            st.info("No Authorized applications detected.")
+            st.info(f"No {status_filter.lower()} logs found matching your criteria.")
 
         st.divider()
 
         # ==============================================================================
         # 2. LICENSE COMPLIANCE AUDIT (Usage-Only Mode)
         # ==============================================================================
-        st.markdown("## License Compliance Audit (Usage Only)")
+        st.markdown("### License Compliance Audit")
         st.caption("Detected active devices for each monitored software. Paid license count unknown.")
 
         usage_data = []
@@ -526,7 +619,7 @@ def render_shadow_apps(parquet_root: Path):
             table_col, chart_col = st.columns([1.7, 1])
 
             with table_col:
-                st.subheader("Detected Software Usage")
+                st.markdown("<div style='font-size:25px; font-weight:600;'>Detected Software Usage</div>",unsafe_allow_html=True)
 
                 # Style the Status column
                 def style_status(val):
@@ -539,8 +632,7 @@ def render_shadow_apps(parquet_root: Path):
                 )
 
             with chart_col:
-                st.subheader("Active Devices per Software")
-
+                st.markdown("<div style='font-size:20px; font-weight:600;'>Active Devices per Software</div>",unsafe_allow_html=True)
                 chart_df = usage_df[["Software", "Active Devices Count"]]
 
                 fig = px.bar(
@@ -570,7 +662,7 @@ def render_shadow_apps(parquet_root: Path):
         # -----------------------------
         # Shadow App Forensics Section (INSIDE TAB 1)
         # -----------------------------
-        st.header("Shadow App Forensics")
+        st.markdown("### Shadow App Forensics")
 
         search_query = st.text_input("Global Forensic Search", placeholder="Enter specific MAC or IP to start deep dive...", key="global_forensic_search").strip().lower()
 
@@ -579,9 +671,19 @@ def render_shadow_apps(parquet_root: Path):
             
             f_col1, f_col2 = st.columns(2)
             with f_col1:
+                st.markdown(
+                    "<div style='font-size:10px; font-weight:600; margin-bottom:6px;'>Forensic View</div>",
+                    unsafe_allow_html=True
+                )
+
                 view_type = st.radio(
-                    "Forensic View", 
-                    ["App Run (Connectivity)", "App Usage (Interaction)", "App Install (Files)", "Suspicious Behavior"],
+                    label="",
+                    options=[
+                        "App Run (Connectivity)",
+                        "App Usage (Interaction)",
+                        "App Install (Files)",
+                        "Suspicious Behavior"
+                    ],
                     horizontal=True
                 )
             with f_col2:
@@ -620,7 +722,7 @@ def render_shadow_apps(parquet_root: Path):
                     color_graph = ["#888888"]
 
                 # --- Activity Graph ---
-                st.markdown("### Traffic Activity Graph")
+                st.markdown("#### Traffic Activity Graph")
                 if not display_df.empty:
                     f_line = display_df.groupby([pd.Grouper(key="datetime", freq="10min")]).size().reset_index(name="hits")
                     fig_f = px.area(f_line, x="datetime", y="hits", template="plotly_dark", 
@@ -633,7 +735,7 @@ def render_shadow_apps(parquet_root: Path):
                 low_col1, low_col2 = st.columns([1, 2])
                 
                 with low_col1:
-                    st.markdown("### Top Destinations")
+                    st.markdown("#### Top Destinations")
                     if not display_df.empty:
                         top_dest = display_df["domain_clean"].value_counts().head(10).reset_index()
                         top_dest.columns = ["Destination", "Count"]
@@ -708,7 +810,7 @@ def render_shadow_apps(parquet_root: Path):
                 g_col1, g_col2, g_col3, g_col4 = st.columns(4)
                 
                 with g_col1:
-                    st.markdown("#### Total Activity")
+                    st.markdown("##### Total Activity")
                     if not forensic_df.empty:
                         forensic_df["hour"] = forensic_df["datetime"].dt.hour
                         hourly_counts = forensic_df.groupby("hour").size().reset_index(name="count")
@@ -716,7 +818,7 @@ def render_shadow_apps(parquet_root: Path):
                         st.plotly_chart(fig1, use_container_width=True)
 
                 with g_col2:
-                    st.markdown("#### Auth vs Unauth")
+                    st.markdown("##### Auth vs Unauth")
                     if not forensic_df.empty:
                         status_counts = forensic_df["App Status"].value_counts().reset_index()
                         status_counts.columns = ["App Status", "count"]
@@ -728,7 +830,7 @@ def render_shadow_apps(parquet_root: Path):
                         st.plotly_chart(fig2, use_container_width=True)
 
                 with g_col3:
-                    st.markdown("#### Source Dist.")
+                    st.markdown("##### Source Dist.")
                     if not forensic_df.empty:
                         source_counts = forensic_df["source_log"].value_counts().reset_index()
                         source_counts.columns = ["Source", "count"]
@@ -736,7 +838,7 @@ def render_shadow_apps(parquet_root: Path):
                         st.plotly_chart(fig3, use_container_width=True)
 
                 with g_col4:
-                    st.markdown("#### Top Ports")
+                    st.markdown("##### Top Ports")
                     if not forensic_df.empty:
                         port_df = forensic_df[forensic_df["dst_port"] > 0]
                         if not port_df.empty:

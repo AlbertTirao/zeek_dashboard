@@ -1,9 +1,11 @@
+#ui/pages/devices
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 import requests
+import yaml # ADDED: Required for YAML parsing
 
 # =====================================================
 # Load Visual Metrics from Parquet
@@ -133,14 +135,55 @@ def get_mac_vendor(mac: str) -> str:
         return "Unknown"
 
 # =====================================================
-# Load authorized MACs
+# Load authorized MACs (UPDATED FOR YAML)
 # =====================================================
 def load_authorized_macs(file_path: Path) -> set:
+    """
+    Loads authorized MACs from YAML.
+    Handles both direct lists and dictionary keys (e.g. authorized_macs: [...]).
+    """
+    # Auto-fix extension: If .txt is passed but .yaml exists, switch to .yaml
+    if file_path.suffix == ".txt":
+        yaml_path = file_path.with_suffix(".yaml")
+        if yaml_path.exists():
+            file_path = yaml_path
+
     if not file_path.exists():
-        st.warning("authorized_macs.txt not found — all devices Unauthorized")
+        # Fallback: Create empty if missing so it doesn't crash
+        try:
+            file_path.parent.mkdir(exist_ok=True, parents=True)
+            with open(file_path, "w") as f:
+                yaml.safe_dump([], f)
+        except: pass
+        st.warning(f"Authorized file not found ({file_path.name}) — all devices Unauthorized")
         return set()
-    with open(file_path, "r") as f:
-        return {line.strip().lower() for line in f if line.strip()}
+
+    try:
+        with open(file_path, "r") as f:
+            data = yaml.safe_load(f)
+
+        if data is None: 
+            return set()
+
+        # Case 1: List
+        if isinstance(data, list):
+            return {str(line).strip().lower() for line in data if line}
+
+        # Case 2: Dictionary
+        if isinstance(data, dict):
+            # Try to find list by filename key
+            if file_path.stem in data and isinstance(data[file_path.stem], list):
+                return {str(line).strip().lower() for line in data[file_path.stem] if line}
+            
+            # Fallback: Scan values for any list
+            for val in data.values():
+                if isinstance(val, list):
+                    return {str(line).strip().lower() for line in val if line}
+
+        return set()
+    except Exception as e:
+        st.error(f"Error reading YAML: {e}")
+        return set()
 
 # =====================================================
 # Main Render Function
@@ -181,6 +224,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
     PARQUET_ROOT = Path("data/parquet")
 
     known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
+    
+    # Load from YAML now
     authorized_macs = load_authorized_macs(authorized_mac_file)
     
     if known_hosts.empty:
@@ -211,6 +256,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
         merged["host_name"], merged["domain"] = "-", None
 
     merged["host_name"] = merged.get("host_name","-").fillna("-")
+    
+    # Updated Status Check (Using YAML set)
     merged["status"] = merged["mac"].apply(lambda m: "Authorized" if m in authorized_macs else "Unauthorized")
 
     # ---------------------------------------------------------
@@ -318,7 +365,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         st.plotly_chart(line_fig, use_container_width=True)
 
     # ---------- Unauthorized Device Ratio Gauge ----------
-    st.markdown("<h2 style='color:white; text-align:left;'>Unauthorized Device Ratio</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='font-size:25px; color:white; text-align:left;'>Unauthorized Device Ratio</h2>", unsafe_allow_html=True)
     
     warning_text, warning_color, warning_icon = "STATUS: SAFE", "#6CA651", "✅"
     if risk_ratio >= 50: warning_text, warning_color, warning_icon = "STATUS: WARNING", "#F3AE4B", "⚠️"
@@ -349,7 +396,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.plotly_chart(gauge_fig, use_container_width=True)
 
     # ---------- Device Count Bar Chart ----------
-    st.markdown("<h2 style='color:white; text-align:left;'>Device Count</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='font-size:25px; color:white; text-align:left;'>Device Count</h2>", unsafe_allow_html=True)
     
     if "ts" in merged.columns and not merged.empty:
         daily_count = merged.drop_duplicates(subset=["mac","date"]).groupby(["date","status"]).size().reset_index(name="devices")
@@ -364,8 +411,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     # =====================================================
     # DEVICE INVENTORY TABLE
     # =====================================================
-    st.markdown("---")
-    st.title("Device Inventory")
+    st.subheader("Device Inventory")
 
     # 1. Prepare Date Options
     available_dates = []
