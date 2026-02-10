@@ -2,6 +2,33 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+import duckdb
+
+def search_log_with_duckdb(parquet_root, selected_date, log_type, term):
+    path = parquet_root / selected_date / f"{log_type}.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+
+    # Build SQL dynamically
+    con = duckdb.connect(database=":memory:")
+    
+    # Read schema first
+    cols = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{path}')"
+    ).fetchdf()["column_name"].tolist()
+
+    # Build OR-based search
+    conditions = " OR ".join(
+        [f"CAST({c} AS VARCHAR) ILIKE '%{term}%'" for c in cols]
+    )
+
+    query = f"""
+        SELECT *
+        FROM read_parquet('{path}')
+        WHERE {conditions}
+    """
+
+    return con.execute(query).df()
 
 # -------------------------
 # Helper: Get available dates from Parquet folders
@@ -113,9 +140,9 @@ def render(parquet_root: Path):
     search_term = st.text_input(" Filter records (search all columns)", "")
     
     if search_term:
-        # Simple case-insensitive string match across all columns
-        mask = df.astype(str).apply(lambda x: x.str.contains(search_term, case=False, na=False)).any(axis=1)
-        df_display = df[mask]
+        df_display = search_log_with_duckdb(
+            parquet_root, selected_date, selected_log, search_term
+        )
     else:
         df_display = df
 
