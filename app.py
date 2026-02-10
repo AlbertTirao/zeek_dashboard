@@ -1,7 +1,8 @@
 # app.py
 import streamlit as st
 from config.client import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_INTERVAL
-from services.drive_services import parse_drive_logs_to_parquet
+# UPDATED: Import the new sync function
+from services.drive_services import sync_drive_to_parquet 
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, devices, tables, zeek_logs, alerts, authorization
 from pathlib import Path
@@ -11,7 +12,8 @@ import os
 # One-time Zeek log → Parquet warm-up (DISK GUARDED)
 # -------------------------
 from pathlib import Path
-from services.drive_services import parse_drive_logs_to_parquet
+# UPDATED: Import the new sync function
+from services.drive_services import sync_drive_to_parquet
 
 PARQUET_DIR = Path("data/parquet")
 WARMUP_FLAG = PARQUET_DIR / ".WARMED"
@@ -20,7 +22,8 @@ status_placeholder = st.empty()
 if not WARMUP_FLAG.exists():
     st.write("🔥 Initializing Parquet cache from ALL Zeek logs...")
 
-    parse_drive_logs_to_parquet(
+    # UPDATED: Use the new incremental sync function
+    sync_drive_to_parquet(
         client_secret_path=CLIENT_SECRET_FILE,
         folder_id=FOLDER_ID,
         parquet_root=PARQUET_DIR,
@@ -59,15 +62,15 @@ else:
 # PICKLE_WARMUP_FLAG = PICKLE_DIR / ".WARMED"
 
 # if not PICKLE_WARMUP_FLAG.exists():
-#     save_parquet_as_pickle(PARQUET_DIR, PICKLE_DIR)
-#     PICKLE_WARMUP_FLAG.touch()
-#     st.write("💾 Pickle cache ready")
+#   save_parquet_as_pickle(PARQUET_DIR, PICKLE_DIR)
+#   PICKLE_WARMUP_FLAG.touch()
+#   st.write("💾 Pickle cache ready")
 # else:
-#     st.write("⚡ Pickle cache already initialized — skipping conversion")
+#   st.write("⚡ Pickle cache already initialized — skipping conversion")
 
-# # =====================================================
-# # CONFIGURATION
-# # =====================================================
+# =====================================================
+# CONFIGURATION
+# =====================================================
 # PARQUET_ROOT = Path("data/parquet")
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
 
@@ -77,7 +80,7 @@ AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
 # WARMUP_FLAG = PARQUET_ROOT / ".WARMED"
 
 # if not WARMUP_FLAG.exists():
-#     st.write("🔥 Initializing Parquet cache...")
+#   st.write("🔥 Initializing Parquet cache...")
 
 # =====================================================
 # AUTOMATIC DATA LOADING (The "Magic" Part)
@@ -86,7 +89,9 @@ AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
 if "data_synced" not in st.session_state:
     # Run the download/conversion process
     # It will now print "👍 Local cache is up to date" if nothing new exists
-    parse_drive_logs_to_parquet(
+    
+    # UPDATED: Use the new incremental sync function
+    sync_drive_to_parquet(
         client_secret_path=CLIENT_SECRET_FILE,
         folder_id=FOLDER_ID,
         parquet_root=PARQUET_DIR,
@@ -108,12 +113,19 @@ if "initialized" not in st.session_state:
 selected_page = render_sidebar(auto_refresh_interval=AUTO_REFRESH_INTERVAL)
 if st.sidebar.button("🔄 Force Refresh Data"):  
     del st.session_state.data_synced
+    # Optional: Delete the warmup flag if you want a hard reset
+    # if WARMUP_FLAG.exists():
+    #     WARMUP_FLAG.unlink()
     st.rerun()
 
 st.session_state.current_page = selected_page
 
 def render_current_page():
     page = st.session_state.current_page
+    
+    # NOTE: Ensure your page modules (devices, tables, etc.) 
+    # are updated to accept PARQUET_DIR (Path object) 
+    # and use load_single_log() internally.
     
     if page == "Devices":
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
