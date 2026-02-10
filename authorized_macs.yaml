@@ -6,7 +6,7 @@ authorized_macs:
 - mac: 00:08:22:64:50:1b
   ip: 192.168.201.38
   hostname: '-'
-  vendor: ''
+  vendor: InPro Comm
 - mac: 00:08:ca:f1:e6:6a
   ip: 192.168.201.78
   hostname: BNS-TECH-ED
@@ -64,11 +64,11 @@ authorized_macs:
   hostname: LAPTOP-8SDVCIRA
   vendor: Intel Corporate
 - mac: 46:0c:77:ad:7b:82
-  ip: 192.168.201.68
+  ip: 192.168.201.10
   hostname: '-'
   vendor: ''
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.97
+  ip: 192.168.201.99
   hostname: JE-s-A06
   vendor: ''
 - mac: 48:ee:0c:60:df:f4
@@ -100,7 +100,7 @@ authorized_macs:
   hostname: '-'
   vendor: TECNO MOBILE LIMITED
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.75
+  ip: 192.168.201.101
   hostname: Auggys-Phone
   vendor: ''
 - mac: c0:35:32:b5:43:5f
@@ -111,6 +111,10 @@ authorized_macs:
   ip: ''
   hostname: ''
   vendor: Ruijie Networks Co.,LTD
+- mac: c4:b2:5b:96:df:4f
+  ip: 192.168.201.8
+  hostname: OpenWrt
+  vendor: None
 - mac: dc:41:a9:64:da:c5
   ip: 192.168.201.106
   hostname: Shiraishi
@@ -132,7 +136,7 @@ authorized_macs:
   hostname: None
   vendor: ''
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.96
+  ip: 192.168.201.36
   hostname: Infinix-SMART-8
   vendor: ''
 - mac: f8:5e:0b:7c:50:f5
