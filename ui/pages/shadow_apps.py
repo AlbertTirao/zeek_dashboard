@@ -1769,7 +1769,6 @@
 
 
 
-# ui/pages/shadow_app.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -1845,22 +1844,25 @@ def query_shadow_logs(_conn, parquet_root: Path, target_dates: list):
             dhcp_cols = [r[0] for r in _conn.execute("DESCRIBE raw_dhcp_files").fetchall()]
             
             # Dynamic Column Selection for DHCP
-            # We pick the first matching column we find in the actual file
             dhcp_ip = next((c for c in ["client_addr", "assigned_addr", "requested_addr", "ip"] if c in dhcp_cols), "'0.0.0.0'")
             dhcp_mac = next((c for c in ["mac", "client_chaddr", "hardware_address"] if c in dhcp_cols), "'Unknown'")
+            
+            # --- NEW: Extract Hostname ---
+            dhcp_host = next((c for c in ["host_name", "client_fqdn", "hostname", "domain"] if c in dhcp_cols), "NULL")
             
             _conn.execute(f"""
                 CREATE OR REPLACE VIEW v_dhcp AS 
                 SELECT DISTINCT
                     {dhcp_ip} as ip_addr,
-                    {dhcp_mac} as mac_addr
+                    {dhcp_mac} as mac_addr,
+                    {dhcp_host} as host_name
                 FROM raw_dhcp_files
-                WHERE {dhcp_ip} IS NOT NULL AND {dhcp_mac} IS NOT NULL
+                WHERE {dhcp_ip} IS NOT NULL
             """)
         except Exception:
-            _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT '0.0.0.0' as ip_addr, 'Unknown' as mac_addr")
+            _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT '0.0.0.0' as ip_addr, 'Unknown' as mac_addr, 'Unknown' as host_name")
     else:
-        _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT '0.0.0.0' as ip_addr, 'Unknown' as mac_addr")
+        _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT '0.0.0.0' as ip_addr, 'Unknown' as mac_addr, 'Unknown' as host_name")
 
     # 3. Main Query (Dynamic Construction)
     try:
@@ -1877,8 +1879,6 @@ def query_shadow_logs(_conn, parquet_root: Path, target_dates: list):
             return f"COALESCE({', '.join(valid)}, {fallback})"
 
         # D. Build the Dynamic SQL
-        # We only ask for columns that we KNOW exist in 'raw_logs'
-        
         sql_ip = get_coalesce(["id.orig_h", "orig_h", "src_ip", "ip"], "'0.0.0.0'")
         sql_mac = get_coalesce(["mac", "orig_mac", "id.orig_mac", "src_mac"], "NULL") # NULL so we can coalesce with DHCP later
         
@@ -1898,8 +1898,7 @@ def query_shadow_logs(_conn, parquet_root: Path, target_dates: list):
             "service", "unparsed_version", "name", "note"
         ], "'-'")
         
-        # E. Context Info Logic (Complex concatenation)
-        # We build this manually based on what exists
+        # E. Context Info Logic
         info_parts = []
         if "method" in existing_cols and "uri" in existing_cols:
             info_parts.append("concat(method, ' ', uri)")
@@ -1917,6 +1916,7 @@ def query_shadow_logs(_conn, parquet_root: Path, target_dates: list):
             try_cast(ts as DOUBLE) as ts,
             {sql_ip} as ip,
             COALESCE({sql_mac}, d.mac_addr, 'Unknown') as mac,
+            COALESCE(d.host_name, 'Unknown') as host_name,
             {sql_port} as dst_port,
             {sql_sent} as bytes_sent,
             {sql_recv} as bytes_received,
@@ -2114,7 +2114,7 @@ def render_shadow_apps(parquet_root: Path):
         
         filter_col1, filter_col2 = st.columns([3, 2])
         with filter_col1: 
-            search_query_audit = st.text_input("Search (MAC, IP, Domain)", placeholder="Search...", key="audit_search").strip().lower()
+            search_query_audit = st.text_input("Search (MAC, IP, Host, Domain)", placeholder="Search...", key="audit_search").strip().lower()
         with filter_col2:
             status_filter = st.radio("Filter Status", ["All", "Authorized", "Unauthorized"], horizontal=True, key="audit_status_filter")
 
@@ -2128,6 +2128,10 @@ def render_shadow_apps(parquet_root: Path):
         # Filtering in Memory (Fast for <1M rows)
         audit_df = df.copy()
 
+        # Handle missing host_name if needed
+        if "host_name" not in audit_df.columns:
+            audit_df["host_name"] = "Unknown"
+
         if status_filter != "All":
             audit_df = audit_df[audit_df["App Status"] == status_filter]
         if selected_source_audit != "All":
@@ -2137,6 +2141,7 @@ def render_shadow_apps(parquet_root: Path):
             audit_df = audit_df[
                 (audit_df["mac"].str.contains(q, case=False, na=False)) | 
                 (audit_df["ip"].str.contains(q, case=False, na=False)) |
+                (audit_df["host_name"].str.contains(q, case=False, na=False)) | 
                 (audit_df["domain_clean"].str.contains(q, case=False, na=False))
             ]
 
@@ -2144,21 +2149,30 @@ def render_shadow_apps(parquet_root: Path):
             if dedup_enabled:
                 display_df = (
                     audit_df.sort_values("datetime")
-                    .groupby(["domain_clean", "mac", "ip", "source_log", "App Status"])
+                    .groupby(["domain_clean", "mac", "ip", "host_name", "source_log", "App Status"])
                     .agg(First_Seen=("datetime", "min"), Last_Seen=("datetime", "max"), Hits=("datetime", "count"))
                     .reset_index()
                     .sort_values("Hits", ascending=False)
                 )
                 col_config = {
-                    "domain_clean": "Application", "mac": "MAC Address", "ip": "IP Address",
-                    "source_log": "Source", "First_Seen": st.column_config.DatetimeColumn("First Seen", format="MM-DD HH:mm"),
-                    "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"), "Hits": st.column_config.NumberColumn("Total Hits"),
+                    "domain_clean": "Application", 
+                    "mac": "MAC Address", 
+                    "ip": "IP Address",
+                    "host_name": "Host Name", 
+                    "source_log": "Source", 
+                    "First_Seen": st.column_config.DatetimeColumn("First Seen", format="MM-DD HH:mm"),
+                    "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"), 
+                    "Hits": st.column_config.NumberColumn("Total Hits"),
                 }
             else:
                 display_df = audit_df.sort_values("datetime", ascending=False)
                 col_config = {
                     "datetime": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
-                    "domain_clean": "Application", "mac": "MAC Address", "ip": "IP Address", "source_log": "Source",
+                    "domain_clean": "Application", 
+                    "mac": "MAC Address", 
+                    "ip": "IP Address", 
+                    "host_name": "Host Name", 
+                    "source_log": "Source",
                 }
 
             display_df = display_df.head(1000)

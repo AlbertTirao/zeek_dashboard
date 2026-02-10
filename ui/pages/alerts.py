@@ -140,7 +140,7 @@ def render(parquet_root, authorized_macs_file):
         # User can now toggle this ON/OFF to stop the "constant rendering"
         auto_refresh = st.checkbox("Auto-Refresh", value=True)
     
-    REFRESH_RATE = 3 
+    REFRESH_RATE = 10
 
     # --- DATA LOADING ---
     df, target_file, known_hosts_df = get_latest_data(parquet_root)
