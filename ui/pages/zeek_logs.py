@@ -1,7 +1,7 @@
 # zeek_logs_duckdb.py
 import streamlit as st
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import duckdb
 import pandas as pd
 
@@ -44,49 +44,140 @@ def get_log_types_for_date(parquet_root: Path, selected_date: str):
     return [f.stem for f in sorted(date_path.glob("*.parquet"))]
 
 # -------------------------
+# Helper: Parse datetime search into a range
+# -------------------------
+def _parse_datetime_range(search_term: str):
+    """
+    If search_term looks like a datetime/date, return (start, end, precision),
+    else return None.
+
+    Supported:
+      YYYY-MM-DD
+      YYYY-MM-DD HH
+      YYYY-MM-DD HH:MM
+      YYYY-MM-DD HH:MM:SS
+      YYYY-MM-DD HH:MM:SS.ffffff
+    """
+    if not search_term:
+        return None
+
+    s = search_term.strip()
+    if not s:
+        return None
+
+    # Try most-specific first
+    patterns = [
+        ("%Y-%m-%d %H:%M:%S.%f", "micro"),
+        ("%Y-%m-%d %H:%M:%S", "second"),
+        ("%Y-%m-%d %H:%M", "minute"),
+        ("%Y-%m-%d %H", "hour"),
+        ("%Y-%m-%d", "day"),
+    ]
+
+    for fmt, precision in patterns:
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            if precision == "micro":
+                # small tolerance helps with float rounding in epoch seconds
+                start = dt - timedelta(milliseconds=1)
+                end = dt + timedelta(milliseconds=1)
+            elif precision == "second":
+                start = dt
+                end = dt + timedelta(seconds=1)
+            elif precision == "minute":
+                start = dt
+                end = dt + timedelta(minutes=1)
+            elif precision == "hour":
+                start = dt
+                end = dt + timedelta(hours=1)
+            else:  # day
+                start = dt
+                end = dt + timedelta(days=1)
+
+            return start, end, precision
+        except ValueError:
+            continue
+
+    return None
+
+# -------------------------
 # Search / Load Logs via DuckDB
 # -------------------------
-def query_parquet_log(parquet_root: Path, selected_date: str, log_type: str, search_term: str = None, limit: int = None):
-    """
-    Load or filter a Zeek log from Parquet using DuckDB.
-    - search_term: string to search across all columns (case-insensitive)
-    """
+def query_parquet_log(
+    parquet_root: Path,
+    selected_date: str,
+    log_type: str,
+    search_term: str = None,
+    limit: int = None,
+):
     path = parquet_root / selected_date / f"{log_type}.parquet"
     if not path.exists():
         return pd.DataFrame()
 
     con = get_duckdb_connection()
 
-    # 1️⃣ Read column names from the parquet schema
-    try:
-        cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchdf()["column_name"].tolist()
-    except Exception as e:
-        st.error(f"Failed to read schema: {e}")
-        return pd.DataFrame()
+    # Use POSIX-like path for DuckDB (more robust on Windows)
+    path_str = path.as_posix().replace("'", "''")
 
-    # 2️⃣ Build SQL
-    sql = f"SELECT * FROM read_parquet('{path}')"
+    # 1️⃣ Read schema (also capture types)
+    schema_df = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{path_str}')"
+    ).fetchdf()
 
-    if search_term:
-        # Quote column names properly
-        quoted_cols = [f'"{c}"' for c in cols]  # <-- double quotes fix
-        conditions = " OR ".join([f"CAST({c} AS VARCHAR) ILIKE '%{search_term}%'" for c in quoted_cols])
-        sql += f" WHERE {conditions}"
+    cols = schema_df["column_name"].tolist()
+    col_types = dict(zip(schema_df["column_name"], schema_df["column_type"]))
+
+    sql = f"SELECT * FROM read_parquet('{path_str}')"
+    params = []
+
+    if search_term and search_term.strip():
+        like = f"%{search_term.strip()}%"
+
+        quoted_cols = [f'"{c}"' for c in cols]
+        conditions = []
+
+        # General: search across all columns
+        for c in quoted_cols:
+            conditions.append(f"CAST({c} AS VARCHAR) ILIKE ?")
+            params.append(like)
+
+        # Special: datetime range filter (makes "date time" search work reliably)
+        dt_range = _parse_datetime_range(search_term)
+        if dt_range and "ts" in col_types:
+            start_dt, end_dt, _precision = dt_range
+            ts_type = str(col_types.get("ts", "")).upper()
+
+            if "TIMESTAMP" in ts_type or "DATE" in ts_type:
+                # ts stored as timestamp/date
+                conditions.append(f'("ts" >= ? AND "ts" < ?)')
+                params.extend([start_dt.replace(tzinfo=None), end_dt.replace(tzinfo=None)])
+            else:
+                # ts stored as epoch seconds (int/float/etc.)
+                start_epoch = start_dt.timestamp()
+                end_epoch = end_dt.timestamp()
+                conditions.append(f'(CAST("ts" AS DOUBLE) >= ? AND CAST("ts" AS DOUBLE) < ?)')
+                params.extend([start_epoch, end_epoch])
+
+        sql += " WHERE " + " OR ".join(conditions)
 
     if limit:
-        sql += f" LIMIT {limit}"
+        sql += f" LIMIT {int(limit)}"
 
-    # 3️⃣ Execute query
     try:
-        df = con.execute(sql).df()
+        df = con.execute(sql, params).df()
     except Exception as e:
-        st.error(f"Failed to execute query: {e}")
+        st.error(f"Query failed: {e}")
         return pd.DataFrame()
 
-    # 4️⃣ Convert 'ts' column to readable datetime if exists
+    # 4️⃣ Human-readable datetime column
     if "ts" in df.columns:
-        ts_numeric = pd.to_numeric(df["ts"], errors="coerce")
-        df.insert(0, "time", pd.to_datetime(ts_numeric, unit="s", errors="coerce"))
+        ts_type = str(col_types.get("ts", "")).upper()
+        if "TIMESTAMP" in ts_type or "DATE" in ts_type:
+            dt_series = pd.to_datetime(df["ts"], errors="coerce")
+        else:
+            dt_series = pd.to_datetime(df["ts"], unit="s", errors="coerce")
+
+        df.insert(0, "date time", dt_series)
 
     return df
 
@@ -123,12 +214,17 @@ def render(parquet_root: Path):
     df_display = query_parquet_log(parquet_root, selected_date, selected_log, search_term)
 
     if df_display.empty:
-        st.warning("No data matched or file is empty.")
+        if search_term and search_term.strip():
+            st.warning("No rows matched your filter.")
+            st.caption("Datetime search supports: YYYY-MM-DD, YYYY-MM-DD HH:MM, YYYY-MM-DD HH:MM:SS, YYYY-MM-DD HH:MM:SS.ffffff")
+        else:
+            st.warning("No data matched or file is empty.")
         return
 
     st.write(f"### {selected_log}.log ({len(df_display)} rows)")
 
     df_display = df_display.reset_index(drop=True)
     df_display.index = df_display.index + 1
+
     # 6️⃣ Display table
     st.dataframe(df_display, use_container_width=True, height=600)
