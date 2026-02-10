@@ -1,36 +1,141 @@
 authorized_macs:
-- 00:08:22:14:c5:fe
-- 00:08:22:64:50:1b
-- 00:08:ca:f1:e6:6a
-- 00:25:90:32:0b:ef
-- 02:35:19:a6:ce:46
-- 12:b3:32:34:9f:d4
-- 14:5a:fc:78:57:9b
-- 1c:87:e3:a3:4a:48
-- 1c:ce:51:c6:ee:35
-- 24:75:3a:a6:67:4d
-- 2c:3b:70:9f:7b:73
-- 2c:d8:de:1a:49:13
-- 38:8a:06:d5:3c:4e
-- 38:8f:30:9f:11:f3
-- 38:d5:7a:78:15:5f
-- 40:d1:33:7c:27:a7
-- 46:0c:77:ad:7b:82
-- 46:1d:f6:9c:b3:e1
-- 48:ee:0c:60:df:f4
-- 50:bb:b5:32:16:9c
-- 52:8a:ed:9c:86:90
-- 74:56:3c:46:e1:19
-- 94:bb:43:4e:78:e6
-- a0:02:a5:1d:14:15
-- a8:5e:f2:e4:43:9f
-- be:18:78:9d:3f:b1
-- c0:35:32:b5:43:5f
-- c4:b2:5b:96:df:47
-- dc:41:a9:64:da:c5
-- de:af:b1:52:8e:ec
-- e0:95:ff:64:6a:e0
-- e2:7d:95:d9:2e:fd
-- e8:de:27:85:6b:40
-- ea:93:6d:86:5e:cd
-- f8:5e:0b:7c:50:f5
+- mac: 00:08:22:14:c5:fe
+  ip: 192.168.201.101
+  hostname: None
+  vendor: InPro Comm
+- mac: 00:08:22:64:50:1b
+  ip: 192.168.201.38
+  hostname: '-'
+  vendor: ''
+- mac: 00:08:ca:f1:e6:6a
+  ip: 192.168.201.78
+  hostname: BNS-TECH-ED
+  vendor: TwinHan Technology Co.,Ltd
+- mac: 00:25:90:32:0b:ef
+  ip: 192.168.201.1
+  hostname: None
+  vendor: Super Micro Computer, Inc.
+- mac: 02:35:19:a6:ce:46
+  ip: 192.168.201.102
+  hostname: Irene-s
+  vendor: ''
+- mac: 12:b3:32:34:9f:d4
+  ip: 192.168.201.52
+  hostname: iPhone
+  vendor: ''
+- mac: 14:5a:fc:78:57:9b
+  ip: 192.168.201.83
+  hostname: Mikamiks
+  vendor: Liteon Technology Corporation
+- mac: 1c:87:e3:a3:4a:48
+  ip: 192.168.201.105
+  hostname: TECNO-CAMON-16
+  vendor: TECNO MOBILE LIMITED
+- mac: 1c:ce:51:c6:ee:35
+  ip: ''
+  hostname: ''
+  vendor: AzureWave Technology Inc.
+- mac: 24:75:3a:a6:67:4d
+  ip: 192.168.201.86
+  hostname: OPPO-A96
+  vendor: GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
+- mac: 2c:3b:70:9f:7b:73
+  ip: 192.168.201.109
+  hostname: PC-02
+  vendor: AzureWave Technology Inc.
+- mac: 2c:d8:de:1a:49:13
+  ip: 192.168.201.9
+  hostname: '-'
+  vendor: AltoBeam Inc.
+- mac: 38:8a:06:d5:3c:4e
+  ip: 192.168.201.110
+  hostname: Galaxy-A15-5G
+  vendor: Samsung Electronics Co.,Ltd
+- mac: 38:8f:30:9f:11:f3
+  ip: 192.168.201.79
+  hostname: Lana-s-phone
+  vendor: Samsung Electronics Co.,Ltd
+- mac: 38:d5:7a:78:15:5f
+  ip: 192.168.201.107
+  hostname: Lana-HP
+  vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
+- mac: 40:d1:33:7c:27:a7
+  ip: 192.168.201.90
+  hostname: LAPTOP-8SDVCIRA
+  vendor: Intel Corporate
+- mac: 46:0c:77:ad:7b:82
+  ip: 192.168.201.68
+  hostname: '-'
+  vendor: ''
+- mac: 46:1d:f6:9c:b3:e1
+  ip: 192.168.201.97
+  hostname: JE-s-A06
+  vendor: ''
+- mac: 48:ee:0c:60:df:f4
+  ip: 192.168.201.242
+  hostname: None
+  vendor: D-Link International
+- mac: 50:bb:b5:32:16:9c
+  ip: 192.168.201.116
+  hostname: LAPTOP-250P3062
+  vendor: AzureWave Technology Inc.
+- mac: 52:8a:ed:9c:86:90
+  ip: ''
+  hostname: ''
+  vendor: ''
+- mac: 74:56:3c:46:e1:19
+  ip: 192.168.201.243
+  hostname: zeek-intern-B760M-DS3H-AX-DDR4
+  vendor: GIGA-BYTE TECHNOLOGY CO.,LTD.
+- mac: 94:bb:43:4e:78:e6
+  ip: 192.168.201.119
+  hostname: LAPTOP-BKN517GT
+  vendor: AzureWave Technology Inc.
+- mac: a0:02:a5:1d:14:15
+  ip: 192.168.201.114
+  hostname: Lester
+  vendor: Intel Corporate
+- mac: a8:5e:f2:e4:43:9f
+  ip: 192.168.201.39
+  hostname: '-'
+  vendor: TECNO MOBILE LIMITED
+- mac: be:18:78:9d:3f:b1
+  ip: 192.168.201.75
+  hostname: Auggys-Phone
+  vendor: ''
+- mac: c0:35:32:b5:43:5f
+  ip: 192.168.201.115
+  hostname: chesca
+  vendor: ''
+- mac: c4:b2:5b:96:df:47
+  ip: ''
+  hostname: ''
+  vendor: Ruijie Networks Co.,LTD
+- mac: dc:41:a9:64:da:c5
+  ip: 192.168.201.106
+  hostname: Shiraishi
+  vendor: Intel Corporate
+- mac: de:af:b1:52:8e:ec
+  ip: ''
+  hostname: ''
+  vendor: ''
+- mac: e0:95:ff:64:6a:e0
+  ip: ''
+  hostname: ''
+  vendor: Infinix mobility limited
+- mac: e2:7d:95:d9:2e:fd
+  ip: 192.168.201.58
+  hostname: '-'
+  vendor: ''
+- mac: e8:de:27:85:6b:40
+  ip: 192.168.201.50
+  hostname: None
+  vendor: ''
+- mac: ea:93:6d:86:5e:cd
+  ip: 192.168.201.96
+  hostname: Infinix-SMART-8
+  vendor: ''
+- mac: f8:5e:0b:7c:50:f5
+  ip: 192.168.201.84
+  hostname: Realme-X
+  vendor: ''
