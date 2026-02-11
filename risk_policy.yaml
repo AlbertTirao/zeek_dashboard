@@ -1,0 +1,52 @@
+# risk_policy.yaml
+# Risk Policy Configuration
+# This policy is consumed by ui/pages/shadow_app.py.
+#
+# How risk is decided (in code order):
+# 1) Behavior tags from traffic volume/anomalies:
+#    - Potential Exfiltration  -> Critical
+#    - Protocol Anomaly        -> High
+#    - Heavy Download          -> Medium
+# 2) Policy rules below (ports / source logs)
+# 3) Low rules by app_status
+# 4) default
+
+critical:
+  # Logs that usually indicate a security-relevant detection or protocol abuse
+  source_logs:
+    - "NOTICE"
+    - "WEIRD"
+  # Optional: add ports you consider "critical" in your environment
+  ports:
+    - 4444 # common C2/backdoor port (example)
+    - 31337 # common backdoor example
+
+high:
+  # Remote admin / legacy / high-risk services
+  ports:
+    - 22 # SSH
+    - 23 # Telnet
+    - 3389 # RDP
+    - 5900 # VNC
+  # Optional: treat certain logs as high signal in your environment
+  source_logs:
+    - "SOFTWARE" # software inventory/install activity (optional)
+
+medium:
+  # Common database ports (often sensitive)
+  ports:
+    - 1433 # SQL Server
+    - 3306 # MySQL
+    - 5432 # PostgreSQL
+  # Optional: file activity can be meaningful for shadow upload / install trails
+  source_logs:
+    - "FILES" # file transfers / file observations (optional)
+
+low:
+  # Baseline "trusted/normal" status. Anything else falls to default below.
+  app_status:
+    - "Authorized"
+
+# Default baseline for traffic that doesn't match rules above.
+# Recommended: "Low" (instead of "Safe") so unknown traffic isn't automatically "green".
+default: "Low"
