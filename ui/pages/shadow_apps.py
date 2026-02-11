@@ -966,7 +966,7 @@ def render_shadow_apps(parquet_root: Path):
     # =============================================================================
     with t1:
         st.markdown("### Application Audit Log")
-        st.info("Click any MAC Address row to open the Shadow App Forensics popup for that device.")
+        st.info("Click any row to open the Shadow App Forensics popup for that device.")
 
         filter_col1, filter_col2, filter_col3 = st.columns([3, 2, 2])
         with filter_col1:
