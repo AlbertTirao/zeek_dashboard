@@ -711,7 +711,7 @@ def render_banning_list(ban_file: Path):
             key="ban_add_input"
         )
     with col_btn:
-        if st.button("Ban MAC", type="primary", key="ban_add_btn"):
+        if st.button("Enter", type="primary", key="ban_add_btn"):
             if new_text:
                 entries = [m.strip().lower() for m in re.split(r'[,\s\n]+', new_text) if m.strip()]
                 existing = {d.get("mac", "").lower() for d in ban_list}
@@ -818,7 +818,7 @@ def render(mac_file: Path):
     st.write("")
 
     # ONLY CHANGE HERE: add a 5th tab for banning list (kept others same)
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Device Access", "Domain Whitelist", "AI Policies", "Audit Log", "Banning List"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Device Access", "Domain Whitelist", "AI Policies", "Audit Log", "Banned List"])
 
     with tab1:
         render_device_manager(saved_devices, mac_file)
@@ -843,8 +843,3 @@ def render(mac_file: Path):
     with tab5:
         render_banning_list(ban_file)
 
-if __name__ == "__main__":
-    st.set_page_config(page_title="Authorization Manager", layout="wide")
-    current_dir = Path(__file__).parent.absolute()
-    test_file = current_dir / "authorized_macs.yaml"
-    render(test_file)
