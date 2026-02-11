@@ -2,6 +2,7 @@
 import os
 import re
 import time
+from datetime import datetime as _dt
 import numpy as np
 import streamlit as st
 import pandas as pd
@@ -46,10 +47,34 @@ def score_to_risk(score: int) -> str:
     return SCORE_TO_RISK.get(int(score), "Safe")
 
 
-def risk_multiselect(label: str, key: str, default=None):
+def _mark_dialog_origin():
+    """
+    One-shot token used to keep the dialog open only on reruns triggered
+    from inside the dialog widgets.
+    """
+    st.session_state["shadow_dialog_origin"] = "dialog"
+
+
+def risk_multiselect(label: str, key: str, default=None, on_change=None):
     if default is None:
         default = ["Critical", "High", "Medium", "Low"]
-    return st.multiselect(label, ["Critical", "High", "Medium", "Low", "Safe"], default=default, key=key)
+    return st.multiselect(
+        label,
+        ["Critical", "High", "Medium", "Low", "Safe"],
+        default=default,
+        key=key,
+        on_change=on_change,
+    )
+
+
+def _close_shadow_dialog(reset_grid: bool = True):
+    st.session_state["shadow_dialog_open"] = False
+    st.session_state["shadow_dialog_mac"] = None
+    st.session_state["shadow_last_selected_mac"] = None
+    st.session_state.pop("shadow_dialog_origin", None)
+
+    if reset_grid:
+        st.session_state["shadow_grid_nonce"] = int(st.session_state.get("shadow_grid_nonce", 0)) + 1
 
 
 # -----------------------------
@@ -133,9 +158,25 @@ LOG_TYPES = ["http", "ssl", "dns", "files", "conn", "software", "weird", "notice
 
 @st.cache_data(show_spinner=False)
 def list_available_dates(parquet_root: Path):
+    """
+    Only return real day folders (YYYY-MM-DD) and EXCLUDE _shadow_cache.
+    """
     if not parquet_root.exists():
         return []
-    return sorted([d.name for d in parquet_root.iterdir() if d.is_dir()], reverse=True)
+
+    out = []
+    for d in parquet_root.iterdir():
+        if not d.is_dir():
+            continue
+        if d.name == CACHE_DIRNAME:
+            continue
+        try:
+            _dt.strptime(d.name, "%Y-%m-%d")
+            out.append(d.name)
+        except ValueError:
+            continue
+
+    return sorted(out, reverse=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -347,7 +388,10 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], log_files: list[str]) ->
         sql_port = get_cast_coalesce(["id.resp_p", "dst_port", "resp_p"], "INT")
         sql_sent = get_cast_coalesce(["orig_bytes", "id.orig_bytes"], "BIGINT")
         sql_recv = get_cast_coalesce(["resp_bytes", "id.resp_bytes"], "BIGINT")
-        sql_app = get_coalesce(["host", "server_name", "query", "filename", "service", "unparsed_version", "name", "note"], "'-'")
+        sql_app = get_coalesce(
+            ["host", "server_name", "query", "filename", "service", "unparsed_version", "name", "note"],
+            "'-'",
+        )
 
         info_parts = []
         if "method" in existing_cols and "uri" in existing_cols:
@@ -640,17 +684,18 @@ def _sql_fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
 
 
 # =============================================================================
-# Dialog (STATE-DRIVEN, STAYS OPEN)
+# Dialog (FIXED: closes properly + doesn't auto-pop on page revisit)
 # =============================================================================
 @st.dialog("Shadow App Forensics Details", width="large")
 def show_forensics_dialog(conn):
+    # Mark that reruns from widgets inside this dialog should keep it open
+    # (via on_change callbacks)
     target_mac = st.session_state.get("shadow_dialog_mac")
 
     top = st.columns([1, 6])
     with top[0]:
-        if st.button("Close", use_container_width=True):
-            st.session_state["shadow_dialog_open"] = False
-            st.session_state["shadow_dialog_mac"] = None
+        if st.button("Close", use_container_width=True, type="primary"):
+            _close_shadow_dialog(reset_grid=True)
             st.rerun()
 
     with top[1]:
@@ -672,16 +717,23 @@ def show_forensics_dialog(conn):
             ["App Run (Connectivity)", "App Usage (Interaction)", "App Install (Files)", "Suspicious Behavior"],
             horizontal=True,
             key=f"dlg_view_{target_mac}",
+            on_change=_mark_dialog_origin,
         )
     with f_col2:
         src_df = _sql_fetch_df(conn, "SELECT DISTINCT source_log FROM shadow_events WHERE mac = ? ORDER BY 1", [target_mac])
         f_raw_sources = src_df["source_log"].dropna().tolist() if not src_df.empty else []
-        selected_f_source = st.selectbox("Filter Source", ["All"] + f_raw_sources, key=f"dlg_src_{target_mac}")
+        selected_f_source = st.selectbox(
+            "Filter Source",
+            ["All"] + f_raw_sources,
+            key=f"dlg_src_{target_mac}",
+            on_change=_mark_dialog_origin,
+        )
     with f_col3:
         forensic_risk = risk_multiselect(
             "Filter Risk",
             key=f"dlg_risk_{target_mac}",
             default=["Critical", "High", "Medium", "Low", "Safe"],
+            on_change=_mark_dialog_origin,
         )
 
     where = ["mac = ?"]
@@ -759,6 +811,22 @@ def show_forensics_dialog(conn):
             hide_index=True,
         )
 
+def hide_dialog_x_button():
+    st.markdown(
+        """
+        <style>
+        /* Hide the built-in X close button on Streamlit dialogs */
+        div[role="dialog"] button[aria-label="Close"],
+        div[role="dialog"] button[title="Close"],
+        div[data-testid="stDialog"] button[aria-label="Close"],
+        div[data-testid="stDialog"] button[title="Close"] {
+            display: none !important;
+            visibility: hidden !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # =============================================================================
 # Main Render
@@ -766,20 +834,39 @@ def show_forensics_dialog(conn):
 def render_shadow_apps(parquet_root: Path):
     st.markdown("#### Shadow Apps Overview")
 
-    # --- init dialog state ---
-    if "shadow_dialog_open" not in st.session_state:
-        st.session_state["shadow_dialog_open"] = False
-    if "shadow_dialog_mac" not in st.session_state:
-        st.session_state["shadow_dialog_mac"] = None
+    hide_dialog_x_button() 
+
+    # --- init state ---
+    st.session_state.setdefault("shadow_dialog_open", False)
+    st.session_state.setdefault("shadow_dialog_mac", None)
+    st.session_state.setdefault("shadow_last_selected_mac", None)
+    st.session_state.setdefault("shadow_grid_nonce", 0)
+
+    # --- auto-close stale dialogs ---
+    # Keep the dialog open ONLY when the rerun was triggered by:
+    #   - a grid click (origin='grid')
+    #   - a dialog widget interaction (origin='dialog')
+    origin = st.session_state.pop("shadow_dialog_origin", None)
+    if st.session_state.get("shadow_dialog_open") and origin not in ("grid", "dialog"):
+        _close_shadow_dialog(reset_grid=False)
 
     available_dates = list_available_dates(parquet_root)
     if not available_dates:
         st.warning("No log directories found.")
         return
 
-    date_options = ["All Available Dates"] + available_dates
-    selected_option = st.selectbox("Select Date Range", date_options, index=1 if len(date_options) > 1 else 0)
-    target_dates = available_dates if selected_option == "All Available Dates" else [selected_option]
+    # Day-by-day ONLY (no All Dates, and no _shadow_cache)
+    def _on_day_change():
+        _close_shadow_dialog(reset_grid=True)
+
+    selected_day = st.selectbox(
+        "Select Day (YYYY-MM-DD)",
+        available_dates,
+        index=0,
+        key="shadow_day_select",
+        on_change=_on_day_change,
+    )
+    target_dates = [selected_day]
 
     approved = load_allowlist()
     allow_re = compile_allow_regex(approved)
@@ -791,13 +878,13 @@ def render_shadow_apps(parquet_root: Path):
 
     cached_files = read_cached_files(parquet_root, target_dates)
     if not cached_files:
-        st.info("No cached shadow files available for selected range.")
+        st.info("No cached shadow files available for selected day.")
         return
 
     register_shadow_view(conn, cached_files)
 
-    # --- if dialog is open, render it every run so it stays open ---
-    if st.session_state["shadow_dialog_open"] and st.session_state["shadow_dialog_mac"]:
+    # --- render dialog only when allowed for this rerun ---
+    if st.session_state.get("shadow_dialog_open") and st.session_state.get("shadow_dialog_mac") and origin in ("grid", "dialog"):
         show_forensics_dialog(conn)
 
     # Metrics
@@ -883,11 +970,24 @@ def render_shadow_apps(parquet_root: Path):
 
         filter_col1, filter_col2, filter_col3 = st.columns([3, 2, 2])
         with filter_col1:
-            search_query_audit = st.text_input("Search (MAC, IP, Domain)", placeholder="Search...", key="audit_search").strip()
+            search_query_audit = st.text_input(
+                "Search (MAC, IP, Domain)",
+                placeholder="Search...",
+                key="audit_search",
+            ).strip()
         with filter_col2:
-            status_filter = st.radio("Filter Status", ["All", "Authorized", "Unauthorized"], horizontal=True, key="audit_status_filter")
+            status_filter = st.radio(
+                "Filter Status",
+                ["All", "Authorized", "Unauthorized"],
+                horizontal=True,
+                key="audit_status_filter",
+            )
         with filter_col3:
-            audit_risk_filter = risk_multiselect("Filter Risk", key="audit_risk_filter", default=["Critical", "High", "Medium", "Low", "Safe"])
+            audit_risk_filter = risk_multiselect(
+                "Filter Risk",
+                key="audit_risk_filter",
+                default=["Critical", "High", "Medium", "Low", "Safe"],
+            )
 
         where = []
         params = []
@@ -1020,6 +1120,8 @@ def render_shadow_apps(parquet_root: Path):
 
             ag_theme, ag_css = get_aggrid_theme_and_css()
 
+            grid_key = f"shadow_audit_grid_{int(st.session_state.get('shadow_grid_nonce', 0))}"
+
             grid_response = AgGrid(
                 display_df,
                 gridOptions=grid_options,
@@ -1031,17 +1133,13 @@ def render_shadow_apps(parquet_root: Path):
                 allow_unsafe_jscode=True,
                 fit_columns_on_grid_load=True,
                 reload_data=False,
-                key="shadow_audit_grid",
+                key=grid_key,
             )
 
-            # ---- selection -> open dialog ----
+            # ---- selection -> open dialog (ONLY when selection changes) ----
             selected_rows = grid_response.get("selected_rows", None)
-
             selected_mac = None
 
-            # streamlit-aggrid can return either:
-            #  - list[dict]
-            #  - pandas.DataFrame
             if isinstance(selected_rows, pd.DataFrame):
                 if not selected_rows.empty and "mac" in selected_rows.columns:
                     selected_mac = selected_rows.iloc[0]["mac"]
@@ -1051,27 +1149,17 @@ def render_shadow_apps(parquet_root: Path):
 
             if selected_mac:
                 selected_mac = str(selected_mac).strip().lower()
-                if (
-                    selected_mac != st.session_state.get("shadow_dialog_mac")
-                    or not st.session_state.get("shadow_dialog_open")
-                ):
+                prev = st.session_state.get("shadow_last_selected_mac")
+
+                if selected_mac != prev:
+                    st.session_state["shadow_last_selected_mac"] = selected_mac
                     st.session_state["shadow_dialog_mac"] = selected_mac
                     st.session_state["shadow_dialog_open"] = True
+                    st.session_state["shadow_dialog_origin"] = "grid"
                     st.rerun()
-
-
-            # streamlit-aggrid usually returns list[dict]
-            if isinstance(selected_rows, list) and len(selected_rows) > 0 and isinstance(selected_rows[0], dict):
-                selected_mac = selected_rows[0].get("mac")
-
-            if selected_mac:
-                selected_mac = str(selected_mac).strip().lower()
-
-                # ✅ two-phase open: store state then rerun so dialog appears "after" selection rerun
-                if selected_mac != st.session_state.get("shadow_dialog_mac") or not st.session_state.get("shadow_dialog_open"):
-                    st.session_state["shadow_dialog_mac"] = selected_mac
-                    st.session_state["shadow_dialog_open"] = True
-                    st.rerun()
+            else:
+                # If user cleared selection (or grid reset), allow re-clicking same MAC later
+                st.session_state["shadow_last_selected_mac"] = None
 
         # License Compliance (unchanged)
         st.markdown("### License Compliance Audit")
@@ -1094,7 +1182,9 @@ def render_shadow_apps(parquet_root: Path):
         with table_col:
             st.dataframe(
                 usage_df.style.map(
-                    lambda x: "color: #FF4B4B; font-weight: 600;" if x == "Usage Detected" else "color: #00CC96; font-weight: 600;",
+                    lambda x: "color: #FF4B4B; font-weight: 600;"
+                    if x == "Usage Detected"
+                    else "color: #00CC96; font-weight: 600;",
                     subset=["Status"],
                 ),
                 use_container_width=True,
