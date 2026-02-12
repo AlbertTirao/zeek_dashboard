@@ -24,6 +24,11 @@ authorized_macs:
   hostname: Irene-s
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
+- mac: 10:5a:95:9f:2f:c7
+  ip: ''
+  hostname: ''
+  vendor: TP-Link Systems Inc.
+  date_modified: '2026-02-12 15:32:12'
 - mac: 12:b3:32:34:9f:d4
   ip: 192.168.201.52
   hostname: iPhone
@@ -49,6 +54,11 @@ authorized_macs:
   hostname: OPPO-A96
   vendor: GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
   date_modified: '2026-02-12 12:37:33'
+- mac: 28:d0:f5:d0:a6:08
+  ip: ''
+  hostname: ''
+  vendor: Ruijie Networks Co.,LTD
+  date_modified: '2026-02-12 15:31:30'
 - mac: 2c:3b:70:9f:7b:73
   ip: 192.168.201.152
   hostname: PC-02
@@ -80,12 +90,12 @@ authorized_macs:
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:0c:77:ad:7b:82
-  ip: 192.168.201.10
+  ip: 192.168.201.68
   hostname: '-'
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.99
+  ip: 192.168.201.140
   hostname: JE-s-A06
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -110,7 +120,7 @@ authorized_macs:
   vendor: GIGA-BYTE TECHNOLOGY CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: 94:bb:43:4e:78:e6
-  ip: 192.168.201.119
+  ip: 192.168.201.103
   hostname: LAPTOP-BKN517GT
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
@@ -125,7 +135,7 @@ authorized_macs:
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.101
+  ip: 192.168.201.143
   hostname: Auggys-Phone
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -170,7 +180,7 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.36
+  ip: 192.168.201.141
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'

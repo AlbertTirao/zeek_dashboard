@@ -2,12 +2,9 @@
 # Streamlit module: detects Unauthorized/Verified devices from Zeek parquet (DHCP/ARP/CONN),
 # keeps "Last Seen" per MAC, and enriches IP/Host/Vendor where available.
 #
-# Update (Time Range Metrics):
-# - Adds a Time Range selector (Last 7 Days / Specific Date / All Time)
-# - Metrics (Total Devices Seen / Verified Devices / Unauthorized Devices) now reflect the selected time range
-# - Tables shown via the existing View buttons are also filtered by the selected time range
-#
-# Drop-in replacement for your current alerts.py
+# Fixes applied:
+# 1) Deterministic YAML list selection (preferred keys + stem key) to match Devices page
+# 2) Keeps robust MAC normalization (aa:bb:cc:dd:ee:ff) for both logs + YAML
 
 import os
 import re
@@ -31,6 +28,15 @@ except ImportError:
 # =============================================================================
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 _DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# YAML list key preference (must match Devices)
+PREFERRED_AUTH_KEYS = [
+    "authorized_macs",
+    "allowlist",
+    "authorized_devices",
+    "devices",
+    "authorized",
+]
 
 
 # =============================================================================
@@ -90,6 +96,38 @@ def to_datetime_series(s: pd.Series) -> pd.Series:
         unit = "s"
 
     return pd.to_datetime(num, unit=unit, errors="coerce", utc=False)
+
+
+# =============================================================================
+# YAML LIST EXTRACTION (DETERMINISTIC)
+# =============================================================================
+def _extract_yaml_list(data, stem_key: str, preferred_keys: List[str]) -> List:
+    """
+    Deterministic selection:
+      1) preferred keys in order (if dict)
+      2) stem key (filename stem) (if dict)
+      3) first list value in dict (fallback)
+      4) if YAML is a list => return it
+    """
+    if data is None:
+        return []
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for k in preferred_keys:
+            if k in data and isinstance(data[k], list):
+                return data[k]
+
+        if stem_key and stem_key in data and isinstance(data[stem_key], list):
+            return data[stem_key]
+
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+
+    return []
 
 
 # =============================================================================
@@ -183,25 +221,22 @@ def _discover_date_dirs(parquet_root: Path) -> Dict[str, List[Path]]:
     """
     by_date: Dict[str, List[Path]] = {}
 
-    # fast path: immediate children
     immediate = [p for p in parquet_root.iterdir() if p.is_dir() and _DATE_DIR_RE.match(p.name)]
     candidates = immediate
 
-    # fallback: search deeper if no immediate date folders
     if not candidates:
         candidates = [p for p in parquet_root.rglob("*") if p.is_dir() and _DATE_DIR_RE.match(p.name)]
 
     for d in candidates:
         by_date.setdefault(d.name, []).append(d)
 
-    # Keep deterministic ordering (useful for caching keys)
     for k in list(by_date.keys()):
         by_date[k] = sorted(by_date[k], key=lambda p: str(p))
     return by_date
 
 
 # =============================================================================
-# AUTHORIZED MACS (YAML)
+# AUTHORIZED MACS (YAML) - FIXED LIST SELECTION
 # =============================================================================
 def load_authorized_macs(auth_file: str) -> set:
     """
@@ -209,6 +244,7 @@ def load_authorized_macs(auth_file: str) -> set:
       - authorized_macs: ["aa:bb:..", ...]
       - authorized_macs: [{"mac": "aa:bb:.."}, ...]
       - ["aa:bb:..", ...]
+    Deterministic list selection to match Devices.
     """
     allowed = set()
     file_path = Path(auth_file)
@@ -222,20 +258,12 @@ def load_authorized_macs(auth_file: str) -> set:
         return allowed
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        data = yaml.safe_load(file_path.read_text(encoding="utf-8"))
     except Exception as e:
         st.error(f"Error reading authorized MACs file: {e}")
         return allowed
 
-    raw_list = []
-    if isinstance(data, dict):
-        for v in data.values():
-            if isinstance(v, list):
-                raw_list = v
-                break
-    elif isinstance(data, list):
-        raw_list = data
+    raw_list = _extract_yaml_list(data, file_path.stem, PREFERRED_AUTH_KEYS)
 
     for item in raw_list:
         if isinstance(item, dict) and "mac" in item:
@@ -506,7 +534,11 @@ def _load_events_and_known_hosts_for_dirs(dir_paths: Tuple[str, ...]) -> Tuple[p
             if not ev.empty:
                 events.append(ev)
 
-    all_events = pd.concat(events, ignore_index=True) if events else pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
+    all_events = (
+        pd.concat(events, ignore_index=True)
+        if events
+        else pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
+    )
     known_hosts = pd.concat(known_hosts_all, ignore_index=True) if known_hosts_all else pd.DataFrame()
     return all_events, known_hosts
 
@@ -530,7 +562,6 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
         return tmp, f"Last 7 Days (since {cutoff.strftime('%Y-%m-%d %H:%M')})"
 
     if mode == "Specific Date" and selected_date:
-        # Selected date is in YYYY-MM-DD
         start = datetime.strptime(selected_date, "%Y-%m-%d")
         end = start + timedelta(days=1)
         tmp = tmp[(tmp["ts_dt"] >= start) & (tmp["ts_dt"] < end)]
@@ -548,9 +579,6 @@ def render(parquet_root: str, authorized_macs_file: str):
         st.error(f"Directory '{parquet_root}' not found.")
         return
 
-    # -----------------------------
-    # Time range selector (mirrors devices page)
-    # -----------------------------
     by_date = _discover_date_dirs(root)
     available_dates = sorted(by_date.keys(), reverse=True)
 
@@ -577,25 +605,21 @@ def render(parquet_root: str, authorized_macs_file: str):
                 selected_date = st.selectbox(
                     "Select Date:",
                     options=available_dates,
-                    index=0 if st.session_state.get("alerts_time_date") not in available_dates else available_dates.index(st.session_state["alerts_time_date"]),
+                    index=0
+                    if st.session_state.get("alerts_time_date") not in available_dates
+                    else available_dates.index(st.session_state["alerts_time_date"]),
                     key="alerts_time_date",
                 )
         else:
-            st.write("")  # keeps layout stable
+            st.write("")
 
-    # -----------------------------
-    # Determine which date dirs to load
-    # -----------------------------
     dir_paths: List[str] = []
 
     if not available_dates:
-        # fallback: no date folders => load "latest matching" behavior (original alerts.py)
-        # This keeps the page usable even if your parquet tree is not date-folder based.
         st.info("Date folders not detected. Falling back to latest DHCP/ARP/CONN parquet files found in the tree.")
 
         allowed_macs = load_authorized_macs(authorized_macs_file)
 
-        # original discovery: latest files anywhere
         def _find_latest_matching(parquet_root_path: Path, keywords: List[str]) -> Optional[Path]:
             files = list(parquet_root_path.rglob("*.parquet"))
             if not files:
@@ -654,7 +678,6 @@ def render(parquet_root: str, authorized_macs_file: str):
         _render_alerts_ui(devices, range_label)
         return
 
-    # Normal path: date folders exist
     if time_mode == "All Time":
         for d in available_dates:
             for p in by_date[d]:
@@ -663,7 +686,6 @@ def render(parquet_root: str, authorized_macs_file: str):
         for p in by_date.get(selected_date, []):
             dir_paths.append(str(p))
     else:
-        # Last 7 Days => load only the dates that could possibly be in the rolling window
         cutoff_date = (datetime.now().date() - timedelta(days=7))
         for d in available_dates:
             try:
@@ -678,9 +700,6 @@ def render(parquet_root: str, authorized_macs_file: str):
         st.info("No parquet date folders matched the selected time range.")
         return
 
-    # -----------------------------
-    # Load events + known_hosts, then filter precisely
-    # -----------------------------
     all_events, known_hosts_df = _load_events_and_known_hosts_for_dirs(tuple(dir_paths))
     all_events, range_label = _apply_time_filter(all_events, time_mode, selected_date)
 
@@ -710,10 +729,8 @@ def _render_alerts_ui(devices: pd.DataFrame, range_label: str) -> None:
     verified_df = devices[devices["status"] == "Verified"].copy()
     unauth_df = devices[devices["status"] == "Unauthorized"].copy()
 
-    # Default view mode
     st.session_state.setdefault("unauth_macs_view", "Unauthorized")
 
-    # Metrics + View Buttons
     st.divider()
     colA, colB, colC = st.columns(3)
 
@@ -732,13 +749,11 @@ def _render_alerts_ui(devices: pd.DataFrame, range_label: str) -> None:
         if st.button("View Unauthorized Devices", use_container_width=True, key="view_unauthorized_devices"):
             st.session_state["unauth_macs_view"] = "Unauthorized"
 
-    # Summary banner (scoped to time range)
     if len(unauth_df) > 0:
         st.error(f"SECURITY ALERT: {len(unauth_df)} UNAUTHORIZED DEVICE(S) DETECTED — {range_label}")
     else:
         st.success(f"System Secure. No unauthorized devices detected — {range_label}")
 
-    # Render selected table
     view = st.session_state.get("unauth_macs_view", "Unauthorized")
 
     if view == "Total":

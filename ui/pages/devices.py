@@ -1,7 +1,18 @@
 # ui/pages/device.py
+# Fixes applied:
+# 1) Uses the SAME normalize_mac() as alerts.py for:
+#    - known_hosts["mac"]
+#    - dhcp["mac"]
+#    - authorized_macs YAML
+#    - banned_macs YAML
+#    - forensic drilldown MAC comparisons
+# 2) Deterministic YAML list selection (preferred keys + stem key), so it always reads the right list
+
 import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional, List
 
 import pandas as pd
 import plotly.express as px
@@ -17,6 +28,62 @@ except ImportError:
     st.error("This solution requires the 'streamlit-aggrid' library.")
     st.info("Please run: pip install streamlit-aggrid")
     st.stop()
+
+# =============================================================================
+# MAC NORMALIZATION (MATCH ALERTS)
+# =============================================================================
+_MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
+
+def normalize_mac(x) -> Optional[str]:
+    """Normalize MAC to 'aa:bb:cc:dd:ee:ff'. Return None if invalid."""
+    if x is None:
+        return None
+    if isinstance(x, (bytes, bytearray)) and len(x) == 6:
+        hx = bytes(x).hex()
+    else:
+        hx = _MAC_HEX_RE.sub("", str(x))
+    if len(hx) != 12:
+        return None
+    return ":".join(hx[i:i+2] for i in range(0, 12, 2)).lower()
+
+# YAML key preference (must match Alerts)
+PREFERRED_AUTH_KEYS = [
+    "authorized_macs",
+    "allowlist",
+    "authorized_devices",
+    "devices",
+    "authorized",
+]
+PREFERRED_BAN_KEYS = [
+    "banned_macs",
+    "denylist",
+    "blocked_macs",
+    "blocked",
+    "banned",
+]
+
+def _extract_list_from_yaml(data, stem_key: str, preferred_keys: List[str]) -> list:
+    """
+    Deterministic selection:
+      1) preferred keys (if dict)
+      2) stem key (filename stem) (if dict)
+      3) first list in dict (fallback)
+      4) if YAML is list => return it
+    """
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in preferred_keys:
+            if k in data and isinstance(data[k], list):
+                return data[k]
+        if stem_key and stem_key in data and isinstance(data[stem_key], list):
+            return data[stem_key]
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+    return []
 
 
 # =====================================================
@@ -50,25 +117,13 @@ def get_device_activity(parquet_root: Path, target_mac: str, target_ip: str, sel
     activity_log = []
     log_types = [("dns", "DNS", "query"), ("http", "HTTP", "host"), ("ssl", "SSL", "server_name")]
 
-    target_mac_norm = (target_mac or "").strip().lower()
+    target_mac_norm = normalize_mac(target_mac) or ""
     target_ip_norm = (target_ip or "").strip()
 
     if selected_date_str and selected_date_str != "All Dates":
         day_dirs = [parquet_root / selected_date_str]
     else:
         day_dirs = sorted((p for p in parquet_root.iterdir() if p.is_dir()))
-
-    def _normalize_mac_one(x) -> str:
-        if x is None:
-            return ""
-        # parquet sometimes stores MAC as 6 bytes
-        if isinstance(x, (bytes, bytearray)) and len(x) == 6:
-            hx = bytes(x).hex()
-            return ":".join(hx[i : i + 2] for i in range(0, 12, 2))
-        return str(x).strip().lower()
-
-    def _normalize_mac_series(s: pd.Series) -> pd.Series:
-        return s.map(_normalize_mac_one)
 
     def _coerce_ts(series: pd.Series) -> pd.Series:
         if pd.api.types.is_datetime64_any_dtype(series):
@@ -113,8 +168,8 @@ def get_device_activity(parquet_root: Path, target_mac: str, target_ip: str, sel
 
                 # Prefer MAC match when present
                 if "mac" in df.columns and target_mac_norm:
-                    mac_norm = _normalize_mac_series(df["mac"])
-                    filtered = df[mac_norm == target_mac_norm]
+                    mac_norm_series = df["mac"].map(normalize_mac)
+                    filtered = df[mac_norm_series == target_mac_norm]
 
                 # Else fallback to IP match if possible
                 elif target_ip_norm:
@@ -163,7 +218,6 @@ def get_device_activity(parquet_root: Path, target_mac: str, target_ip: str, sel
 # =====================================================
 @st.cache_data(show_spinner=False)
 def get_mac_vendor(mac: str) -> str:
-    # kept for compatibility with other pages
     if not mac or mac == "unknown":
         return "Unknown"
     try:
@@ -184,53 +238,25 @@ def load_authorized_macs(file_path: Path) -> set:
         return set()
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        data = yaml.safe_load(file_path.read_text(encoding="utf-8"))
     except Exception as e:
         st.error(f"Error reading YAML: {e}")
         return set()
 
-    if data is None:
-        return set()
-
-    raw_list = []
-    if isinstance(data, list):
-        raw_list = data
-    elif isinstance(data, dict):
-        if file_path.stem in data and isinstance(data[file_path.stem], list):
-            raw_list = data[file_path.stem]
-        else:
-            for val in data.values():
-                if isinstance(val, list):
-                    raw_list = val
-                    break
+    raw_list = _extract_list_from_yaml(data, file_path.stem, PREFERRED_AUTH_KEYS)
 
     final_macs = set()
     for item in raw_list:
         if isinstance(item, str):
-            m = item.strip().lower()
-            if m:
-                final_macs.add(m)
+            m = normalize_mac(item)
         elif isinstance(item, dict):
-            m = str(item.get("mac", "")).strip().lower()
-            if m:
-                final_macs.add(m)
+            m = normalize_mac(item.get("mac"))
+        else:
+            m = None
+        if m:
+            final_macs.add(m)
 
     return final_macs
-
-
-def _extract_list_from_yaml(data, stem_key: str):
-    if data is None:
-        return []
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        if stem_key in data and isinstance(data[stem_key], list):
-            return data[stem_key]
-        for v in data.values():
-            if isinstance(v, list):
-                return v
-    return []
 
 
 def load_banned_macs(ban_file: Path) -> set:
@@ -239,7 +265,7 @@ def load_banned_macs(ban_file: Path) -> set:
       banned_macs.yaml:
         banned_macs:
           - "aa:bb:.."
-          - {mac: "aa:bb:..", date_modified: "..."}   (from authorization page)
+          - {mac: "aa:bb:..", date_modified: "..."}
     """
     if not ban_file.exists():
         return set()
@@ -248,24 +274,25 @@ def load_banned_macs(ban_file: Path) -> set:
     except Exception:
         return set()
 
-    raw_list = _extract_list_from_yaml(data, ban_file.stem)
+    raw_list = _extract_list_from_yaml(data, ban_file.stem, PREFERRED_BAN_KEYS)
 
     banned = set()
     for it in raw_list:
         if isinstance(it, str):
-            m = it.strip().lower()
-            if m:
-                banned.add(m)
+            m = normalize_mac(it)
         elif isinstance(it, dict):
-            m = str(it.get("mac", "")).strip().lower()
-            if m:
-                banned.add(m)
+            m = normalize_mac(it.get("mac"))
+        else:
+            m = None
+        if m:
+            banned.add(m)
     return banned
 
 
 def save_banned_macs(ban_file: Path, banned_set: set) -> None:
     ban_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = {ban_file.stem: sorted(list(banned_set))}
+    # Always store under a deterministic key to avoid future ambiguity
+    payload = {"banned_macs": sorted(list(banned_set))}
     ban_file.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
@@ -362,12 +389,8 @@ def _humanize_ago(delta: timedelta) -> str:
 def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_store: Path):
     """
     Returns:
-      - authorized_set: set[str] normalized mac
+      - authorized_set: set[str] normalized mac (aa:bb:cc:dd:ee:ff)
       - added_at_map: dict[str, datetime] when it was first seen in the authorized list
-    Rules:
-      - If YAML item is dict and has timestamp fields, use them (best-effort)
-      - Else use persistent JSON store authorized_macs_history.json
-      - If newly authorized and no timestamp exists, set to now (first moment this code sees it authorized)
     """
     if file_path.suffix == ".txt":
         yaml_path = file_path.with_suffix(".yaml")
@@ -384,46 +407,53 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
         st.error(f"Error reading YAML: {e}")
         return set(), {}
 
-    raw_list = _extract_list_from_yaml(data, file_path.stem)
+    raw_list = _extract_list_from_yaml(data, file_path.stem, PREFERRED_AUTH_KEYS)
 
-    store = _load_auth_history_store(authorized_mac_file_for_store)
-    store_norm = {str(k).strip().lower(): v for k, v in store.items() if isinstance(k, str)}
+    # Normalize store keys so old formats (hyphen/upper/no-colon) still map correctly
+    store_raw = _load_auth_history_store(authorized_mac_file_for_store)
+    store_norm = {}
+    for k, v in (store_raw or {}).items():
+        if not isinstance(k, str):
+            continue
+        nk = normalize_mac(k)
+        if nk:
+            store_norm[nk] = v
 
     now = datetime.now()
     authorized_set = set()
     added_at_map = {}
 
     for item in raw_list:
-        mac = None
+        mac_norm = None
         added_dt = None
 
         if isinstance(item, str):
-            mac = item.strip().lower()
+            mac_norm = normalize_mac(item)
         elif isinstance(item, dict):
-            mac = str(item.get("mac", "")).strip().lower()
+            mac_norm = normalize_mac(item.get("mac"))
             for k in ["date_added", "added_at", "timestamp", "created_at", "date_modified"]:
                 if k in item and item.get(k):
                     added_dt = _parse_any_dt(item.get(k))
                     if added_dt:
                         break
 
-        if not mac:
+        if not mac_norm:
             continue
 
-        authorized_set.add(mac)
+        authorized_set.add(mac_norm)
 
         if added_dt:
-            added_at_map[mac] = added_dt
-            store_norm[mac] = added_dt.strftime("%Y-%m-%d %H:%M:%S")
+            added_at_map[mac_norm] = added_dt
+            store_norm[mac_norm] = added_dt.strftime("%Y-%m-%d %H:%M:%S")
             continue
 
-        stored_str = store_norm.get(mac)
+        stored_str = store_norm.get(mac_norm)
         stored_dt = _parse_any_dt(stored_str) if stored_str else None
         if stored_dt:
-            added_at_map[mac] = stored_dt
+            added_at_map[mac_norm] = stored_dt
         else:
-            added_at_map[mac] = now
-            store_norm[mac] = now.strftime("%Y-%m-%d %H:%M:%S")
+            added_at_map[mac_norm] = now
+            store_norm[mac_norm] = now.strftime("%Y-%m-%d %H:%M:%S")
 
     _save_auth_history_store(authorized_mac_file_for_store, store_norm)
     return authorized_set, added_at_map
@@ -463,7 +493,7 @@ def _close_dialog():
 
 
 # =====================================================
-# Forensic popup (aligned row: Time Range | Service | Date)
+# Forensic popup
 # =====================================================
 @st.dialog(" ", width="large", dismissible=False)
 def forensic_popup(parquet_root, mac, ip, available_dates_list):
@@ -540,9 +570,6 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
         st.warning("No activity logs found for the selected filter.")
         return
 
-    # =========================
-    # Traffic Volume (small dataset fix)
-    # =========================
     st.markdown("#### Traffic Volume")
 
     tmp = activity_df.copy()
@@ -559,7 +586,6 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
         st.info("No traffic volume data to chart.")
         return
 
-    # Key fix: if only one hour exists, extend the range by 1 hour
     if hour_min == hour_max:
         hour_max = hour_min + pd.Timedelta(hours=1)
 
@@ -607,12 +633,6 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
 
 # =====================================================
 # Device list popup (EXCLUDES banned + adds Download)
-# Authorized:
-#   - Date column shows Authorized At
-#   - History shows Added X ago
-# Unauthorized:
-#   - Date column shows Last Seen
-#   - History shows Last seen X ago
 # =====================================================
 @st.dialog("  ", width="large", dismissible=False)
 def device_list_popup(status_type, df, parquet_root, available_dates_list, banned_macs: set, authorized_added_at_map: dict):
@@ -671,43 +691,33 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     )
 
     inventory = inventory.sort_values("last_seen", ascending=False)
-
     now = datetime.now()
 
     if status_type == "Authorized":
         def _get_added_dt(mac: str):
-            m = str(mac).strip().lower()
-            dtv = authorized_added_at_map.get(m)
-            return dtv if isinstance(dtv, datetime) else None
+            m = normalize_mac(mac)
+            return authorized_added_at_map.get(m) if m else None
 
         inventory["authorized_at"] = inventory["mac"].map(_get_added_dt)
 
-        # Date shows when you authorized it
         inventory["date_str"] = inventory["authorized_at"].apply(
             lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, datetime) else "-"
         )
 
-        # History shows time since it was authorized
         inventory["history"] = inventory["authorized_at"].apply(
             lambda d: ("Added " + _humanize_ago(now - d)) if isinstance(d, datetime) else "-"
         )
 
     else:
-        # Date shows last seen from logs
         inventory["date_str"] = inventory["last_seen"].dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        # History shows time since last seen
         inventory["history"] = inventory["last_seen"].apply(
             lambda d: ("Last seen " + _humanize_ago(now - d)) if isinstance(d, datetime) else "-"
         )
 
-    # Keep only requested visible columns
     inventory = inventory[["mac", "ip", "host_name", "date_str", "history", "last_seen"]].copy()
-
     inventory = inventory.reset_index(drop=True)
     inventory.insert(0, "#", inventory.index + 1)
 
-    # Download CSV
     csv_bytes = inventory.drop(columns=["last_seen"], errors="ignore").to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download CSV",
@@ -723,11 +733,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     gb.configure_column("mac", header_name="MAC Address")
     gb.configure_column("ip", header_name="IP Address")
     gb.configure_column("host_name", header_name="Host Name")
-
-    gb.configure_column(
-        "date_str",
-        header_name=("Authorized At" if status_type == "Authorized" else "Last Seen"),
-    )
+    gb.configure_column("date_str", header_name=("Authorized At" if status_type == "Authorized" else "Last Seen"))
     gb.configure_column("history", header_name="History")
     gb.configure_column("last_seen", hide=True)
 
@@ -753,7 +759,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
 
 
 # =====================================================
-# Custom metric block (UPDATED delta text -> "+2 (today)")
+# Custom metric block (unchanged)
 # =====================================================
 def render_metric(
     label: str,
@@ -772,9 +778,7 @@ def render_metric(
         dv = 0.0
 
     show = abs(dv) >= 1e-12
-
-    # ---- fixed delta slot height so buttons never move ----
-    SLOT_H = 38  # px (same space whether pill or empty)
+    SLOT_H = 38  # px
 
     if show:
         suffix = "%" if delta_is_percent else ""
@@ -800,7 +804,6 @@ def render_metric(
             f"</div>"
         )
     else:
-        # empty but SAME HEIGHT as delta pill slot
         delta_html = f"<div style='height:{SLOT_H}px;'></div>"
 
     st.markdown(f"<div style='font-size:14px; opacity:0.85'>{label}</div>", unsafe_allow_html=True)
@@ -809,6 +812,7 @@ def render_metric(
         unsafe_allow_html=True,
     )
     st.markdown(delta_html, unsafe_allow_html=True)
+
 
 # =====================================================
 # Main Render
@@ -830,7 +834,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     PARQUET_ROOT = Path(logs_root)
     known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
 
-    # track Authorized "added at" timestamps
+    # track Authorized "added at" timestamps (normalized MAC keys)
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
     )
@@ -850,13 +854,18 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     if "mac" in known_hosts.columns:
         known_hosts = known_hosts.copy()
-        known_hosts["mac"] = known_hosts["mac"].astype(str).str.lower().str.strip()
+        known_hosts["mac"] = known_hosts["mac"].map(normalize_mac)
+        known_hosts = known_hosts.dropna(subset=["mac"])
+    else:
+        st.error("known_hosts.parquet has no 'mac' column.")
+        return
 
     # Merge DHCP (optional)
     if not dhcp.empty:
         if "mac" in dhcp.columns:
             dhcp = dhcp.copy()
-            dhcp["mac"] = dhcp["mac"].astype(str).str.lower().str.strip()
+            dhcp["mac"] = dhcp["mac"].map(normalize_mac)
+            dhcp = dhcp.dropna(subset=["mac"])
             dhcp_cols = [c for c in ["mac", "host_name", "domain"] if c in dhcp.columns]
             dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"])
             merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
@@ -871,7 +880,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     merged["host_name"] = merged.get("host_name", "-").fillna("-")
 
-    # ts -> datetime + date
+    # ts -> datetime + date (kept same behavior)
     if "ts" in merged.columns:
         merged = merged.copy()
         merged["ts"] = pd.to_numeric(merged["ts"], errors="coerce")
@@ -879,12 +888,12 @@ def render(logs_root: Path, authorized_mac_file: Path):
         merged = merged.dropna(subset=["ts"])
         merged["date"] = merged["ts"].dt.date
 
-    # STRICT RULE:
+    # STRICT RULE (NOW NORMALIZED-CORRECT):
     merged["status"] = merged["mac"].apply(
-        lambda m: "Authorized" if (str(m).strip().lower() in authorized_macs) else "Unauthorized"
+        lambda m: "Authorized" if (m in authorized_macs) else "Unauthorized"
     )
 
-    # EXCLUDE BANNED EVERYWHERE
+    # EXCLUDE BANNED EVERYWHERE (normalized set)
     in_scope = merged.copy()
     if "mac" in in_scope.columns and banned_macs:
         in_scope = in_scope[~in_scope["mac"].isin(banned_macs)]
@@ -907,10 +916,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     }
 
     # =====================================================
-    # DAILY DELTA LOGIC (UPDATED)
-    # - Shows: "+2 (today)" / "-1 (today)"
-    # - Locks for the day (refresh won't change delta)
-    # - Resets tomorrow; if no change tomorrow => hides delta
+    # DAILY DELTA LOGIC (unchanged)
     # =====================================================
     today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -935,7 +941,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     prev_state = store.get("state") if isinstance(store.get("state"), dict) else None
 
-    # New day -> set baseline to last known state (yesterday end), reset delta and unlock
     if store.get("daily_date") != today_str:
         baseline = prev_state if isinstance(prev_state, dict) else current_state
         store["daily_date"] = today_str
@@ -964,15 +969,13 @@ def render(logs_root: Path, authorized_mac_file: Path):
             "risk": round(current_state["risk"] - b_risk, 2),
         }
 
-        # Only lock if something changed today. If still zero, keep unlocked so it stays hidden.
         if not _delta_is_zero(computed):
             store["daily_delta"] = computed
             store["daily_locked"] = True
             daily_delta = computed
         else:
-            daily_delta = computed  # zero -> UI hides it
+            daily_delta = computed
 
-    # Always update last known state for tomorrow’s baseline
     store["state"] = current_state
     save_metrics_store(authorized_mac_file, store)
 
@@ -987,7 +990,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     GREY = "#9aa0a6"
     CYAN = "#00F7FF"
 
-    # 5 metrics
     m1, m2, m3, m4, m5 = st.columns(5)
 
     with m1:
@@ -1017,7 +1019,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     st.markdown("---")
 
-    # Activity Overview
     st.subheader("Activity Overview")
     hourly = pd.DataFrame()
     if not in_scope.empty:
@@ -1040,7 +1041,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    # Unauthorized Device Ratio
     st.markdown("<h2 style='color:white; text-align:left;'>Unauthorized Device Ratio</h2>", unsafe_allow_html=True)
 
     warning_text, warning_color, warning_icon = "STATUS: SAFE", "#6CA651", "✅"
@@ -1094,7 +1094,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     )
     st.plotly_chart(gauge_fig, use_container_width=True)
 
-    # Dialog manager
     raw_dates = sorted([str(d) for d in merged["date"].unique() if pd.notnull(d)], reverse=True)
 
     if st.session_state.active_dialog == "list":
