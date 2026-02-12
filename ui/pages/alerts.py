@@ -1,4 +1,4 @@
-# ui/pages/unauthorized_macs.py
+# ui/pages/alerts.py
 # Streamlit module: detects Unauthorized MACs from Zeek parquet (DHCP/ARP/CONN),
 # keeps "Last Seen" per MAC, and fills Host Name/IP using the latest non-null value per MAC.
 #
@@ -395,7 +395,7 @@ def build_display_table(df: pd.DataFrame) -> pd.DataFrame:
                 "mac_norm": "MAC Address",
                 "vendor": "Vendor",
                 "host": "Host Name",
-                "seen_in": "Seen In",
+                "seen_in": "Source",
                 "status": "Status",
             }
         )

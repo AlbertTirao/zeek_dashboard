@@ -1,191 +1,145 @@
 authorized_macs:
-- mac: 00:08:22:14:c5:fe
-  ip: 192.168.201.101
-  hostname: None
-  vendor: InPro Comm
-  date_modified: '2026-02-11 08:56:19'
-- mac: 00:08:22:64:50:1b
-  ip: 192.168.201.38
-  hostname: '-'
-  vendor: InPro Comm
-  date_modified: '2026-02-11 08:56:19'
-- mac: 00:08:ca:f1:e6:6a
-  ip: 192.168.201.78
-  hostname: BNS-TECH-ED
-  vendor: TwinHan Technology Co.,Ltd
-  date_modified: '2026-02-11 08:56:19'
-- mac: 00:25:90:32:0b:ef
-  ip: 192.168.201.1
-  hostname: None
-  vendor: Super Micro Computer, Inc.
-  date_modified: '2026-02-11 08:56:19'
-- mac: 02:35:19:a6:ce:46
-  ip: 192.168.201.102
-  hostname: Irene-s
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: 10:5a:95:9f:2f:c7
-  ip: ''
-  hostname: ''
-  vendor: TP-Link Systems Inc.
-  date_modified: '2026-02-11 08:59:59'
-- mac: 12:b3:32:34:9f:d4
-  ip: 192.168.201.52
-  hostname: iPhone
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: 14:5a:fc:78:57:9b
-  ip: 192.168.201.130
-  hostname: Mikamiks
-  vendor: Liteon Technology Corporation
-  date_modified: '2026-02-11 08:56:19'
-- mac: 1c:87:e3:a3:4a:48
-  ip: 192.168.201.126
-  hostname: TECNO-CAMON-16
-  vendor: TECNO MOBILE LIMITED
-  date_modified: '2026-02-11 08:56:19'
-- mac: 1c:ce:51:c6:ee:35
-  ip: ''
-  hostname: ''
-  vendor: AzureWave Technology Inc.
-  date_modified: '2026-02-11 08:56:19'
-- mac: 24:75:3a:a6:67:4d
-  ip: 192.168.201.134
-  hostname: OPPO-A96
-  vendor: GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
-  date_modified: '2026-02-11 08:56:19'
-- mac: 28:d0:f5:d0:a6:08
-  ip: ''
-  hostname: ''
-  vendor: Ruijie Networks Co.,LTD
-  date_modified: '2026-02-11 11:57:24'
-- mac: 2c:3b:70:9f:7b:73
-  ip: 192.168.201.132
-  hostname: PC-02
-  vendor: AzureWave Technology Inc.
-  date_modified: '2026-02-11 10:32:13'
-- mac: 2c:d8:de:1a:49:13
-  ip: 192.168.201.9
-  hostname: '-'
-  vendor: AltoBeam Inc.
-  date_modified: '2026-02-11 08:56:19'
-- mac: 38:8a:06:d5:3c:4e
-  ip: 192.168.201.131
-  hostname: Galaxy-A15-5G
-  vendor: Samsung Electronics Co.,Ltd
-  date_modified: '2026-02-11 08:56:19'
-- mac: 38:8f:30:9f:11:f3
-  ip: 192.168.201.125
-  hostname: Lana-s-phone
-  vendor: Samsung Electronics Co.,Ltd
-  date_modified: '2026-02-11 08:56:19'
-- mac: 38:d5:7a:78:15:5f
-  ip: 192.168.201.128
-  hostname: Lana-HP
-  vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
-  date_modified: '2026-02-11 08:56:19'
-- mac: 40:d1:33:7c:27:a7
-  ip: 192.168.201.135
-  hostname: LAPTOP-8SDVCIRA
-  vendor: Intel Corporate
-  date_modified: '2026-02-11 08:56:19'
-- mac: 46:0c:77:ad:7b:82
-  ip: 192.168.201.10
-  hostname: '-'
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.99
-  hostname: JE-s-A06
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: 48:ee:0c:60:df:f4
-  ip: 192.168.201.242
-  hostname: None
-  vendor: D-Link International
-  date_modified: '2026-02-11 08:56:19'
-- mac: 50:bb:b5:32:16:9c
-  ip: 192.168.201.136
-  hostname: LAPTOP-250P3062
-  vendor: AzureWave Technology Inc.
-  date_modified: '2026-02-11 08:56:19'
-- mac: 52:8a:ed:9c:86:90
-  ip: ''
-  hostname: ''
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: 74:56:3c:46:e1:19
-  ip: 192.168.201.243
-  hostname: zeek-intern-B760M-DS3H-AX-DDR4
-  vendor: GIGA-BYTE TECHNOLOGY CO.,LTD.
-  date_modified: '2026-02-11 08:56:19'
-- mac: 94:bb:43:4e:78:e6
-  ip: 192.168.201.119
-  hostname: LAPTOP-BKN517GT
-  vendor: AzureWave Technology Inc.
-  date_modified: '2026-02-11 08:56:19'
-- mac: a0:02:a5:1d:14:15
-  ip: 192.168.201.114
-  hostname: Lester
-  vendor: Intel Corporate
-  date_modified: '2026-02-11 08:56:19'
-- mac: a8:5e:f2:e4:43:9f
-  ip: 192.168.201.39
-  hostname: '-'
-  vendor: TECNO MOBILE LIMITED
-  date_modified: '2026-02-11 08:56:19'
-- mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.101
-  hostname: Auggys-Phone
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: c0:35:32:b5:43:5f
-  ip: 192.168.201.137
-  hostname: chesca
-  vendor: Liteon Technology Corporation
-  date_modified: '2026-02-11 08:56:19'
-- mac: c4:b2:5b:96:df:47
-  ip: ''
-  hostname: ''
-  vendor: Ruijie Networks Co.,LTD
-  date_modified: '2026-02-11 08:56:19'
-- mac: c4:b2:5b:96:df:4f
-  ip: 192.168.201.8
-  hostname: OpenWrt
-  vendor: None
-  date_modified: '2026-02-11 08:56:19'
-- mac: dc:41:a9:64:da:c5
-  ip: 192.168.201.127
-  hostname: Shiraishi
-  vendor: Intel Corporate
-  date_modified: '2026-02-11 08:56:19'
-- mac: de:af:b1:52:8e:ec
-  ip: ''
-  hostname: ''
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: e0:95:ff:64:6a:e0
-  ip: ''
-  hostname: ''
-  vendor: Infinix mobility limited
-  date_modified: '2026-02-11 08:56:19'
-- mac: e2:7d:95:d9:2e:fd
-  ip: 192.168.201.58
-  hostname: '-'
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: e8:de:27:85:6b:40
-  ip: 192.168.201.50
-  hostname: None
-  vendor: TP-LINK TECHNOLOGIES CO.,LTD.
-  date_modified: '2026-02-11 08:56:19'
-- mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.36
-  hostname: Infinix-SMART-8
-  vendor: ''
-  date_modified: '2026-02-11 08:56:19'
-- mac: f8:5e:0b:7c:50:f5
-  ip: 192.168.201.129
-  hostname: Realme-X
-  vendor: Realme Chongqing Mobile Telecommunications Corp.,Ltd.
-  date_modified: '2026-02-11 08:56:19'
+  - mac: 00:08:22:14:c5:fe
+    ip: 192.168.201.101
+    hostname: None
+    vendor: InPro Comm
+  - mac: 00:08:22:64:50:1b
+    ip: 192.168.201.38
+    hostname: "-"
+    vendor: InPro Comm
+  - mac: 00:08:ca:f1:e6:6a
+    ip: 192.168.201.78
+    hostname: BNS-TECH-ED
+    vendor: TwinHan Technology Co.,Ltd
+  - mac: 00:25:90:32:0b:ef
+    ip: 192.168.201.1
+    hostname: None
+    vendor: Super Micro Computer, Inc.
+  - mac: 02:35:19:a6:ce:46
+    ip: 192.168.201.102
+    hostname: Irene-s
+    vendor: ""
+  - mac: 12:b3:32:34:9f:d4
+    ip: 192.168.201.52
+    hostname: iPhone
+    vendor: ""
+  - mac: 14:5a:fc:78:57:9b
+    ip: 192.168.201.154
+    hostname: Mikamiks
+    vendor: Liteon Technology Corporation
+  - mac: 1c:87:e3:a3:4a:48
+    ip: 192.168.201.146
+    hostname: TECNO-CAMON-16
+    vendor: TECNO MOBILE LIMITED
+  - mac: 1c:ce:51:c6:ee:35
+    ip: 192.168.201.162
+    hostname: Mayt
+    vendor: AzureWave Technology Inc.
+  - mac: 24:75:3a:a6:67:4d
+    ip: 192.168.201.156
+    hostname: OPPO-A96
+    vendor: GUANGDONG OPPO MOBILE TELECOMMUNICATIONS CORP.,LTD
+  - mac: 2c:3b:70:9f:7b:73
+    ip: 192.168.201.152
+    hostname: PC-02
+    vendor: AzureWave Technology Inc.
+  - mac: 2c:d8:de:1a:49:13
+    ip: 192.168.201.9
+    hostname: "-"
+    vendor: AltoBeam Inc.
+  - mac: 38:8a:06:d5:3c:4e
+    ip: 192.168.201.150
+    hostname: Galaxy-A15-5G
+    vendor: Samsung Electronics Co.,Ltd
+  - mac: 38:8f:30:9f:11:f3
+    ip: 192.168.201.149
+    hostname: Lana-s-phone
+    vendor: Samsung Electronics Co.,Ltd
+  - mac: 38:d5:7a:78:15:5f
+    ip: 192.168.201.153
+    hostname: Lana-HP
+    vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
+  - mac: 40:d1:33:7c:27:a7
+    ip: 192.168.201.157
+    hostname: LAPTOP-8SDVCIRA
+    vendor: Intel Corporate
+  - mac: 46:0c:77:ad:7b:82
+    ip: 192.168.201.68
+    hostname: "-"
+    vendor: ""
+  - mac: 46:1d:f6:9c:b3:e1
+    ip: 192.168.201.121
+    hostname: JE-s-A06
+    vendor: ""
+  - mac: 48:ee:0c:60:df:f4
+    ip: 192.168.201.242
+    hostname: None
+    vendor: D-Link International
+  - mac: 50:bb:b5:32:16:9c
+    ip: 192.168.201.160
+    hostname: LAPTOP-250P3062
+    vendor: AzureWave Technology Inc.
+  - mac: 52:8a:ed:9c:86:90
+    ip: ""
+    hostname: ""
+    vendor: ""
+  - mac: 74:56:3c:46:e1:19
+    ip: 192.168.201.243
+    hostname: zeek-intern-B760M-DS3H-AX-DDR4
+    vendor: GIGA-BYTE TECHNOLOGY CO.,LTD.
+  - mac: 94:bb:43:4e:78:e6
+    ip: 192.168.201.119
+    hostname: LAPTOP-BKN517GT
+    vendor: AzureWave Technology Inc.
+  - mac: a0:02:a5:1d:14:15
+    ip: 192.168.201.158
+    hostname: Lester
+    vendor: Intel Corporate
+  - mac: a8:5e:f2:e4:43:9f
+    ip: 192.168.201.39
+    hostname: "-"
+    vendor: TECNO MOBILE LIMITED
+  - mac: be:18:78:9d:3f:b1
+    ip: 192.168.201.123
+    hostname: Auggys-Phone
+    vendor: ""
+  - mac: c0:35:32:b5:43:5f
+    ip: 192.168.201.159
+    hostname: chesca
+    vendor: ""
+  - mac: c4:b2:5b:96:df:47
+    ip: ""
+    hostname: ""
+    vendor: Ruijie Networks Co.,LTD
+  - mac: c4:b2:5b:96:df:4f
+    ip: 192.168.201.8
+    hostname: OpenWrt
+    vendor: None
+  - mac: dc:41:a9:64:da:c5
+    ip: 192.168.201.147
+    hostname: Shiraishi
+    vendor: Intel Corporate
+  - mac: de:af:b1:52:8e:ec
+    ip: ""
+    hostname: ""
+    vendor: ""
+  - mac: e0:95:ff:64:6a:e0
+    ip: ""
+    hostname: ""
+    vendor: Infinix mobility limited
+  - mac: e2:7d:95:d9:2e:fd
+    ip: 192.168.201.58
+    hostname: "-"
+    vendor: ""
+  - mac: e8:de:27:85:6b:40
+    ip: 192.168.201.50
+    hostname: None
+    vendor: ""
+  - mac: ea:93:6d:86:5e:cd
+    ip: 192.168.201.96
+    hostname: Infinix-SMART-8
+    vendor: ""
+  - mac: f8:5e:0b:7c:50:f5
+    ip: 192.168.201.151
+    hostname: Realme-X
+    vendor: ""
