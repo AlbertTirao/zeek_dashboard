@@ -4,7 +4,7 @@ from config.client import LOGS_DIR, CLIENT_SECRET_FILE, FOLDER_ID, AUTO_REFRESH_
 # UPDATED: Import the new sync function
 from services.drive_services import sync_drive_to_parquet 
 from ui.sidebar import render_sidebar
-from ui.pages import analytics, devices, tables, zeek_logs, alerts, authorization
+from ui.pages import analytics, devices, zeek_logs, alerts, authorization
 from pathlib import Path
 import os
 
@@ -93,9 +93,6 @@ def render_current_page():
     
     if page == "Devices":
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
-    
-    elif page == "Tables":
-        tables.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
         
     elif page == "Analytics":
         analytics.render(PARQUET_DIR)
