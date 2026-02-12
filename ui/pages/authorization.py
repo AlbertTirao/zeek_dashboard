@@ -920,7 +920,7 @@ def render(mac_file: Path):
     st.write("")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Device Access", "Domain Whitelist", "AI Policies", "Audit Log", "Banned List"]
+        ["Device Access", "Domain Whitelist", "AI Policies", "Audit Log", "Ban List"]
     )
 
     with tab1:

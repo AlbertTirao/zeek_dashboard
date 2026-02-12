@@ -290,7 +290,7 @@ def save_metrics_store(authorized_mac_file: Path, store: dict) -> None:
 
 
 # =====================================================
-# 3b) Authorized History Store (kept; not used for history anymore)
+# 3b) Authorized "Added At" store (persistent, safe, does not touch YAML)
 # =====================================================
 def _auth_history_store_file(authorized_mac_file: Path) -> Path:
     return authorized_mac_file.with_name("authorized_macs_history.json")
@@ -360,7 +360,15 @@ def _humanize_ago(delta: timedelta) -> str:
 
 
 def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_store: Path):
-    # Kept to avoid removing anything; still returns authorized set + map if you need it later.
+    """
+    Returns:
+      - authorized_set: set[str] normalized mac
+      - added_at_map: dict[str, datetime] when it was first seen in the authorized list
+    Rules:
+      - If YAML item is dict and has timestamp fields, use them (best-effort)
+      - Else use persistent JSON store authorized_macs_history.json
+      - If newly authorized and no timestamp exists, set to now (first moment this code sees it authorized)
+    """
     if file_path.suffix == ".txt":
         yaml_path = file_path.with_suffix(".yaml")
         if yaml_path.exists():
@@ -532,6 +540,9 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
         st.warning("No activity logs found for the selected filter.")
         return
 
+    # =========================
+    # Traffic Volume (small dataset fix)
+    # =========================
     st.markdown("#### Traffic Volume")
 
     tmp = activity_df.copy()
@@ -548,6 +559,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
         st.info("No traffic volume data to chart.")
         return
 
+    # Key fix: if only one hour exists, extend the range by 1 hour
     if hour_min == hour_max:
         hour_max = hour_min + pd.Timedelta(hours=1)
 
@@ -595,8 +607,12 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
 
 # =====================================================
 # Device list popup (EXCLUDES banned + adds Download)
-# Columns: MAC | IP | Host Name | Date | History
-# History is computed from the SAME "Date" (last_seen)
+# Authorized:
+#   - Date column shows Authorized At
+#   - History shows Added X ago
+# Unauthorized:
+#   - Date column shows Last Seen
+#   - History shows Last seen X ago
 # =====================================================
 @st.dialog("  ", width="large", dismissible=False)
 def device_list_popup(status_type, df, parquet_root, available_dates_list, banned_macs: set, authorized_added_at_map: dict):
@@ -656,22 +672,42 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
 
     inventory = inventory.sort_values("last_seen", ascending=False)
 
-    # Date column = Last Seen timestamp (what you want)
-    inventory["date_str"] = inventory["last_seen"].dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    # FIX: History is based on the SAME last_seen date (not added time)
     now = datetime.now()
-    inventory["history"] = inventory["last_seen"].apply(
-        lambda d: _humanize_ago(now - d) if isinstance(d, datetime) else "-"
-    )
 
-    # Final column order you requested
+    if status_type == "Authorized":
+        def _get_added_dt(mac: str):
+            m = str(mac).strip().lower()
+            dtv = authorized_added_at_map.get(m)
+            return dtv if isinstance(dtv, datetime) else None
+
+        inventory["authorized_at"] = inventory["mac"].map(_get_added_dt)
+
+        # Date shows when you authorized it
+        inventory["date_str"] = inventory["authorized_at"].apply(
+            lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, datetime) else "-"
+        )
+
+        # History shows time since it was authorized
+        inventory["history"] = inventory["authorized_at"].apply(
+            lambda d: ("Added " + _humanize_ago(now - d)) if isinstance(d, datetime) else "-"
+        )
+
+    else:
+        # Date shows last seen from logs
+        inventory["date_str"] = inventory["last_seen"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # History shows time since last seen
+        inventory["history"] = inventory["last_seen"].apply(
+            lambda d: ("Last seen " + _humanize_ago(now - d)) if isinstance(d, datetime) else "-"
+        )
+
+    # Keep only requested visible columns
     inventory = inventory[["mac", "ip", "host_name", "date_str", "history", "last_seen"]].copy()
 
     inventory = inventory.reset_index(drop=True)
     inventory.insert(0, "#", inventory.index + 1)
 
-    # Download CSV (only visible columns)
+    # Download CSV
     csv_bytes = inventory.drop(columns=["last_seen"], errors="ignore").to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download CSV",
@@ -687,7 +723,11 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     gb.configure_column("mac", header_name="MAC Address")
     gb.configure_column("ip", header_name="IP Address")
     gb.configure_column("host_name", header_name="Host Name")
-    gb.configure_column("date_str", header_name="Date")
+
+    gb.configure_column(
+        "date_str",
+        header_name=("Authorized At" if status_type == "Authorized" else "Last Seen"),
+    )
     gb.configure_column("history", header_name="History")
     gb.configure_column("last_seen", hide=True)
 
@@ -713,7 +753,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
 
 
 # =====================================================
-# Custom metric block
+# Custom metric block (UPDATED delta text -> "+2 (today)")
 # =====================================================
 def render_metric(
     label: str,
@@ -732,6 +772,10 @@ def render_metric(
         dv = 0.0
 
     show = abs(dv) >= 1e-12
+
+    # ---- fixed delta slot height so buttons never move ----
+    SLOT_H = 38  # px (same space whether pill or empty)
+
     if show:
         suffix = "%" if delta_is_percent else ""
         if delta_is_percent:
@@ -742,29 +786,29 @@ def render_metric(
         up = dv > 0
         arrow = "↑" if up else "↓"
         sign = "+" if up else ""
-        label_txt = "Increase" if up else "Decrease"
         color = up_color if up else down_color
-        delta_text = f"{arrow} {sign}{disp}{suffix} ({label_txt})"
+        delta_text = f"{arrow} {sign}{disp}{suffix} (today)"
+
+        delta_html = (
+            f"<div style='height:{SLOT_H}px; display:flex; align-items:center;'>"
+            f"  <div style='display:inline-flex; align-items:center; justify-content:center;"
+            f"      padding:4px 10px; border-radius:999px;"
+            f"      background:rgba(255,255,255,0.06);"
+            f"      color:{color}; font-size:16px; font-weight:600;'>"
+            f"    {delta_text}"
+            f"  </div>"
+            f"</div>"
+        )
     else:
-        delta_text = ""
-        color = down_color
+        # empty but SAME HEIGHT as delta pill slot
+        delta_html = f"<div style='height:{SLOT_H}px;'></div>"
 
     st.markdown(f"<div style='font-size:14px; opacity:0.85'>{label}</div>", unsafe_allow_html=True)
     st.markdown(
         f"<div style='font-size:42px; font-weight:650; line-height:1.1'>{value_str}</div>",
         unsafe_allow_html=True,
     )
-
-    if show:
-        st.markdown(
-            f"<div style='display:inline-block; margin-top:6px; padding:4px 10px; border-radius:999px; "
-            f"background:rgba(255,255,255,0.06); color:{color}; font-size:16px; font-weight:600;'>"
-            f"{delta_text}</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown("<div style='height:30px;'></div>", unsafe_allow_html=True)
-
+    st.markdown(delta_html, unsafe_allow_html=True)
 
 # =====================================================
 # Main Render
@@ -786,7 +830,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     PARQUET_ROOT = Path(logs_root)
     known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
 
-    # kept (returns added map too, but history now uses last_seen)
+    # track Authorized "added at" timestamps
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
     )
@@ -854,7 +898,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     unauth_seen = int(in_scope[in_scope["status"] == "Unauthorized"]["mac"].nunique())
     risk = round((unauth_seen / total_devices * 100), 2) if total_devices else 0.0
 
-    # Persist deltas across refresh
     current_state = {
         "total": total_devices,
         "active_today": active_today,
@@ -863,67 +906,88 @@ def render(logs_root: Path, authorized_mac_file: Path):
         "risk": float(risk),
     }
 
+    # =====================================================
+    # DAILY DELTA LOGIC (UPDATED)
+    # - Shows: "+2 (today)" / "-1 (today)"
+    # - Locks for the day (refresh won't change delta)
+    # - Resets tomorrow; if no change tomorrow => hides delta
+    # =====================================================
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    def _delta_is_zero(d: dict) -> bool:
+        if not isinstance(d, dict):
+            return True
+        if int(d.get("total", 0)) != 0:
+            return False
+        if int(d.get("active_today", 0)) != 0:
+            return False
+        if int(d.get("auth", 0)) != 0:
+            return False
+        if int(d.get("unauth", 0)) != 0:
+            return False
+        if abs(float(d.get("risk", 0.0))) > 1e-12:
+            return False
+        return True
+
     store = load_metrics_store(authorized_mac_file)
-    stored_state = store.get("state")
-    stored_delta = store.get("last_delta")
+    if not isinstance(store, dict):
+        store = {}
 
-    if not isinstance(stored_state, dict):
-        store = {
-            "state": current_state,
-            "last_delta": {"total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0},
-            "last_change_at": None,
+    prev_state = store.get("state") if isinstance(store.get("state"), dict) else None
+
+    # New day -> set baseline to last known state (yesterday end), reset delta and unlock
+    if store.get("daily_date") != today_str:
+        baseline = prev_state if isinstance(prev_state, dict) else current_state
+        store["daily_date"] = today_str
+        store["daily_baseline"] = baseline
+        store["daily_delta"] = {"total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0}
+        store["daily_locked"] = False
+
+    baseline = store.get("daily_baseline") if isinstance(store.get("daily_baseline"), dict) else current_state
+    daily_delta = store.get("daily_delta") if isinstance(store.get("daily_delta"), dict) else {
+        "total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0
+    }
+    locked = bool(store.get("daily_locked", False))
+
+    if not locked:
+        b_total = int(baseline.get("total", current_state["total"]))
+        b_active = int(baseline.get("active_today", current_state["active_today"]))
+        b_auth = int(baseline.get("auth", current_state["auth"]))
+        b_unauth = int(baseline.get("unauth", current_state["unauth"]))
+        b_risk = float(baseline.get("risk", current_state["risk"]))
+
+        computed = {
+            "total": current_state["total"] - b_total,
+            "active_today": current_state["active_today"] - b_active,
+            "auth": current_state["auth"] - b_auth,
+            "unauth": current_state["unauth"] - b_unauth,
+            "risk": round(current_state["risk"] - b_risk, 2),
         }
-        save_metrics_store(authorized_mac_file, store)
-        d_total = d_active = d_auth = d_unauth = 0
-        d_risk = 0.0
-    else:
-        prev = {
-            "total": int(stored_state.get("total", current_state["total"])),
-            "active_today": int(stored_state.get("active_today", current_state["active_today"])),
-            "auth": int(stored_state.get("auth", current_state["auth"])),
-            "unauth": int(stored_state.get("unauth", current_state["unauth"])),
-            "risk": float(stored_state.get("risk", current_state["risk"])),
-        }
 
-        changed = (
-            prev["total"] != current_state["total"]
-            or prev["active_today"] != current_state["active_today"]
-            or prev["auth"] != current_state["auth"]
-            or prev["unauth"] != current_state["unauth"]
-            or abs(prev["risk"] - current_state["risk"]) > 1e-9
-        )
-
-        if changed:
-            d_total = current_state["total"] - prev["total"]
-            d_active = current_state["active_today"] - prev["active_today"]
-            d_auth = current_state["auth"] - prev["auth"]
-            d_unauth = current_state["unauth"] - prev["unauth"]
-            d_risk = round(current_state["risk"] - prev["risk"], 2)
-
-            store["state"] = current_state
-            store["last_delta"] = {
-                "total": d_total,
-                "active_today": d_active,
-                "auth": d_auth,
-                "unauth": d_unauth,
-                "risk": d_risk,
-            }
-            store["last_change_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_metrics_store(authorized_mac_file, store)
+        # Only lock if something changed today. If still zero, keep unlocked so it stays hidden.
+        if not _delta_is_zero(computed):
+            store["daily_delta"] = computed
+            store["daily_locked"] = True
+            daily_delta = computed
         else:
-            if not isinstance(stored_delta, dict):
-                stored_delta = {"total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0}
-            d_total = int(stored_delta.get("total", 0))
-            d_active = int(stored_delta.get("active_today", 0))
-            d_auth = int(stored_delta.get("auth", 0))
-            d_unauth = int(stored_delta.get("unauth", 0))
-            d_risk = float(stored_delta.get("risk", 0.0))
+            daily_delta = computed  # zero -> UI hides it
+
+    # Always update last known state for tomorrow’s baseline
+    store["state"] = current_state
+    save_metrics_store(authorized_mac_file, store)
+
+    d_total = int(daily_delta.get("total", 0))
+    d_active = int(daily_delta.get("active_today", 0))
+    d_auth = int(daily_delta.get("auth", 0))
+    d_unauth = int(daily_delta.get("unauth", 0))
+    d_risk = float(daily_delta.get("risk", 0.0))
 
     RED = "#F63049"
     GREEN = "#2ecc71"
     GREY = "#9aa0a6"
     CYAN = "#00F7FF"
 
+    # 5 metrics
     m1, m2, m3, m4, m5 = st.columns(5)
 
     with m1:
@@ -953,6 +1017,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     st.markdown("---")
 
+    # Activity Overview
     st.subheader("Activity Overview")
     hourly = pd.DataFrame()
     if not in_scope.empty:
@@ -975,6 +1040,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         )
         st.plotly_chart(fig, use_container_width=True)
 
+    # Unauthorized Device Ratio
     st.markdown("<h2 style='color:white; text-align:left;'>Unauthorized Device Ratio</h2>", unsafe_allow_html=True)
 
     warning_text, warning_color, warning_icon = "STATUS: SAFE", "#6CA651", "✅"
@@ -1028,6 +1094,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     )
     st.plotly_chart(gauge_fig, use_container_width=True)
 
+    # Dialog manager
     raw_dates = sorted([str(d) for d in merged["date"].unique() if pd.notnull(d)], reverse=True)
 
     if st.session_state.active_dialog == "list":
