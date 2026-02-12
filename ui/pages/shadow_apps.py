@@ -1,4 +1,4 @@
-# ui/pages/shadow_apps.py  (or shadow_app.py - use your actual filename)
+# ui/pages/shadow_apps.py  
 import os
 import re
 import time

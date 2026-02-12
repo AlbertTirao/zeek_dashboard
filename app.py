@@ -40,47 +40,11 @@ else:
     else:
         status_placeholder.empty()
 
-# # -------------------------
-# # Load & verify Parquet cache (PRINT ON EVERY RERUN)
-# # -------------------------
-# from services.drive_services import load_all_parquets
-# from pathlib import Path
-
-# PARQUET_DIR = Path("data/parquet")
-
-# # Always load from Streamlit cache (fast, no re-read if unchanged)
-# parquet_cache = load_all_parquets(PARQUET_DIR)
-
-# # 🔁 ALWAYS print on every script execution (refresh, rerun, auto-refresh)
-# st.write("🔎 Verifying Parquet cache on this run:")
-# debug_print_parquet_cache(parquet_cache)
-
-# # -------------------------
-# # One-time Parquet → Pickle warm-up (DISK GUARDED)
-# # -------------------------
-# PICKLE_DIR = PARQUET_DIR / "pickle"
-# PICKLE_WARMUP_FLAG = PICKLE_DIR / ".WARMED"
-
-# if not PICKLE_WARMUP_FLAG.exists():
-#   save_parquet_as_pickle(PARQUET_DIR, PICKLE_DIR)
-#   PICKLE_WARMUP_FLAG.touch()
-#   st.write("💾 Pickle cache ready")
-# else:
-#   st.write("⚡ Pickle cache already initialized — skipping conversion")
-
 # =====================================================
 # CONFIGURATION
 # =====================================================
 # PARQUET_ROOT = Path("data/parquet")
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
-
-# # Ensure Parquet Root Exists
-# os.makedirs(PARQUET_ROOT, exist_ok=True)
-
-# WARMUP_FLAG = PARQUET_ROOT / ".WARMED"
-
-# if not WARMUP_FLAG.exists():
-#   st.write("🔥 Initializing Parquet cache...")
 
 # =====================================================
 # AUTOMATIC DATA LOADING (The "Magic" Part)
