@@ -1,4 +1,4 @@
-# ui/pages/unauthorized_macs.py
+# ui/pages/alerts.py
 # Streamlit module: detects Unauthorized MACs from Zeek parquet (DHCP/ARP/CONN),
 # keeps "Last Seen" per MAC, and fills Host Name/IP using the latest non-null value per MAC.
 #
