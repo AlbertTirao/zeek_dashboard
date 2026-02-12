@@ -1,4 +1,4 @@
-# ui/pages/shadow_app.py
+# ui/pages/shadow_apps.py  (or shadow_app.py - use your actual filename)
 import os
 import re
 import time
@@ -18,14 +18,15 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # PERFORMANCE STRATEGY (FAST LOAD)
 # =============================================================================
 
-CACHE_VERSION = "shadow-cache-v1"
+# Bump version so old cached parquet (without hostname) gets rebuilt automatically
+CACHE_VERSION = "shadow-cache-v2-hostname"
 
 # -----------------------------
 # Config
 # -----------------------------
 WHITELIST_FILE = Path(__file__).resolve().parents[2] / "whitelist_domains.yaml"
 RISK_POLICY_FILE = Path(__file__).resolve().parents[2] / "risk_policy.yaml"
-CACHE_DIRNAME = "_shadow_cache"
+CACHE_DIRNAME = "_shadow_cache_apps"
 
 LICENSE_REGISTRY = {
     "office.com": None,
@@ -38,6 +39,25 @@ LICENSE_REGISTRY = {
 RISK_SCORE = {"Safe": 0, "Low": 1, "Medium": 2, "High": 3, "Critical": 4}
 SCORE_TO_RISK = {v: k for k, v in RISK_SCORE.items()}
 
+_MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
+
+
+def normalize_mac(x) -> str:
+    """Normalize MAC to aa:bb:cc:dd:ee:ff when possible; fallback to lower string."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "unknown"
+    try:
+        if isinstance(x, (bytes, bytearray)) and len(x) == 6:
+            hx = bytes(x).hex()
+        else:
+            hx = _MAC_HEX_RE.sub("", str(x))
+        if len(hx) == 12:
+            return ":".join(hx[i:i + 2] for i in range(0, 12, 2)).lower()
+    except Exception:
+        pass
+    s = str(x).strip().lower()
+    return s if s else "unknown"
+
 
 def risk_score(val: str) -> int:
     return int(RISK_SCORE.get(str(val), 0))
@@ -48,10 +68,6 @@ def score_to_risk(score: int) -> str:
 
 
 def _mark_dialog_origin():
-    """
-    One-shot token used to keep the dialog open only on reruns triggered
-    from inside the dialog widgets.
-    """
     st.session_state["shadow_dialog_origin"] = "dialog"
 
 
@@ -159,7 +175,7 @@ LOG_TYPES = ["http", "ssl", "dns", "files", "conn", "software", "weird", "notice
 @st.cache_data(show_spinner=False)
 def list_available_dates(parquet_root: Path):
     """
-    Only return real day folders (YYYY-MM-DD) and EXCLUDE _shadow_cache.
+    Only return real day folders (YYYY-MM-DD) and EXCLUDE _shadow_cache_apps.
     """
     if not parquet_root.exists():
         return []
@@ -182,6 +198,7 @@ def list_available_dates(parquet_root: Path):
 @st.cache_data(show_spinner=False)
 def collect_parquet_files(parquet_root: Path, target_dates: tuple):
     dhcp_files = []
+    known_hosts_files = []
     log_files = []
     for d in target_dates:
         d_path = parquet_root / d
@@ -192,12 +209,16 @@ def collect_parquet_files(parquet_root: Path, target_dates: tuple):
         if dhcp_p.exists():
             dhcp_files.append(str(dhcp_p))
 
+        kh_p = d_path / "known_hosts.parquet"
+        if kh_p.exists():
+            known_hosts_files.append(str(kh_p))
+
         for l in LOG_TYPES:
             l_path = d_path / f"{l}.parquet"
             if l_path.exists():
                 log_files.append(str(l_path))
 
-    return dhcp_files, log_files
+    return dhcp_files, known_hosts_files, log_files
 
 
 def _stat_sig(path: Path):
@@ -334,46 +355,160 @@ def load_risk_policy():
         return {}
 
 
-def query_shadow_logs_raw(_conn, dhcp_files: list[str], log_files: list[str]) -> pd.DataFrame:
+def _describe_cols(conn, obj_name: str) -> list[str]:
+    try:
+        return [r[0] for r in conn.execute(f"DESCRIBE {obj_name}").fetchall()]
+    except Exception:
+        try:
+            df = conn.execute(f"DESCRIBE {obj_name}").df()
+            return df.iloc[:, 0].astype(str).tolist()
+        except Exception:
+            return []
+
+
+def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[str], log_files: list[str]) -> pd.DataFrame:
+    """
+    Returns event rows with mapping ip -> mac + hostname (DHCP/known_hosts).
+    Output columns include: ts, ip, mac, hostname, dst_port, bytes_sent, bytes_received, app_identifier, Info, source_log
+    """
     if not log_files:
         return pd.DataFrame()
 
-    # DHCP view
+    # ---- DHCP mapping view ----
     if dhcp_files:
         try:
             _conn.execute(
                 "CREATE OR REPLACE VIEW raw_dhcp_files AS "
                 f"SELECT * FROM read_parquet({dhcp_files}, union_by_name=True)"
             )
-            dhcp_cols = [r[0] for r in _conn.execute("DESCRIBE raw_dhcp_files").fetchall()]
-            dhcp_ip = next((c for c in ["client_addr", "assigned_addr", "requested_addr", "ip"] if c in dhcp_cols), None)
-            dhcp_mac = next((c for c in ["mac", "client_chaddr", "hardware_address"] if c in dhcp_cols), None)
+            dhcp_cols = _describe_cols(_conn, "raw_dhcp_files")
+
+            dhcp_ip = next((c for c in ["client_addr", "assigned_addr", "requested_addr", "ip", "id.orig_h", "orig_h"] if c in dhcp_cols), None)
+            dhcp_mac = next((c for c in ["mac", "client_chaddr", "hardware_address", "hwaddr", "chaddr"] if c in dhcp_cols), None)
+            dhcp_host = next((c for c in ["host_name", "hostname", "client_hostname", "client_fqdn", "client_name"] if c in dhcp_cols), None)
+            dhcp_ts = next((c for c in ["ts", "timestamp", "seen_ts", "time"] if c in dhcp_cols), None)
 
             if dhcp_ip and dhcp_mac:
-                _conn.execute(
-                    f"""
-                    CREATE OR REPLACE VIEW v_dhcp AS
-                    SELECT DISTINCT
-                        "{dhcp_ip}" as ip_addr,
-                        "{dhcp_mac}" as mac_addr
-                    FROM raw_dhcp_files
-                    WHERE "{dhcp_ip}" IS NOT NULL AND "{dhcp_mac}" IS NOT NULL
-                    """
-                )
+                host_expr = f'CAST("{dhcp_host}" AS VARCHAR)' if dhcp_host else "'Unknown'"
+                if dhcp_ts:
+                    _conn.execute(
+                        f"""
+                        CREATE OR REPLACE VIEW v_dhcp AS
+                        WITH base AS (
+                            SELECT
+                                CAST("{dhcp_ip}" AS VARCHAR) AS ip_addr,
+                                CAST("{dhcp_mac}" AS VARCHAR) AS mac_raw,
+                                {host_expr} AS host_raw,
+                                try_cast("{dhcp_ts}" AS DOUBLE) AS ts
+                            FROM raw_dhcp_files
+                            WHERE "{dhcp_ip}" IS NOT NULL AND "{dhcp_mac}" IS NOT NULL
+                        )
+                        SELECT
+                            ip_addr,
+                            arg_max(mac_raw, ts) AS mac_addr,
+                            COALESCE(NULLIF(arg_max(host_raw, ts), ''), 'Unknown') AS hostname
+                        FROM base
+                        GROUP BY ip_addr
+                        """
+                    )
+                else:
+                    _conn.execute(
+                        f"""
+                        CREATE OR REPLACE VIEW v_dhcp AS
+                        SELECT
+                            CAST("{dhcp_ip}" AS VARCHAR) AS ip_addr,
+                            any_value(CAST("{dhcp_mac}" AS VARCHAR)) AS mac_addr,
+                            COALESCE(NULLIF(any_value({host_expr}), ''), 'Unknown') AS hostname
+                        FROM raw_dhcp_files
+                        WHERE "{dhcp_ip}" IS NOT NULL AND "{dhcp_mac}" IS NOT NULL
+                        GROUP BY 1
+                        """
+                    )
             else:
-                _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT '0.0.0.0' as ip_addr, 'Unknown' as mac_addr")
+                _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
         except Exception:
-            _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT '0.0.0.0' as ip_addr, 'Unknown' as mac_addr")
+            _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
     else:
-        _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT '0.0.0.0' as ip_addr, 'Unknown' as mac_addr")
+        _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
 
-    # logs view
+    # ---- known_hosts mapping view (fallback) ----
+    if known_hosts_files:
+        try:
+            _conn.execute(
+                "CREATE OR REPLACE VIEW raw_known_hosts_files AS "
+                f"SELECT * FROM read_parquet({known_hosts_files}, union_by_name=True)"
+            )
+            kh_cols = _describe_cols(_conn, "raw_known_hosts_files")
+
+            kh_ip = next((c for c in ["host", "ip", "ip_addr", "addr", "id.orig_h", "orig_h"] if c in kh_cols), None)
+            kh_mac = next((c for c in ["mac", "mac_addr", "hwaddr", "client_chaddr"] if c in kh_cols), None)
+            kh_host = next((c for c in ["host_name", "hostname", "name", "device_name"] if c in kh_cols), None)
+            kh_ts = next((c for c in ["ts", "timestamp", "seen_ts", "time"] if c in kh_cols), None)
+
+            if kh_ip and kh_mac:
+                host_expr = f'CAST("{kh_host}" AS VARCHAR)' if kh_host else "'Unknown'"
+                if kh_ts:
+                    _conn.execute(
+                        f"""
+                        CREATE OR REPLACE VIEW v_known AS
+                        WITH base AS (
+                            SELECT
+                                CAST("{kh_ip}" AS VARCHAR) AS ip_addr,
+                                CAST("{kh_mac}" AS VARCHAR) AS mac_raw,
+                                {host_expr} AS host_raw,
+                                try_cast("{kh_ts}" AS DOUBLE) AS ts
+                            FROM raw_known_hosts_files
+                            WHERE "{kh_ip}" IS NOT NULL AND "{kh_mac}" IS NOT NULL
+                        )
+                        SELECT
+                            ip_addr,
+                            arg_max(mac_raw, ts) AS mac_addr,
+                            COALESCE(NULLIF(arg_max(host_raw, ts), ''), 'Unknown') AS hostname
+                        FROM base
+                        GROUP BY ip_addr
+                        """
+                    )
+                else:
+                    _conn.execute(
+                        f"""
+                        CREATE OR REPLACE VIEW v_known AS
+                        SELECT
+                            CAST("{kh_ip}" AS VARCHAR) AS ip_addr,
+                            any_value(CAST("{kh_mac}" AS VARCHAR)) AS mac_addr,
+                            COALESCE(NULLIF(any_value({host_expr}), ''), 'Unknown') AS hostname
+                        FROM raw_known_hosts_files
+                        WHERE "{kh_ip}" IS NOT NULL AND "{kh_mac}" IS NOT NULL
+                        GROUP BY 1
+                        """
+                    )
+            else:
+                _conn.execute("CREATE OR REPLACE VIEW v_known AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
+        except Exception:
+            _conn.execute("CREATE OR REPLACE VIEW v_known AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
+    else:
+        _conn.execute("CREATE OR REPLACE VIEW v_known AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
+
+    # Merge mapping
+    _conn.execute(
+        """
+        CREATE OR REPLACE VIEW v_ip_map AS
+        SELECT
+            COALESCE(d.ip_addr, k.ip_addr) AS ip_addr,
+            COALESCE(NULLIF(d.mac_addr,''), NULLIF(k.mac_addr,''), 'Unknown') AS mac_addr,
+            COALESCE(NULLIF(d.hostname,''), NULLIF(k.hostname,''), 'Unknown') AS hostname
+        FROM v_dhcp d
+        FULL OUTER JOIN v_known k
+            ON d.ip_addr = k.ip_addr
+        """
+    )
+
+    # ---- Logs view ----
     try:
         _conn.execute(
             "CREATE OR REPLACE VIEW raw_logs AS "
             f"SELECT * FROM read_parquet({log_files}, union_by_name=True, filename='source_file_path')"
         )
-        existing_cols = set([r[0] for r in _conn.execute("DESCRIBE raw_logs").fetchall()])
+        existing_cols = set(_describe_cols(_conn, "raw_logs"))
 
         def get_coalesce(candidates, fallback="'Unknown'"):
             valid = [f'"{c}"' for c in candidates if c in existing_cols]
@@ -410,7 +545,8 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], log_files: list[str]) ->
         SELECT
             try_cast(ts as DOUBLE) as ts,
             {sql_ip} as ip,
-            COALESCE({sql_mac}, d.mac_addr, 'Unknown') as mac,
+            COALESCE({sql_mac}, m.mac_addr, 'Unknown') as mac,
+            COALESCE(NULLIF(m.hostname,''), 'Unknown') as hostname,
             {sql_port} as dst_port,
             {sql_sent} as bytes_sent,
             {sql_recv} as bytes_received,
@@ -418,7 +554,7 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], log_files: list[str]) ->
             {sql_info} as Info,
             upper(regexp_extract(source_file_path, '([a-z]+)\\.parquet', 1)) as source_log
         FROM raw_logs r
-        LEFT JOIN v_dhcp d ON {sql_ip} = d.ip_addr
+        LEFT JOIN v_ip_map m ON {sql_ip} = m.ip_addr
         """
         return _conn.execute(query).df()
     except Exception:
@@ -494,11 +630,11 @@ def vectorized_risk(df: pd.DataFrame, policy: dict):
     if crit_logs:
         m = slog.isin(crit_logs) & score.eq(-1)
         score[m] = 4
-        basis[m] = "Policy: critical.source_logs matched (" + slog[m] + ")"
+        basis.loc[m] = "Policy: critical.source_logs matched (" + slog.loc[m].astype(str) + ")"
     if crit_ports:
         m = port.isin(crit_ports) & score.eq(-1)
         score[m] = 4
-        basis[m] = "Policy: critical.ports matched (" + port[m].astype(str) + ")"
+        basis.loc[m] = "Policy: critical.ports matched (" + port.loc[m].astype(str) + ")"
 
     if high_logs:
         m = slog.isin(high_logs) & score.eq(-1)
@@ -535,14 +671,19 @@ def vectorized_risk(df: pd.DataFrame, policy: dict):
 
 
 def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_policy: dict):
-    dhcp_files, log_files = collect_parquet_files(parquet_root, (date_str,))
-    sources = list(dhcp_files) + list(log_files)
+    dhcp_files, known_hosts_files, log_files = collect_parquet_files(parquet_root, (date_str,))
+    sources = list(dhcp_files) + list(known_hosts_files) + list(log_files)
     sources_max_mtime = _paths_max_mtime(sources)
 
     if cache_is_fresh(parquet_root, date_str, sources_max_mtime):
         return
 
-    raw_df = query_shadow_logs_raw(conn, dhcp_files=dhcp_files, log_files=log_files)
+    raw_df = query_shadow_logs_raw(
+        conn,
+        dhcp_files=dhcp_files,
+        known_hosts_files=known_hosts_files,
+        log_files=log_files,
+    )
     if raw_df is None or raw_df.empty:
         meta = {
             "cache_version": CACHE_VERSION,
@@ -562,7 +703,10 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     df = df.dropna(subset=["datetime"])
 
     df["ip"] = df["ip"].fillna("Unknown").astype(str)
-    df["mac"] = df["mac"].fillna("Unknown").astype(str).str.lower()
+    df["mac"] = df["mac"].apply(normalize_mac)
+    df["hostname"] = df.get("hostname", "Unknown").fillna("Unknown").astype(str)
+    df["hostname"] = df["hostname"].replace({"": "Unknown"})
+    df.loc[df["hostname"].str.lower().isin(["nan", "none"]), "hostname"] = "Unknown"
 
     df["domain_clean"] = df["app_identifier"].apply(extract_domain)
     mask_empty = df["domain_clean"].eq("") | df["domain_clean"].isna()
@@ -587,6 +731,7 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
         "datetime",
         "ip",
         "mac",
+        "hostname",  # ✅ persist
         "domain_clean",
         "app_identifier",
         "source_log",
@@ -646,13 +791,27 @@ def register_shadow_view(conn, cached_files: list[str]):
     if not cached_files:
         conn.execute("CREATE OR REPLACE VIEW shadow_events AS SELECT 1 WHERE false")
         return
+
     file_list_sql = "[" + ",".join("'" + f.replace("'", "''") + "'" for f in cached_files) + "]"
+
+    # Create base view from parquet
     conn.execute(
         f"""
         CREATE OR REPLACE VIEW shadow_events AS
         SELECT * FROM read_parquet({file_list_sql}, union_by_name=True)
         """
     )
+
+    # Hard fallback: if cached parquet still doesn't have hostname, inject it so SQL never breaks
+    cols = set(_describe_cols(conn, "shadow_events"))
+    if "hostname" not in cols:
+        conn.execute(
+            f"""
+            CREATE OR REPLACE VIEW shadow_events AS
+            SELECT *, 'Unknown'::VARCHAR AS hostname
+            FROM read_parquet({file_list_sql}, union_by_name=True)
+            """
+        )
 
 
 def color_risk(val):
@@ -684,12 +843,10 @@ def _sql_fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
 
 
 # =============================================================================
-# Dialog (FIXED: closes properly + doesn't auto-pop on page revisit)
+# Dialog
 # =============================================================================
-@st.dialog("Shadow App Forensics Details", width="large")
+@st.dialog("Shadow App Forensics Details", width="large", dismissible=False)
 def show_forensics_dialog(conn):
-    # Mark that reruns from widgets inside this dialog should keep it open
-    # (via on_change callbacks)
     target_mac = st.session_state.get("shadow_dialog_mac")
 
     top = st.columns([1, 6])
@@ -762,7 +919,7 @@ def show_forensics_dialog(conn):
         conn,
         f"""
         SELECT
-            datetime, mac, ip, domain_clean, source_log, Info, dst_port,
+            datetime, mac, hostname, ip, domain_clean, source_log, Info, dst_port,
             bytes_sent, bytes_received, Behavior, "App Status", "Risk Level", "Risk Basis"
         FROM shadow_events
         WHERE {where_sql}
@@ -811,11 +968,11 @@ def show_forensics_dialog(conn):
             hide_index=True,
         )
 
+
 def hide_dialog_x_button():
     st.markdown(
         """
         <style>
-        /* Hide the built-in X close button on Streamlit dialogs */
         div[role="dialog"] button[aria-label="Close"],
         div[role="dialog"] button[title="Close"],
         div[data-testid="stDialog"] button[aria-label="Close"],
@@ -828,13 +985,13 @@ def hide_dialog_x_button():
         unsafe_allow_html=True,
     )
 
+
 # =============================================================================
 # Main Render
 # =============================================================================
 def render_shadow_apps(parquet_root: Path):
     st.markdown("#### Shadow Apps Overview")
-
-    hide_dialog_x_button() 
+    hide_dialog_x_button()
 
     # --- init state ---
     st.session_state.setdefault("shadow_dialog_open", False)
@@ -843,9 +1000,6 @@ def render_shadow_apps(parquet_root: Path):
     st.session_state.setdefault("shadow_grid_nonce", 0)
 
     # --- auto-close stale dialogs ---
-    # Keep the dialog open ONLY when the rerun was triggered by:
-    #   - a grid click (origin='grid')
-    #   - a dialog widget interaction (origin='dialog')
     origin = st.session_state.pop("shadow_dialog_origin", None)
     if st.session_state.get("shadow_dialog_open") and origin not in ("grid", "dialog"):
         _close_shadow_dialog(reset_grid=False)
@@ -855,7 +1009,6 @@ def render_shadow_apps(parquet_root: Path):
         st.warning("No log directories found.")
         return
 
-    # Day-by-day ONLY (no All Dates, and no _shadow_cache)
     def _on_day_change():
         _close_shadow_dialog(reset_grid=True)
 
@@ -959,19 +1112,19 @@ def render_shadow_apps(parquet_root: Path):
         else:
             st.info("No data for source chart.")
 
-    t1, t2 = st.tabs(["Authorized Applications & License Audit", "Unauthorized Applications"])
+    t1, t2 = st.tabs(["Auth/Unauthorized Applications & License Audit", "Data Exfiltration"])
 
     # =============================================================================
     # TAB 1: AgGrid (CLICK ROW -> OPEN DIALOG)
     # =============================================================================
     with t1:
         st.markdown("### Application Audit Log")
-        st.info("Click any row to open the Shadow App Forensics popup for that device.")
+        st.info("Click any MAC Address row to open the Shadow App Forensics popup for that device.")
 
         filter_col1, filter_col2, filter_col3 = st.columns([3, 2, 2])
         with filter_col1:
             search_query_audit = st.text_input(
-                "Search (MAC, IP, Domain)",
+                "Search (MAC, Hostname, IP, Domain)",
                 placeholder="Search...",
                 key="audit_search",
             ).strip()
@@ -1002,8 +1155,8 @@ def render_shadow_apps(parquet_root: Path):
 
         if search_query_audit:
             q = f"%{search_query_audit}%"
-            where.append("(mac ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
-            params.extend([q, q, q])
+            where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
+            params.extend([q, q, q, q])
 
         where_sql = "WHERE " + " AND ".join(where) if where else ""
 
@@ -1012,6 +1165,7 @@ def render_shadow_apps(parquet_root: Path):
             SELECT
                 domain_clean,
                 mac,
+                hostname,
                 ip,
                 source_log,
                 "App Status" AS "App Status",
@@ -1025,6 +1179,7 @@ def render_shadow_apps(parquet_root: Path):
             SELECT
                 domain_clean,
                 mac,
+                hostname,
                 ip,
                 source_log,
                 "App Status",
@@ -1033,18 +1188,19 @@ def render_shadow_apps(parquet_root: Path):
                 COUNT(*) AS Hits,
                 MAX(_risk_score) AS Max_Risk_Score
             FROM base
-            GROUP BY 1,2,3,4,5
+            GROUP BY 1,2,3,4,5,6
         ),
         pick_basis AS (
             SELECT
                 domain_clean,
                 mac,
+                hostname,
                 ip,
                 source_log,
                 "App Status",
                 risk_basis AS Max_Risk_Basis,
                 ROW_NUMBER() OVER (
-                    PARTITION BY domain_clean, mac, ip, source_log, "App Status"
+                    PARTITION BY domain_clean, mac, hostname, ip, source_log, "App Status"
                     ORDER BY _risk_score DESC, datetime DESC
                 ) AS rn
             FROM base
@@ -1052,6 +1208,7 @@ def render_shadow_apps(parquet_root: Path):
         SELECT
             a.domain_clean,
             a.mac,
+            a.hostname,
             a.ip,
             a.source_log,
             a."App Status",
@@ -1068,7 +1225,12 @@ def render_shadow_apps(parquet_root: Path):
             b.Max_Risk_Basis
         FROM agg a
         LEFT JOIN (SELECT * FROM pick_basis WHERE rn = 1) b
-            ON a.domain_clean=b.domain_clean AND a.mac=b.mac AND a.ip=b.ip AND a.source_log=b.source_log AND a."App Status"=b."App Status"
+            ON a.domain_clean=b.domain_clean
+           AND a.mac=b.mac
+           AND a.hostname=b.hostname
+           AND a.ip=b.ip
+           AND a.source_log=b.source_log
+           AND a."App Status"=b."App Status"
         ORDER BY a.Max_Risk_Score DESC, a.Hits DESC
         LIMIT 1000
         """
@@ -1136,7 +1298,7 @@ def render_shadow_apps(parquet_root: Path):
                 key=grid_key,
             )
 
-            # ---- selection -> open dialog (ONLY when selection changes) ----
+            # selection -> open dialog
             selected_rows = grid_response.get("selected_rows", None)
             selected_mac = None
 
@@ -1158,18 +1320,29 @@ def render_shadow_apps(parquet_root: Path):
                     st.session_state["shadow_dialog_origin"] = "grid"
                     st.rerun()
             else:
-                # If user cleared selection (or grid reset), allow re-clicking same MAC later
                 st.session_state["shadow_last_selected_mac"] = None
 
-        # License Compliance (unchanged)
+        # =============================================================================
+        # License Compliance (NO DROPDOWN - TABLE)
+        # =============================================================================
+        st.divider()
         st.markdown("### License Compliance Audit")
+
+        # summary + details
         usage_rows = []
+        details_all = []
+
+        # ensure hostname exists (fallback view already injects it)
+        shadow_cols = set(_describe_cols(conn, "shadow_events"))
+        has_hostname = "hostname" in shadow_cols
+
         for software in LICENSE_REGISTRY.keys():
             cnt = conn.execute(
                 """
                 SELECT COUNT(DISTINCT mac)
                 FROM shadow_events
                 WHERE domain_clean ILIKE ?
+                  AND mac IS NOT NULL AND mac <> '' AND lower(mac) <> 'unknown'
                 """,
                 [f"%{software}%"],
             ).fetchone()
@@ -1177,8 +1350,51 @@ def render_shadow_apps(parquet_root: Path):
             status = "Usage Detected" if unique_users > 0 else "No Usage"
             usage_rows.append({"Software": software, "Active Devices Count": unique_users, "Status": status})
 
+            # details per software
+            if has_hostname:
+                df_sw = conn.execute(
+                    """
+                    SELECT
+                        ? AS Software,
+                        mac AS mac,
+                        arg_max(hostname, datetime) AS hostname,
+                        MAX(datetime) AS last_seen,
+                        COUNT(*) AS events
+                    FROM shadow_events
+                    WHERE domain_clean ILIKE ?
+                      AND mac IS NOT NULL AND mac <> '' AND lower(mac) <> 'unknown'
+                    GROUP BY mac
+                    ORDER BY last_seen DESC NULLS LAST
+                    """,
+                    [software, f"%{software}%"],
+                ).df()
+            else:
+                df_sw = conn.execute(
+                    """
+                    SELECT
+                        ? AS Software,
+                        mac AS mac,
+                        'Unknown' AS hostname,
+                        MAX(datetime) AS last_seen,
+                        COUNT(*) AS events
+                    FROM shadow_events
+                    WHERE domain_clean ILIKE ?
+                      AND mac IS NOT NULL AND mac <> '' AND lower(mac) <> 'unknown'
+                    GROUP BY mac
+                    ORDER BY last_seen DESC NULLS LAST
+                    """,
+                    [software, f"%{software}%"],
+                ).df()
+
+            if not df_sw.empty:
+                df_sw["mac"] = df_sw["mac"].apply(normalize_mac)
+                df_sw["hostname"] = df_sw["hostname"].fillna("Unknown").astype(str).replace({"": "Unknown"})
+                df_sw["last_seen"] = pd.to_datetime(df_sw["last_seen"], errors="coerce")
+                details_all.append(df_sw)
+
         usage_df = pd.DataFrame(usage_rows)
         table_col, chart_col = st.columns([1.7, 1])
+
         with table_col:
             st.dataframe(
                 usage_df.style.map(
@@ -1190,6 +1406,7 @@ def render_shadow_apps(parquet_root: Path):
                 use_container_width=True,
                 hide_index=True,
             )
+
         with chart_col:
             fig = px.bar(
                 usage_df,
@@ -1203,8 +1420,41 @@ def render_shadow_apps(parquet_root: Path):
             fig.update_layout(xaxis_title=None, yaxis_title="Active Devices", height=420, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
 
+        st.markdown("#### License Users (MAC / Hostname / Last Seen)")
+        if details_all:
+            license_df = pd.concat(details_all, ignore_index=True)
+
+            gb2 = GridOptionsBuilder.from_dataframe(license_df)
+            gb2.configure_default_column(filter=True, sortable=True, resizable=True)
+            gb2.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+
+            ag_theme, ag_css = get_aggrid_theme_and_css()
+
+            AgGrid(
+                license_df,
+                gridOptions=gb2.build(),
+                update_mode=GridUpdateMode.NO_UPDATE,
+                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                height=420,
+                theme=ag_theme,
+                custom_css=ag_css,
+                allow_unsafe_jscode=False,
+                fit_columns_on_grid_load=True,
+                reload_data=False,
+                key="license_devices_grid",
+            )
+
+            st.download_button(
+                "Download License Users CSV",
+                data=license_df.to_csv(index=False).encode("utf-8"),
+                file_name="license_users.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No license usage detected for the selected day.")
+
     # =============================================================================
-    # TAB 2
+    # TAB 2 (kept: your existing content can remain here)
     # =============================================================================
     with t2:
         st.markdown("## Unauthorized Threat Dashboard")
@@ -1268,7 +1518,7 @@ def render_shadow_apps(parquet_root: Path):
                 exfil_points = _sql_fetch_df(
                     conn,
                     """
-                    SELECT dst_port, bytes_sent, Behavior, domain_clean, mac, "Risk Level"
+                    SELECT dst_port, bytes_sent, Behavior, domain_clean, mac, hostname, "Risk Level"
                     FROM shadow_events
                     WHERE "App Status"='Unauthorized' AND COALESCE(bytes_sent,0) > 0
                     ORDER BY bytes_sent DESC
@@ -1282,7 +1532,7 @@ def render_shadow_apps(parquet_root: Path):
                         y="bytes_sent",
                         size="bytes_sent",
                         color="Behavior",
-                        hover_data=["domain_clean", "mac", "Risk Level"],
+                        hover_data=["domain_clean", "mac", "hostname", "Risk Level"],
                         title="Outbound Data Volume by Port (Top 5000 Events)",
                         template="plotly_dark",
                     )
@@ -1384,8 +1634,8 @@ def render_shadow_apps(parquet_root: Path):
 
         if search_query_unauth:
             q = f"%{search_query_unauth}%"
-            where.append("(mac ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
-            params.extend([q, q, q])
+            where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
+            params.extend([q, q, q, q])
 
         where_sql = " AND ".join(where)
 
@@ -1395,6 +1645,7 @@ def render_shadow_apps(parquet_root: Path):
             SELECT
                 datetime,
                 mac,
+                hostname,
                 ip,
                 domain_clean,
                 source_log,
@@ -1422,6 +1673,7 @@ def render_shadow_apps(parquet_root: Path):
                 column_config={
                     "datetime": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
                     "mac": "MAC Address",
+                    "hostname": "Hostname",
                     "ip": "IP Address",
                     "domain_clean": "Unauthorized Domain",
                     "source_log": "Source",
