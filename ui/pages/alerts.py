@@ -395,7 +395,7 @@ def build_display_table(df: pd.DataFrame) -> pd.DataFrame:
                 "mac_norm": "MAC Address",
                 "vendor": "Vendor",
                 "host": "Host Name",
-                "seen_in": "Seen In",
+                "seen_in": "Source",
                 "status": "Status",
             }
         )
