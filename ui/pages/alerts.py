@@ -1,14 +1,17 @@
 # ui/pages/alerts.py
-# Streamlit module: detects Unauthorized MACs from Zeek parquet (DHCP/ARP/CONN),
-# keeps "Last Seen" per MAC, and fills Host Name/IP using the latest non-null value per MAC.
+# Streamlit module: detects Unauthorized/Verified devices from Zeek parquet (DHCP/ARP/CONN),
+# keeps "Last Seen" per MAC, and enriches IP/Host/Vendor where available.
 #
-# UI:
-# - No auto-refresh controls
-# - Adds buttons to view details:
-#   View Total Devices / View Verified / View Unauthorized
+# Update (Time Range Metrics):
+# - Adds a Time Range selector (Last 7 Days / Specific Date / All Time)
+# - Metrics (Total Devices Seen / Verified Devices / Unauthorized Devices) now reflect the selected time range
+# - Tables shown via the existing View buttons are also filtered by the selected time range
+#
+# Drop-in replacement for your current alerts.py
 
 import os
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
@@ -23,13 +26,16 @@ try:
 except ImportError:
     VENDOR_LIB_AVAILABLE = False
 
+# =============================================================================
+# CONSTANTS / REGEX
+# =============================================================================
+_MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 # =============================================================================
 # NORMALIZATION
 # =============================================================================
-_MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
-
-
 def normalize_mac(x) -> Optional[str]:
     """Normalize MAC to 'aa:bb:cc:dd:ee:ff'. Return None if invalid."""
     if x is None:
@@ -43,7 +49,7 @@ def normalize_mac(x) -> Optional[str]:
 
     if len(hx) != 12:
         return None
-    return ":".join(hx[i:i + 2] for i in range(0, 12, 2)).lower()
+    return ":".join(hx[i : i + 2] for i in range(0, 12, 2)).lower()
 
 
 def is_broadcast_mac(mac: Optional[str]) -> bool:
@@ -51,12 +57,39 @@ def is_broadcast_mac(mac: Optional[str]) -> bool:
 
 
 def to_datetime_series(s: pd.Series) -> pd.Series:
-    """Convert Zeek ts float seconds or strings to pandas datetime."""
+    """
+    Robust timestamp conversion:
+    - If already datetime => return as-is
+    - If object => try parse
+    - If numeric => infer unit by magnitude (ns/us/ms/s)
+    """
     if s is None:
         return pd.Series([pd.NaT] * 0, dtype="datetime64[ns]")
-    if pd.api.types.is_numeric_dtype(s):
-        return pd.to_datetime(s, unit="s", errors="coerce")
-    return pd.to_datetime(s, errors="coerce")
+
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
+
+    if pd.api.types.is_object_dtype(s):
+        parsed = pd.to_datetime(s, errors="coerce", utc=False)
+        if parsed.notna().any():
+            return parsed
+
+    num = pd.to_numeric(s, errors="coerce")
+    if not num.notna().any():
+        return pd.to_datetime(s, errors="coerce", utc=False)
+
+    m = float(num.dropna().abs().max())
+    # Zeek seconds ~ 1.7e9, ms ~ 1.7e12, us ~ 1.7e15, ns ~ 1.7e18
+    if m > 1e17:
+        unit = "ns"
+    elif m > 1e14:
+        unit = "us"
+    elif m > 1e11:
+        unit = "ms"
+    else:
+        unit = "s"
+
+    return pd.to_datetime(num, unit=unit, errors="coerce", utc=False)
 
 
 # =============================================================================
@@ -110,8 +143,26 @@ def best_column(df: pd.DataFrame, scorer_fn, preferred: List[str]) -> Optional[s
 # =============================================================================
 # FILE DISCOVERY + READ
 # =============================================================================
-def find_latest_matching(parquet_root: Path, keywords: List[str]) -> Optional[Path]:
-    files = list(parquet_root.rglob("*.parquet"))
+def read_parquet_safe(path: Optional[Path]) -> pd.DataFrame:
+    if not path:
+        return pd.DataFrame()
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _find_log_file_in_day(day_dir: Path, keywords: List[str]) -> Optional[Path]:
+    """
+    Find a parquet file inside a day directory matching any keyword.
+    Prefers exact '<keyword>.parquet' but falls back to rglob match.
+    """
+    for k in keywords:
+        exact = day_dir / f"{k}.parquet"
+        if exact.exists():
+            return exact
+
+    files = list(day_dir.rglob("*.parquet"))
     if not files:
         return None
 
@@ -123,13 +174,30 @@ def find_latest_matching(parquet_root: Path, keywords: List[str]) -> Optional[Pa
     return matches[0]
 
 
-def read_parquet_safe(path: Optional[Path]) -> pd.DataFrame:
-    if not path:
-        return pd.DataFrame()
-    try:
-        return pd.read_parquet(path)
-    except Exception:
-        return pd.DataFrame()
+def _discover_date_dirs(parquet_root: Path) -> Dict[str, List[Path]]:
+    """
+    Return mapping: { 'YYYY-MM-DD': [Path(...), ...] }
+    Supports both:
+      - parquet_root/YYYY-MM-DD/*.parquet
+      - parquet_root/**/YYYY-MM-DD/*.parquet
+    """
+    by_date: Dict[str, List[Path]] = {}
+
+    # fast path: immediate children
+    immediate = [p for p in parquet_root.iterdir() if p.is_dir() and _DATE_DIR_RE.match(p.name)]
+    candidates = immediate
+
+    # fallback: search deeper if no immediate date folders
+    if not candidates:
+        candidates = [p for p in parquet_root.rglob("*") if p.is_dir() and _DATE_DIR_RE.match(p.name)]
+
+    for d in candidates:
+        by_date.setdefault(d.name, []).append(d)
+
+    # Keep deterministic ordering (useful for caching keys)
+    for k in list(by_date.keys()):
+        by_date[k] = sorted(by_date[k], key=lambda p: str(p))
+    return by_date
 
 
 # =============================================================================
@@ -184,19 +252,15 @@ def load_authorized_macs(auth_file: str) -> set:
 # KNOWN HOSTS ENRICHMENT
 # =============================================================================
 def build_known_maps(known_hosts_df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str]]:
-    mac_to_ip = {}
-    mac_to_vendor = {}
+    mac_to_ip: Dict[str, str] = {}
+    mac_to_vendor: Dict[str, str] = {}
 
     if known_hosts_df is None or known_hosts_df.empty:
         return mac_to_ip, mac_to_vendor
 
     mac_col = best_column(known_hosts_df, score_mac_column, ["mac", "MAC Address", "host_mac", "l2addr"])
     ip_col = best_column(known_hosts_df, score_ip_column, ["host_ip", "ip", "IP Address", "addr"])
-    vendor_col = None
-    for c in ["vendor", "Vendor", "manuf", "manufacturer"]:
-        if c in known_hosts_df.columns:
-            vendor_col = c
-            break
+    vendor_col = next((c for c in ["vendor", "Vendor", "manuf", "manufacturer"] if c in known_hosts_df.columns), None)
 
     if not mac_col:
         return mac_to_ip, mac_to_vendor
@@ -287,11 +351,10 @@ def extract_device_events(df: pd.DataFrame, source: str, fallback_ts: Optional[p
         ],
     )
 
-    host_col = None
-    for c in ["host_name", "client_fqdn", "hostname", "host", "Host Name", "computer_name"]:
-        if c in df.columns:
-            host_col = c
-            break
+    host_col = next(
+        (c for c in ["host_name", "client_fqdn", "hostname", "host", "Host Name", "computer_name"] if c in df.columns),
+        None,
+    )
 
     if not mac_col:
         return pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
@@ -323,11 +386,12 @@ def extract_device_events(df: pd.DataFrame, source: str, fallback_ts: Optional[p
 
     out = tmp[["ts_dt", "mac_norm", "ip", "host", "source"]].copy()
     out = out.dropna(subset=["mac_norm"])
+    out = out.dropna(subset=["ts_dt"])
     return out
 
 
 # =============================================================================
-# BUILD DEVICE TABLE
+# BUILD DEVICE TABLE (latest record per MAC within the selected time range)
 # =============================================================================
 def build_device_table(events: pd.DataFrame, mac_to_ip: Dict[str, str]) -> pd.DataFrame:
     if events is None or events.empty:
@@ -344,9 +408,7 @@ def build_device_table(events: pd.DataFrame, mac_to_ip: Dict[str, str]) -> pd.Da
     if "host" in tmp.columns:
         tmp["host"] = tmp["host"].astype("string").replace(["nan", "None", "none", "-", ""], pd.NA)
     if "ip" in tmp.columns:
-        tmp["ip"] = tmp["ip"].astype("string").replace(
-            ["None", "none", "-", "nan", "0.0.0.0", "Unknown IP", ""], pd.NA
-        )
+        tmp["ip"] = tmp["ip"].astype("string").replace(["None", "none", "-", "nan", "0.0.0.0", "Unknown IP", ""], pd.NA)
 
     idx = tmp.groupby("mac_norm")["ts_dt"].idxmax()
     latest = tmp.loc[idx].copy()
@@ -367,6 +429,7 @@ def build_device_table(events: pd.DataFrame, mac_to_ip: Dict[str, str]) -> pd.Da
     )
     latest["ip"] = latest["mac_norm"].map(ip_last)
 
+    # Fill IP from known_hosts if still missing
     latest["ip"] = latest.apply(
         lambda r: mac_to_ip.get(r["mac_norm"]) if pd.isna(r["ip"]) else r["ip"],
         axis=1,
@@ -408,6 +471,75 @@ def style_status(val):
 
 
 # =============================================================================
+# TIME-RANGE LOADERS (cached)
+# =============================================================================
+@st.cache_data(show_spinner=False)
+def _load_events_and_known_hosts_for_dirs(dir_paths: Tuple[str, ...]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Cached disk I/O: read parquet files inside the provided date directories, then return:
+      (all_events, known_hosts_concat)
+    """
+    events: List[pd.DataFrame] = []
+    known_hosts_all: List[pd.DataFrame] = []
+
+    for dir_str in dir_paths:
+        day_dir = Path(dir_str)
+
+        dhcp_file = _find_log_file_in_day(day_dir, ["dhcp"])
+        arp_file = _find_log_file_in_day(day_dir, ["arp"])
+        conn_file = _find_log_file_in_day(day_dir, ["conn"])
+        known_hosts_file = _find_log_file_in_day(day_dir, ["known_hosts", "knownhost"])
+
+        if known_hosts_file:
+            kh_df = read_parquet_safe(known_hosts_file)
+            if not kh_df.empty:
+                known_hosts_all.append(kh_df)
+
+        for fpath, src in [(dhcp_file, "dhcp"), (arp_file, "arp"), (conn_file, "conn")]:
+            if not fpath:
+                continue
+            df = read_parquet_safe(fpath)
+            if df.empty:
+                continue
+            fallback = pd.Timestamp.fromtimestamp(os.path.getmtime(fpath))
+            ev = extract_device_events(df, src, fallback)
+            if not ev.empty:
+                events.append(ev)
+
+    all_events = pd.concat(events, ignore_index=True) if events else pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
+    known_hosts = pd.concat(known_hosts_all, ignore_index=True) if known_hosts_all else pd.DataFrame()
+    return all_events, known_hosts
+
+
+def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[str]) -> Tuple[pd.DataFrame, str]:
+    """
+    Apply the final time filter to events (even if we pre-selected directories),
+    returning (filtered_events, human_label).
+    """
+    if events is None or events.empty:
+        return events, ""
+
+    now = datetime.now()
+    tmp = events.copy()
+    tmp["ts_dt"] = pd.to_datetime(tmp["ts_dt"], errors="coerce")
+    tmp = tmp.dropna(subset=["ts_dt"])
+
+    if mode == "Last 7 Days":
+        cutoff = now - timedelta(days=7)
+        tmp = tmp[tmp["ts_dt"] >= cutoff]
+        return tmp, f"Last 7 Days (since {cutoff.strftime('%Y-%m-%d %H:%M')})"
+
+    if mode == "Specific Date" and selected_date:
+        # Selected date is in YYYY-MM-DD
+        start = datetime.strptime(selected_date, "%Y-%m-%d")
+        end = start + timedelta(days=1)
+        tmp = tmp[(tmp["ts_dt"] >= start) & (tmp["ts_dt"] < end)]
+        return tmp, f"Specific Date ({selected_date})"
+
+    return tmp, "All Time"
+
+
+# =============================================================================
 # MAIN RENDER
 # =============================================================================
 def render(parquet_root: str, authorized_macs_file: str):
@@ -416,58 +548,165 @@ def render(parquet_root: str, authorized_macs_file: str):
         st.error(f"Directory '{parquet_root}' not found.")
         return
 
-    allowed_macs = load_authorized_macs(authorized_macs_file)
+    # -----------------------------
+    # Time range selector (mirrors devices page)
+    # -----------------------------
+    by_date = _discover_date_dirs(root)
+    available_dates = sorted(by_date.keys(), reverse=True)
 
-    dhcp_file = find_latest_matching(root, ["dhcp"])
-    arp_file = find_latest_matching(root, ["arp"])
-    conn_file = find_latest_matching(root, ["conn"])
-    known_hosts_file = find_latest_matching(root, ["known_hosts", "knownhost"])
+    st.session_state.setdefault("alerts_time_mode", "Last 7 Days")
+    st.session_state.setdefault("alerts_time_date", available_dates[0] if available_dates else None)
 
-    known_hosts_df = read_parquet_safe(known_hosts_file)
-    mac_to_ip, mac_to_vendor = build_known_maps(known_hosts_df)
-
-    dhcp_df = read_parquet_safe(dhcp_file)
-    arp_df = read_parquet_safe(arp_file)
-    conn_df = read_parquet_safe(conn_file)
-
-    dhcp_mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(dhcp_file)) if dhcp_file else None
-    arp_mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(arp_file)) if arp_file else None
-    conn_mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(conn_file)) if conn_file else None
-
-    events = []
-    e1 = extract_device_events(dhcp_df, "dhcp", dhcp_mtime)
-    if not e1.empty:
-        events.append(e1)
-
-    e2 = extract_device_events(arp_df, "arp", arp_mtime)
-    if not e2.empty:
-        events.append(e2)
-
-    e3 = extract_device_events(conn_df, "conn", conn_mtime)
-    if not e3.empty:
-        events.append(e3)
-
-    if not events:
-        st.warning(
-            "No MAC-bearing device events found. "
-            "Usually means your parquet logs don't include MAC fields (DHCP/ARP) or the MAC column names differ."
+    tr_col1, tr_col2 = st.columns([1.2, 2.8], vertical_alignment="center")
+    with tr_col1:
+        time_mode = st.selectbox(
+            "Time Range:",
+            ["Last 7 Days", "Specific Date", "All Time"],
+            index=["Last 7 Days", "Specific Date", "All Time"].index(st.session_state["alerts_time_mode"])
+            if st.session_state["alerts_time_mode"] in ["Last 7 Days", "Specific Date", "All Time"]
+            else 0,
+            key="alerts_time_mode",
         )
+
+    selected_date = None
+    with tr_col2:
+        if time_mode == "Specific Date":
+            if not available_dates:
+                st.info("No date folders (YYYY-MM-DD) found under your parquet root.")
+            else:
+                selected_date = st.selectbox(
+                    "Select Date:",
+                    options=available_dates,
+                    index=0 if st.session_state.get("alerts_time_date") not in available_dates else available_dates.index(st.session_state["alerts_time_date"]),
+                    key="alerts_time_date",
+                )
+        else:
+            st.write("")  # keeps layout stable
+
+    # -----------------------------
+    # Determine which date dirs to load
+    # -----------------------------
+    dir_paths: List[str] = []
+
+    if not available_dates:
+        # fallback: no date folders => load "latest matching" behavior (original alerts.py)
+        # This keeps the page usable even if your parquet tree is not date-folder based.
+        st.info("Date folders not detected. Falling back to latest DHCP/ARP/CONN parquet files found in the tree.")
+
+        allowed_macs = load_authorized_macs(authorized_macs_file)
+
+        # original discovery: latest files anywhere
+        def _find_latest_matching(parquet_root_path: Path, keywords: List[str]) -> Optional[Path]:
+            files = list(parquet_root_path.rglob("*.parquet"))
+            if not files:
+                return None
+            matches = [f for f in files if any(k in f.name.lower() for k in keywords)]
+            if not matches:
+                return None
+            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            return matches[0]
+
+        dhcp_file = _find_latest_matching(root, ["dhcp"])
+        arp_file = _find_latest_matching(root, ["arp"])
+        conn_file = _find_latest_matching(root, ["conn"])
+        known_hosts_file = _find_latest_matching(root, ["known_hosts", "knownhost"])
+
+        known_hosts_df = read_parquet_safe(known_hosts_file)
+        mac_to_ip, mac_to_vendor = build_known_maps(known_hosts_df)
+
+        dhcp_df = read_parquet_safe(dhcp_file)
+        arp_df = read_parquet_safe(arp_file)
+        conn_df = read_parquet_safe(conn_file)
+
+        dhcp_mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(dhcp_file)) if dhcp_file else None
+        arp_mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(arp_file)) if arp_file else None
+        conn_mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(conn_file)) if conn_file else None
+
+        events = []
+        for df, src, fb in [(dhcp_df, "dhcp", dhcp_mtime), (arp_df, "arp", arp_mtime), (conn_df, "conn", conn_mtime)]:
+            ev = extract_device_events(df, src, fb)
+            if not ev.empty:
+                events.append(ev)
+
+        if not events:
+            st.warning(
+                "No MAC-bearing device events found. "
+                "Usually means your parquet logs don't include MAC fields (DHCP/ARP) or the MAC column names differ."
+            )
+            return
+
+        all_events = pd.concat(events, ignore_index=True)
+        all_events, range_label = _apply_time_filter(all_events, time_mode, selected_date)
+
+        if all_events.empty:
+            st.info(f"No events found for the selected time range: {range_label}.")
+            return
+
+        devices = build_device_table(all_events, mac_to_ip)
+        if devices.empty:
+            st.info(f"No devices found for the selected time range: {range_label}.")
+            return
+
+        mac_lookup = get_vendor_lookup_instance()
+        devices["vendor"] = devices["mac_norm"].map(lambda m: resolve_vendor(m, mac_to_vendor, mac_lookup))
+        devices["status"] = devices["mac_norm"].map(lambda m: "Verified" if m in allowed_macs else "Unauthorized")
+
+        _render_alerts_ui(devices, range_label)
         return
 
-    all_events = pd.concat(events, ignore_index=True)
+    # Normal path: date folders exist
+    if time_mode == "All Time":
+        for d in available_dates:
+            for p in by_date[d]:
+                dir_paths.append(str(p))
+    elif time_mode == "Specific Date" and selected_date:
+        for p in by_date.get(selected_date, []):
+            dir_paths.append(str(p))
+    else:
+        # Last 7 Days => load only the dates that could possibly be in the rolling window
+        cutoff_date = (datetime.now().date() - timedelta(days=7))
+        for d in available_dates:
+            try:
+                dd = datetime.strptime(d, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if dd >= cutoff_date:
+                for p in by_date[d]:
+                    dir_paths.append(str(p))
+
+    if not dir_paths:
+        st.info("No parquet date folders matched the selected time range.")
+        return
+
+    # -----------------------------
+    # Load events + known_hosts, then filter precisely
+    # -----------------------------
+    all_events, known_hosts_df = _load_events_and_known_hosts_for_dirs(tuple(dir_paths))
+    all_events, range_label = _apply_time_filter(all_events, time_mode, selected_date)
+
+    if all_events.empty:
+        st.info(f"No events found for the selected time range: {range_label}.")
+        return
+
+    mac_to_ip, mac_to_vendor = build_known_maps(known_hosts_df)
     devices = build_device_table(all_events, mac_to_ip)
 
     if devices.empty:
-        st.warning(
-            "No valid device MAC events found after normalization. "
-            "Most common reason: MAC column exists but values are not valid MAC format, or timestamps are missing."
-        )
+        st.info(f"No devices found for the selected time range: {range_label}.")
         return
 
+    allowed_macs = load_authorized_macs(authorized_macs_file)
     mac_lookup = get_vendor_lookup_instance()
     devices["vendor"] = devices["mac_norm"].map(lambda m: resolve_vendor(m, mac_to_vendor, mac_lookup))
     devices["status"] = devices["mac_norm"].map(lambda m: "Verified" if m in allowed_macs else "Unauthorized")
 
+    _render_alerts_ui(devices, range_label)
+
+
+# =============================================================================
+# UI RENDER (kept isolated so render() stays readable)
+# =============================================================================
+def _render_alerts_ui(devices: pd.DataFrame, range_label: str) -> None:
     verified_df = devices[devices["status"] == "Verified"].copy()
     unauth_df = devices[devices["status"] == "Unauthorized"].copy()
 
@@ -479,37 +718,37 @@ def render(parquet_root: str, authorized_macs_file: str):
     colA, colB, colC = st.columns(3)
 
     with colA:
-        st.metric("Total Devices Seen", len(devices))
+        st.metric("Total Devices Seen", int(len(devices)))
         if st.button("View Total Devices", use_container_width=True, key="view_total_devices"):
             st.session_state["unauth_macs_view"] = "Total"
 
     with colB:
-        st.metric("Verified Devices", len(verified_df))
+        st.metric("Verified Devices", int(len(verified_df)))
         if st.button("View Verified Devices", use_container_width=True, key="view_verified_devices"):
             st.session_state["unauth_macs_view"] = "Verified"
 
     with colC:
-        st.metric("Unauthorized Devices", len(unauth_df))
+        st.metric("Unauthorized Devices", int(len(unauth_df)))
         if st.button("View Unauthorized Devices", use_container_width=True, key="view_unauthorized_devices"):
             st.session_state["unauth_macs_view"] = "Unauthorized"
 
-    # Summary banner
+    # Summary banner (scoped to time range)
     if len(unauth_df) > 0:
-        st.error(f"SECURITY ALERT: {len(unauth_df)} UNAUTHORIZED DEVICE(S) DETECTED")
+        st.error(f"SECURITY ALERT: {len(unauth_df)} UNAUTHORIZED DEVICE(S) DETECTED — {range_label}")
     else:
-        st.success("System Secure. No unauthorized devices detected in MAC-bearing logs.")
+        st.success(f"System Secure. No unauthorized devices detected — {range_label}")
 
     # Render selected table
     view = st.session_state.get("unauth_macs_view", "Unauthorized")
 
     if view == "Total":
-        st.subheader("All Devices (Latest Seen)")
+        st.subheader(f"All Devices (Latest Seen) — {range_label}")
         df_to_show = devices.copy()
     elif view == "Verified":
-        st.subheader("Verified Devices (Latest Seen)")
+        st.subheader(f"Verified Devices (Latest Seen) — {range_label}")
         df_to_show = verified_df
     else:
-        st.subheader("Unauthorized Devices (Latest Seen)")
+        st.subheader(f"Unauthorized Devices (Latest Seen) — {range_label}")
         df_to_show = unauth_df
 
     if df_to_show.empty:
@@ -522,7 +761,5 @@ def render(parquet_root: str, authorized_macs_file: str):
         table.style.map(style_status, subset=["Status"]),
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "Last Seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss")
-        },
+        column_config={"Last Seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss")},
     )
