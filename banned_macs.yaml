@@ -1,5 +1,9 @@
 banned_macs:
 - mac: 00:08:22:24:ff:30
   date_modified: '2026-02-11 09:07:34'
+- mac: 00:08:22:78:3c:cc
+  date_modified: '2026-02-12 16:49:05'
 - mac: 00:08:22:80:3b:7a
   date_modified: '2026-02-12 13:25:50'
+- mac: 00:08:22:a8:40:69
+  date_modified: '2026-02-12 16:50:36'
