@@ -1,10 +1,4 @@
-# ui/pages/alerts.py
-# Fast + accurate Alerts page (DuckDB + per-date/per-dir cache) for Zeek parquet (DHCP/ARP/CONN + known_hosts)
-#
-# UI change requested:
-# - ✅ REMOVE: "Removed from Allowlist (since last check)" metric
-# - ✅ REMOVE: "Show removed allowlist MACs" checkbox
-# - ✅ KEEP LOGIC ALWAYS ON: removed-from-allowlist MACs are still surfaced as alerts + rows
+
 
 import hashlib
 import json
@@ -751,7 +745,7 @@ def render(parquet_root: str, authorized_macs_file: str):
 
 
 # =============================================================================
-# UI RENDER (removed allowlist logic ALWAYS ON, but UI elements removed)
+# UI RENDER (removed allowlist logic ALWAYS ON; "new unauthorized" removed)
 # =============================================================================
 def _render_alerts_ui(
     devices: pd.DataFrame,
@@ -770,13 +764,6 @@ def _render_alerts_ui(
     verified_df = devices[devices.get("status", "") == "Verified"].copy() if not devices.empty else pd.DataFrame()
     unauth_df = devices[devices.get("status", "") == "Unauthorized"].copy() if not devices.empty else pd.DataFrame()
 
-    # "new unauthorized since last check" (session-based)
-    st.session_state.setdefault("_alerts_prev_unauth_set", set())
-    current_unauth_set = set(unauth_df["mac_norm"].dropna().astype(str).tolist()) if not unauth_df.empty else set()
-    prev_unauth_set = st.session_state.get("_alerts_prev_unauth_set", set()) or set()
-    new_unauth = sorted(current_unauth_set - prev_unauth_set)
-    st.session_state["_alerts_prev_unauth_set"] = current_unauth_set
-
     # ---- removed allowlist ALWAYS ON ----
     removed_set = set(removed_from_allowlist)
 
@@ -794,11 +781,17 @@ def _render_alerts_ui(
             last_seen_map = ev.groupby("mac_norm")["ts_dt"].last().to_dict()
             last_ip_map = ev.dropna(subset=["ip"]).groupby("mac_norm")["ip"].last().to_dict()
             last_host_map = ev.dropna(subset=["host"]).groupby("mac_norm")["host"].last().to_dict()
-            last_src_map = ev.groupby("mac_norm")["source"].apply(lambda s: ", ".join(sorted(set(map(str, s))))).to_dict()
+            last_src_map = ev.groupby("mac_norm")["source"].apply(
+                lambda s: ", ".join(sorted(set(map(str, s))))
+            ).to_dict()
 
     # Synthetic rows for removed allowlist MACs not currently in devices table (ALWAYS ON)
     if removed_from_allowlist:
-        existing = set(devices["mac_norm"].astype(str).tolist()) if not devices.empty and "mac_norm" in devices.columns else set()
+        existing = (
+            set(devices["mac_norm"].astype(str).tolist())
+            if not devices.empty and "mac_norm" in devices.columns
+            else set()
+        )
         removed_rows = []
         for m in removed_from_allowlist:
             if m in existing:
@@ -836,7 +829,7 @@ def _render_alerts_ui(
     st.session_state.setdefault("unauth_macs_view", "Unauthorized")
 
     st.divider()
-    colA, colB, colC, colD = st.columns([1, 1, 1, 1.2])
+    colA, colB, colC = st.columns([1, 1, 1])
 
     with colA:
         st.metric("Total Devices Seen", int(len(devices)) if devices is not None else 0)
@@ -853,17 +846,10 @@ def _render_alerts_ui(
         if st.button("View Unauthorized Devices", use_container_width=True, key="view_unauthorized_devices"):
             st.session_state["unauth_macs_view"] = "Unauthorized"
 
-    with colD:
-        st.metric("New Unauthorized (since last check)", int(len(new_unauth)))
-
-    # Priority alerts (removed allowlist still has highest priority, but no "show removed" expander)
+    # Priority alerts (removed allowlist still has highest priority)
     if removed_from_allowlist:
         st.error(f"ALLOWLIST ALERT: {len(removed_from_allowlist)} MAC(s) REMOVED from allowlist — {range_label}")
         st.caption("Removed MACs are included in the table below as 'Unauthorized' with note 'Removed from allowlist'.")
-    elif len(new_unauth) > 0:
-        st.error(f"ALERT: {len(new_unauth)} NEW UNAUTHORIZED DEVICE(S) DETECTED — {range_label}")
-        with st.expander("Show new unauthorized MACs"):
-            st.code("\n".join(new_unauth))
     elif len(unauth_df) > 0:
         st.warning(f"Unauthorized devices present: {len(unauth_df)} — {range_label}")
     else:
