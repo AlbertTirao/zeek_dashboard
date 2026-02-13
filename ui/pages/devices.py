@@ -612,6 +612,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
 # Unauthorized:
 #   - Date column shows Last Seen
 # NOTE: History column removed per request.
+# NOTE: Search bar added (MAC only).
 # =====================================================
 @st.dialog("  ", width="large", dismissible=False)
 def device_list_popup(status_type, df, parquet_root, available_dates_list, banned_macs: set, authorized_added_at_map: dict):
@@ -626,6 +627,21 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
             _close_dialog()
 
     st.markdown(f"### {status_type} Devices")
+
+    # -----------------------------
+    # MAC Search (dialog only)
+    # -----------------------------
+    mac_query = st.text_input(
+        "Search MAC Address:",
+        value="",
+        placeholder="Paste MAC Address",
+        key=f"popup_mac_search_{status_type.lower()}",
+    ).strip().lower()
+
+    def _norm_mac_token(x: str) -> str:
+        return "".join(ch for ch in (x or "").lower() if ch.isalnum())
+
+    mac_query_norm = _norm_mac_token(mac_query)
 
     col_d1, col_d2 = st.columns([1.2, 2.8], vertical_alignment="bottom")
     with col_d1:
@@ -672,6 +688,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     inventory = inventory.sort_values("last_seen", ascending=False)
 
     if status_type == "Authorized":
+
         def _get_added_dt(mac: str):
             m = str(mac).strip().lower()
             dtv = authorized_added_at_map.get(m)
@@ -689,6 +706,22 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
 
     # Keep only requested visible columns (history removed)
     inventory = inventory[["mac", "ip", "host_name", "date_str", "last_seen"]].copy()
+
+    # Apply search filter to dialog inventory (MAC only)
+    if mac_query_norm:
+        inv = inventory.copy()
+        inv["_mac_norm"] = inv["mac"].astype(str).map(_norm_mac_token)
+        inv = inv[
+            inv["mac"].astype(str).str.lower().str.contains(mac_query, na=False)
+            | inv["_mac_norm"].str.contains(mac_query_norm, na=False)
+        ].copy()
+        inv = inv.drop(columns=["_mac_norm"], errors="ignore")
+
+        if inv.empty:
+            st.info("No matching MAC address found.")
+            return
+
+        inventory = inv
 
     inventory = inventory.reset_index(drop=True)
     inventory.insert(0, "#", inventory.index + 1)
@@ -709,11 +742,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     gb.configure_column("mac", header_name="MAC Address")
     gb.configure_column("ip", header_name="IP Address")
     gb.configure_column("host_name", header_name="Host Name")
-
-    gb.configure_column(
-        "date_str",
-        header_name=("Date" if status_type == "Authorized" else "Date"),
-    )
+    gb.configure_column("date_str", header_name=("Date" if status_type == "Authorized" else "Date"))
     gb.configure_column("last_seen", hide=True)
 
     grid_response = AgGrid(
@@ -893,72 +922,44 @@ def render(logs_root: Path, authorized_mac_file: Path):
     }
 
     # =====================================================
-    # DAILY DELTA LOGIC (UPDATED)
-    # - Shows: "+2 (today)" / "-1 (today)"
-    # - Locks for the day (refresh won't change delta)
-    # - Resets tomorrow; if no change tomorrow => hides delta
+    # DAILY DELTA LOGIC (FIXED)
+    # - Baseline is the first state seen today
+    # - Delta updates whenever counts change (refresh won't change anything unless data changed)
+    # - Resets automatically on the first run of a new day
+    # - If no change today => delta remains zero => UI hides it
     # =====================================================
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
-    def _delta_is_zero(d: dict) -> bool:
-        if not isinstance(d, dict):
-            return True
-        if int(d.get("total", 0)) != 0:
-            return False
-        if int(d.get("active_today", 0)) != 0:
-            return False
-        if int(d.get("auth", 0)) != 0:
-            return False
-        if int(d.get("unauth", 0)) != 0:
-            return False
-        if abs(float(d.get("risk", 0.0))) > 1e-12:
-            return False
-        return True
+    today_str = today.strftime("%Y-%m-%d")
 
     store = load_metrics_store(authorized_mac_file)
     if not isinstance(store, dict):
         store = {}
 
-    prev_state = store.get("state") if isinstance(store.get("state"), dict) else None
-
-    # New day -> set baseline to last known state (yesterday end), reset delta and unlock
-    if store.get("daily_date") != today_str:
-        baseline = prev_state if isinstance(prev_state, dict) else current_state
+    # New day -> baseline becomes "first state seen today"
+    if store.get("daily_date") != today_str or not isinstance(store.get("daily_baseline"), dict):
         store["daily_date"] = today_str
-        store["daily_baseline"] = baseline
+        store["daily_baseline"] = current_state
         store["daily_delta"] = {"total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0}
+        # keep key for backward compatibility (not used for locking anymore)
         store["daily_locked"] = False
 
     baseline = store.get("daily_baseline") if isinstance(store.get("daily_baseline"), dict) else current_state
-    daily_delta = store.get("daily_delta") if isinstance(store.get("daily_delta"), dict) else {
-        "total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0
+
+    b_total = int(baseline.get("total", current_state["total"]))
+    b_active = int(baseline.get("active_today", current_state["active_today"]))
+    b_auth = int(baseline.get("auth", current_state["auth"]))
+    b_unauth = int(baseline.get("unauth", current_state["unauth"]))
+    b_risk = float(baseline.get("risk", current_state["risk"]))
+
+    daily_delta = {
+        "total": current_state["total"] - b_total,
+        "active_today": current_state["active_today"] - b_active,
+        "auth": current_state["auth"] - b_auth,
+        "unauth": current_state["unauth"] - b_unauth,
+        "risk": round(current_state["risk"] - b_risk, 2),
     }
-    locked = bool(store.get("daily_locked", False))
 
-    if not locked:
-        b_total = int(baseline.get("total", current_state["total"]))
-        b_active = int(baseline.get("active_today", current_state["active_today"]))
-        b_auth = int(baseline.get("auth", current_state["auth"]))
-        b_unauth = int(baseline.get("unauth", current_state["unauth"]))
-        b_risk = float(baseline.get("risk", current_state["risk"]))
-
-        computed = {
-            "total": current_state["total"] - b_total,
-            "active_today": current_state["active_today"] - b_active,
-            "auth": current_state["auth"] - b_auth,
-            "unauth": current_state["unauth"] - b_unauth,
-            "risk": round(current_state["risk"] - b_risk, 2),
-        }
-
-        # Only lock if something changed today. If still zero, keep unlocked so it stays hidden.
-        if not _delta_is_zero(computed):
-            store["daily_delta"] = computed
-            store["daily_locked"] = True
-            daily_delta = computed
-        else:
-            daily_delta = computed  # zero -> UI hides it
-
-    # Always update last known state for tomorrow’s baseline
+    # Persist today’s delta + last known state
+    store["daily_delta"] = daily_delta
     store["state"] = current_state
     save_metrics_store(authorized_mac_file, store)
 

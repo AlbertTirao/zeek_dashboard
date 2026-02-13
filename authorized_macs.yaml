@@ -85,7 +85,7 @@ authorized_macs:
   vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: 40:d1:33:7c:27:a7
-  ip: 192.168.201.157
+  ip: 192.168.201.104
   hostname: LAPTOP-8SDVCIRA
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -95,7 +95,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.99
+  ip: 192.168.201.140
   hostname: JE-s-A06
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -105,7 +105,7 @@ authorized_macs:
   vendor: D-Link International
   date_modified: '2026-02-12 12:37:33'
 - mac: 50:bb:b5:32:16:9c
-  ip: 192.168.201.160
+  ip: 192.168.201.185
   hostname: LAPTOP-250P3062
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
@@ -120,12 +120,12 @@ authorized_macs:
   vendor: GIGA-BYTE TECHNOLOGY CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: 94:bb:43:4e:78:e6
-  ip: 192.168.201.119
+  ip: 192.168.201.109
   hostname: LAPTOP-BKN517GT
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: a0:02:a5:1d:14:15
-  ip: 192.168.201.158
+  ip: 192.168.201.182
   hostname: Lester
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -135,12 +135,12 @@ authorized_macs:
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.101
+  ip: 192.168.201.143
   hostname: Auggys-Phone
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: c0:35:32:b5:43:5f
-  ip: 192.168.201.159
+  ip: 192.168.201.183
   hostname: chesca
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
@@ -151,7 +151,7 @@ authorized_macs:
   date_modified: '2026-02-12 12:37:33'
 - mac: c4:b2:5b:96:df:4f
   ip: 192.168.201.101
-  hostname: '-'
+  hostname: OpenWrt
   vendor: None
   date_modified: '2026-02-12 12:37:33'
 - mac: dc:41:a9:64:da:c5
@@ -180,7 +180,7 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.36
+  ip: 192.168.201.141
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
