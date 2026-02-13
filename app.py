@@ -91,10 +91,10 @@ def render_current_page():
     # are updated to accept PARQUET_DIR (Path object) 
     # and use load_single_log() internally.
     
-    if page == "Devices":
+    if page == "Device Inspections":
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
         
-    elif page == "Analytics":
+    elif page == "Traffic Monitoring":
         analytics.render(PARQUET_DIR)
         
     elif page == "Zeek Logs":

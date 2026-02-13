@@ -1,19 +1,23 @@
-# ui/pages/device.py
-# Fixes applied:
-# 1) Uses the SAME normalize_mac() as alerts.py for:
-#    - known_hosts["mac"]
-#    - dhcp["mac"]
-#    - authorized_macs YAML
-#    - banned_macs YAML
-#    - forensic drilldown MAC comparisons
-# 2) Deterministic YAML list selection (preferred keys + stem key), so it always reads the right list
+# ui/pages/devices.py
+# Fast backend (DuckDB + per-date cache meta signature) + Original UI layout preserved
+#
+# Cache folder:
+#   data/parquet/_cache_devices/date=YYYY-MM-DD/device_facts.parquet
+#
+# Fixes:
+# - removes fragile nested f-strings with escaped quotes (caused your Pylance syntax errors)
+# - tz-naive vs tz-aware safe datetime handling
+# - get_device_activity: no missing-column SQL errors (inspects columns per parquet)
 
 import json
+import os
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
 
+import duckdb
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -30,37 +34,121 @@ except ImportError:
     st.stop()
 
 # =============================================================================
+# CONFIG (Shadow-style cache)
+# =============================================================================
+CACHE_VERSION = "devices-cache-v3-ui-preserved-fixed"
+CACHE_DIRNAME = "_cache_devices"
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def cache_dir(parquet_root: Path) -> Path:
+    return Path(parquet_root) / CACHE_DIRNAME
+
+
+def cache_facts_path(parquet_root: Path, date_str: str) -> Path:
+    return cache_dir(parquet_root) / f"date={date_str}" / "device_facts.parquet"
+
+
+def cache_meta_path(parquet_root: Path, date_str: str) -> Path:
+    return cache_dir(parquet_root) / f"date={date_str}" / "meta.yaml"
+
+
+def read_yaml(path: Path) -> dict:
+    try:
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_yaml(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+    except Exception:
+        pass
+
+
+def _paths_max_mtime(paths: List[str]) -> int:
+    m = 0
+    for p in paths:
+        try:
+            m = max(m, int(os.path.getmtime(p)))
+        except Exception:
+            pass
+    return m
+
+
+def _sql_list_str(paths: List[str]) -> str:
+    # DuckDB wants a SQL list literal: ['a','b']
+    return "[" + ",".join("'" + str(p).replace("'", "''") + "'" for p in paths) + "]"
+
+
+def _describe_cols(conn: duckdb.DuckDBPyConnection, obj_name: str) -> List[str]:
+    try:
+        return [r[0] for r in conn.execute(f"DESCRIBE {obj_name}").fetchall()]
+    except Exception:
+        try:
+            df = conn.execute(f"DESCRIBE {obj_name}").df()
+            return df.iloc[:, 0].astype(str).tolist()
+        except Exception:
+            return []
+
+
+def _duckdb_path(p: Path) -> str:
+    # Return a single-quoted SQL string for a path
+    return "'" + p.as_posix().replace("'", "''") + "'"
+
+
+@st.cache_resource(show_spinner=False)
+def get_db_connection() -> duckdb.DuckDBPyConnection:
+    conn = duckdb.connect(database=":memory:")
+    try:
+        conn.execute("SET memory_limit='4GB'")
+    except Exception:
+        pass
+    try:
+        n = os.cpu_count() or 4
+        conn.execute(f"SET threads TO {max(2, min(n, 8))}")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA enable_object_cache")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA enable_progress_bar=false")
+    except Exception:
+        pass
+    return conn
+
+
+# =============================================================================
 # MAC NORMALIZATION (MATCH ALERTS)
 # =============================================================================
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 
+
 def normalize_mac(x) -> Optional[str]:
     """Normalize MAC to 'aa:bb:cc:dd:ee:ff'. Return None if invalid."""
-    if x is None:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
     if isinstance(x, (bytes, bytearray)) and len(x) == 6:
         hx = bytes(x).hex()
     else:
-        hx = _MAC_HEX_RE.sub("", str(x))
+        hx = _MAC_HEX_RE.sub("", str(x).strip())
     if len(hx) != 12:
         return None
-    return ":".join(hx[i:i+2] for i in range(0, 12, 2)).lower()
+    return ":".join(hx[i : i + 2] for i in range(0, 12, 2)).lower()
+
 
 # YAML key preference (must match Alerts)
-PREFERRED_AUTH_KEYS = [
-    "authorized_macs",
-    "allowlist",
-    "authorized_devices",
-    "devices",
-    "authorized",
-]
-PREFERRED_BAN_KEYS = [
-    "banned_macs",
-    "denylist",
-    "blocked_macs",
-    "blocked",
-    "banned",
-]
+PREFERRED_AUTH_KEYS = ["authorized_macs", "allowlist", "authorized_devices", "devices", "authorized"]
+PREFERRED_BAN_KEYS = ["banned_macs", "denylist", "blocked_macs", "blocked", "banned"]
+
 
 def _extract_list_from_yaml(data, stem_key: str, preferred_keys: List[str]) -> list:
     """
@@ -86,69 +174,578 @@ def _extract_list_from_yaml(data, stem_key: str, preferred_keys: List[str]) -> l
     return []
 
 
-# =====================================================
-# 1) Load Visual Metrics from Parquet
-# =====================================================
+# =============================================================================
+# Date discovery (ignore cache dirs)
+# =============================================================================
+def _is_cache_path(p: Path) -> bool:
+    parts = [x.lower() for x in p.parts]
+    if CACHE_DIRNAME.lower() in parts:
+        return True
+    if any("_shadow_cache" in x for x in parts):
+        return True
+    return False
+
+
 @st.cache_data(show_spinner=False)
-def load_visual_metrics_from_parquet(parquet_root: Path):
-    known_hosts_all = []
-    dhcp_all = []
+def get_available_dates(parquet_root: Path) -> List[str]:
+    parquet_root = Path(parquet_root)
     if not parquet_root.exists():
-        return pd.DataFrame(), pd.DataFrame()
+        return []
 
-    for day_dir in sorted((p for p in parquet_root.iterdir() if p.is_dir())):
-        kh = day_dir / "known_hosts.parquet"
-        dh = day_dir / "dhcp.parquet"
-        if kh.exists():
-            known_hosts_all.append(pd.read_parquet(kh))
-        if dh.exists():
-            dhcp_all.append(pd.read_parquet(dh))
+    if DATE_DIR_RE.match(parquet_root.name):
+        return [parquet_root.name]
 
-    known_hosts = pd.concat(known_hosts_all, ignore_index=True) if known_hosts_all else pd.DataFrame()
-    dhcp = pd.concat(dhcp_all, ignore_index=True) if dhcp_all else pd.DataFrame()
-    return known_hosts, dhcp
+    out: List[str] = []
+    for p in parquet_root.iterdir():
+        if p.is_dir() and not _is_cache_path(p) and DATE_DIR_RE.match(p.name):
+            out.append(p.name)
+        elif p.is_dir() and not _is_cache_path(p) and p.name.startswith("date="):
+            ds = p.name.split("=", 1)[1]
+            if DATE_DIR_RE.match(ds):
+                out.append(ds)
+    return sorted(set(out), reverse=True)
 
 
-# =====================================================
-# 2) Drill-Down Log Loader (robust ts + robust MAC)
-# =====================================================
-@st.cache_data(show_spinner=False)
-def get_device_activity(parquet_root: Path, target_mac: str, target_ip: str, selected_date_str: str):
-    activity_log = []
-    log_types = [("dns", "DNS", "query"), ("http", "HTTP", "host"), ("ssl", "SSL", "server_name")]
+def _date_dir(parquet_root: Path, date_str: str) -> Path:
+    p1 = Path(parquet_root) / date_str
+    if p1.exists():
+        return p1
+    return Path(parquet_root) / f"date={date_str}"
 
+
+def _collect_dataset_files(date_dir: Path, base: str) -> List[Path]:
+    if not date_dir.exists():
+        return []
+
+    out: List[Path] = []
+    direct = date_dir / f"{base}.parquet"
+    if direct.exists():
+        out.append(direct)
+
+    nested = date_dir / base
+    if nested.exists() and nested.is_dir():
+        out.extend(sorted(nested.glob("*.parquet")))
+
+    out.extend(sorted(date_dir.glob(f"{base}_*.parquet")))
+    out.extend(sorted(date_dir.glob(f"{base}-*.parquet")))
+
+    out = [p for p in out if p.is_file() and not _is_cache_path(p)]
+    uniq = {str(p.resolve()): p for p in out}
+    return sorted(uniq.values(), key=lambda x: str(x))
+
+
+# =============================================================================
+# Cache freshness gate
+# =============================================================================
+def cache_is_fresh(parquet_root: Path, date_str: str, sources_max_mtime: int) -> bool:
+    meta = read_yaml(cache_meta_path(parquet_root, date_str))
+    if not meta:
+        return False
+    if not cache_facts_path(parquet_root, date_str).exists():
+        return False
+    if meta.get("cache_version") != CACHE_VERSION:
+        return False
+    if int(meta.get("sources_max_mtime", 0)) != int(sources_max_mtime):
+        return False
+    return True
+
+
+# =============================================================================
+# DuckDB daily cache build (device_facts)
+# =============================================================================
+def build_daily_cache(conn: duckdb.DuckDBPyConnection, parquet_root: Path, date_str: str) -> None:
+    date_dir = _date_dir(parquet_root, date_str)
+    if not date_dir.exists():
+        return
+
+    known_files = _collect_dataset_files(date_dir, "known_hosts")
+    dhcp_files = _collect_dataset_files(date_dir, "dhcp")
+    conn_files = _collect_dataset_files(date_dir, "conn")
+
+    known = [str(p) for p in known_files]
+    dhcp = [str(p) for p in dhcp_files]
+    conns = [str(p) for p in conn_files]
+
+    sources = known + dhcp + conns
+    sources_max_mtime = _paths_max_mtime(sources)
+
+    if cache_is_fresh(parquet_root, date_str, sources_max_mtime):
+        return
+
+    if not known:
+        write_yaml(
+            cache_meta_path(parquet_root, date_str),
+            {
+                "cache_version": CACHE_VERSION,
+                "date": date_str,
+                "rows": 0,
+                "sources_max_mtime": int(sources_max_mtime),
+                "built_at": int(time.time()),
+                "note": "No known_hosts parquet found",
+            },
+        )
+        return
+
+    # Register raw views
+    conn.execute(
+        "CREATE OR REPLACE VIEW raw_known_hosts_files AS "
+        f"SELECT * FROM read_parquet({_sql_list_str(known)}, union_by_name=True)"
+    )
+    kh_cols = set(_describe_cols(conn, "raw_known_hosts_files"))
+
+    if dhcp:
+        conn.execute(
+            "CREATE OR REPLACE VIEW raw_dhcp_files AS "
+            f"SELECT * FROM read_parquet({_sql_list_str(dhcp)}, union_by_name=True)"
+        )
+        dh_cols = set(_describe_cols(conn, "raw_dhcp_files"))
+    else:
+        conn.execute("CREATE OR REPLACE VIEW raw_dhcp_files AS SELECT 1 WHERE false")
+        dh_cols = set()
+
+    if conns:
+        conn.execute(
+            "CREATE OR REPLACE VIEW raw_conn_files AS "
+            f"SELECT * FROM read_parquet({_sql_list_str(conns)}, union_by_name=True)"
+        )
+        cn_cols = set(_describe_cols(conn, "raw_conn_files"))
+    else:
+        conn.execute("CREATE OR REPLACE VIEW raw_conn_files AS SELECT 1 WHERE false")
+        cn_cols = set()
+
+    def pick(cols: set, candidates: List[str]) -> Optional[str]:
+        for c in candidates:
+            if c in cols:
+                return c
+        return None
+
+    # known_hosts
+    kh_ip = pick(kh_cols, ["host", "ip", "ip_addr", "addr", "id.orig_h", "orig_h", "client_addr", "assigned_addr"])
+    kh_mac = pick(kh_cols, ["mac", "mac_addr", "mac_address", "hwaddr", "orig_l2_addr", "l2_addr", "src_mac", "client_chaddr"])
+    kh_host = pick(kh_cols, ["host_name", "hostname", "device_name", "name"])
+    kh_ts = pick(kh_cols, ["ts", "timestamp", "seen_ts", "time"])
+
+    # dhcp
+    dh_ip = pick(dh_cols, ["client_addr", "assigned_addr", "requested_addr", "ip", "id.orig_h", "orig_h", "addr", "host"])
+    dh_mac = pick(dh_cols, ["mac", "mac_addr", "mac_address", "hwaddr", "orig_l2_addr", "l2_addr", "src_mac", "client_chaddr", "hardware_address", "chaddr"])
+    dh_host = pick(dh_cols, ["host_name", "hostname", "client_hostname", "client_fqdn", "client_name"])
+    dh_ts = pick(dh_cols, ["ts", "timestamp", "seen_ts", "time"])
+
+    # conn
+    cn_ip = pick(cn_cols, ["id.orig_h", "orig_h", "src_ip", "ip", "host", "addr"])
+    cn_mac = pick(cn_cols, ["orig_l2_addr", "src_mac", "l2_addr", "mac", "hwaddr"])
+    cn_host = pick(cn_cols, ["host_name", "hostname", "device_name", "host"])
+    cn_ts = pick(cn_cols, ["ts", "timestamp", "seen_ts", "time"])
+
+    def ts_expr(col: Optional[str]) -> str:
+        """
+        Robust timestamp expression:
+        - Prefer parsing as TIMESTAMP
+        - Fallback to epoch seconds (DOUBLE)
+        - Never mixes types inside COALESCE (prevents NULL ts everywhere)
+        """
+        if not col:
+            return "NULL"
+        return (
+            "CASE "
+            f"WHEN try_cast(\"{col}\" AS TIMESTAMP) IS NOT NULL THEN try_cast(\"{col}\" AS TIMESTAMP) "
+            f"WHEN try_cast(\"{col}\" AS DOUBLE)    IS NOT NULL THEN to_timestamp(try_cast(\"{col}\" AS DOUBLE)) "
+            "ELSE NULL END"
+        )
+
+    def str_expr(col: Optional[str], fallback: str = "''") -> str:
+        if not col:
+            return fallback
+        return f"CAST(\"{col}\" AS VARCHAR)"
+
+    def norm_mac_expr(raw_expr: str) -> str:
+        return (
+            "CASE "
+            f"WHEN length(lower(regexp_replace({raw_expr}, '[^0-9a-fA-F]', '', 'g'))) = 12 THEN "
+            "  ("
+            "    substr(lower(regexp_replace(" + raw_expr + ", '[^0-9a-fA-F]', '', 'g')), 1, 2) || ':' || "
+            "    substr(lower(regexp_replace(" + raw_expr + ", '[^0-9a-fA-F]', '', 'g')), 3, 2) || ':' || "
+            "    substr(lower(regexp_replace(" + raw_expr + ", '[^0-9a-fA-F]', '', 'g')), 5, 2) || ':' || "
+            "    substr(lower(regexp_replace(" + raw_expr + ", '[^0-9a-fA-F]', '', 'g')), 7, 2) || ':' || "
+            "    substr(lower(regexp_replace(" + raw_expr + ", '[^0-9a-fA-F]', '', 'g')), 9, 2) || ':' || "
+            "    substr(lower(regexp_replace(" + raw_expr + ", '[^0-9a-fA-F]', '', 'g')), 11, 2)"
+            "  ) "
+            "ELSE NULL END"
+        )
+
+    # v_dhcp
+    if dh_ip and dh_mac:
+        dh_host_expr = str_expr(dh_host, "''")
+        if dh_ts:
+            conn.execute(
+                f"""
+                CREATE OR REPLACE VIEW v_dhcp AS
+                WITH base AS (
+                    SELECT
+                        CAST("{dh_ip}" AS VARCHAR) AS ip_addr,
+                        {str_expr(dh_mac, "NULL")} AS mac_raw,
+                        {dh_host_expr} AS host_raw,
+                        {ts_expr(dh_ts)} AS ts_raw
+                    FROM raw_dhcp_files
+                    WHERE "{dh_ip}" IS NOT NULL AND "{dh_mac}" IS NOT NULL
+                )
+                SELECT
+                    ip_addr,
+                    arg_max(mac_raw, ts_raw) AS mac_addr,
+                    COALESCE(NULLIF(arg_max(host_raw, ts_raw), ''), '') AS hostname
+                FROM base
+                GROUP BY 1
+                """
+            )
+        else:
+            conn.execute(
+                f"""
+                CREATE OR REPLACE VIEW v_dhcp AS
+                SELECT
+                    CAST("{dh_ip}" AS VARCHAR) AS ip_addr,
+                    any_value({str_expr(dh_mac, "NULL")}) AS mac_addr,
+                    COALESCE(NULLIF(any_value({dh_host_expr}), ''), '') AS hostname
+                FROM raw_dhcp_files
+                WHERE "{dh_ip}" IS NOT NULL AND "{dh_mac}" IS NOT NULL
+                GROUP BY 1
+                """
+            )
+    else:
+        conn.execute(
+            "CREATE OR REPLACE VIEW v_dhcp AS "
+            "SELECT NULL::VARCHAR AS ip_addr, NULL::VARCHAR AS mac_addr, ''::VARCHAR AS hostname WHERE false"
+        )
+
+    # v_conn_map
+    if cn_ip and cn_mac:
+        cn_host_expr = str_expr(cn_host, "''")
+        if cn_ts:
+            conn.execute(
+                f"""
+                CREATE OR REPLACE VIEW v_conn_map AS
+                WITH base AS (
+                    SELECT
+                        CAST("{cn_ip}" AS VARCHAR) AS ip_addr,
+                        {str_expr(cn_mac, "NULL")} AS mac_raw,
+                        {cn_host_expr} AS host_raw,
+                        {ts_expr(cn_ts)} AS ts_raw
+                    FROM raw_conn_files
+                    WHERE "{cn_ip}" IS NOT NULL AND "{cn_mac}" IS NOT NULL
+                )
+                SELECT
+                    ip_addr,
+                    arg_max(mac_raw, ts_raw) AS mac_addr,
+                    COALESCE(NULLIF(arg_max(host_raw, ts_raw), ''), '') AS hostname
+                FROM base
+                GROUP BY 1
+                """
+            )
+        else:
+            conn.execute(
+                f"""
+                CREATE OR REPLACE VIEW v_conn_map AS
+                SELECT
+                    CAST("{cn_ip}" AS VARCHAR) AS ip_addr,
+                    any_value({str_expr(cn_mac, "NULL")}) AS mac_addr,
+                    COALESCE(NULLIF(any_value({cn_host_expr}), ''), '') AS hostname
+                FROM raw_conn_files
+                WHERE "{cn_ip}" IS NOT NULL AND "{cn_mac}" IS NOT NULL
+                GROUP BY 1
+                """
+            )
+    else:
+        conn.execute(
+            "CREATE OR REPLACE VIEW v_conn_map AS "
+            "SELECT NULL::VARCHAR AS ip_addr, NULL::VARCHAR AS mac_addr, ''::VARCHAR AS hostname WHERE false"
+        )
+
+    # v_known
+    if kh_ip and kh_mac:
+        kh_host_expr = str_expr(kh_host, "''")
+        if kh_ts:
+            conn.execute(
+                f"""
+                CREATE OR REPLACE VIEW v_known AS
+                WITH base AS (
+                    SELECT
+                        CAST("{kh_ip}" AS VARCHAR) AS ip_addr,
+                        {str_expr(kh_mac, "NULL")} AS mac_raw,
+                        {kh_host_expr} AS host_raw,
+                        {ts_expr(kh_ts)} AS ts_raw
+                    FROM raw_known_hosts_files
+                    WHERE "{kh_ip}" IS NOT NULL AND "{kh_mac}" IS NOT NULL
+                )
+                SELECT
+                    ip_addr,
+                    arg_max(mac_raw, ts_raw) AS mac_addr,
+                    COALESCE(NULLIF(arg_max(host_raw, ts_raw), ''), '') AS hostname
+                FROM base
+                GROUP BY 1
+                """
+            )
+        else:
+            conn.execute(
+                f"""
+                CREATE OR REPLACE VIEW v_known AS
+                SELECT
+                    CAST("{kh_ip}" AS VARCHAR) AS ip_addr,
+                    any_value({str_expr(kh_mac, "NULL")}) AS mac_addr,
+                    COALESCE(NULLIF(any_value({kh_host_expr}), ''), '') AS hostname
+                FROM raw_known_hosts_files
+                WHERE "{kh_ip}" IS NOT NULL AND "{kh_mac}" IS NOT NULL
+                GROUP BY 1
+                """
+            )
+    else:
+        conn.execute(
+            "CREATE OR REPLACE VIEW v_known AS "
+            "SELECT NULL::VARCHAR AS ip_addr, NULL::VARCHAR AS mac_addr, ''::VARCHAR AS hostname WHERE false"
+        )
+
+    conn.execute(
+        """
+        CREATE OR REPLACE VIEW v_ip_map AS
+        SELECT
+            COALESCE(d.ip_addr, c.ip_addr, k.ip_addr) AS ip_addr,
+            COALESCE(NULLIF(d.mac_addr,''), NULLIF(c.mac_addr,''), NULLIF(k.mac_addr,'')) AS mac_addr,
+            COALESCE(NULLIF(d.hostname,''), NULLIF(c.hostname,''), NULLIF(k.hostname,''), '') AS hostname
+        FROM v_dhcp d
+        FULL OUTER JOIN v_conn_map c
+            ON d.ip_addr = c.ip_addr
+        FULL OUTER JOIN v_known k
+            ON COALESCE(d.ip_addr, c.ip_addr) = k.ip_addr
+        """
+    )
+
+    ip_expr = f"CAST(\"{kh_ip}\" AS VARCHAR)" if kh_ip else "''"
+    host_expr = str_expr(kh_host, "''") if kh_host else "''"
+    mac_raw_expr = str_expr(kh_mac, "NULL") if kh_mac else "NULL"
+    ts_raw_expr = ts_expr(kh_ts) if kh_ts else "NULL"
+
+    out_path = cache_facts_path(parquet_root, date_str)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    final_sql = f"""
+    WITH base AS (
+        SELECT
+            {ts_raw_expr} AS ts,
+            {ip_expr}     AS ip_raw,
+            {mac_raw_expr} AS mac_raw,
+            {host_expr}   AS host_raw
+        FROM raw_known_hosts_files
+    ),
+    enriched AS (
+        SELECT
+            ts,
+            COALESCE(NULLIF(trim(ip_raw), ''), '') AS host,
+            COALESCE(NULLIF(trim(host_raw), ''), '') AS host_kh,
+            mac_raw AS mac_kh,
+            m.mac_addr AS mac_ip,
+            m.hostname AS host_ip
+        FROM base b
+        LEFT JOIN v_ip_map m
+            ON COALESCE(NULLIF(trim(b.ip_raw), ''), '') = m.ip_addr
+    )
+    SELECT
+        ts,
+        host,
+        {norm_mac_expr("CAST(COALESCE(mac_kh, mac_ip) AS VARCHAR)")} AS mac,
+        COALESCE(NULLIF(host_kh, ''), NULLIF(host_ip, ''), '') AS host_name,
+        CAST(ts AS DATE) AS date
+    FROM enriched
+    WHERE ts IS NOT NULL
+    """
+
+    try:
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except Exception:
+                pass
+
+        conn.execute(f"COPY ({final_sql}) TO {_duckdb_path(out_path)} (FORMAT 'parquet')")
+
+        rows = 0
+        try:
+            rows = int(conn.execute(f"SELECT COUNT(*) FROM read_parquet({_duckdb_path(out_path)})").fetchone()[0])
+        except Exception:
+            rows = 0
+
+        write_yaml(
+            cache_meta_path(parquet_root, date_str),
+            {
+                "cache_version": CACHE_VERSION,
+                "date": date_str,
+                "rows": int(rows),
+                "sources_max_mtime": int(sources_max_mtime),
+                "built_at": int(time.time()),
+                "facts_file": str(out_path.name),
+            },
+        )
+    except Exception:
+        write_yaml(
+            cache_meta_path(parquet_root, date_str),
+            {
+                "cache_version": CACHE_VERSION,
+                "date": date_str,
+                "rows": 0,
+                "sources_max_mtime": int(sources_max_mtime),
+                "built_at": int(time.time()),
+                "note": "Cache build failed",
+            },
+        )
+
+
+def ensure_cache(conn: duckdb.DuckDBPyConnection, parquet_root: Path, target_dates: List[str]) -> None:
+    if not target_dates:
+        return
+    prog = st.progress(0, text="Preparing optimized cache...")
+    total = len(target_dates)
+    for i, d in enumerate(target_dates, start=1):
+        try:
+            build_daily_cache(conn, parquet_root, d)
+        except Exception as e:
+            write_yaml(
+                cache_meta_path(parquet_root, d),
+                {
+                    "cache_version": CACHE_VERSION,
+                    "date": d,
+                    "rows": 0,
+                    "sources_max_mtime": 0,
+                    "built_at": int(time.time()),
+                    "note": f"Cache build exception: {type(e).__name__}: {e}",
+                },
+            )
+        except Exception:
+            pass
+        prog.progress(int(i / total * 100), text="Preparing optimized cache...")
+    prog.empty()
+
+
+def read_cached_files(parquet_root: Path, target_dates: List[str]) -> List[str]:
+    files: List[str] = []
+    for d in target_dates:
+        p = cache_facts_path(parquet_root, d)
+        if p.exists():
+            files.append(str(p))
+    return files
+
+
+def register_devices_view(conn: duckdb.DuckDBPyConnection, cached_files: List[str]) -> None:
+    if not cached_files:
+        conn.execute("CREATE OR REPLACE VIEW device_facts AS SELECT 1 WHERE false")
+        return
+    file_list_sql = _sql_list_str(cached_files)
+    conn.execute(
+        f"""
+        CREATE OR REPLACE VIEW device_facts AS
+        SELECT * FROM read_parquet({file_list_sql}, union_by_name=True)
+        """
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_device_facts(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
+    parquet_root = Path(parquet_root)
+    if not parquet_root.exists():
+        return pd.DataFrame()
+
+    conn = get_db_connection()
+
+    # 1) Build/ensure cache
+    ensure_cache(conn, parquet_root, target_dates)
+
+    # 2) Register view over cached parquet files
+    cached_files = read_cached_files(parquet_root, target_dates)
+    if not cached_files:
+        return pd.DataFrame()
+
+    register_devices_view(conn, cached_files)
+
+    # 3) Validate schema (auto-heal if cache is broken/old)
+    required_cols = {"ts", "host", "mac", "host_name", "date"}
+    cols = set(_describe_cols(conn, "device_facts"))
+
+    if not required_cols.issubset(cols):
+        # Delete ONLY the per-date cache facts/meta and rebuild
+        for d in target_dates:
+            try:
+                p = cache_facts_path(parquet_root, d)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+            try:
+                m = cache_meta_path(parquet_root, d)
+                if m.exists():
+                    m.unlink()
+            except Exception:
+                pass
+
+        # Rebuild caches
+        ensure_cache(conn, parquet_root, target_dates)
+
+        # Re-register view
+        cached_files = read_cached_files(parquet_root, target_dates)
+        if not cached_files:
+            return pd.DataFrame()
+
+        register_devices_view(conn, cached_files)
+
+        # Re-check schema
+        cols = set(_describe_cols(conn, "device_facts"))
+        if not required_cols.issubset(cols):
+            # If still broken, fail clearly (this should not happen unless source parquet is missing expected fields)
+            raise RuntimeError(
+                f"device_facts cache schema is missing required columns. "
+                f"Have={sorted(cols)} Required={sorted(required_cols)}. "
+                f"Check known_hosts/dhcp/conn source parquet fields for this date set."
+            )
+
+    # 4) Now safe to query
+    df = conn.execute("SELECT ts, host, mac, host_name, date FROM device_facts").df()
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # 5) Clean types
+    df["mac"] = df["mac"].apply(normalize_mac)
+    df = df.dropna(subset=["mac"])
+
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts"])
+    if isinstance(df["ts"].dtype, pd.DatetimeTZDtype):
+        df["ts"] = df["ts"].dt.tz_convert(None)
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["host"] = df["host"].astype(str).fillna("").replace({"None": "", "nan": ""})
+    df["host_name"] = df["host_name"].astype(str).fillna("-").replace({"None": "-", "nan": "-"})
+    return df.sort_values("ts", ascending=False)
+
+
+# =============================================================================
+# Drill-down (DuckDB scan) – robust to missing columns
+# =============================================================================
+@st.cache_data(show_spinner=False, ttl=120)
+def get_device_activity(parquet_root: Path, target_mac: str, target_ip: str, selected_date_str: str) -> pd.DataFrame:
     target_mac_norm = normalize_mac(target_mac) or ""
     target_ip_norm = (target_ip or "").strip()
+    mac_hex = target_mac_norm.replace(":", "")
+
+    parquet_root = Path(parquet_root)
+    con = get_db_connection()
 
     if selected_date_str and selected_date_str != "All Dates":
-        day_dirs = [parquet_root / selected_date_str]
+        day_dirs = [parquet_root / selected_date_str, parquet_root / f"date={selected_date_str}"]
     else:
-        day_dirs = sorted((p for p in parquet_root.iterdir() if p.is_dir()))
+        day_dirs = [p for p in parquet_root.iterdir() if p.is_dir() and not _is_cache_path(p)]
 
-    def _coerce_ts(series: pd.Series) -> pd.Series:
-        if pd.api.types.is_datetime64_any_dtype(series):
-            return series
+    log_types = [
+        ("dns", "DNS", "query"),
+        ("http", "HTTP", "host"),
+        ("ssl", "SSL", "server_name"),
+    ]
 
-        if pd.api.types.is_object_dtype(series):
-            parsed = pd.to_datetime(series, errors="coerce", utc=False)
-            if parsed.notna().any():
-                return parsed
-
-        num = pd.to_numeric(series, errors="coerce")
-        if not num.notna().any():
-            return pd.to_datetime(series, errors="coerce")
-
-        m = float(num.dropna().abs().max())
-        # Zeek seconds ~ 1.7e9, ms ~ 1.7e12, us ~ 1.7e15, ns ~ 1.7e18
-        if m > 1e17:
-            unit = "ns"
-        elif m > 1e14:
-            unit = "us"
-        elif m > 1e11:
-            unit = "ms"
-        else:
-            unit = "s"
-        return pd.to_datetime(num, unit=unit, errors="coerce")
+    frames: List[pd.DataFrame] = []
 
     for day_dir in day_dirs:
         if not day_dir.exists():
@@ -159,63 +756,94 @@ def get_device_activity(parquet_root: Path, target_mac: str, target_ip: str, sel
             if not pq_file.exists():
                 continue
 
+            # Create temp view so we can DESCRIBE columns safely
             try:
-                df = pd.read_parquet(pq_file)
-                if df.empty or "ts" not in df.columns:
-                    continue
-
-                filtered = pd.DataFrame()
-
-                # Prefer MAC match when present
-                if "mac" in df.columns and target_mac_norm:
-                    mac_norm_series = df["mac"].map(normalize_mac)
-                    filtered = df[mac_norm_series == target_mac_norm]
-
-                # Else fallback to IP match if possible
-                elif target_ip_norm:
-                    if "id.orig_h" in df.columns:
-                        filtered = df[df["id.orig_h"].astype(str) == target_ip_norm]
-                    elif "host" in df.columns:
-                        filtered = df[df["host"].astype(str) == target_ip_norm]
-
-                if filtered.empty:
-                    continue
-
-                if detail_col not in filtered.columns:
-                    filtered = filtered.copy()
-                    filtered[detail_col] = "-"
-
-                norm = pd.DataFrame()
-                norm["ts"] = filtered["ts"]
-                norm["Service"] = service
-                norm["Destination"] = filtered[detail_col].astype(str)
-
-                if service == "HTTP" and "uri" in filtered.columns:
-                    norm["Details"] = filtered["uri"].astype(str)
-                elif service == "DNS" and "qtype_name" in filtered.columns:
-                    norm["Details"] = filtered["qtype_name"].astype(str)
-                elif service == "SSL" and "version" in filtered.columns:
-                    norm["Details"] = filtered["version"].astype(str)
-                else:
-                    norm["Details"] = "-"
-
-                activity_log.append(norm)
-
+                con.execute(f"CREATE OR REPLACE VIEW _tmp_log AS SELECT * FROM read_parquet({_duckdb_path(pq_file)}, union_by_name=True)")
+                cols = set(_describe_cols(con, "_tmp_log"))
             except Exception:
                 continue
 
-    if not activity_log:
+            where_parts: List[str] = []
+
+            # IP match
+            if target_ip_norm and "id.orig_h" in cols:
+                ip_sql = target_ip_norm.replace("'", "''")
+                where_parts.append(f'CAST("id.orig_h" AS VARCHAR) = \'{ip_sql}\'')
+
+            # MAC-ish match: only include columns that exist
+            macish_candidates = ["orig_l2_addr", "src_mac", "l2_addr", "mac", "hwaddr"]
+            macish_cols = [c for c in macish_candidates if c in cols]
+
+            if mac_hex and macish_cols:
+                coalesce_expr = "coalesce(" + ", ".join([f'"{c}"' for c in macish_cols]) + ")"
+                where_parts.append(
+                    "("
+                    f"lower(regexp_replace(CAST({coalesce_expr} AS VARCHAR), '[^0-9a-fA-F]', '', 'g')) = '{mac_hex}'"
+                    ")"
+                )
+
+            if not where_parts:
+                continue
+
+            where_sql = " OR ".join(where_parts)
+
+            if service == "HTTP":
+                # destination best-effort
+                dest_expr = "CAST(coalesce(host, \"id.resp_h\") AS VARCHAR)" if ("host" in cols or "id.resp_h" in cols) else "''"
+                uri_expr = "CAST(coalesce(uri,'') AS VARCHAR) AS Details" if "uri" in cols else "'' AS Details"
+                sql = (
+                    "SELECT ts AS ts, "
+                    f"'{service}' AS Service, "
+                    f"{dest_expr} AS Destination, "
+                    f"{uri_expr} "
+                    "FROM _tmp_log "
+                    f"WHERE {where_sql}"
+                )
+            elif service == "DNS":
+                dest_expr = "CAST(coalesce(query, \"id.resp_h\") AS VARCHAR)" if ("query" in cols or "id.resp_h" in cols) else "''"
+                details_expr = "CAST(coalesce(qtype_name,'-') AS VARCHAR) AS Details" if "qtype_name" in cols else "'' AS Details"
+                sql = (
+                    "SELECT ts AS ts, "
+                    f"'{service}' AS Service, "
+                    f"{dest_expr} AS Destination, "
+                    f"{details_expr} "
+                    "FROM _tmp_log "
+                    f"WHERE {where_sql}"
+                )
+            else:
+                dest_expr = "CAST(coalesce(server_name, \"id.resp_h\") AS VARCHAR)" if ("server_name" in cols or "id.resp_h" in cols) else "''"
+                details_expr = "CAST(coalesce(version,'-') AS VARCHAR) AS Details" if "version" in cols else "'' AS Details"
+                sql = (
+                    "SELECT ts AS ts, "
+                    f"'{service}' AS Service, "
+                    f"{dest_expr} AS Destination, "
+                    f"{details_expr} "
+                    "FROM _tmp_log "
+                    f"WHERE {where_sql}"
+                )
+
+            try:
+                part = con.execute(sql).df()
+                if part is not None and not part.empty:
+                    frames.append(part)
+            except Exception:
+                continue
+
+    if not frames:
         return pd.DataFrame()
 
-    final_df = pd.concat(activity_log, ignore_index=True)
-    final_df["ts"] = _coerce_ts(final_df["ts"])
-    final_df = final_df.dropna(subset=["ts"])
-    return final_df.sort_values("ts", ascending=False)
+    out = pd.concat(frames, ignore_index=True)
+    out["ts"] = pd.to_datetime(out["ts"], errors="coerce")
+    out = out.dropna(subset=["ts"])
+    # keep tz-naive
+    if isinstance(out["ts"].dtype, pd.DatetimeTZDtype):
+        out["ts"] = out["ts"].dt.tz_convert(None)
+    return out.sort_values("ts", ascending=False)
 
 
-# =====================================================
-# 3) Helpers
-# =====================================================
+# =============================================================================
+# Helpers / Stores
+# =============================================================================
 @st.cache_data(show_spinner=False)
 def get_mac_vendor(mac: str) -> str:
     if not mac or mac == "unknown":
@@ -260,13 +888,6 @@ def load_authorized_macs(file_path: Path) -> set:
 
 
 def load_banned_macs(ban_file: Path) -> set:
-    """
-    Supports:
-      banned_macs.yaml:
-        banned_macs:
-          - "aa:bb:.."
-          - {mac: "aa:bb:..", date_modified: "..."}
-    """
     if not ban_file.exists():
         return set()
     try:
@@ -291,7 +912,6 @@ def load_banned_macs(ban_file: Path) -> set:
 
 def save_banned_macs(ban_file: Path, banned_set: set) -> None:
     ban_file.parent.mkdir(parents=True, exist_ok=True)
-    # Always store under a deterministic key to avoid future ambiguity
     payload = {"banned_macs": sorted(list(banned_set))}
     ban_file.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
@@ -316,9 +936,6 @@ def save_metrics_store(authorized_mac_file: Path, store: dict) -> None:
     fp.write_text(json.dumps(store, indent=2), encoding="utf-8")
 
 
-# =====================================================
-# 3b) Authorized "Added At" store (persistent, safe, does not touch YAML)
-# =====================================================
 def _auth_history_store_file(authorized_mac_file: Path) -> Path:
     return authorized_mac_file.with_name("authorized_macs_history.json")
 
@@ -347,7 +964,23 @@ def _parse_any_dt(value):
         ts = pd.to_datetime(value, errors="coerce", utc=False)
         if pd.isna(ts):
             return None
+        if isinstance(ts, pd.Timestamp) and ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
         return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _to_naive_ts(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    try:
+        t = pd.to_datetime(x, errors="coerce")
+        if pd.isna(t):
+            return None
+        if isinstance(t, pd.Timestamp) and t.tzinfo is not None:
+            t = t.tz_convert(None)
+        return t
     except Exception:
         return None
 
@@ -387,11 +1020,6 @@ def _humanize_ago(delta: timedelta) -> str:
 
 
 def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_store: Path):
-    """
-    Returns:
-      - authorized_set: set[str] normalized mac (aa:bb:cc:dd:ee:ff)
-      - added_at_map: dict[str, datetime] when it was first seen in the authorized list
-    """
     if file_path.suffix == ".txt":
         yaml_path = file_path.with_suffix(".yaml")
         if yaml_path.exists():
@@ -409,7 +1037,6 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
 
     raw_list = _extract_list_from_yaml(data, file_path.stem, PREFERRED_AUTH_KEYS)
 
-    # Normalize store keys so old formats (hyphen/upper/no-colon) still map correctly
     store_raw = _load_auth_history_store(authorized_mac_file_for_store)
     store_norm = {}
     for k, v in (store_raw or {}).items():
@@ -431,9 +1058,9 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
             mac_norm = normalize_mac(item)
         elif isinstance(item, dict):
             mac_norm = normalize_mac(item.get("mac"))
-            for k in ["date_added", "added_at", "timestamp", "created_at", "date_modified"]:
-                if k in item and item.get(k):
-                    added_dt = _parse_any_dt(item.get(k))
+            for kk in ["date_added", "added_at", "timestamp", "created_at", "date_modified"]:
+                if kk in item and item.get(kk):
+                    added_dt = _parse_any_dt(item.get(kk))
                     if added_dt:
                         break
 
@@ -459,9 +1086,9 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
     return authorized_set, added_at_map
 
 
-# =====================================================
-# Dialog header hide + custom topbar
-# =====================================================
+# =============================================================================
+# Dialog header hide + topbar
+# =============================================================================
 def hide_dialog_header():
     st.markdown(
         """
@@ -492,9 +1119,9 @@ def _close_dialog():
     st.rerun()
 
 
-# =====================================================
-# Forensic popup
-# =====================================================
+# =============================================================================
+# Forensic popup (UNCHANGED UI)
+# =============================================================================
 @st.dialog(" ", width="large", dismissible=False)
 def forensic_popup(parquet_root, mac, ip, available_dates_list):
     hide_dialog_header()
@@ -558,7 +1185,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
 
     if not activity_df.empty:
         activity_df = activity_df.copy()
-        activity_df["date_str"] = activity_df["ts"].dt.date.astype(str)
+        activity_df["date_str"] = pd.to_datetime(activity_df["ts"], errors="coerce").dt.date.astype(str)
 
         if date_filter_set is not None:
             activity_df = activity_df[activity_df["date_str"].isin(date_filter_set)]
@@ -573,8 +1200,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
     st.markdown("#### Traffic Volume")
 
     tmp = activity_df.copy()
-    tmp["hour"] = tmp["ts"].dt.floor("H")
-
+    tmp["hour"] = pd.to_datetime(tmp["ts"], errors="coerce").dt.floor("H")
     counts = tmp.groupby(["hour", "Service"]).size().reset_index(name="Events")
 
     services = ["DNS", "HTTP", "SSL"]
@@ -590,13 +1216,8 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
         hour_max = hour_min + pd.Timedelta(hours=1)
 
     all_hours = pd.date_range(start=hour_min, end=hour_max, freq="H")
-
     full_index = pd.MultiIndex.from_product([all_hours, services], names=["hour", "Service"])
-    counts_full = (
-        counts.set_index(["hour", "Service"])
-        .reindex(full_index, fill_value=0)
-        .reset_index()
-    )
+    counts_full = counts.set_index(["hour", "Service"]).reindex(full_index, fill_value=0).reset_index()
 
     fig = go.Figure()
     for svc in services:
@@ -631,9 +1252,9 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
     st.dataframe(top, use_container_width=True)
 
 
-# =====================================================
-# Device list popup (EXCLUDES banned + adds Download)
-# =====================================================
+# =============================================================================
+# Device list popup (UNCHANGED UI, timezone-safe)
+# =============================================================================
 @st.dialog("  ", width="large", dismissible=False)
 def device_list_popup(status_type, df, parquet_root, available_dates_list, banned_macs: set, authorized_added_at_map: dict):
     hide_dialog_header()
@@ -691,7 +1312,9 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     )
 
     inventory = inventory.sort_values("last_seen", ascending=False)
-    now = datetime.now()
+
+    inventory["last_seen"] = inventory["last_seen"].apply(_to_naive_ts)
+    now = pd.Timestamp(datetime.now())  # tz-naive
 
     if status_type == "Authorized":
         def _get_added_dt(mac: str):
@@ -699,19 +1322,22 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
             return authorized_added_at_map.get(m) if m else None
 
         inventory["authorized_at"] = inventory["mac"].map(_get_added_dt)
+        inventory["authorized_at"] = inventory["authorized_at"].apply(_to_naive_ts)
 
         inventory["date_str"] = inventory["authorized_at"].apply(
-            lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, datetime) else "-"
+            lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, (datetime, pd.Timestamp)) else "-"
         )
-
         inventory["history"] = inventory["authorized_at"].apply(
-            lambda d: ("Added " + _humanize_ago(now - d)) if isinstance(d, datetime) else "-"
+            lambda d: ("Added " + _humanize_ago((now - pd.Timestamp(d)).to_pytimedelta()))
+            if isinstance(d, (datetime, pd.Timestamp)) else "-"
         )
-
     else:
-        inventory["date_str"] = inventory["last_seen"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        inventory["date_str"] = inventory["last_seen"].apply(
+            lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, (datetime, pd.Timestamp)) else "-"
+        )
         inventory["history"] = inventory["last_seen"].apply(
-            lambda d: ("Last seen " + _humanize_ago(now - d)) if isinstance(d, datetime) else "-"
+            lambda d: ("Last seen " + _humanize_ago((now - pd.Timestamp(d)).to_pytimedelta()))
+            if isinstance(d, (datetime, pd.Timestamp)) else "-"
         )
 
     inventory = inventory[["mac", "ip", "host_name", "date_str", "history", "last_seen"]].copy()
@@ -758,9 +1384,9 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
             st.rerun()
 
 
-# =====================================================
-# Custom metric block (unchanged)
-# =====================================================
+# =============================================================================
+# Custom metric block (UNCHANGED)
+# =============================================================================
 def render_metric(
     label: str,
     value,
@@ -814,9 +1440,9 @@ def render_metric(
     st.markdown(delta_html, unsafe_allow_html=True)
 
 
-# =====================================================
-# Main Render
-# =====================================================
+# =============================================================================
+# Main Render (UI preserved)
+# =============================================================================
 def render(logs_root: Path, authorized_mac_file: Path):
     st.set_page_config(page_title="Network Overview", layout="wide")
 
@@ -832,73 +1458,36 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.title("Device Overview")
 
     PARQUET_ROOT = Path(logs_root)
-    known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
+    available_dates = get_available_dates(PARQUET_ROOT)
 
-    # track Authorized "added at" timestamps (normalized MAC keys)
-    authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
-        authorized_mac_file, authorized_mac_file
-    )
+    if not available_dates:
+        st.info("No device data available")
+        return
+
+    with st.spinner("Loading device facts (DuckDB + cache)..."):
+        merged = load_device_facts(PARQUET_ROOT, available_dates)
+
+    authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(authorized_mac_file, authorized_mac_file)
 
     BAN_FILE = authorized_mac_file.with_name("banned_macs.yaml")
     banned_macs = load_banned_macs(BAN_FILE)
 
-    # if now authorized, auto-remove from ban list
+    # auto-remove from ban list if now authorized
     intersect = banned_macs.intersection(authorized_macs)
     if intersect:
         banned_macs = banned_macs - intersect
         save_banned_macs(BAN_FILE, banned_macs)
 
-    if known_hosts.empty:
+    if merged.empty:
         st.info("No device data available")
         return
 
-    if "mac" in known_hosts.columns:
-        known_hosts = known_hosts.copy()
-        known_hosts["mac"] = known_hosts["mac"].map(normalize_mac)
-        known_hosts = known_hosts.dropna(subset=["mac"])
-    else:
-        st.error("known_hosts.parquet has no 'mac' column.")
-        return
+    merged["status"] = merged["mac"].apply(lambda m: "Authorized" if (m in authorized_macs) else "Unauthorized")
 
-    # Merge DHCP (optional)
-    if not dhcp.empty:
-        if "mac" in dhcp.columns:
-            dhcp = dhcp.copy()
-            dhcp["mac"] = dhcp["mac"].map(normalize_mac)
-            dhcp = dhcp.dropna(subset=["mac"])
-            dhcp_cols = [c for c in ["mac", "host_name", "domain"] if c in dhcp.columns]
-            dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"])
-            merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
-        else:
-            dhcp_cols = [c for c in ["client_addr", "host_name", "domain"] if c in dhcp.columns]
-            dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"])
-            merged = pd.merge(known_hosts, dhcp_norm, how="left", left_on="host", right_on="client_addr")
-    else:
-        merged = known_hosts.copy()
-        merged["host_name"] = "-"
-        merged["domain"] = None
-
-    merged["host_name"] = merged.get("host_name", "-").fillna("-")
-
-    # ts -> datetime + date (kept same behavior)
-    if "ts" in merged.columns:
-        merged = merged.copy()
-        merged["ts"] = pd.to_numeric(merged["ts"], errors="coerce")
-        merged["ts"] = pd.to_datetime(merged["ts"], unit="s", errors="coerce")
-        merged = merged.dropna(subset=["ts"])
-        merged["date"] = merged["ts"].dt.date
-
-    # STRICT RULE (NOW NORMALIZED-CORRECT):
-    merged["status"] = merged["mac"].apply(
-        lambda m: "Authorized" if (m in authorized_macs) else "Unauthorized"
-    )
-
-    # EXCLUDE BANNED EVERYWHERE (normalized set)
     in_scope = merged.copy()
-    if "mac" in in_scope.columns and banned_macs:
+    if banned_macs:
         in_scope = in_scope[~in_scope["mac"].isin(banned_macs)]
 
-    # Metrics
     today = datetime.now().date()
 
     total_devices = int(in_scope["mac"].nunique())
@@ -907,17 +1496,9 @@ def render(logs_root: Path, authorized_mac_file: Path):
     unauth_seen = int(in_scope[in_scope["status"] == "Unauthorized"]["mac"].nunique())
     risk = round((unauth_seen / total_devices * 100), 2) if total_devices else 0.0
 
-    current_state = {
-        "total": total_devices,
-        "active_today": active_today,
-        "auth": auth_seen,
-        "unauth": unauth_seen,
-        "risk": float(risk),
-    }
+    current_state = {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
 
-    # =====================================================
     # DAILY DELTA LOGIC (unchanged)
-    # =====================================================
     today_str = datetime.now().strftime("%Y-%m-%d")
 
     def _delta_is_zero(d: dict) -> bool:
@@ -949,9 +1530,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         store["daily_locked"] = False
 
     baseline = store.get("daily_baseline") if isinstance(store.get("daily_baseline"), dict) else current_state
-    daily_delta = store.get("daily_delta") if isinstance(store.get("daily_delta"), dict) else {
-        "total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0
-    }
+    daily_delta = store.get("daily_delta") if isinstance(store.get("daily_delta"), dict) else {"total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0}
     locked = bool(store.get("daily_locked", False))
 
     if not locked:
@@ -1022,13 +1601,10 @@ def render(logs_root: Path, authorized_mac_file: Path):
     st.subheader("Activity Overview")
     hourly = pd.DataFrame()
     if not in_scope.empty:
-        hourly = (
-            in_scope.set_index("ts")
-            .groupby("status")
-            .resample("1H")
-            .size()
-            .reset_index(name="events")
-        )
+        tmp = in_scope.copy()
+        tmp["ts"] = pd.to_datetime(tmp["ts"], errors="coerce")
+        tmp = tmp.dropna(subset=["ts"])
+        hourly = tmp.set_index("ts").groupby("status").resample("1H").size().reset_index(name="events")
 
     if not hourly.empty:
         fig = px.line(
@@ -1094,7 +1670,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     )
     st.plotly_chart(gauge_fig, use_container_width=True)
 
-    raw_dates = sorted([str(d) for d in merged["date"].unique() if pd.notnull(d)], reverse=True)
+    raw_dates = sorted([str(d) for d in in_scope["date"].unique() if pd.notnull(d)], reverse=True)
 
     if st.session_state.active_dialog == "list":
         device_list_popup(
@@ -1105,7 +1681,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
             banned_macs,
             authorized_added_at_map,
         )
-
     elif st.session_state.active_dialog == "forensics":
         forensic_popup(
             PARQUET_ROOT,

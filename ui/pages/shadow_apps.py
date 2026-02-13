@@ -985,6 +985,41 @@ def hide_dialog_x_button():
         unsafe_allow_html=True,
     )
 
+def inject_license_white_text_css():
+    st.markdown(
+        """
+        <style>
+        /* Make text white inside License section and streamlit widgets */
+        .license-section, .license-section * {
+            color: #EAEAEA !important;
+        }
+
+        /* Fix Streamlit dataframe/table text in dark background */
+        .license-section [data-testid="stDataFrame"] * {
+            color: #EAEAEA !important;
+        }
+        .license-section table * {
+            color: #EAEAEA !important;
+        }
+
+        /* Inputs / selects inside license area */
+        .license-section input, 
+        .license-section textarea, 
+        .license-section select {
+            color: #EAEAEA !important;
+            background: #000 !important;
+        }
+
+        /* Streamlit expander header text */
+        .license-section [data-testid="stExpander"] summary * {
+            color: #EAEAEA !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 
 # =============================================================================
 # Main Render
@@ -1240,7 +1275,19 @@ def render_shadow_apps(parquet_root: Path):
         if display_df.empty:
             st.info("No logs match your filter.")
         else:
-            gb = GridOptionsBuilder.from_dataframe(display_df)
+            # Add row index column like license grid (optional but makes it feel identical)
+            df_grid = display_df.copy()
+            df_grid.insert(0, "#", range(1, len(df_grid) + 1))
+
+            gb = GridOptionsBuilder.from_dataframe(df_grid)
+
+            # Make it behave like the License Users grid (filter/sort/resize + footer pagination)
+            gb.configure_default_column(filter=True, sortable=True, resizable=True)
+
+            # IMPORTANT: pagination gives you the bottom footer bar (what you called "bottom header")
+            gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+
+            # Keep single-row selection
             gb.configure_selection(selection_mode="single", use_checkbox=False)
 
             mac_cellstyle = JsCode(
@@ -1272,8 +1319,19 @@ def render_shadow_apps(parquet_root: Path):
                 """
             )
 
+            # Column formatting (match)
+            gb.configure_column("#", header_name="#", width=70, pinned="left", suppressMovable=True, resizable=False)
             gb.configure_column("mac", header_name="MAC Address (Click)", cellStyle=mac_cellstyle)
             gb.configure_column("Max_Risk", header_name="Risk Level", cellStyle=risk_cellstyle)
+
+            # Optional: tighten these widths (feel more like a fixed enterprise table)
+            gb.configure_column("domain_clean", header_name="Domain", minWidth=220)
+            gb.configure_column("hostname", header_name="Hostname", minWidth=160)
+            gb.configure_column("ip", header_name="IP", minWidth=130)
+            gb.configure_column("source_log", header_name="Source", width=110)
+            gb.configure_column("Hits", header_name="Hits", width=90)
+            gb.configure_column("First_Seen", header_name="First Seen", width=170)
+            gb.configure_column("Last_Seen", header_name="Last Seen", width=170)
 
             grid_options = gb.build()
             grid_options["rowSelection"] = "single"
@@ -1285,11 +1343,11 @@ def render_shadow_apps(parquet_root: Path):
             grid_key = f"shadow_audit_grid_{int(st.session_state.get('shadow_grid_nonce', 0))}"
 
             grid_response = AgGrid(
-                display_df,
+                df_grid,
                 gridOptions=grid_options,
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                height=520,
+                height=520,  # footer still appears
                 theme=ag_theme,
                 custom_css=ag_css,
                 allow_unsafe_jscode=True,
@@ -1300,6 +1358,27 @@ def render_shadow_apps(parquet_root: Path):
 
             # selection -> open dialog
             selected_rows = grid_response.get("selected_rows", None)
+            selected_mac = None
+
+            if isinstance(selected_rows, pd.DataFrame):
+                if not selected_rows.empty and "mac" in selected_rows.columns:
+                    selected_mac = selected_rows.iloc[0]["mac"]
+            elif isinstance(selected_rows, list):
+                if len(selected_rows) > 0 and isinstance(selected_rows[0], dict):
+                    selected_mac = selected_rows[0].get("mac")
+
+            if selected_mac:
+                selected_mac = str(selected_mac).strip().lower()
+                prev = st.session_state.get("shadow_last_selected_mac")
+
+                if selected_mac != prev:
+                    st.session_state["shadow_last_selected_mac"] = selected_mac
+                    st.session_state["shadow_dialog_mac"] = selected_mac
+                    st.session_state["shadow_dialog_open"] = True
+                    st.session_state["shadow_dialog_origin"] = "grid"
+                    st.rerun()
+            else:
+                st.session_state["shadow_last_selected_mac"] = None
             selected_mac = None
 
             if isinstance(selected_rows, pd.DataFrame):
@@ -1420,7 +1499,7 @@ def render_shadow_apps(parquet_root: Path):
             fig.update_layout(xaxis_title=None, yaxis_title="Active Devices", height=420, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("#### License Users (MAC / Hostname / Last Seen)")
+        st.markdown("#### License Users")
         if details_all:
             license_df = pd.concat(details_all, ignore_index=True)
 
