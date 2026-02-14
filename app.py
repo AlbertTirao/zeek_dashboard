@@ -120,7 +120,7 @@ if "data_synced" not in st.session_state:
 
 # CHANGED: make default match render_current_page() routing
 if "initialized" not in st.session_state:
-    st.session_state.current_page = "Device Inspections"
+    st.session_state.current_page = "Device Inspection"
     st.session_state.initialized = True
 
 # CHANGED: render sidebar ONCE and persist selection (fixes DuplicateElementId)
@@ -140,7 +140,7 @@ def render_current_page():
     # are updated to accept PARQUET_DIR (Path object) 
     # and use load_single_log() internally.
     
-    if page == "Device Inspections":
+    if page == "Device Inspection":
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
         
     elif page == "Traffic Monitoring":

@@ -85,7 +85,7 @@ authorized_macs:
   vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: 40:d1:33:7c:27:a7
-  ip: 192.168.201.104
+  ip: 192.168.201.210
   hostname: LAPTOP-8SDVCIRA
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -105,7 +105,7 @@ authorized_macs:
   vendor: D-Link International
   date_modified: '2026-02-12 12:37:33'
 - mac: 50:bb:b5:32:16:9c
-  ip: 192.168.201.185
+  ip: 192.168.201.208
   hostname: LAPTOP-250P3062
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
@@ -140,7 +140,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: c0:35:32:b5:43:5f
-  ip: 192.168.201.183
+  ip: 192.168.201.207
   hostname: chesca
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
