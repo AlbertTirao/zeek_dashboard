@@ -75,7 +75,7 @@ def render_sidebar(auto_refresh_interval=3600):
         if "sidebar_page" not in st.session_state:
             st.session_state.sidebar_page = "Visual"
 
-        # CORRECTED ICONS HERE
+        # CORRECTED ICONS HERE  
         page = option_menu(
             menu_title=None,
             options=["Device Inspections", "Traffic Monitoring", "Zeek Logs", "Alerts", "Authorization"],
@@ -114,7 +114,8 @@ def render_sidebar(auto_refresh_interval=3600):
                     "color": "#ffffff",
                     "border-radius": "0"
                 }
-            }
+            }, 
+            key="sidebar_option_menu",  # CHANGED: prevents component_instance ID collisions
         )
 
         # Update session state with current selection

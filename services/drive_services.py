@@ -154,8 +154,7 @@ def _flush_chunk(rows, path, writer):
 # =====================================================
 # 3. ORCHESTRATION (Incremental Sync)
 # =====================================================
-
-def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root: Path):
+def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root: Path, log_callback=None):
     """
     Main function to sync Google Drive logs to local Parquet cache.
     - Skips historical logs that already exist.
@@ -163,11 +162,18 @@ def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root:
     """
     drive = authenticate_drive(client_secret_path)
     today_str = datetime.now().strftime("%Y-%m-%d")
-    
-    # Progress tracking
-    status_text = st.empty()
-    progress_bar = st.progress(0)
+
     files_processed = 0
+
+    # CHANGED: unified logger (toasts in UI OR queue callback for background thread)
+    def _log(msg: str):
+        try:
+            if callable(log_callback):
+                log_callback(msg)
+            else:
+                st.toast(msg)  # upper-right notification UI
+        except Exception:
+            pass
 
     # Recursive generator
     def walk_folder(fid):
@@ -178,55 +184,51 @@ def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root:
             else:
                 yield item
 
-    # Collect all candidates first (optional, but helps with progress bar)
-    # For massive drives, just iterate directly. Here we iterate directly.
-    
     for f in walk_folder(folder_id):
         name = f["title"]
-        
+
         # Filter: Only .log files, ignore summaries
         if not name.endswith(".log") or "conn-summary" in name:
             continue
 
         log_type = name.replace(".log", "")
-        
+
         # Determine Partition Date
         try:
-            # Prefer Drive 'modifiedDate' as the partition key
-            mod_time = f["modifiedDate"] # e.g., 2023-10-27T10:00:00.000Z
+            mod_time = f["modifiedDate"]
             dt_obj = datetime.strptime(mod_time.split(".")[0], "%Y-%m-%dT%H:%M:%S")
             log_date = dt_obj.strftime("%Y-%m-%d")
-        except:
+        except Exception:
             log_date = today_str
 
         target_path = parquet_root / log_date / f"{log_type}.parquet"
 
         # === INCREMENTAL LOGIC ===
         if target_path.exists():
-            # If it's an old file, skip it (Immutable History)
             if log_date != today_str:
                 continue
-            # If it is TODAY'S file, delete it so we can re-ingest (Append Simulation)
             try:
                 os.remove(target_path)
             except OSError:
-                pass 
+                pass
 
-        status_text.text(f"📥 Ingesting: {log_date} / {name} ...")
-        
+        # CHANGED: log via toast/queue (no st.empty/progress UI)
+        _log(f"📥 Ingesting: {log_date} / {name} ...")
+
         try:
             stream_zeek_log_to_parquet(drive, f, target_path)
             files_processed += 1
         except Exception as e:
-            st.error(f"❌ Error on {name}: {e}")
+            _log(f"❌ Error on {name}: {e}")
 
-    status_text.empty()
-    progress_bar.empty()
-    
+    # CHANGED: final status via toast/queue
     if files_processed > 0:
-        st.toast(f"✅ Sync Complete: {files_processed} new logs.")
+        _log(f"✅ Sync Complete: {files_processed} new logs.")
     else:
-        st.toast("⚡ Cache is up to date.")
+        _log("⚡ Cache is up to date.")
+
+    # CHANGED: return count so app.py can toast a clean “finished” message
+    return files_processed
 
 # =====================================================
 # 4. LAZY LOADING & DUCKDB INTEGRATION (Read API)

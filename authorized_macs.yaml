@@ -35,12 +35,12 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 14:5a:fc:78:57:9b
-  ip: 192.168.201.180
+  ip: 192.168.201.199
   hostname: Mikamiks
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
 - mac: 1c:87:e3:a3:4a:48
-  ip: 192.168.201.174
+  ip: 192.168.201.196
   hostname: TECNO-CAMON-16
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
@@ -60,7 +60,7 @@ authorized_macs:
   vendor: Ruijie Networks Co.,LTD
   date_modified: '2026-02-12 15:31:30'
 - mac: 2c:3b:70:9f:7b:73
-  ip: 192.168.201.179
+  ip: 192.168.201.205
   hostname: PC-02
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
@@ -70,17 +70,17 @@ authorized_macs:
   vendor: AltoBeam Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:8a:06:d5:3c:4e
-  ip: 192.168.201.178
+  ip: 192.168.201.203
   hostname: Galaxy-A15-5G
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:8f:30:9f:11:f3
-  ip: 192.168.201.173
+  ip: 192.168.201.197
   hostname: Lana-s-phone
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:d5:7a:78:15:5f
-  ip: 192.168.201.175
+  ip: 192.168.201.204
   hostname: Lana-HP
   vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
   date_modified: '2026-02-12 12:37:33'
@@ -95,7 +95,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.140
+  ip: 192.168.201.97
   hostname: JE-s-A06
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -135,7 +135,7 @@ authorized_macs:
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.143
+  ip: 192.168.201.75
   hostname: Auggys-Phone
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -150,12 +150,12 @@ authorized_macs:
   vendor: Ruijie Networks Co.,LTD
   date_modified: '2026-02-12 12:37:33'
 - mac: c4:b2:5b:96:df:4f
-  ip: 192.168.201.101
+  ip: 192.168.201.8
   hostname: OpenWrt
   vendor: None
   date_modified: '2026-02-12 12:37:33'
 - mac: dc:41:a9:64:da:c5
-  ip: 192.168.201.176
+  ip: 192.168.201.198
   hostname: Shiraishi
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -180,12 +180,12 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.141
+  ip: 192.168.201.96
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: f8:5e:0b:7c:50:f5
-  ip: 192.168.201.177
+  ip: 192.168.201.201
   hostname: Realme-X
   vendor: Realme Chongqing Mobile Telecommunications Corp.,Ltd.
   date_modified: '2026-02-12 12:37:33'
