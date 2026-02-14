@@ -78,9 +78,9 @@ def render_sidebar(auto_refresh_interval=3600):
         # CORRECTED ICONS HERE  
         page = option_menu(
             menu_title=None,
-            options=["Device Inspections", "Traffic Monitoring", "Zeek Logs", "Alerts", "Authorization"],
+            options=["Device Inspection", "Traffic Monitoring", "Zeek Logs", "Alerts", "Authorization"],
             icons=[
-                "pc-display",        # Device Inspections (endpoint/device icon)
+                "pc-display",        # Device Inspection (endpoint/device icon)
                 "activity",          # Traffic Monitoring (network activity)
                 "file-earmark-text", # Zeek Logs
                 "bell",              # Alerts
