@@ -849,6 +849,23 @@ def _sql_fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
 def show_forensics_dialog(conn):
     target_mac = st.session_state.get("shadow_dialog_mac")
 
+    # ---- Make dialog a little wider (Streamlit dialog width is limited; CSS widens container) ----
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] > div[role="dialog"] {
+            width: min(95vw, 1500px) !important;
+            max-width: min(95vw, 1500px) !important;
+        }
+        div[data-testid="stDialog"] div[role="dialog"] .stDialogContent {
+            padding-left: 1.25rem !important;
+            padding-right: 1.25rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     top = st.columns([1, 6])
     with top[0]:
         if st.button("Close", use_container_width=True, type="primary"):
@@ -862,7 +879,7 @@ def show_forensics_dialog(conn):
         st.info("No MAC selected.")
         return
 
-    chk = conn.execute("SELECT COUNT(*) FROM shadow_events WHERE mac = ?", [target_mac]).fetchone()
+    chk = conn.execute("SELECT COUNT(*) FROM shadow_events WHERE lower(mac) = lower(?)", [target_mac]).fetchone()
     if not chk or int(chk[0]) == 0:
         st.warning("No data found for this specific MAC address.")
         return
@@ -877,7 +894,11 @@ def show_forensics_dialog(conn):
             on_change=_mark_dialog_origin,
         )
     with f_col2:
-        src_df = _sql_fetch_df(conn, "SELECT DISTINCT source_log FROM shadow_events WHERE mac = ? ORDER BY 1", [target_mac])
+        src_df = _sql_fetch_df(
+            conn,
+            "SELECT DISTINCT source_log FROM shadow_events WHERE lower(mac) = lower(?) ORDER BY 1",
+            [target_mac],
+        )
         f_raw_sources = src_df["source_log"].dropna().tolist() if not src_df.empty else []
         selected_f_source = st.selectbox(
             "Filter Source",
@@ -893,7 +914,7 @@ def show_forensics_dialog(conn):
             on_change=_mark_dialog_origin,
         )
 
-    where = ["mac = ?"]
+    where = ["lower(mac) = lower(?)"]
     params = [target_mac]
 
     if "App Run" in view_type:
@@ -933,6 +954,9 @@ def show_forensics_dialog(conn):
         st.warning("No events match your filters for this MAC.")
         return
 
+    # =============================================================================
+    # Existing content (kept): Timeline + Top Destinations + Detailed Logs
+    # =============================================================================
     st.markdown("#### Activity Timeline")
     timeline = forensic_df.copy()
     timeline["datetime"] = pd.to_datetime(timeline["datetime"], errors="coerce")
@@ -968,6 +992,109 @@ def show_forensics_dialog(conn):
             hide_index=True,
         )
 
+    # =============================================================================
+    # MOVED: Applications / Software inventory table (BOTTOM)
+    # =============================================================================
+    st.divider()
+    st.markdown("#### Applications / Software Observed (This MAC)")
+
+    inv_where = ["lower(mac) = lower(?)"]
+    inv_params = [target_mac]
+
+    # Keep inventory aligned with user filters (source + risk)
+    if selected_f_source != "All":
+        inv_where.append("source_log = ?")
+        inv_params.append(selected_f_source)
+
+    if forensic_risk:
+        inv_in = _build_in_clause(forensic_risk, inv_params)
+        inv_where.append(f""""Risk Level" IN {inv_in}""")
+
+    inv_where_sql = " AND ".join(inv_where)
+
+    inventory_df = _sql_fetch_df(
+        conn,
+        f"""
+        WITH base AS (
+            SELECT
+                domain_clean,
+                app_identifier,
+                source_log,
+                "App Status" AS app_status,
+                _risk_score,
+                datetime
+            FROM shadow_events
+            WHERE {inv_where_sql}
+              AND domain_clean IS NOT NULL
+              AND domain_clean <> ''
+        ),
+        agg AS (
+            SELECT
+                domain_clean,
+                COALESCE(NULLIF(app_identifier,''), domain_clean) AS app_identifier,
+                STRING_AGG(DISTINCT source_log, ', ' ORDER BY source_log) AS sources,
+                MIN(datetime) AS first_seen,
+                MAX(datetime) AS last_seen,
+                COUNT(*) AS hits,
+                MAX(_risk_score) AS max_risk_score,
+                CASE WHEN SUM(CASE WHEN app_status='Unauthorized' THEN 1 ELSE 0 END) > 0
+                     THEN 'Unauthorized' ELSE 'Authorized' END AS status
+            FROM base
+            GROUP BY 1,2
+        )
+        SELECT
+            domain_clean AS destination,
+            app_identifier AS application_or_identifier,
+            sources,
+            status,
+            first_seen,
+            last_seen,
+            hits,
+            CASE max_risk_score
+                WHEN 4 THEN 'Critical'
+                WHEN 3 THEN 'High'
+                WHEN 2 THEN 'Medium'
+                WHEN 1 THEN 'Low'
+                ELSE 'Safe'
+            END AS max_risk
+        FROM agg
+        ORDER BY
+            max_risk_score DESC,
+            hits DESC,
+            last_seen DESC
+        """,
+        inv_params,
+    )
+
+    if inventory_df.empty:
+        st.info("No application inventory could be derived for this MAC (with current filters).")
+    else:
+        inv_show = inventory_df.copy()
+        inv_show.insert(0, "#", range(1, len(inv_show) + 1))
+
+        st.dataframe(
+            inv_show.style.map(color_risk, subset=["max_risk"]),
+            column_config={
+                "#": st.column_config.NumberColumn("#", width="small"),
+                "destination": "Destination (domain_clean)",
+                "application_or_identifier": "Application / Software Identifier",
+                "sources": "Source Logs",
+                "status": "Status",
+                "first_seen": st.column_config.DatetimeColumn("First Seen", format="YYYY-MM-DD HH:mm:ss"),
+                "last_seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss"),
+                "hits": st.column_config.NumberColumn("Hits"),
+                "max_risk": "Max Risk",
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Download Application Inventory CSV",
+            data=inventory_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"shadow_app_inventory_{target_mac}.csv",
+            mime="text/csv",
+        )
 
 def hide_dialog_x_button():
     st.markdown(
@@ -1018,8 +1145,6 @@ def inject_license_white_text_css():
         """,
         unsafe_allow_html=True,
     )
-
-
 
 # =============================================================================
 # Main Render
@@ -1156,7 +1281,7 @@ def render_shadow_apps(parquet_root: Path):
         st.markdown("### Application Audit Log")
         st.info("Click any MAC Address row to open the Shadow App Forensics popup for that device.")
 
-        filter_col1, filter_col2, filter_col3 = st.columns([3, 2, 2])
+        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([3, 2, 2, 2])
         with filter_col1:
             search_query_audit = st.text_input(
                 "Search (MAC, Hostname, IP, Domain)",
@@ -1176,6 +1301,16 @@ def render_shadow_apps(parquet_root: Path):
                 key="audit_risk_filter",
                 default=["Critical", "High", "Medium", "Low", "Safe"],
             )
+        with filter_col4:
+            # Pull available sources from the data (for the selected day already loaded into shadow_events)
+            src_df_audit = _sql_fetch_df(conn, "SELECT DISTINCT source_log FROM shadow_events ORDER BY 1")
+            audit_sources = src_df_audit["source_log"].dropna().tolist() if not src_df_audit.empty else []
+            audit_source_filter = st.multiselect(
+                "Filter Source",
+                audit_sources,
+                default=audit_sources,   # default = all
+                key="audit_source_filter",
+            )
 
         where = []
         params = []
@@ -1192,6 +1327,10 @@ def render_shadow_apps(parquet_root: Path):
             q = f"%{search_query_audit}%"
             where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
             params.extend([q, q, q, q])
+
+        if audit_source_filter:
+            in_clause = _build_in_clause(audit_source_filter, params)
+            where.append(f"source_log IN {in_clause}")
 
         where_sql = "WHERE " + " AND ".join(where) if where else ""
 
@@ -1347,7 +1486,7 @@ def render_shadow_apps(parquet_root: Path):
                 gridOptions=grid_options,
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                height=520,  # footer still appears
+                height=500,  # footer still appears
                 theme=ag_theme,
                 custom_css=ag_css,
                 allow_unsafe_jscode=True,

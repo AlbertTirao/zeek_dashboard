@@ -4,7 +4,8 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -47,24 +48,78 @@ KNOWN_HOSTS_KEYWORDS = ["known_hosts", "knownhost", "known-hosts"]
 
 
 # =============================================================================
+# SQL PATH QUOTING (fixes f-string quote issues)
+# =============================================================================
+def _sql_quote_path(p: Path) -> str:
+    return str(p).replace("'", "''")
+
+
+# =============================================================================
 # DUCKDB
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def _duckdb_conn():
     con = duckdb.connect(database=":memory:")
+
     try:
-        con.execute("PRAGMA threads=4")
+        n = os.cpu_count() or 4
+        con.execute(f"SET threads TO {max(2, min(n, 8))}")
     except Exception:
         pass
+
+    try:
+        con.execute("SET memory_limit='4GB'")
+    except Exception:
+        pass
+
+    # These reduce overhead a lot on repeated parquet scans
+    try:
+        con.execute("PRAGMA enable_object_cache")
+    except Exception:
+        pass
+
+    try:
+        con.execute("PRAGMA enable_progress_bar=false")
+    except Exception:
+        pass
+
+    # Optional but often helps: avoid spilling to slow default temp
+    try:
+        tmp = Path("./.duckdb_temp")
+        tmp.mkdir(parents=True, exist_ok=True)
+        tmp_sql = str(tmp).replace("'", "''")
+        con.execute(f"SET temp_directory='{tmp_sql}'")
+    except Exception:
+        pass
+
     return con
+
+
+@lru_cache(maxsize=512)
+def _schema_cols_cached(parquet_path_str: str, mtime: float, size: int) -> Tuple[str, ...]:
+    """
+    Cache schema extraction per file signature (path + mtime + size).
+    Avoids repeated DESCRIBE cost across reruns/days.
+    """
+    con = _duckdb_conn()
+    try:
+        df = con.execute("DESCRIBE SELECT * FROM parquet_scan(?)", [parquet_path_str]).df()
+        cols = [str(x) for x in df["column_name"].tolist()]
+        return tuple(cols)
+    except Exception:
+        return tuple()
 
 
 def _duckdb_schema_cols(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> List[str]:
     try:
-        df = con.execute("DESCRIBE SELECT * FROM parquet_scan(?)", [str(parquet_path)]).df()
-        return [str(x) for x in df["column_name"].tolist()]
+        st_ = parquet_path.stat()
+        return list(_schema_cols_cached(str(parquet_path), float(st_.st_mtime), int(st_.st_size)))
     except Exception:
-        return []
+        try:
+            df = con.execute("DESCRIBE SELECT * FROM parquet_scan(?)", [str(parquet_path)]).df()
+            return [str(x) for x in df["column_name"].tolist()]
+        except Exception:
+            return []
 
 
 # =============================================================================
@@ -106,9 +161,18 @@ def _extract_yaml_list(data, stem_key: str, preferred_keys: List[str]) -> List:
     return []
 
 
-def load_authorized_macs(auth_file: str) -> set:
-    allowed = set()
-    file_path = Path(auth_file)
+def _auth_file_sig(p: Path) -> Tuple[str, float, int]:
+    try:
+        st_ = p.stat()
+        return (str(p), float(st_.st_mtime), int(st_.st_size))
+    except Exception:
+        return (str(p), 0.0, 0)
+
+
+@st.cache_data(show_spinner=False)
+def _load_authorized_macs_cached(auth_file_str: str, sig: Tuple[str, float, int]) -> Tuple[str, ...]:
+    allowed: set = set()
+    file_path = Path(auth_file_str)
 
     if file_path.suffix != ".yaml":
         yaml_path = file_path.with_suffix(".yaml")
@@ -116,13 +180,12 @@ def load_authorized_macs(auth_file: str) -> set:
             file_path = yaml_path
 
     if not file_path.exists():
-        return allowed
+        return tuple()
 
     try:
         data = yaml.safe_load(file_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        st.error(f"Error reading authorized MACs file: {e}")
-        return allowed
+    except Exception:
+        return tuple()
 
     raw_list = _extract_yaml_list(data, file_path.stem, PREFERRED_AUTH_KEYS)
 
@@ -134,7 +197,22 @@ def load_authorized_macs(auth_file: str) -> set:
         if m:
             allowed.add(m)
 
-    return allowed
+    return tuple(sorted(allowed))
+
+
+def load_authorized_macs(auth_file: str) -> set:
+    file_path = Path(auth_file)
+
+    if file_path.suffix != ".yaml":
+        yaml_path = file_path.with_suffix(".yaml")
+        if yaml_path.exists():
+            file_path = yaml_path
+
+    if not file_path.exists():
+        return set()
+
+    sig = _auth_file_sig(file_path)
+    return set(_load_authorized_macs_cached(str(file_path), sig))
 
 
 # =============================================================================
@@ -226,33 +304,123 @@ def _extract_date_from_dirname(name: str) -> Optional[str]:
     return None
 
 
-def _discover_date_dirs(parquet_root: Path) -> Dict[str, List[Path]]:
-    by_date: Dict[str, List[Path]] = {}
-    for d in parquet_root.rglob("*"):
-        if not d.is_dir():
-            continue
-        ds = _extract_date_from_dirname(d.name)
+@st.cache_data(show_spinner=False, ttl=300)
+def _discover_date_dirs(parquet_root_str: str) -> Dict[str, List[str]]:
+    """
+    Faster discovery using os.scandir.
+    - Look for direct children that are date dirs or date= dirs
+    - Also look 1 level deeper (covers common layouts)
+    - Avoid scanning inside cache folders
+    """
+    root = Path(parquet_root_str)
+    by_date: Dict[str, List[str]] = {}
+
+    def _is_cache_like(name_l: str) -> bool:
+        if name_l == CACHE_DIRNAME.lower():
+            return True
+        if name_l.startswith("_shadow_cache"):
+            return True
+        if CACHE_DIRNAME.lower() in name_l:
+            return True
+        return False
+
+    def _maybe_add_dir(full_path: str, base_name: str):
+        bn_l = base_name.lower()
+        if _is_cache_like(bn_l):
+            return
+        ds = _extract_date_from_dirname(base_name)
         if ds:
-            by_date.setdefault(ds, []).append(d)
+            by_date.setdefault(ds, []).append(full_path)
+
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    _maybe_add_dir(entry.path, entry.name)
+
+                    if _is_cache_like(entry.name.lower()):
+                        continue
+
+                    try:
+                        with os.scandir(entry.path) as it2:
+                            for e2 in it2:
+                                if e2.is_dir(follow_symlinks=False):
+                                    _maybe_add_dir(e2.path, e2.name)
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+    except Exception:
+        # Fallback to Path if scandir fails
+        try:
+            for p in root.iterdir():
+                if p.is_dir():
+                    _maybe_add_dir(str(p), p.name)
+                    try:
+                        for p2 in p.iterdir():
+                            if p2.is_dir():
+                                _maybe_add_dir(str(p2), p2.name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     for k in list(by_date.keys()):
-        by_date[k] = sorted(by_date[k], key=lambda p: str(p))
+        by_date[k] = sorted(by_date[k], key=lambda s: s)
     return by_date
 
 
-def _find_log_file_in_day(day_dir: Path, keywords: List[str]) -> Optional[Path]:
+@st.cache_data(show_spinner=False, ttl=300)
+def _find_log_file_in_day_cached(day_dir_str: str, keywords: Tuple[str, ...], day_dir_mtime: float) -> Optional[str]:
+    """
+    Cached log discovery per day_dir + mtime.
+    Prevents repeated glob/scans on every rerun.
+    """
+    day_dir = Path(day_dir_str)
+
+    # 1) exact hits first
     for k in keywords:
         exact = day_dir / f"{k}.parquet"
         if exact.exists():
-            return exact
+            return str(exact)
 
-    files = list(day_dir.rglob("*.parquet"))
-    if not files:
+    candidates: List[Path] = []
+    try:
+        candidates.extend(list(day_dir.glob("*.parquet")))
+    except Exception:
+        pass
+
+    try:
+        for sub in day_dir.iterdir():
+            if sub.is_dir():
+                if CACHE_DIRNAME.lower() in sub.name.lower() or "_shadow_cache" in sub.name.lower():
+                    continue
+                candidates.extend(list(sub.glob("*.parquet")))
+    except Exception:
+        pass
+
+    if not candidates:
         return None
-    matches = [f for f in files if any(k in f.name.lower() for k in keywords)]
+
+    kw = [k.lower() for k in keywords]
+    matches = [p for p in candidates if any(k in p.name.lower() for k in kw)]
     if not matches:
         return None
+
     matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return matches[0]
+    return str(matches[0])
+
+
+def _find_log_file_in_day(day_dir: Path, keywords: List[str]) -> Optional[Path]:
+    try:
+        mtime = float(day_dir.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+
+    out = _find_log_file_in_day_cached(str(day_dir), tuple(keywords), mtime)
+    return Path(out) if out else None
 
 
 # =============================================================================
@@ -378,7 +546,7 @@ def _build_cache_for_date_dir(
               NULLIF(NULLIF({ip_sql}, ''), 'nan') AS ip,
               NULLIF(NULLIF({host_sql}, ''), 'nan') AS host,
               '{src_name}' AS source
-            FROM parquet_scan('{str(src_path).replace("'", "''")}')
+            FROM parquet_scan('{_sql_quote_path(src_path)}')
             """
         )
 
@@ -391,7 +559,7 @@ def _build_cache_for_date_dir(
           AND ts_dt IS NOT NULL
           AND mac_norm != 'ff:ff:ff:ff:ff:ff'
         """
-        con.execute(f"COPY ({final_sql}) TO '{str(events_out).replace("'", "''")}' (FORMAT PARQUET)")
+        con.execute(f"COPY ({final_sql}) TO '{_sql_quote_path(events_out)}' (FORMAT PARQUET)")
     else:
         pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]).to_parquet(events_out, index=False)
 
@@ -411,10 +579,10 @@ def _build_cache_for_date_dir(
               {mac_norm} AS mac_norm,
               NULLIF(NULLIF({ip_sql}, ''), 'nan') AS ip,
               NULLIF(NULLIF({vendor_sql}, ''), 'nan') AS vendor
-            FROM parquet_scan('{str(known_hosts_path).replace("'", "''")}')
+            FROM parquet_scan('{_sql_quote_path(known_hosts_path)}')
             WHERE {mac_norm} IS NOT NULL
             """
-            con.execute(f"COPY ({kh_sql}) TO '{str(kh_out).replace("'", "''")}' (FORMAT PARQUET)")
+            con.execute(f"COPY ({kh_sql}) TO '{_sql_quote_path(kh_out)}' (FORMAT PARQUET)")
         else:
             pd.DataFrame(columns=["mac_norm", "ip", "vendor"]).to_parquet(kh_out, index=False)
     else:
@@ -428,33 +596,90 @@ def _load_cached_for_date_dirs(
     parquet_root: Path,
     selected_date_dirs: List[Tuple[str, Path]],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    SPEED UPDATE (no UI/logic change):
+    - Still builds/uses the same per-dir parquet caches on disk
+    - When loading, aggregates to "latest per MAC" inside DuckDB
+      to avoid loading huge raw event rows into pandas.
+    """
     con = _duckdb_conn()
-    ev_all: List[pd.DataFrame] = []
-    kh_all: List[pd.DataFrame] = []
+
+    events_paths: List[str] = []
+    kh_paths: List[str] = []
 
     for date_str, date_dir in selected_date_dirs:
         events_p, kh_p = _build_cache_for_date_dir(con, parquet_root, date_str, date_dir)
+        if events_p.exists():
+            events_paths.append(str(events_p))
+        if kh_p.exists():
+            kh_paths.append(str(kh_p))
 
-        try:
-            df = pd.read_parquet(events_p)
-            if not df.empty:
-                ev_all.append(df)
-        except Exception:
-            pass
+    # ---- FAST LOAD: events aggregated in DuckDB (latest per mac) ----
+    if events_paths:
+        agg_sql = """
+        WITH ev AS (
+          SELECT ts_dt, mac_norm, ip, host, source
+          FROM read_parquet(?, union_by_name=true)
+        ),
+        clean AS (
+          SELECT
+            try_cast(ts_dt AS timestamp) AS ts_dt,
+            cast(mac_norm AS varchar) AS mac_norm,
+            NULLIF(NULLIF(cast(ip AS varchar), ''), 'nan') AS ip,
+            NULLIF(NULLIF(cast(host AS varchar), ''), 'nan') AS host,
+            cast(source AS varchar) AS source
+          FROM ev
+          WHERE mac_norm IS NOT NULL
+            AND ts_dt IS NOT NULL
+            AND mac_norm != 'ff:ff:ff:ff:ff:ff'
+        ),
+        latest AS (
+          SELECT ts_dt, mac_norm, ip, host
+          FROM clean
+          QUALIFY row_number() OVER (PARTITION BY mac_norm ORDER BY ts_dt DESC) = 1
+        ),
+        ip_last AS (
+          SELECT mac_norm, ip
+          FROM clean
+          WHERE ip IS NOT NULL
+          QUALIFY row_number() OVER (PARTITION BY mac_norm ORDER BY ts_dt DESC) = 1
+        ),
+        host_last AS (
+          SELECT mac_norm, host
+          FROM clean
+          WHERE host IS NOT NULL
+          QUALIFY row_number() OVER (PARTITION BY mac_norm ORDER BY ts_dt DESC) = 1
+        ),
+        src AS (
+          SELECT mac_norm,
+                 string_agg(DISTINCT source, ', ' ORDER BY source) AS source
+          FROM clean
+          GROUP BY mac_norm
+        )
+        SELECT
+          latest.ts_dt AS ts_dt,
+          latest.mac_norm AS mac_norm,
+          ip_last.ip AS ip,
+          host_last.host AS host,
+          src.source AS source
+        FROM latest
+        LEFT JOIN ip_last USING(mac_norm)
+        LEFT JOIN host_last USING(mac_norm)
+        LEFT JOIN src USING(mac_norm)
+        ORDER BY ts_dt DESC
+        """
+        events = con.execute(agg_sql, [events_paths]).df()
+    else:
+        events = pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
 
-        try:
-            kh = pd.read_parquet(kh_p)
-            if not kh.empty:
-                kh_all.append(kh)
-        except Exception:
-            pass
+    if kh_paths:
+        known_hosts = con.execute(
+            "SELECT * FROM read_parquet(?, union_by_name=true)",
+            [kh_paths],
+        ).df()
+    else:
+        known_hosts = pd.DataFrame(columns=["mac_norm", "ip", "vendor"])
 
-    events = pd.concat(ev_all, ignore_index=True) if ev_all else pd.DataFrame(
-        columns=["ts_dt", "mac_norm", "ip", "host", "source"]
-    )
-    known_hosts = pd.concat(kh_all, ignore_index=True) if kh_all else pd.DataFrame(
-        columns=["mac_norm", "ip", "vendor"]
-    )
     return events, known_hosts
 
 
@@ -531,20 +756,18 @@ def build_device_table(events: pd.DataFrame, mac_to_ip: Dict[str, str]) -> pd.Da
             ["None", "none", "-", "nan", "0.0.0.0", "Unknown IP", ""], pd.NA
         )
 
-    idx = tmp.groupby("mac_norm")["ts_dt"].idxmax()
-    latest = tmp.loc[idx].copy()
+    tmp_sorted = tmp.sort_values("ts_dt")
+    latest = tmp_sorted.drop_duplicates(subset=["mac_norm"], keep="last").copy()
 
     host_last = (
-        tmp.dropna(subset=["host"])
-        .sort_values("ts_dt")
+        tmp_sorted.dropna(subset=["host"])
         .groupby("mac_norm")["host"]
         .last()
     )
     latest["host"] = latest["mac_norm"].map(host_last)
 
     ip_last = (
-        tmp.dropna(subset=["ip"])
-        .sort_values("ts_dt")
+        tmp_sorted.dropna(subset=["ip"])
         .groupby("mac_norm")["ip"]
         .last()
     )
@@ -555,11 +778,19 @@ def build_device_table(events: pd.DataFrame, mac_to_ip: Dict[str, str]) -> pd.Da
         axis=1,
     )
 
-    src_agg = (
-        tmp.groupby("mac_norm")["source"]
-        .apply(lambda s: ", ".join(sorted(set(map(str, s)))))
-        .to_dict()
-    )
+    # "source" is still present; build seen_in from it
+    if "source" in tmp_sorted.columns:
+        src_agg = (
+            tmp_sorted.dropna(subset=["source"])
+            .assign(source=lambda d: d["source"].astype(str))
+            .drop_duplicates(subset=["mac_norm", "source"])
+            .groupby("mac_norm")["source"]
+            .apply(lambda s: ", ".join(sorted(set(map(str, s)))))
+            .to_dict()
+        )
+    else:
+        src_agg = {}
+
     latest["seen_in"] = latest["mac_norm"].map(lambda m: src_agg.get(str(m), ""))
 
     return latest.sort_values("ts_dt", ascending=False)
@@ -581,16 +812,31 @@ def _vendor_lookup():
 def resolve_vendor(mac_norm: Optional[str], mac_to_vendor: Dict[str, str], mac_lookup) -> str:
     if not mac_norm:
         return "Unknown Vendor"
+
     if mac_norm in mac_to_vendor:
         return mac_to_vendor[mac_norm]
+
+    st.session_state.setdefault("_alerts_vendor_cache", {})
+    vcache: Dict[str, str] = st.session_state["_alerts_vendor_cache"]
+
+    if mac_norm in vcache:
+        return vcache[mac_norm]
+
     if mac_lookup:
         try:
-            return mac_lookup.lookup(mac_norm)
+            v = mac_lookup.lookup(mac_norm)
+            if v:
+                vcache[mac_norm] = v
+                return v
         except Exception:
             pass
+
     if not VENDOR_LIB_AVAILABLE:
-        return "Unknown (install mac-vendor-lookup)"
-    return "Unknown Vendor"
+        vcache[mac_norm] = "Unknown (install mac-vendor-lookup)"
+        return vcache[mac_norm]
+
+    vcache[mac_norm] = "Unknown Vendor"
+    return vcache[mac_norm]
 
 
 # =============================================================================
@@ -629,7 +875,8 @@ def render(parquet_root: str, authorized_macs_file: str):
         st.error(f"Directory '{parquet_root}' not found.")
         return
 
-    by_date = _discover_date_dirs(root)
+    by_date_str = _discover_date_dirs(str(root))
+    by_date: Dict[str, List[Path]] = {k: [Path(p) for p in v] for k, v in by_date_str.items()}
     available_dates = sorted(by_date.keys(), reverse=True)
 
     if not available_dates:
@@ -686,13 +933,13 @@ def render(parquet_root: str, authorized_macs_file: str):
         for p in by_date.get(selected_date, []):
             selected_date_dirs.append((selected_date, p))
     else:
-        cutoff = (datetime.now().date() - pd.Timedelta(days=7))
+        cutoff_date = datetime.now().date() - timedelta(days=7)
         for d in available_dates:
             try:
                 dd = datetime.strptime(d, "%Y-%m-%d").date()
             except Exception:
                 continue
-            if dd >= cutoff:
+            if dd >= cutoff_date:
                 for p in by_date[d]:
                     selected_date_dirs.append((d, p))
 
@@ -724,10 +971,12 @@ def render(parquet_root: str, authorized_macs_file: str):
     mac_lookup = _vendor_lookup()
 
     if not devices.empty:
-        devices["vendor"] = devices["mac_norm"].astype(str).map(lambda m: resolve_vendor(m, mac_to_vendor, mac_lookup))
-        devices["status"] = devices["mac_norm"].astype(str).map(
-            lambda m: "Verified" if m in allowed_macs else "Unauthorized"
-        )
+        macs = devices["mac_norm"].astype(str)
+        uniq = pd.unique(macs)
+        vmap = {m: resolve_vendor(m, mac_to_vendor, mac_lookup) for m in uniq}
+        devices["vendor"] = macs.map(vmap)
+
+        devices["status"] = macs.map(lambda m: "Verified" if m in allowed_macs else "Unauthorized")
     else:
         devices = pd.DataFrame(columns=["ts_dt", "ip", "mac_norm", "vendor", "host", "seen_in", "status"])
 
