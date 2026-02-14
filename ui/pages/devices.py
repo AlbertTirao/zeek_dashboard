@@ -1,5 +1,6 @@
 # ui/pages/device.py
 import json
+import re  # CHANGED: shared MAC normalization (keeps counts consistent across pages)
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -9,6 +10,88 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yaml
+
+# =============================================================================
+# CHANGED: Shared MAC normalization (same canonical MAC format as Alerts/Authorization)
+# - Prevents mismatched counts due to bytes MACs / hyphens / dot notation / no-colon formats
+# =============================================================================
+_MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
+
+def normalize_mac(v):
+    """Return canonical 'aa:bb:cc:dd:ee:ff' or None."""
+    if v is None:
+        return None
+
+    if isinstance(v, (bytes, bytearray)):
+        # either raw 6 bytes or bytes of a string
+        if len(v) == 6:
+            h = bytes(v).hex()
+        else:
+            try:
+                s = v.decode("utf-8", "ignore")
+            except Exception:
+                return None
+            h = _MAC_HEX_RE.sub("", s)
+    else:
+        s = str(v).strip().lower()
+        if not s or s == "nan":
+            return None
+        h = _MAC_HEX_RE.sub("", s)
+
+    if len(h) != 12:
+        return None
+
+    return ":".join(h[i:i+2] for i in range(0, 12, 2)).lower()
+
+def is_broadcast_mac(mac):
+    return mac == "ff:ff:ff:ff:ff:ff"
+
+
+# =============================================================================
+# CHANGED: Date-folder discovery (avoid scanning cache dirs; match Alerts page)
+# =============================================================================
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def _extract_date_from_dirname(name: str):
+    if DATE_DIR_RE.match(name):
+        return name
+    if name.startswith("date="):
+        tail = name.split("date=", 1)[1]
+        if DATE_DIR_RE.match(tail):
+            return tail
+    return None
+
+def iter_date_dirs(parquet_root: Path):
+    """Yield (date_str, path_to_date_dir). Only includes real date folders."""
+    if not parquet_root.exists():
+        return
+    for p in sorted((x for x in parquet_root.iterdir() if x.is_dir()), key=lambda z: z.name):
+        n = p.name.lower()
+        if n.startswith("_") or "cache" in n:
+            continue
+        d = _extract_date_from_dirname(p.name)
+        if d:
+            yield d, p
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def load_active_today_macs_from_parquet(parquet_root: Path, today_str: str) -> set:
+    """CHANGED: Active Today is based on today's known_hosts parquet (folder date), not ts parsing."""
+    for d, p in iter_date_dirs(parquet_root):
+        if d == today_str:
+            kh = p / "known_hosts.parquet"
+            if not kh.exists():
+                return set()
+            try:
+                df = pd.read_parquet(kh)
+            except Exception:
+                return set()
+            if "mac" not in df.columns:
+                return set()
+            macs = df["mac"].map(normalize_mac).dropna()
+            macs = macs[~macs.map(is_broadcast_mac)]
+            return set(macs.tolist())
+    return set()
 
 # --- IMPORTS FOR CLICKABLE TABLE ---
 try:
@@ -29,7 +112,7 @@ def load_visual_metrics_from_parquet(parquet_root: Path):
     if not parquet_root.exists():
         return pd.DataFrame(), pd.DataFrame()
 
-    for day_dir in sorted((p for p in parquet_root.iterdir() if p.is_dir())):
+    for _date_str, day_dir in iter_date_dirs(parquet_root):  # CHANGED: only real date folders (matches Alerts)
         kh = day_dir / "known_hosts.parquet"
         dh = day_dir / "dhcp.parquet"
         if kh.exists():
@@ -207,13 +290,14 @@ def load_authorized_macs(file_path: Path) -> set:
 
     final_macs = set()
     for item in raw_list:
+        # CHANGED: normalize MACs to canonical format for cross-page consistency
         if isinstance(item, str):
-            m = item.strip().lower()
-            if m:
+            m = normalize_mac(item)
+            if m and not is_broadcast_mac(m):
                 final_macs.add(m)
         elif isinstance(item, dict):
-            m = str(item.get("mac", "")).strip().lower()
-            if m:
+            m = normalize_mac(item.get("mac"))
+            if m and not is_broadcast_mac(m):
                 final_macs.add(m)
 
     return final_macs
@@ -252,13 +336,14 @@ def load_banned_macs(ban_file: Path) -> set:
 
     banned = set()
     for it in raw_list:
+        # CHANGED: normalize all MACs the same way across pages
         if isinstance(it, str):
-            m = it.strip().lower()
-            if m:
+            m = normalize_mac(it)
+            if m and not is_broadcast_mac(m):
                 banned.add(m)
         elif isinstance(it, dict):
-            m = str(it.get("mac", "")).strip().lower()
-            if m:
+            m = normalize_mac(it.get("mac"))
+            if m and not is_broadcast_mac(m):
                 banned.add(m)
     return banned
 
@@ -387,7 +472,7 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
     raw_list = _extract_list_from_yaml(data, file_path.stem)
 
     store = _load_auth_history_store(authorized_mac_file_for_store)
-    store_norm = {str(k).strip().lower(): v for k, v in store.items() if isinstance(k, str)}
+    store_norm = {normalize_mac(k): v for k, v in store.items() if normalize_mac(k)}  # CHANGED: canonical MAC keys
 
     now = datetime.now()
     authorized_set = set()
@@ -398,16 +483,16 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
         added_dt = None
 
         if isinstance(item, str):
-            mac = item.strip().lower()
+            mac = normalize_mac(item)  # CHANGED
         elif isinstance(item, dict):
-            mac = str(item.get("mac", "")).strip().lower()
+            mac = normalize_mac(item.get("mac"))  # CHANGED
             for k in ["date_added", "added_at", "timestamp", "created_at", "date_modified"]:
                 if k in item and item.get(k):
                     added_dt = _parse_any_dt(item.get(k))
                     if added_dt:
                         break
 
-        if not mac:
+        if not mac or is_broadcast_mac(mac):
             continue
 
         authorized_set.add(mac)
@@ -865,13 +950,18 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     if "mac" in known_hosts.columns:
         known_hosts = known_hosts.copy()
-        known_hosts["mac"] = known_hosts["mac"].astype(str).str.lower().str.strip()
+        # CHANGED: normalize MACs robustly (handles bytes, hyphens, dot notation, no-colon)
+        known_hosts["mac"] = known_hosts["mac"].map(normalize_mac)
+        known_hosts = known_hosts.dropna(subset=["mac"])
+        known_hosts = known_hosts[~known_hosts["mac"].map(is_broadcast_mac)]
 
     # Merge DHCP (optional)
     if not dhcp.empty:
         if "mac" in dhcp.columns:
             dhcp = dhcp.copy()
-            dhcp["mac"] = dhcp["mac"].astype(str).str.lower().str.strip()
+            dhcp["mac"] = dhcp["mac"].map(normalize_mac)  # CHANGED
+            dhcp = dhcp.dropna(subset=["mac"])
+            dhcp = dhcp[~dhcp["mac"].map(is_broadcast_mac)]
             dhcp_cols = [c for c in ["mac", "host_name", "domain"] if c in dhcp.columns]
             dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"])
             merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
@@ -896,7 +986,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     # STRICT RULE:
     merged["status"] = merged["mac"].apply(
-        lambda m: "Authorized" if (str(m).strip().lower() in authorized_macs) else "Unauthorized"
+        lambda m: "Authorized" if (m in authorized_macs) else "Unauthorized"  # CHANGED: membership on normalized MAC
     )
 
     # EXCLUDE BANNED EVERYWHERE
@@ -906,9 +996,15 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     # Metrics
     today = datetime.now().date()
+    today_str = today.strftime("%Y-%m-%d")  # CHANGED
 
     total_devices = int(in_scope["mac"].nunique())
-    active_today = int(in_scope[in_scope["date"] == today]["mac"].nunique()) if "date" in in_scope.columns else 0
+
+    # CHANGED: derive Active Today from today's known_hosts parquet (folder date), not ts parsing
+    active_today_set = load_active_today_macs_from_parquet(PARQUET_ROOT, today_str)
+    if banned_macs:
+        active_today_set = active_today_set - set(banned_macs)
+    active_today = int(len(active_today_set))
     auth_seen = int(in_scope[in_scope["status"] == "Authorized"]["mac"].nunique())
     unauth_seen = int(in_scope[in_scope["status"] == "Unauthorized"]["mac"].nunique())
     risk = round((unauth_seen / total_devices * 100), 2) if total_devices else 0.0

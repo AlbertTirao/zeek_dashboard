@@ -140,6 +140,62 @@ def normalize_mac(x) -> Optional[str]:
 def is_broadcast_mac(mac: Optional[str]) -> bool:
     return mac == "ff:ff:ff:ff:ff:ff"
 
+# =============================================================================
+# CHANGED: BANNED MACS (shared across pages) + INVENTORY MAC SET (known_hosts)
+# - Alerts still builds event-driven tables, but header metrics now use the same
+#   "device inventory" as Device Overview: unique MACs from known_hosts parquets.
+# =============================================================================
+def load_banned_macs(ban_file: Path) -> set:
+    """Load banned MACs from banned_macs.yaml in the same format used by the other pages."""
+    if not ban_file.exists():
+        return set()
+    try:
+        data = yaml.safe_load(ban_file.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+
+    raw_list = _extract_yaml_list(data, ban_file.stem, preferred_keys=["banned_macs", "banned"])
+    banned = set()
+    for item in raw_list:
+        if isinstance(item, dict) and "mac" in item:
+            m = normalize_mac(item.get("mac"))
+        else:
+            m = normalize_mac(item)
+        if m and not is_broadcast_mac(m):
+            banned.add(m)
+    return banned
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_inventory_macs(parquet_root_str: str) -> set:
+    """CHANGED: Canonical device universe from known_hosts across ALL date folders."""
+    by_date_str = _discover_date_dirs(parquet_root_str)
+    kh_paths = []
+    for date_str, dirs in by_date_str.items():
+        for d in dirs:
+            p = Path(d) / "known_hosts.parquet"
+            if p.exists():
+                kh_paths.append(str(p))
+
+    if not kh_paths:
+        return set()
+
+    con = duckdb.connect(database=":memory:", read_only=False)
+    try:
+        # schema can vary; we only require a 'mac' column
+        df = con.execute("SELECT * FROM read_parquet($1)", [kh_paths]).df()
+    except Exception:
+        return set()
+    finally:
+        con.close()
+
+    if "mac" not in df.columns:
+        return set()
+
+    macs = df["mac"].map(normalize_mac).dropna()
+    macs = macs[~macs.map(is_broadcast_mac)]
+    return set(macs.tolist())
+
 
 # =============================================================================
 # YAML ALLOWLIST
@@ -913,6 +969,25 @@ def render(parquet_root: str, authorized_macs_file: str):
 
     allowed_macs = load_authorized_macs(authorized_macs_file)
 
+    # =============================================================================
+    # CHANGED: Use the same device inventory + ban list as Device Overview for counts
+    # =============================================================================
+    auth_path = Path(authorized_macs_file)
+    if auth_path.suffix != ".yaml":
+        y = auth_path.with_suffix(".yaml")
+        if y.exists():
+            auth_path = y
+    ban_file = auth_path.with_name("banned_macs.yaml")
+    banned_macs = load_banned_macs(ban_file)
+
+    inventory = load_inventory_macs(str(root))
+    if banned_macs:
+        inventory = inventory - set(banned_macs)
+
+    inventory_total = int(len(inventory))
+    inventory_verified = int(len(inventory.intersection(set(allowed_macs))))
+    inventory_unauthorized = int(len(inventory - set(allowed_macs)))
+
     # Allowlist-change detection (session-based)
     st.session_state.setdefault("_alerts_prev_allowed_set", None)
     prev_allowed = st.session_state.get("_alerts_prev_allowed_set")
@@ -955,6 +1030,9 @@ def render(parquet_root: str, authorized_macs_file: str):
             mac_to_vendor={},
             mac_lookup=_vendor_lookup(),
             events=pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]),
+            inventory_total=0,
+            inventory_verified=0,
+            inventory_unauthorized=0,
         )
         return
 
@@ -967,6 +1045,10 @@ def render(parquet_root: str, authorized_macs_file: str):
     devices = build_device_table(events, mac_to_ip) if not events.empty else pd.DataFrame(
         columns=["ts_dt", "ip", "mac_norm", "host", "seen_in", "source"]
     )
+
+    # CHANGED: exclude banned devices from alert tables (keeps device sets consistent)
+    if not devices.empty and banned_macs and "mac_norm" in devices.columns:
+        devices = devices[~devices["mac_norm"].astype(str).isin(banned_macs)].copy()
 
     mac_lookup = _vendor_lookup()
 
@@ -990,6 +1072,9 @@ def render(parquet_root: str, authorized_macs_file: str):
         mac_to_vendor=mac_to_vendor,
         mac_lookup=mac_lookup,
         events=events,
+        inventory_total=inventory_total,
+        inventory_verified=inventory_verified,
+        inventory_unauthorized=inventory_unauthorized,
     )
 
 
@@ -1006,6 +1091,9 @@ def _render_alerts_ui(
     mac_to_vendor: Dict[str, str],
     mac_lookup,
     events: pd.DataFrame,
+    inventory_total: int,
+    inventory_verified: int,
+    inventory_unauthorized: int,
 ) -> None:
     if devices is None:
         devices = pd.DataFrame()
@@ -1081,17 +1169,18 @@ def _render_alerts_ui(
     colA, colB, colC = st.columns([1, 1, 1])
 
     with colA:
-        st.metric("Total Devices Seen", int(len(devices)) if devices is not None else 0)
+        st.metric("Total Devices", int(inventory_total))  # CHANGED: inventory-based (matches Device Overview)
+        st.caption(f"Seen in {range_label}: {int(len(devices)) if devices is not None else 0}")  # CHANGED: keep alerts context
         if st.button("View Total Devices", use_container_width=True, key="view_total_devices"):
             st.session_state["unauth_macs_view"] = "Total"
 
     with colB:
-        st.metric("Verified Devices", int(len(verified_df)))
+        st.metric("Verified Devices", int(inventory_verified))  # CHANGED
         if st.button("View Verified Devices", use_container_width=True, key="view_verified_devices"):
             st.session_state["unauth_macs_view"] = "Verified"
 
     with colC:
-        st.metric("Unauthorized Devices", int(len(unauth_df)))
+        st.metric("Unauthorized Devices", int(inventory_unauthorized))  # CHANGED
         if st.button("View Unauthorized Devices", use_container_width=True, key="view_unauthorized_devices"):
             st.session_state["unauth_macs_view"] = "Unauthorized"
 

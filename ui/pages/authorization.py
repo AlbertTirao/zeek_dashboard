@@ -13,6 +13,35 @@ import inspect
 # -----------------------------
 MAC_REGEX_PATTERN = r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
 DOMAIN_REGEX_PATTERN = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
+
+# =============================================================================
+# CHANGED: Shared MAC normalization (same canonical format as Devices/Alerts)
+# - Prevents mismatched counts/enrichment due to different MAC string formats
+# =============================================================================
+_MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
+
+def normalize_mac(v):
+    """Return canonical 'aa:bb:cc:dd:ee:ff' or None."""
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        if len(v) == 6:
+            h = bytes(v).hex()
+        else:
+            try:
+                s = v.decode("utf-8", "ignore")
+            except Exception:
+                return None
+            h = _MAC_HEX_RE.sub("", s)
+    else:
+        s = str(v).strip().lower()
+        if not s or s == "nan":
+            return None
+        h = _MAC_HEX_RE.sub("", s)
+    if len(h) != 12:
+        return None
+    return ":".join(h[i:i+2] for i in range(0, 12, 2)).lower()
+
 PARQUET_ROOT = Path("data/parquet")
 
 # -----------------------------
@@ -105,7 +134,9 @@ def _file_mtime_str(p: Path):
         return _now_str()
 
 def _mac_is_valid(mac: str) -> bool:
-    return bool(re.match(MAC_REGEX_PATTERN, (mac or "").strip()))
+    # CHANGED: validate after normalization so inputs like AABBCCDDEEFF or AA-BB-... are accepted
+    nm = normalize_mac(mac)
+    return bool(nm and re.match(MAC_REGEX_PATTERN, nm))
 
 def _domain_is_valid(domain: str) -> bool:
     return bool(re.match(DOMAIN_REGEX_PATTERN, (domain or "").strip()))
@@ -144,7 +175,8 @@ def load_devices(filepath: Path) -> list[dict]:
             for item in raw_list:
                 if isinstance(item, str):
                     structured_data.append({
-                        "mac": item.strip().lower(),
+                        "mac": (normalize_mac(item) or ""),  # CHANGED: canonical MAC
+                        
                         "ip": "", "hostname": "", "vendor": "",
                         "date_modified": file_stamp
                     })
@@ -153,7 +185,7 @@ def load_devices(filepath: Path) -> list[dict]:
                     clean_item = {str(k).lower(): v for k, v in item.items()}
                     entry.update(clean_item)
                     if entry["mac"]:
-                        entry["mac"] = str(entry["mac"]).strip().lower()
+                        entry["mac"] = (normalize_mac(entry["mac"]) or "")  # CHANGED: canonical MAC
                         if not entry.get("date_modified"):
                             entry["date_modified"] = file_stamp
                         structured_data.append(entry)
@@ -210,7 +242,7 @@ def load_domain_whitelist(filepath: Path) -> list[dict]:
 
         for it in raw_list:
             if isinstance(it, str):
-                dom = it.strip().lower()
+                dom = (normalize_mac(it) or "")  # CHANGED
                 if dom:
                     out.append({"domain": dom, "date_modified": file_stamp})
             elif isinstance(it, dict):
@@ -269,11 +301,11 @@ def load_ban_list(filepath: Path) -> list[dict]:
         file_stamp = _file_mtime_str(filepath)
         for it in raw_list:
             if isinstance(it, str):
-                m = it.strip().lower()
+                m = (normalize_mac(it) or "")  # CHANGED
                 if m:
                     out.append({"mac": m, "date_modified": file_stamp})
             elif isinstance(it, dict):
-                m = str(it.get("mac", "")).strip().lower()
+                m = (normalize_mac(it.get("mac")) or "")  # CHANGED
                 if m:
                     out.append({
                         "mac": m,
@@ -402,12 +434,20 @@ def auto_enrich_devices(device_list):
     net_df = get_latest_network_info()
     net_map = {}
     if not net_df.empty:
+        # CHANGED: normalize network MACs so enrichment matches canonical MACs
+        net_df = net_df.copy()
+        if "mac" in net_df.columns:
+            net_df["mac"] = net_df["mac"].map(normalize_mac)
+            net_df = net_df.dropna(subset=["mac"])
         net_map = net_df.set_index("mac").to_dict(orient="index")
 
     changes_detected = False
 
     for device in device_list:
-        mac = device.get("mac", "").lower()
+        mac = normalize_mac(device.get("mac", ""))  # CHANGED
+
+        if not mac:
+            continue
 
         if mac in net_map:
             found_ip = str(net_map[mac].get("latest_ip", ""))
@@ -465,8 +505,8 @@ def render_device_manager(device_list: list[dict], filepath: Path):
     with col_btn:
         if st.button("Add Device", key="btn_import_mac", type="primary"):
             if new_text:
-                entries = [m.strip().lower() for m in re.split(r"[,\s\n]+", new_text) if m.strip()]
-                existing_macs = {d.get("mac", "").lower() for d in device_list}
+                entries = [normalize_mac(m) for m in re.split(r"[,\s\n]+", new_text) if normalize_mac(m)]  # CHANGED
+                existing_macs = {normalize_mac(d.get("mac")) for d in device_list if normalize_mac(d.get("mac"))}  # CHANGED
 
                 added_count = 0
                 new_entries_for_log = []
@@ -557,19 +597,19 @@ def render_device_manager(device_list: list[dict], filepath: Path):
             edited_df = edited_df.drop(columns=["#"])
 
         new_state_dicts = edited_df.to_dict("records")
-        visible_macs = set([str(x.get("mac", "")).strip().lower() for x in new_state_dicts if x.get("mac")])
+        visible_macs = set([normalize_mac(x.get("mac")) for x in new_state_dicts if normalize_mac(x.get("mac"))])  # CHANGED
 
-        old_map = {d.get("mac", "").lower(): d for d in device_list if d.get("mac")}
+        old_map = {normalize_mac(d.get("mac")): d for d in device_list if normalize_mac(d.get("mac"))}  # CHANGED
 
         final_list = []
         if search_query or date_filter != "All":
             for item in device_list:
-                if item.get("mac", "").lower() not in visible_macs:
+                if normalize_mac(item.get("mac")) not in visible_macs:  # CHANGED
                     final_list.append(item)
 
         for item in new_state_dicts:
             if item.get("mac") and str(item["mac"]).strip():
-                mac_clean = str(item["mac"]).strip().lower()
+                mac_clean = (normalize_mac(item["mac"]) or "")  # CHANGED
                 ip_clean = str(item.get("ip", "")).strip()
                 host_clean = str(item.get("hostname", "")).strip()
 
@@ -810,8 +850,8 @@ def render_banning_list(ban_file: Path):
     with col_btn:
         if st.button("Enter", type="primary", key="ban_add_btn"):
             if new_text:
-                entries = [m.strip().lower() for m in re.split(r"[,\s\n]+", new_text) if m.strip()]
-                existing = {d.get("mac", "").lower() for d in ban_list}
+                entries = [normalize_mac(m) for m in re.split(r"[,\s\n]+", new_text) if normalize_mac(m)]  # CHANGED
+                existing = {normalize_mac(d.get("mac")) for d in ban_list if normalize_mac(d.get("mac"))}  # CHANGED
 
                 added = []
                 for mac in entries:
@@ -876,7 +916,7 @@ def render_banning_list(ban_file: Path):
         old_map = {x["mac"]: x for x in ban_list}
 
         for r in rows:
-            mac = str(r.get("mac", "")).strip().lower()
+            mac = (normalize_mac(r.get("mac")) or "")  # CHANGED
             if not mac:
                 continue
             if not _mac_is_valid(mac):
