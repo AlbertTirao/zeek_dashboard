@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import yaml
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 
 # =============================================================================
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
@@ -938,99 +939,453 @@ def _safe_value_counts_top(s: pd.Series) -> str:
 
 
 # =============================================================================
+# UI HELPERS
+# =============================================================================
+
+MAX_ROWS_DISPLAY = 10000
+SEVERITY_COLORS = {
+    "CRITICAL": "#ef4444",
+    "HIGH": "#f97316",
+    "MEDIUM": "#f59e0b",
+    "LOW": "#22c55e",
+}
+POLICY_COLORS = {
+    "Shadow AI": "#ef4444",
+    "Allowed": "#22c55e",
+}
+
+
+def _is_dark_theme() -> bool:
+    try:
+        base = st.get_option("theme.base")
+        if isinstance(base, str) and base.lower() in {"light", "dark"}:
+            return base.lower() == "dark"
+    except Exception:
+        pass
+    return True
+
+
+def get_aggrid_theme_and_css():
+    dark = _is_dark_theme()
+    theme = "alpine-dark" if dark else "alpine"
+
+    custom_css = {
+        ".ag-root-wrapper": {"background-color": "#050B16", "color": "#EAEAEA", "border": "1px solid #22324E"},
+        ".ag-header": {"background-color": "#0A1730", "color": "#EAF2FF", "border-bottom": "1px solid #29406A"},
+        ".ag-header-cell, .ag-header-group-cell": {
+            "background-color": "#0A1730",
+            "color": "#EAF2FF",
+            "border-right": "1px solid #20365A",
+        },
+        ".ag-header-cell-label": {"font-weight": "700", "letter-spacing": "0.02em"},
+        ".ag-cell": {"background-color": "#050B16", "color": "#EAEAEA", "border-color": "#13233D"},
+        ".ag-row": {"background-color": "#050B16"},
+        ".ag-row-odd": {"background-color": "#071224"},
+        ".ag-row-even": {"background-color": "#050E1D"},
+        ".ag-row-hover": {"background-color": "#0F203D"},
+        ".ag-row-selected": {"background-color": "#1E3A5F"},
+        ".ag-floating-filter-body input": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #32517F !important",
+            "border-radius": "6px !important",
+        },
+        ".ag-paging-panel": {"background-color": "#050B16", "color": "#EAEAEA", "border-top": "1px solid #22324E"},
+        ".ag-paging-row-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-paging-page-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-pagination": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-paging-page-size": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-page-size": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+            "outline": "none !important",
+        },
+        ".ag-paging-panel .ag-page-size option": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-select, .ag-paging-panel .ag-picker-field-wrapper": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+    }
+    return theme, custom_css
+
+
+def get_plotly_template() -> str:
+    return "plotly_dark" if _is_dark_theme() else "plotly_white"
+
+
+def style_plotly_figure(fig, *, height: int = 360, show_legend: bool = True):
+    fig.update_layout(
+        template=get_plotly_template(),
+        height=height,
+        margin=dict(l=12, r=12, t=40, b=12),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.02, x=1.0, xanchor="right", yanchor="bottom"),
+    )
+    if not show_legend:
+        fig.update_layout(showlegend=False)
+    return fig
+
+
+def _risk_score_cellstyle() -> JsCode:
+    return JsCode(
+        """
+        function(params) {
+            const v = Number(params.value || 0);
+            if (v >= 80) return { 'color': '#ef4444', 'fontWeight': '900' };
+            if (v >= 60) return { 'color': '#f97316', 'fontWeight': '900' };
+            if (v >= 30) return { 'color': '#f59e0b', 'fontWeight': '800' };
+            return { 'color': '#22c55e', 'fontWeight': '700' };
+        }
+        """
+    )
+
+
+def _severity_cellstyle() -> JsCode:
+    return JsCode(
+        """
+        function(params) {
+            const v = (params.value || '').toString().toUpperCase();
+            if (v === 'CRITICAL') return { 'color': '#ef4444', 'fontWeight': '900' };
+            if (v === 'HIGH') return { 'color': '#f97316', 'fontWeight': '900' };
+            if (v === 'MEDIUM') return { 'color': '#f59e0b', 'fontWeight': '800' };
+            if (v === 'LOW') return { 'color': '#22c55e', 'fontWeight': '700' };
+            return {};
+        }
+        """
+    )
+
+
+def _policy_cellstyle() -> JsCode:
+    return JsCode(
+        """
+        function(params) {
+            const v = (params.value || '').toString();
+            if (v === 'Shadow AI') return { 'color': '#ef4444', 'fontWeight': '900' };
+            if (v === 'Allowed') return { 'color': '#22c55e', 'fontWeight': '800' };
+            return {};
+        }
+        """
+    )
+
+
+def render_shadow_aggrid(
+    df: pd.DataFrame,
+    gb: GridOptionsBuilder,
+    *,
+    key: str,
+    height: int = 430,
+    update_mode=GridUpdateMode.NO_UPDATE,
+):
+    grid_options = gb.build()
+    autofit_js = JsCode(
+        """
+        function(params) {
+            setTimeout(function() {
+                if (params && params.api) {
+                    params.api.sizeColumnsToFit();
+                }
+            }, 0);
+        }
+        """
+    )
+    grid_options["onFirstDataRendered"] = autofit_js
+    grid_options["onGridSizeChanged"] = autofit_js
+
+    ag_theme, ag_css = get_aggrid_theme_and_css()
+    table_css = dict(ag_css)
+    table_css.update(
+        {
+            ".ag-root-wrapper": {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"},
+            ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E"},
+            ".ag-header-cell, .ag-header-group-cell": {"background-color": "#10213E", "color": "#EAF2FF", "border-right": "1px solid #2A466E"},
+            ".ag-row-odd": {"background-color": "#07162A"},
+            ".ag-row-even": {"background-color": "#0A1C33"},
+            ".ag-row-hover": {"background-color": "#13305A"},
+            ".ag-row-selected": {"background-color": "#1B3F75"},
+        }
+    )
+
+    st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
+    grid_response = AgGrid(
+        df,
+        gridOptions=grid_options,
+        update_mode=update_mode,
+        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+        height=height,
+        theme=ag_theme,
+        custom_css=table_css,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=True,
+        reload_data=False,
+        key=key,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+    return grid_response
+
+
+def _new_grid_builder(df_grid: pd.DataFrame, page_size: int = 15) -> GridOptionsBuilder:
+    gb = GridOptionsBuilder.from_dataframe(df_grid)
+    gb.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
+    gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=page_size)
+    if "#" in df_grid.columns:
+        gb.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False, flex=0)
+    return gb
+
+
+def inject_shadow_ai_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --panel-border: rgba(255,255,255,0.12);
+            --panel-bg: rgba(255,255,255,0.03);
+        }
+        .stApp {
+            background:
+                radial-gradient(1200px 550px at 10% -5%, rgba(0, 247, 255, 0.08), transparent 45%),
+                radial-gradient(900px 460px at 90% 8%, rgba(246, 48, 73, 0.08), transparent 42%),
+                #040B18;
+        }
+        .shadow-day-chip {
+            border: 1px solid rgba(255,255,255,0.18);
+            background: rgba(255,255,255,0.05);
+            border-radius: 999px;
+            padding: 7px 12px;
+            margin-top: 1.72rem;
+            font-size: 12px;
+            font-weight: 700;
+            line-height: 1.2;
+            display: inline-flex;
+            align-items: center;
+        }
+        .shadow-callout {
+            border: 1px solid var(--panel-border);
+            background: var(--panel-bg);
+            border-radius: 10px;
+            padding: 0.5rem 0.72rem;
+            font-size: 0.84rem;
+            margin-bottom: 0.45rem;
+        }
+        .shadow-filter-shell {
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
+            border-radius: 12px;
+            padding: 0.72rem 0.85rem 0.55rem 0.85rem;
+            margin-bottom: 0.45rem;
+        }
+        .shadow-filter-hint {
+            font-size: 0.76rem;
+            color: #9fb1c8;
+            margin-top: 0.2rem;
+            margin-bottom: 0.3rem;
+        }
+        .shadow-filter-shell [data-testid="stWidgetLabel"] p {
+            font-size: 0.76rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: #bfd1ea;
+            font-weight: 700;
+        }
+        .shadow-filter-shell [data-testid="stTextInput"] input,
+        .shadow-filter-shell [data-testid="stTextArea"] textarea,
+        .shadow-filter-shell [data-testid="stNumberInput"] input {
+            background: rgba(8, 20, 40, 0.8) !important;
+            border: 1px solid #35517d !important;
+            color: #e5eefc !important;
+        }
+        .shadow-filter-shell [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+        .shadow-filter-shell [data-testid="stMultiSelect"] div[data-baseweb="select"] > div {
+            background: rgba(8, 20, 40, 0.8) !important;
+            border: 1px solid #35517d !important;
+            color: #e5eefc !important;
+            min-height: 2.42rem;
+        }
+        .shadow-table-shell {
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            background: linear-gradient(180deg, rgba(2,6,23,0.5), rgba(2,6,23,0.35));
+            border-radius: 12px;
+            padding: 0.56rem 0.62rem 0.46rem 0.62rem;
+            margin-bottom: 0.75rem;
+        }
+        [data-testid="stMetric"] {
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            padding: 0.55rem 0.75rem;
+        }
+        [data-testid="stMetricLabel"] p {
+            font-size: 0.75rem;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        [data-testid="stMetricValue"] {
+            line-height: 1.1;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.45rem;
+            margin-bottom: 0.35rem;
+        }
+        .stTabs [data-baseweb="tab"] {
+            border: 1px solid var(--panel-border);
+            border-radius: 999px;
+            background: rgba(255,255,255,0.03);
+            padding: 0.38rem 0.88rem;
+            font-size: 0.86rem;
+            height: auto;
+        }
+        .stTabs [data-baseweb="tab"][aria-selected="true"] {
+            background: rgba(255,255,255,0.08);
+            border-color: rgba(255,255,255,0.2);
+            font-weight: 700;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =============================================================================
 # UI RENDERER
 # =============================================================================
 
 def render_shadow_ai(parquet_root: Path):
-    st.markdown("#### Shadow AI & Data Leakage")
+    inject_shadow_ai_css()
+    st.markdown("### Shadow AI & Data Leakage Monitor")
+    st.markdown(
+        "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN telemetry with signature and policy context to surface potential Shadow AI usage and leakage risk.</div>",
+        unsafe_allow_html=True,
+    )
 
     parquet_root = Path(parquet_root)
     if not parquet_root.exists():
         st.error(f"Parquet root not found: {parquet_root}")
         return
 
+    available_dates = get_available_dates(parquet_root)
+    if not available_dates:
+        st.warning("No logs found.")
+        return
+
+    date_options = ["All Available Dates"] + available_dates
+    top1, top2, top3 = st.columns([1.5, 2.3, 0.8])
+    with top1:
+        selected_date = st.selectbox(
+            "Dataset Scope",
+            date_options,
+            index=1 if len(available_dates) > 0 else 0,
+            key="shadow_ai_date_v2",
+        )
+    selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
+    with top2:
+        scope_label = selected_date if selected_date != "All Available Dates" else f"All Available Dates ({len(available_dates)})"
+        st.markdown(
+            f"<div class='shadow-day-chip'>Active scope: <strong>{scope_label}</strong></div>",
+            unsafe_allow_html=True,
+        )
+    with top3:
+        st.write("")
+        st.write("")
+        if st.button("Refresh", key="shadow_ai_refresh_v2"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+
     with st.expander("Detection basis (how Shadow AI is decided)", expanded=False):
         st.write(
-            "Events are generated when Zeek telemetry matches a signature from ai_signatures.yaml "
-            "(HTTP host/uri, TLS SNI, DNS query) or a configured local AI port (conn id.resp_p). "
-            "Policy Verdict uses authorized_providers as an allowlist."
+            "Events are generated when Zeek telemetry matches `ai_signatures.yaml` (HTTP host/uri, TLS SNI, DNS query) "
+            "or a configured local AI port (`conn id.resp_p`). Policy verdict is based on `authorized_providers`."
         )
-        st.write("Evidence fields: Match_Field, Signature_Match, Matched_Value, Detection_Basis, Policy_Basis, Evidence_Type, Confidence.")
-
-    available_dates = get_available_dates(parquet_root)
-    date_options = ["All Available Dates"] + available_dates
+        st.write(
+            "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, "
+            "Policy_Basis, Evidence_Type, and Confidence."
+        )
 
     provider_values = sorted(list((RAW_AI_SIGNATURES or {}).keys()))
     signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])})
     match_field_values = ["HTTP host/uri", "TLS SNI", "DNS query", "conn id.resp_p"]
     evidence_values = ["HTTP+POST", "HTTP+GET", "TLS SNI", "DNS query", "Local Port", "HTTP"]
 
-    with st.container(border=True):
-        c1, c2, c3 = st.columns([2, 2, 2])
-        with c1:
-            selected_date = st.selectbox(
-                "Select Date Range",
-                date_options,
-                index=1 if len(date_options) > 1 else 0,
-            )
-        with c2:
-            selected_verdict = st.multiselect(
-                "Policy Verdict",
-                ["Shadow AI", "Allowed"],
-                default=["Shadow AI", "Allowed"],
-            )
-        with c3:
-            selected_severity = st.multiselect(
-                "Severity",
-                ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-                default=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-            )
+    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns([1.6, 1.45, 1.8, 1.1])
+    with c1:
+        selected_verdict = st.multiselect(
+            "Policy Verdict",
+            ["Shadow AI", "Allowed"],
+            default=["Shadow AI", "Allowed"],
+            key="shadow_ai_filter_verdict_v2",
+        )
+    with c2:
+        selected_severity = st.multiselect(
+            "Severity",
+            ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+            default=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+            key="shadow_ai_filter_severity_v2",
+        )
+    with c3:
+        provider_filter = st.multiselect(
+            "Provider",
+            provider_values,
+            default=[],
+            placeholder="All providers",
+            key="shadow_ai_filter_provider_v2",
+        )
+    with c4:
+        min_upload_kb = st.number_input("Min Upload (KB)", min_value=0, value=0, step=10, key="shadow_ai_filter_min_upload_v2")
 
-        c4, c5, c6 = st.columns([2, 2, 2])
-        with c4:
-            provider_filter = st.multiselect(
-                "Provider",
-                provider_values,
-                default=[],
-                placeholder="All providers",
-            )
-        with c5:
-            basis_field = st.multiselect(
-                "Match Field (basis)",
-                match_field_values,
-                default=match_field_values,
-            )
-        with c6:
-            basis_sig = st.multiselect(
-                "Signature Match (basis)",
-                signature_values,
-                default=[],
-                placeholder="All signatures",
-            )
+    c5, c6, c7 = st.columns([1.6, 1.6, 2.2])
+    with c5:
+        basis_field = st.multiselect(
+            "Match Field",
+            match_field_values,
+            default=match_field_values,
+            key="shadow_ai_filter_field_v2",
+        )
+    with c6:
+        basis_sig = st.multiselect(
+            "Signature Match",
+            signature_values,
+            default=[],
+            placeholder="All signatures",
+            key="shadow_ai_filter_signature_v2",
+        )
+    with c7:
+        search_q = st.text_input(
+            "Search (MAC, Host, Provider, IP, Detail, Basis)",
+            placeholder="Enter keywords...",
+            key="shadow_ai_filter_search_v2",
+        )
 
-        c7, c8, c9 = st.columns([2, 2, 2])
-        with c7:
-            evidence_filter = st.multiselect(
-                "Evidence Type",
-                evidence_values,
-                default=[],
-                placeholder="All evidence types",
-            )
-        with c8:
-            only_resolved_mac = st.checkbox("Only resolved MAC", value=False)
-        with c9:
-            ignore_dns_only = st.checkbox("Ignore DNS-only events", value=False)
+    c8, c9, c10 = st.columns([1.45, 1.35, 2.2])
+    with c8:
+        evidence_filter = st.multiselect(
+            "Evidence Type",
+            evidence_values,
+            default=[],
+            placeholder="All evidence",
+            key="shadow_ai_filter_evidence_v2",
+        )
+    with c9:
+        only_resolved_mac = st.checkbox("Only resolved MAC", value=False, key="shadow_ai_filter_resolved_v2")
+    with c10:
+        ignore_dns_only = st.checkbox("Ignore DNS-only events", value=False, key="shadow_ai_filter_ignore_dns_v2")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        c10, c11 = st.columns([3, 3])
-        with c10:
-            search_q = st.text_input("Search (MAC, Host, Provider, IP, Detail, Basis)", placeholder="Enter keywords...")
-        with c11:
-            min_upload_kb = st.number_input("Min Upload (KB)", min_value=0, value=0, step=10)
+    verdict_summary = ", ".join(selected_verdict) if selected_verdict else "None"
+    severity_summary = ", ".join(selected_severity) if selected_severity else "None"
+    provider_summary = f"{len(provider_filter)} selected" if provider_filter else "All"
+    search_summary = "On" if (search_q or "").strip() else "Off"
+    st.markdown(
+        f"<div class='shadow-filter-hint'>Verdict: <strong>{verdict_summary}</strong> | Severity: <strong>{severity_summary}</strong> | Providers: <strong>{provider_summary}</strong> | Search: <strong>{search_summary}</strong></div>",
+        unsafe_allow_html=True,
+    )
 
-    # date scoping
     target_dates = available_dates if selected_date == "All Available Dates" else ([selected_date] if selected_date else [])
-
-    with st.spinner("Loading and correlating telemetry..."):
+    with st.spinner("Analyzing telemetry (fast cache)..."):
         df = load_shadow_ai_data(parquet_root, target_dates)
 
     if df.empty:
@@ -1053,10 +1408,9 @@ def render_shadow_ai(parquet_root: Path):
     if evidence_filter:
         filtered = filtered[filtered["Evidence_Type"].isin(evidence_filter)]
     if min_upload_kb > 0:
-        filtered = filtered[filtered["Upload_Bytes"] >= (min_upload_kb * 1024)]
+        filtered = filtered[filtered["Upload_Bytes"] >= (float(min_upload_kb) * 1024)]
     if only_resolved_mac:
-        filtered = filtered[filtered["mac"].astype(str).fillna("").str.len() > 0
-                            & filtered["mac"].astype(str).str.contains(":", na=False)]
+        filtered = filtered[filtered["mac"].astype(str).str.contains(":", na=False)]
     if ignore_dns_only:
         filtered = filtered[filtered["Detection_Source"].isin(["HTTP", "SSL", "CONN (Port)"])]
 
@@ -1077,25 +1431,30 @@ def render_shadow_ai(parquet_root: Path):
                 | filtered["Matched_Value"].astype(str).str.lower().str.contains(q, na=False)
             ]
 
-    # -----------------------------------------------------------------------------
-    # KPI / Exposure summary
-    # -----------------------------------------------------------------------------
-    st.markdown("---")
+    if filtered.empty:
+        st.warning("No data matches your filters.")
+        return
+
+    st.divider()
     m1, m2, m3, m4, m5, m6 = st.columns(6)
 
-    total_leakage_mb = float(filtered["Upload_Bytes"].sum()) / 1024 / 1024 if not filtered.empty else 0.0
-    shadow_count = int((filtered["Policy_Verdict"] == "Shadow AI").sum()) if not filtered.empty else 0
-    critical_events = int((filtered["Severity"] == "CRITICAL").sum()) if not filtered.empty else 0
+    total_leakage_mb = float(filtered["Upload_Bytes"].sum()) / 1024 / 1024
+    shadow_count = int((filtered["Policy_Verdict"] == "Shadow AI").sum())
+    critical_events = int((filtered["Severity"] == "CRITICAL").sum())
     unique_macs = int(filtered["mac"].astype(str).replace({"": None}).dropna().nunique()) if "mac" in filtered.columns else 0
     unique_hosts = int(filtered["host_name"].astype(str).replace({"": None}).dropna().nunique()) if "host_name" in filtered.columns else 0
     unique_ips = int(filtered["id.orig_h"].astype(str).replace({"": None, "nan": None}).dropna().nunique()) if "id.orig_h" in filtered.columns else 0
 
-    m1.metric("Selected Events", len(filtered))
-    m2.metric("Shadow AI Events", shadow_count, delta="Risk" if shadow_count > 0 else "Clear", delta_color="inverse")
-    m3.metric("Critical Incidents", critical_events, delta="Investigate" if critical_events > 0 else "Clear", delta_color="inverse")
-    m4.metric("Unique MACs", unique_macs)
-    m5.metric("Unique Hosts", unique_hosts)
+    m1.metric("Selected Events", f"{len(filtered):,}")
+    m2.metric("Shadow AI Events", f"{shadow_count:,}", delta="Risk" if shadow_count > 0 else "Clear", delta_color="inverse")
+    m3.metric("Critical Incidents", f"{critical_events:,}", delta="Investigate" if critical_events > 0 else "Clear", delta_color="inverse")
+    m4.metric("Unique MACs", f"{unique_macs:,}")
+    m5.metric("Unique Hosts", f"{unique_hosts:,}")
     m6.metric("Data Leakage", f"{total_leakage_mb:.2f} MB")
+    st.markdown(
+        f"<div class='shadow-filter-hint'>Unique source IPs in scope: <strong>{unique_ips:,}</strong></div>",
+        unsafe_allow_html=True,
+    )
 
     # -----------------------------------------------------------------------------
     # TABS: SOC dashboards
@@ -1125,11 +1484,15 @@ def render_shadow_ai(parquet_root: Path):
                 y="AI_Provider",
                 size="Risk_Score",
                 color="Severity",
+                color_discrete_map=SEVERITY_COLORS,
                 hover_data=["mac", "host_name", "Detail", "Destination", "Evidence_Type", "Confidence", "Detection_Basis", "Policy_Basis", "id.orig_h"],
                 title=f"Incident Timeline ({selected_date})",
-                template="plotly_dark",
+                template=get_plotly_template(),
                 render_mode=render_mode,
             )
+            style_plotly_figure(fig_scatter, height=370)
+            fig_scatter.update_xaxes(title="Time")
+            fig_scatter.update_yaxes(title="Provider")
             st.plotly_chart(fig_scatter, use_container_width=True)
 
         with g2:
@@ -1144,8 +1507,11 @@ def render_shadow_ai(parquet_root: Path):
                 y="Client_Type",
                 orientation="h",
                 title="Avg Risk by Client",
-                template="plotly_dark",
+                template=get_plotly_template(),
             )
+            style_plotly_figure(fig_bar, height=370, show_legend=False)
+            fig_bar.update_xaxes(title="Average Risk Score")
+            fig_bar.update_yaxes(title=None)
             st.plotly_chart(fig_bar, use_container_width=True)
 
         # Provider summary
@@ -1155,17 +1521,24 @@ def render_shadow_ai(parquet_root: Path):
             Unique_MACs=("mac", lambda x: x.astype(str).replace({"": None}).dropna().nunique()),
             Last_Seen=("ts", "max"),
             Total_Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
-        ).reset_index().sort_values(["Policy_Verdict", "Events"], ascending=[True, False])
+            Avg_Risk=("Risk_Score", "mean"),
+        ).reset_index().sort_values(["Events", "Total_Upload_MB"], ascending=False)
 
-        st.dataframe(
-            prov_sum,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"),
-                "Total_Upload_MB": st.column_config.NumberColumn("Upload (MB)", format="%.2f"),
-            },
-        )
+        prov_grid = prov_sum.copy()
+        prov_grid.insert(0, "#", range(1, len(prov_grid) + 1))
+        prov_grid["Last_Seen"] = pd.to_datetime(prov_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+        prov_grid["Total_Upload_MB"] = pd.to_numeric(prov_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
+        prov_grid["Avg_Risk"] = pd.to_numeric(prov_grid["Avg_Risk"], errors="coerce").fillna(0).round(1)
+
+        gb_prov = _new_grid_builder(prov_grid, page_size=15)
+        gb_prov.configure_column("AI_Provider", header_name="Provider", minWidth=160, flex=1.3)
+        gb_prov.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
+        gb_prov.configure_column("Events", width=92, flex=0.8)
+        gb_prov.configure_column("Unique_MACs", header_name="Unique MACs", minWidth=110)
+        gb_prov.configure_column("Last_Seen", header_name="Last Seen", minWidth=150)
+        gb_prov.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=105)
+        gb_prov.configure_column("Avg_Risk", header_name="Avg Risk", minWidth=95, cellStyle=_risk_score_cellstyle())
+        render_shadow_aggrid(prov_grid, gb_prov, key=f"shadow_ai_provider_grid_{selected_scope_key}", height=390)
 
     # =============================================================================
     # TAB: TRENDS
@@ -1185,34 +1558,51 @@ def render_shadow_ai(parquet_root: Path):
         if daily.empty:
             st.info("No trend data.")
         else:
-            fig1 = px.line(
-                daily,
-                x="day",
-                y="Events",
-                color="Policy_Verdict",
-                title="Events per day",
-                template="plotly_dark",
-            )
-            st.plotly_chart(fig1, use_container_width=True)
+            c_left, c_right = st.columns([1.2, 1.2])
+            with c_left:
+                fig1 = px.line(
+                    daily,
+                    x="day",
+                    y="Events",
+                    color="Policy_Verdict",
+                    color_discrete_map=POLICY_COLORS,
+                    title="Events per day",
+                    template=get_plotly_template(),
+                    markers=True,
+                )
+                style_plotly_figure(fig1, height=360)
+                fig1.update_xaxes(title="Day")
+                fig1.update_yaxes(title="Events")
+                st.plotly_chart(fig1, use_container_width=True)
 
-            fig2 = px.line(
-                daily,
-                x="day",
-                y="Unique_MACs",
-                color="Policy_Verdict",
-                title="Unique MACs per day",
-                template="plotly_dark",
-            )
-            st.plotly_chart(fig2, use_container_width=True)
+            with c_right:
+                fig2 = px.line(
+                    daily,
+                    x="day",
+                    y="Unique_MACs",
+                    color="Policy_Verdict",
+                    color_discrete_map=POLICY_COLORS,
+                    title="Unique MACs per day",
+                    template=get_plotly_template(),
+                    markers=True,
+                )
+                style_plotly_figure(fig2, height=360)
+                fig2.update_xaxes(title="Day")
+                fig2.update_yaxes(title="Unique MACs")
+                st.plotly_chart(fig2, use_container_width=True)
 
             fig3 = px.bar(
                 daily,
                 x="day",
                 y="Upload_MB",
                 color="Policy_Verdict",
+                color_discrete_map=POLICY_COLORS,
                 title="Upload (MB) per day",
-                template="plotly_dark",
+                template=get_plotly_template(),
             )
+            style_plotly_figure(fig3, height=360)
+            fig3.update_xaxes(title="Day")
+            fig3.update_yaxes(title="Upload MB")
             st.plotly_chart(fig3, use_container_width=True)
 
     # =============================================================================
@@ -1229,17 +1619,23 @@ def render_shadow_ai(parquet_root: Path):
             Last_Seen=("ts", "max"),
             Total_Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
             Evidence=("Evidence_Type", _safe_value_counts_top),
-        ).reset_index().sort_values(["Policy_Verdict", "Events"], ascending=[True, False])
+        ).reset_index().sort_values(["Events", "Total_Upload_MB"], ascending=False)
 
-        st.dataframe(
-            top_dest,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"),
-                "Total_Upload_MB": st.column_config.NumberColumn("Upload (MB)", format="%.2f"),
-            },
-        )
+        dest_grid = top_dest.copy()
+        dest_grid.insert(0, "#", range(1, len(dest_grid) + 1))
+        dest_grid["Last_Seen"] = pd.to_datetime(dest_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+        dest_grid["Total_Upload_MB"] = pd.to_numeric(dest_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
+
+        gb_dest = _new_grid_builder(dest_grid, page_size=20)
+        gb_dest.configure_column("AI_Provider", header_name="Provider", minWidth=150)
+        gb_dest.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
+        gb_dest.configure_column("Domain", minWidth=220, flex=1.6)
+        gb_dest.configure_column("Events", width=95, flex=0.8)
+        gb_dest.configure_column("Unique_MACs", header_name="Unique MACs", minWidth=110)
+        gb_dest.configure_column("Last_Seen", header_name="Last Seen", minWidth=145)
+        gb_dest.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=105)
+        gb_dest.configure_column("Evidence", minWidth=130)
+        render_shadow_aggrid(dest_grid, gb_dest, key=f"shadow_ai_dest_grid_{selected_scope_key}", height=455)
 
         st.markdown("### POST/Upload focus (HTTP evidence)")
         http_only = filtered[(filtered["Detection_Source"] == "HTTP")].copy()
@@ -1255,22 +1651,25 @@ def render_shadow_ai(parquet_root: Path):
             post_kpi2.metric("POST Upload (MB)", f"{post_upload_mb:.2f}")
 
             # top endpoints
-            post["endpoint"] = post.get("uri", "").astype(str).fillna("").str.split("?").str[0]
+            post["endpoint"] = post["uri"].astype(str).fillna("").str.split("?").str[0] if "uri" in post.columns else ""
             top_end = post.groupby(["AI_Provider", "endpoint"]).agg(
                 Events=("ts", "count"),
                 Total_Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
                 Last_Seen=("ts", "max"),
             ).reset_index().sort_values(["Total_Upload_MB", "Events"], ascending=False)
 
-            st.dataframe(
-                top_end,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"),
-                    "Total_Upload_MB": st.column_config.NumberColumn("Upload (MB)", format="%.2f"),
-                },
-            )
+            top_end_grid = top_end.copy()
+            top_end_grid.insert(0, "#", range(1, len(top_end_grid) + 1))
+            top_end_grid["Last_Seen"] = pd.to_datetime(top_end_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            top_end_grid["Total_Upload_MB"] = pd.to_numeric(top_end_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
+
+            gb_end = _new_grid_builder(top_end_grid, page_size=15)
+            gb_end.configure_column("AI_Provider", header_name="Provider", minWidth=150)
+            gb_end.configure_column("endpoint", header_name="Endpoint", minWidth=260, flex=1.8)
+            gb_end.configure_column("Events", width=95, flex=0.8)
+            gb_end.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=105)
+            gb_end.configure_column("Last_Seen", header_name="Last Seen", minWidth=145)
+            render_shadow_aggrid(top_end_grid, gb_end, key=f"shadow_ai_top_end_grid_{selected_scope_key}", height=390)
 
     # =============================================================================
     # TAB: SHADOW AI BY MAC (with drilldown)
@@ -1301,21 +1700,30 @@ def render_shadow_ai(parquet_root: Path):
                              else ("HIGH" if (x == "HIGH").any()
                                    else ("MEDIUM" if (x == "MEDIUM").any() else "LOW"))),
             ).reset_index().sort_values(["Events", "Total_Upload_MB"], ascending=False)
+            mac_grid = mac_summary.copy()
+            mac_grid.insert(0, "#", range(1, len(mac_grid) + 1))
+            mac_grid["Last_Seen"] = pd.to_datetime(mac_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            mac_grid["First_Seen"] = pd.to_datetime(mac_grid["First_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            mac_grid["Total_Upload_MB"] = pd.to_numeric(mac_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
 
-            st.dataframe(
-                mac_summary,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"),
-                    "First_Seen": st.column_config.DatetimeColumn("First Seen", format="MM-DD HH:mm"),
-                    "Total_Upload_MB": st.column_config.NumberColumn("Upload (MB)", format="%.2f"),
-                },
-            )
+            gb_mac = _new_grid_builder(mac_grid, page_size=15)
+            gb_mac.configure_column("mac", header_name="MAC", minWidth=150)
+            gb_mac.configure_column("Host", minWidth=140)
+            gb_mac.configure_column("Last_Seen", header_name="Last Seen", minWidth=150)
+            gb_mac.configure_column("First_Seen", header_name="First Seen", minWidth=150)
+            gb_mac.configure_column("Events", width=90, flex=0.8)
+            gb_mac.configure_column("Unique_Providers", header_name="Providers", minWidth=95)
+            gb_mac.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=110)
+            gb_mac.configure_column("Top_Provider", header_name="Top Provider", minWidth=140)
+            gb_mac.configure_column("Top_Domain", header_name="Top Domain", minWidth=170)
+            gb_mac.configure_column("Source_IP", header_name="IP", minWidth=120)
+            gb_mac.configure_column("Top_Evidence", header_name="Top Evidence", minWidth=130)
+            gb_mac.configure_column("Max_Severity", header_name="Max Severity", minWidth=110, cellStyle=_severity_cellstyle())
+            render_shadow_aggrid(mac_grid, gb_mac, key=f"shadow_ai_mac_summary_grid_{selected_scope_key}", height=430)
 
             st.markdown("### Drilldown (select MAC)")
             mac_list = mac_summary["mac"].tolist()
-            selected_mac = st.selectbox("MAC", mac_list, index=0)
+            selected_mac = st.selectbox("MAC", mac_list, index=0, key=f"shadow_ai_mac_select_{selected_scope_key}")
 
             mac_events = mac_view[mac_view["mac"] == selected_mac].copy().sort_values("ts", ascending=False)
 
@@ -1335,11 +1743,15 @@ def render_shadow_ai(parquet_root: Path):
                     y="AI_Provider",
                     size="Risk_Score",
                     color="Severity",
+                    color_discrete_map=SEVERITY_COLORS,
                     hover_data=["Domain", "Detail", "Evidence_Type", "Matched_Value", "Detection_Basis"],
                     title="MAC timeline (provider events)",
-                    template="plotly_dark",
+                    template=get_plotly_template(),
                     render_mode="webgl" if len(mac_events) > 1500 else "auto",
                 )
+                style_plotly_figure(figm, height=360)
+                figm.update_xaxes(title="Time")
+                figm.update_yaxes(title="Provider")
                 st.plotly_chart(figm, use_container_width=True)
 
             with cB:
@@ -1347,26 +1759,51 @@ def render_shadow_ai(parquet_root: Path):
                     Events=("ts", "count"),
                     Upload_MB=("Upload_Bytes", lambda x: float(x.sum())/1024/1024),
                 ).reset_index().sort_values("Events", ascending=False)
-                figp = px.bar(byprov, x="Events", y="AI_Provider", orientation="h", title="Providers (this MAC)", template="plotly_dark")
+                figp = px.bar(
+                    byprov,
+                    x="Events",
+                    y="AI_Provider",
+                    orientation="h",
+                    title="Providers (this MAC)",
+                    template=get_plotly_template(),
+                )
+                style_plotly_figure(figp, height=360, show_legend=False)
+                figp.update_xaxes(title="Events")
+                figp.update_yaxes(title=None)
                 st.plotly_chart(figp, use_container_width=True)
 
-            st.dataframe(
-                mac_events[
-                    [
-                        "ts", "Severity", "AI_Provider", "Domain", "Evidence_Type",
-                        "Detail", "Upload_Bytes", "Destination", "Matched_Value",
-                        "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
-                        "id.orig_h", "host_name", "user_agent",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-                height=520,
-                column_config={
-                    "ts": st.column_config.DatetimeColumn("Time", format="MM-DD HH:mm"),
-                    "Upload_Bytes": st.column_config.NumberColumn("Upload Bytes", format="%d"),
-                },
-            )
+            mac_event_cols = [
+                "ts", "Severity", "AI_Provider", "Domain", "Evidence_Type",
+                "Detail", "Upload_Bytes", "Destination", "Matched_Value",
+                "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
+                "id.orig_h", "host_name", "user_agent",
+            ]
+            for c in mac_event_cols:
+                if c not in mac_events.columns:
+                    mac_events[c] = ""
+            mac_event_grid = mac_events[mac_event_cols].head(MAX_ROWS_DISPLAY).copy()
+            mac_event_grid.insert(0, "#", range(1, len(mac_event_grid) + 1))
+            mac_event_grid["ts"] = pd.to_datetime(mac_event_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            mac_event_grid["Upload_Bytes"] = pd.to_numeric(mac_event_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+
+            gb_events = _new_grid_builder(mac_event_grid, page_size=20)
+            gb_events.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
+            gb_events.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
+            gb_events.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
+            gb_events.configure_column("Domain", minWidth=160, flex=1.2)
+            gb_events.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
+            gb_events.configure_column("Detail", minWidth=180, flex=1.7)
+            gb_events.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
+            gb_events.configure_column("Destination", minWidth=170, flex=1.5)
+            gb_events.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
+            gb_events.configure_column("Match_Field", header_name="Field", minWidth=120, flex=1.0)
+            gb_events.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
+            gb_events.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
+            gb_events.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.5)
+            gb_events.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
+            gb_events.configure_column("host_name", header_name="Host", minWidth=130, flex=1.1)
+            gb_events.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=2.0)
+            render_shadow_aggrid(mac_event_grid, gb_events, key=f"shadow_ai_mac_events_grid_{selected_scope_key}", height=540)
 
     # =============================================================================
     # TAB: BIG TRANSFERS
@@ -1376,14 +1813,15 @@ def render_shadow_ai(parquet_root: Path):
         bdf = filtered.copy()
         bdf["transfer_bucket"] = bdf["Upload_Bytes"].apply(lambda b: _bucket_transfer(float(b or 0)))
 
-        # thresholds (SOC)
+        st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         cA, cB, cC = st.columns(3)
         with cA:
-            thresh_kb = st.number_input("Alert threshold (KB)", min_value=1, value=1024, step=256)  # default 1MB
+            thresh_kb = st.number_input("Alert threshold (KB)", min_value=1, value=1024, step=256, key="shadow_ai_alert_thresh_v2")
         with cB:
-            only_shadow = st.checkbox("Only Shadow AI", value=True)
+            only_shadow = st.checkbox("Only Shadow AI", value=True, key="shadow_ai_alert_only_shadow_v2")
         with cC:
-            only_http_post = st.checkbox("Only HTTP POST", value=False)
+            only_http_post = st.checkbox("Only HTTP POST", value=False, key="shadow_ai_alert_only_post_v2")
+        st.markdown("</div>", unsafe_allow_html=True)
 
         alert_df = bdf.copy()
         if only_shadow:
@@ -1399,23 +1837,35 @@ def render_shadow_ai(parquet_root: Path):
         if alert_df.empty:
             st.info("No events above the threshold in the current view.")
         else:
-            st.dataframe(
-                alert_df[
-                    [
-                        "ts", "Severity", "mac", "host_name", "id.orig_h",
-                        "AI_Provider", "Domain", "Evidence_Type",
-                        "Upload_Bytes", "Detail", "Destination",
-                        "Matched_Value", "Detection_Basis",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-                height=560,
-                column_config={
-                    "ts": st.column_config.DatetimeColumn("Time", format="MM-DD HH:mm"),
-                    "Upload_Bytes": st.column_config.NumberColumn("Upload Bytes", format="%d"),
-                },
-            )
+            alert_cols = [
+                "ts", "Severity", "mac", "host_name", "id.orig_h",
+                "AI_Provider", "Domain", "Evidence_Type",
+                "Upload_Bytes", "Detail", "Destination",
+                "Matched_Value", "Detection_Basis",
+            ]
+            for c in alert_cols:
+                if c not in alert_df.columns:
+                    alert_df[c] = ""
+            alert_grid = alert_df[alert_cols].head(MAX_ROWS_DISPLAY).copy()
+            alert_grid.insert(0, "#", range(1, len(alert_grid) + 1))
+            alert_grid["ts"] = pd.to_datetime(alert_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            alert_grid["Upload_Bytes"] = pd.to_numeric(alert_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+
+            gb_alert = _new_grid_builder(alert_grid, page_size=20)
+            gb_alert.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
+            gb_alert.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
+            gb_alert.configure_column("mac", header_name="MAC", minWidth=150, flex=1.2)
+            gb_alert.configure_column("host_name", header_name="Host", minWidth=130, flex=1.1)
+            gb_alert.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
+            gb_alert.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
+            gb_alert.configure_column("Domain", minWidth=165, flex=1.3)
+            gb_alert.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
+            gb_alert.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
+            gb_alert.configure_column("Detail", minWidth=180, flex=1.7)
+            gb_alert.configure_column("Destination", minWidth=170, flex=1.5)
+            gb_alert.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
+            gb_alert.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
+            render_shadow_aggrid(alert_grid, gb_alert, key=f"shadow_ai_alert_grid_{selected_scope_key}", height=560)
 
     # =============================================================================
     # TAB: FORENSICS
@@ -1430,25 +1880,42 @@ def render_shadow_ai(parquet_root: Path):
             if hi.empty:
                 st.success("No high severity incidents in the current view.")
             else:
-                st.dataframe(
-                    hi[
-                        [
-                            "ts", "Severity", "Policy_Verdict",
-                            "mac", "host_name", "id.orig_h",
-                            "AI_Provider", "Domain", "Evidence_Type",
-                            "Upload_Bytes", "Detail", "Destination",
-                            "Match_Field", "Signature_Match", "Matched_Value",
-                            "Detection_Basis", "Policy_Basis", "Confidence",
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                    height=560,
-                    column_config={
-                        "ts": st.column_config.DatetimeColumn("Time", format="MM-DD HH:mm"),
-                        "Upload_Bytes": st.column_config.NumberColumn("Upload Bytes", format="%d"),
-                    },
-                )
+                hi_cols = [
+                    "ts", "Severity", "Policy_Verdict",
+                    "mac", "host_name", "id.orig_h",
+                    "AI_Provider", "Domain", "Evidence_Type",
+                    "Upload_Bytes", "Detail", "Destination",
+                    "Match_Field", "Signature_Match", "Matched_Value",
+                    "Detection_Basis", "Policy_Basis", "Confidence",
+                ]
+                for c in hi_cols:
+                    if c not in hi.columns:
+                        hi[c] = ""
+                hi_grid = hi[hi_cols].head(MAX_ROWS_DISPLAY).copy()
+                hi_grid.insert(0, "#", range(1, len(hi_grid) + 1))
+                hi_grid["ts"] = pd.to_datetime(hi_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+                hi_grid["Upload_Bytes"] = pd.to_numeric(hi_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+
+                gb_hi = _new_grid_builder(hi_grid, page_size=20)
+                gb_hi.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
+                gb_hi.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
+                gb_hi.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.9, cellStyle=_policy_cellstyle())
+                gb_hi.configure_column("mac", header_name="MAC", minWidth=145, flex=1.1)
+                gb_hi.configure_column("host_name", header_name="Host", minWidth=130, flex=1.0)
+                gb_hi.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
+                gb_hi.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
+                gb_hi.configure_column("Domain", minWidth=165, flex=1.3)
+                gb_hi.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
+                gb_hi.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
+                gb_hi.configure_column("Detail", minWidth=170, flex=1.6)
+                gb_hi.configure_column("Destination", minWidth=160, flex=1.4)
+                gb_hi.configure_column("Match_Field", header_name="Field", minWidth=110, flex=1.0)
+                gb_hi.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
+                gb_hi.configure_column("Matched_Value", header_name="Matched", minWidth=170, flex=1.5)
+                gb_hi.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
+                gb_hi.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=170, flex=1.6)
+                gb_hi.configure_column("Confidence", minWidth=95, flex=0.8)
+                render_shadow_aggrid(hi_grid, gb_hi, key=f"shadow_ai_hi_grid_{selected_scope_key}", height=560)
 
         with ftab[1]:
             cols = [
@@ -1464,13 +1931,35 @@ def render_shadow_ai(parquet_root: Path):
             for c in cols:
                 if c not in filtered.columns:
                     filtered[c] = ""
-            st.dataframe(
-                filtered[cols],
-                use_container_width=True,
-                hide_index=True,
-                height=650,
-                column_config={"ts": st.column_config.DatetimeColumn("Time", format="MM-DD HH:mm")},
-            )
+
+            log_grid = filtered[cols].head(MAX_ROWS_DISPLAY).copy()
+            log_grid.insert(0, "#", range(1, len(log_grid) + 1))
+            log_grid["ts"] = pd.to_datetime(log_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            log_grid["Risk_Score"] = pd.to_numeric(log_grid["Risk_Score"], errors="coerce").fillna(0).astype(int)
+
+            gb_log = _new_grid_builder(log_grid, page_size=20)
+            gb_log.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
+            gb_log.configure_column("mac", header_name="MAC", minWidth=145, flex=1.1)
+            gb_log.configure_column("host_name", header_name="Host", minWidth=130, flex=1.0)
+            gb_log.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
+            gb_log.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
+            gb_log.configure_column("Risk_Score", header_name="Risk", minWidth=85, flex=0.8, cellStyle=_risk_score_cellstyle())
+            gb_log.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
+            gb_log.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.9, cellStyle=_policy_cellstyle())
+            gb_log.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.5)
+            gb_log.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
+            gb_log.configure_column("Confidence", minWidth=95, flex=0.8)
+            gb_log.configure_column("Client_Type", header_name="Client", minWidth=120, flex=1.0)
+            gb_log.configure_column("Detection_Source", header_name="Source", minWidth=110, flex=0.9)
+            gb_log.configure_column("Domain", minWidth=160, flex=1.3)
+            gb_log.configure_column("Destination", minWidth=170, flex=1.5)
+            gb_log.configure_column("Detail", minWidth=180, flex=1.7)
+            gb_log.configure_column("Match_Field", header_name="Field", minWidth=120, flex=1.0)
+            gb_log.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
+            gb_log.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
+            gb_log.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
+            gb_log.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=2.0)
+            render_shadow_aggrid(log_grid, gb_log, key=f"shadow_ai_log_grid_{selected_scope_key}", height=650)
 
         with ftab[2]:
             leakers = filtered.groupby(["Policy_Verdict", "host_name", "mac", "AI_Provider"]).agg(
@@ -1484,22 +1973,22 @@ def render_shadow_ai(parquet_root: Path):
             if leakers.empty:
                 st.info("No upload activity in the current view.")
             else:
-                max_val = float(leakers["Total_Upload_MB"].max())
-                max_val = max(1.0, max_val)
-                st.dataframe(
-                    leakers,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Last_Seen": st.column_config.DatetimeColumn("Last Seen", format="MM-DD HH:mm"),
-                        "Total_Upload_MB": st.column_config.ProgressColumn(
-                            "Data Exfiltrated (MB)",
-                            format="%.2f MB",
-                            min_value=0.0,
-                            max_value=max_val,
-                        )
-                    },
-                )
+                leak_grid = leakers.copy()
+                leak_grid.insert(0, "#", range(1, len(leak_grid) + 1))
+                leak_grid["Last_Seen"] = pd.to_datetime(leak_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+                leak_grid["Total_Upload_MB"] = pd.to_numeric(leak_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
+
+                gb_leak = _new_grid_builder(leak_grid, page_size=15)
+                gb_leak.configure_column("Policy_Verdict", header_name="Verdict", minWidth=110, cellStyle=_policy_cellstyle())
+                gb_leak.configure_column("host_name", header_name="Host", minWidth=145)
+                gb_leak.configure_column("mac", header_name="MAC", minWidth=150)
+                gb_leak.configure_column("AI_Provider", header_name="Provider", minWidth=145)
+                gb_leak.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=110)
+                gb_leak.configure_column("Event_Count", header_name="Events", minWidth=90)
+                gb_leak.configure_column("Last_Seen", header_name="Last Seen", minWidth=150)
+                gb_leak.configure_column("Top_Domain", header_name="Top Domain", minWidth=180)
+                gb_leak.configure_column("Top_Evidence", header_name="Top Evidence", minWidth=130)
+                render_shadow_aggrid(leak_grid, gb_leak, key=f"shadow_ai_leak_grid_{selected_scope_key}", height=450)
 
     # =============================================================================
     # TAB: POLICY / NOISE CONTROL
@@ -1507,8 +1996,8 @@ def render_shadow_ai(parquet_root: Path):
     with tabs[6]:
         st.markdown("### Policy posture / noise controls")
 
-        st.write("**Allowlist behavior:** if `authorized_providers` is empty, the system defaults to deny → everything is Shadow AI.")
-        st.write("To allow specific providers, add provider names (exact keys) to `authorized_providers` in ai_signatures.yaml.")
+        st.write("Allowlist behavior: if `authorized_providers` is empty, the system defaults to deny and everything is Shadow AI.")
+        st.write("To allow specific providers, add provider names (exact keys) to `authorized_providers` in `ai_signatures.yaml`.")
 
         # show allowlist content
         st.markdown("#### Current allowlist (authorized_providers)")
@@ -1520,14 +2009,26 @@ def render_shadow_ai(parquet_root: Path):
         # show detection sources distribution
         st.markdown("#### Detection sources distribution")
         dist = filtered.groupby(["Policy_Verdict", "Detection_Source"]).size().reset_index(name="Events")
-        st.dataframe(dist, use_container_width=True, hide_index=True)
+        dist_grid = dist.copy()
+        dist_grid.insert(0, "#", range(1, len(dist_grid) + 1))
+        gb_dist = _new_grid_builder(dist_grid, page_size=10)
+        gb_dist.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
+        gb_dist.configure_column("Detection_Source", header_name="Source", minWidth=130)
+        gb_dist.configure_column("Events", minWidth=90)
+        render_shadow_aggrid(dist_grid, gb_dist, key=f"shadow_ai_dist_grid_{selected_scope_key}", height=290)
 
         st.markdown("#### Signature fragments causing matches (top)")
         sig_top = filtered.groupby(["Policy_Verdict", "Signature_Match"]).size().reset_index(name="Events")
         sig_top = sig_top.sort_values("Events", ascending=False).head(50)
-        st.dataframe(sig_top, use_container_width=True, hide_index=True)
+        sig_grid = sig_top.copy()
+        sig_grid.insert(0, "#", range(1, len(sig_grid) + 1))
+        gb_sig = _new_grid_builder(sig_grid, page_size=15)
+        gb_sig.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
+        gb_sig.configure_column("Signature_Match", header_name="Signature", minWidth=220, flex=1.8)
+        gb_sig.configure_column("Events", minWidth=90)
+        render_shadow_aggrid(sig_grid, gb_sig, key=f"shadow_ai_sig_grid_{selected_scope_key}", height=360)
 
         st.markdown("#### Suggested tuning (if noisy)")
-        st.write("- If many hits are **DNS-only**, enable 'Ignore DNS-only events' and focus on HTTP/SSL evidence.")
-        st.write("- If one signature fragment dominates false positives, narrow it (anchor it) in ai_signatures.yaml.")
+        st.write("- If many hits are DNS-only, enable `Ignore DNS-only events` and focus on HTTP/SSL evidence.")
+        st.write("- If one signature fragment dominates false positives, narrow or anchor it in `ai_signatures.yaml`.")
         st.write("- Prefer HTTP host/uri and TLS SNI for stronger attribution; DNS is weaker evidence.")

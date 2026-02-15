@@ -4,45 +4,18 @@ import pandas as pd
 import datetime
 import yaml
 import re
-import requests  # For Vendor Lookup
-import time      # For API rate limiting
+import requests
+import time
 import inspect
+from uuid import uuid4
 
 # -----------------------------
 # Configuration & Constants
 # -----------------------------
 MAC_REGEX_PATTERN = r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
 DOMAIN_REGEX_PATTERN = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
-
-# =============================================================================
-# CHANGED: Shared MAC normalization (same canonical format as Devices/Alerts)
-# - Prevents mismatched counts/enrichment due to different MAC string formats
-# =============================================================================
-_MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
-
-def normalize_mac(v):
-    """Return canonical 'aa:bb:cc:dd:ee:ff' or None."""
-    if v is None:
-        return None
-    if isinstance(v, (bytes, bytearray)):
-        if len(v) == 6:
-            h = bytes(v).hex()
-        else:
-            try:
-                s = v.decode("utf-8", "ignore")
-            except Exception:
-                return None
-            h = _MAC_HEX_RE.sub("", s)
-    else:
-        s = str(v).strip().lower()
-        if not s or s == "nan":
-            return None
-        h = _MAC_HEX_RE.sub("", s)
-    if len(h) != 12:
-        return None
-    return ":".join(h[i:i+2] for i in range(0, 12, 2)).lower()
-
 PARQUET_ROOT = Path("data/parquet")
+MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 
 # -----------------------------
 # Styling & Assets
@@ -107,8 +80,7 @@ def _st_dataframe(df, **kwargs):
 
 def _with_row_numbers(df: pd.DataFrame) -> pd.DataFrame:
     """Returns a copy of df with a disabled display-only '#' column inserted first."""
-    out = df.copy()
-    out = out.reset_index(drop=True)
+    out = df.copy().reset_index(drop=True)
     out.insert(0, "#", pd.Series(range(1, len(out) + 1), dtype="int64"))
     return out
 
@@ -133,13 +105,52 @@ def _file_mtime_str(p: Path):
     except Exception:
         return _now_str()
 
+def normalize_mac(value) -> str:
+    """
+    Canonicalize MAC to lowercase colon form: aa:bb:cc:dd:ee:ff
+    Supports:
+      - bytes length 6
+      - aa-bb-cc-dd-ee-ff
+      - aabb.ccdd.eeff
+      - aabbccddeeff
+      - aa:bb:cc:dd:ee:ff
+    Returns "" if invalid.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        b = bytes(value)
+        if len(b) == 6:
+            return ":".join(f"{x:02x}" for x in b)
+        try:
+            value = b.decode("utf-8", errors="ignore")
+        except Exception:
+            value = str(b)
+
+    s = str(value).strip().lower()
+    if not s:
+        return ""
+
+    hx = MAC_HEX_RE.sub("", s)
+    if len(hx) != 12:
+        return ""
+    return ":".join(hx[i:i+2] for i in range(0, 12, 2))
+
 def _mac_is_valid(mac: str) -> bool:
-    # CHANGED: validate after normalization so inputs like AABBCCDDEEFF or AA-BB-... are accepted
-    nm = normalize_mac(mac)
-    return bool(nm and re.match(MAC_REGEX_PATTERN, nm))
+    mac = normalize_mac(mac)
+    return bool(re.match(MAC_REGEX_PATTERN, mac))
 
 def _domain_is_valid(domain: str) -> bool:
     return bool(re.match(DOMAIN_REGEX_PATTERN, (domain or "").strip()))
+
+def _dedupe_keep_last(rows: list[dict], key: str) -> list[dict]:
+    """Dedupe list of dicts by key, keep the last occurrence."""
+    out = {}
+    for r in rows:
+        k = str(r.get(key, "")).strip().lower()
+        if k:
+            out[k] = r
+    return list(out.values())
 
 # -----------------------------
 # Data Logic - Structured (Devices)
@@ -150,73 +161,91 @@ def load_devices(filepath: Path) -> list[dict]:
     if not filepath.exists():
         return []
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        try:
-            data = yaml.safe_load(f)
-            if not data:
-                return []
-
-            raw_list = []
-            if isinstance(data, list):
-                raw_list = data
-            elif isinstance(data, dict):
-                target_key = filepath.stem
-                if target_key in data and isinstance(data[target_key], list):
-                    raw_list = data[target_key]
-                else:
-                    for val in data.values():
-                        if isinstance(val, list):
-                            raw_list = val
-                            break
-
-            structured_data = []
-            file_stamp = _file_mtime_str(filepath)
-
-            for item in raw_list:
-                if isinstance(item, str):
-                    structured_data.append({
-                        "mac": (normalize_mac(item) or ""),  # CHANGED: canonical MAC
-                        
-                        "ip": "", "hostname": "", "vendor": "",
-                        "date_modified": file_stamp
-                    })
-                elif isinstance(item, dict):
-                    entry = default_structure.copy()
-                    clean_item = {str(k).lower(): v for k, v in item.items()}
-                    entry.update(clean_item)
-                    if entry["mac"]:
-                        entry["mac"] = (normalize_mac(entry["mac"]) or "")  # CHANGED: canonical MAC
-                        if not entry.get("date_modified"):
-                            entry["date_modified"] = file_stamp
-                        structured_data.append(entry)
-
-            return structured_data
-        except Exception as e:
-            print(f"Error loading devices: {e}")
+    try:
+        data = yaml.safe_load(filepath.read_text(encoding="utf-8"))
+        if not data:
             return []
+
+        raw_list = []
+        if isinstance(data, list):
+            raw_list = data
+        elif isinstance(data, dict):
+            target_key = filepath.stem
+            if target_key in data and isinstance(data[target_key], list):
+                raw_list = data[target_key]
+            else:
+                for val in data.values():
+                    if isinstance(val, list):
+                        raw_list = val
+                        break
+
+        structured = []
+        file_stamp = _file_mtime_str(filepath)
+
+        for item in raw_list:
+            if isinstance(item, str):
+                m = normalize_mac(item)
+                if not m:
+                    continue
+                structured.append({
+                    "mac": m,
+                    "ip": "", "hostname": "", "vendor": "",
+                    "date_modified": file_stamp
+                })
+            elif isinstance(item, dict):
+                entry = default_structure.copy()
+                clean_item = {str(k).lower(): v for k, v in item.items()}
+                entry.update(clean_item)
+
+                m = normalize_mac(entry.get("mac", ""))
+                if not m:
+                    continue
+
+                entry["mac"] = m
+                entry["ip"] = str(entry.get("ip", "") or "").strip()
+                entry["hostname"] = str(entry.get("hostname", "") or "").strip()
+                entry["vendor"] = str(entry.get("vendor", "") or "").strip()
+                entry["date_modified"] = str(entry.get("date_modified") or file_stamp).strip()
+                structured.append(entry)
+
+        structured = _dedupe_keep_last(structured, "mac")
+        structured.sort(key=lambda x: x.get("mac", ""))
+        return structured
+
+    except Exception as e:
+        st.error(f"Error loading devices: {e}")
+        return []
 
 def save_devices(filepath: Path, device_list: list[dict]) -> None:
     filepath.parent.mkdir(exist_ok=True, parents=True)
     key_name = filepath.stem
-    device_list.sort(key=lambda x: x.get("mac", ""))
+
+    # normalize + validate + dedupe
+    cleaned = []
+    for d in device_list:
+        m = normalize_mac(d.get("mac", ""))
+        if not m or not _mac_is_valid(m):
+            continue
+        cleaned.append({
+            "mac": m,
+            "ip": str(d.get("ip", "") or "").strip(),
+            "hostname": str(d.get("hostname", "") or "").strip(),
+            "vendor": str(d.get("vendor", "") or "").strip(),
+            "date_modified": str(d.get("date_modified") or _now_str()).strip(),
+        })
+
+    cleaned = _dedupe_keep_last(cleaned, "mac")
+    cleaned.sort(key=lambda x: x.get("mac", ""))
+
     with open(filepath, "w", encoding="utf-8") as f:
-        yaml.safe_dump({key_name: device_list}, f, sort_keys=False)
+        yaml.safe_dump({key_name: cleaned}, f, sort_keys=False)
 
 # -----------------------------
-# Data Logic - Domains ✅ Date Modified ONLY (Category removed)
+# Data Logic - Domains (Date Modified ONLY)
 # -----------------------------
 def load_domain_whitelist(filepath: Path) -> list[dict]:
-    """
-    Supports:
-      - Old format: list[str] OR {whitelist_domains:[str,...]}
-      - New format: list[dict] OR {whitelist_domains:[{domain,date_modified},...]}
-      - If your file currently contains category, we ignore it safely.
-    Returns list of dicts:
-      {"domain": "...", "date_modified": "..."}
-    """
     if not filepath.exists():
         return []
-
     default_row = {"domain": "", "date_modified": ""}
 
     try:
@@ -239,10 +268,9 @@ def load_domain_whitelist(filepath: Path) -> list[dict]:
 
         file_stamp = _file_mtime_str(filepath)
         out = []
-
         for it in raw_list:
             if isinstance(it, str):
-                dom = (normalize_mac(it) or "")  # CHANGED
+                dom = it.strip().lower()
                 if dom:
                     out.append({"domain": dom, "date_modified": file_stamp})
             elif isinstance(it, dict):
@@ -253,27 +281,33 @@ def load_domain_whitelist(filepath: Path) -> list[dict]:
                 dom = str(row.get("domain", "")).strip().lower()
                 if not dom and "domain name" in clean:
                     dom = str(clean.get("domain name", "")).strip().lower()
-
                 if not dom:
                     continue
-
                 dm = str(row.get("date_modified") or file_stamp).strip()
                 out.append({"domain": dom, "date_modified": dm})
 
-        # dedupe by domain (keep last)
-        uniq = {r["domain"]: r for r in out if r.get("domain")}
-        return list(uniq.values())
-
+        out = _dedupe_keep_last(out, "domain")
+        out.sort(key=lambda x: x.get("domain", ""))
+        return out
     except Exception:
         return []
 
 def save_domain_whitelist(filepath: Path, rows: list[dict]) -> None:
-    """Writes ONLY domain + date_modified (category removed from disk too)."""
     filepath.parent.mkdir(exist_ok=True, parents=True)
     key_name = filepath.stem
-    rows = sorted(rows, key=lambda x: x.get("domain", ""))
+
+    cleaned = []
+    for r in rows:
+        dom = str(r.get("domain", "")).strip().lower()
+        if not dom or not _domain_is_valid(dom):
+            continue
+        cleaned.append({"domain": dom, "date_modified": str(r.get("date_modified") or _now_str()).strip()})
+
+    cleaned = _dedupe_keep_last(cleaned, "domain")
+    cleaned.sort(key=lambda x: x.get("domain", ""))
+
     with open(filepath, "w", encoding="utf-8") as f:
-        yaml.safe_dump({key_name: rows}, f, sort_keys=False)
+        yaml.safe_dump({key_name: cleaned}, f, sort_keys=False)
 
 # -----------------------------
 # BAN LIST
@@ -301,37 +335,48 @@ def load_ban_list(filepath: Path) -> list[dict]:
         file_stamp = _file_mtime_str(filepath)
         for it in raw_list:
             if isinstance(it, str):
-                m = (normalize_mac(it) or "")  # CHANGED
+                m = normalize_mac(it)
                 if m:
                     out.append({"mac": m, "date_modified": file_stamp})
             elif isinstance(it, dict):
-                m = (normalize_mac(it.get("mac")) or "")  # CHANGED
+                m = normalize_mac(it.get("mac", ""))
                 if m:
-                    out.append({
-                        "mac": m,
-                        "date_modified": str(it.get("date_modified") or file_stamp)
-                    })
-        uniq = {x["mac"]: x for x in out}
-        return list(uniq.values())
+                    out.append({"mac": m, "date_modified": str(it.get("date_modified") or file_stamp)})
+
+        out = _dedupe_keep_last(out, "mac")
+        out.sort(key=lambda x: x.get("mac", ""))
+        return out
     except Exception:
         return []
 
 def save_ban_list(filepath: Path, ban_list: list[dict]) -> None:
     filepath.parent.mkdir(exist_ok=True, parents=True)
     key_name = filepath.stem
-    ban_list = sorted(ban_list, key=lambda x: x.get("mac", ""))
+
+    cleaned = []
+    for r in ban_list:
+        m = normalize_mac(r.get("mac", ""))
+        if not m or not _mac_is_valid(m):
+            continue
+        cleaned.append({"mac": m, "date_modified": str(r.get("date_modified") or _now_str()).strip()})
+
+    cleaned = _dedupe_keep_last(cleaned, "mac")
+    cleaned.sort(key=lambda x: x.get("mac", ""))
+
     with open(filepath, "w", encoding="utf-8") as f:
-        yaml.safe_dump({key_name: ban_list}, f, sort_keys=False)
+        yaml.safe_dump({key_name: cleaned}, f, sort_keys=False)
 
 # -----------------------------
 # Metadata Enrichment Logic
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def get_mac_vendor(mac: str) -> str:
-    if not mac or mac == "unknown":
+    mac = normalize_mac(mac)
+    if not mac:
         return "Unknown"
     try:
-        time.sleep(0.6)
+        # soft rate limit for public API
+        time.sleep(0.25)
         r = requests.get(f"https://api.macvendors.com/{mac}", timeout=2)
         return r.text if r.status_code == 200 else "Unknown"
     except Exception:
@@ -359,11 +404,15 @@ def get_latest_network_info() -> pd.DataFrame:
         return pd.DataFrame()
 
     if "mac" in known_hosts.columns:
-        known_hosts["mac"] = known_hosts["mac"].astype(str).str.lower().str.strip()
+        known_hosts = known_hosts.copy()
+        known_hosts["mac"] = known_hosts["mac"].map(normalize_mac)
+        known_hosts = known_hosts[known_hosts["mac"] != ""]
 
     if not dhcp.empty:
         if "mac" in dhcp.columns:
-            dhcp["mac"] = dhcp["mac"].astype(str).str.lower().str.strip()
+            dhcp = dhcp.copy()
+            dhcp["mac"] = dhcp["mac"].map(normalize_mac)
+            dhcp = dhcp[dhcp["mac"] != ""]
             dhcp_cols = [c for c in ["mac", "host_name"] if c in dhcp.columns]
             dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"], keep="last")
             merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
@@ -392,12 +441,11 @@ def get_latest_network_info() -> pd.DataFrame:
 def load_ai_config(filepath: Path):
     if not filepath.exists():
         return {"authorized_providers": [], "ai_signatures": {}}
-    with open(filepath, "r", encoding="utf-8") as f:
-        try:
-            config = yaml.safe_load(f)
-            return config if config else {"authorized_providers": [], "ai_signatures": {}}
-        except Exception:
-            return {"authorized_providers": [], "ai_signatures": {}}
+    try:
+        config = yaml.safe_load(filepath.read_text(encoding="utf-8"))
+        return config if config else {"authorized_providers": [], "ai_signatures": {}}
+    except Exception:
+        return {"authorized_providers": [], "ai_signatures": {}}
 
 def save_ai_config(filepath: Path, config_dict: dict):
     filepath.parent.mkdir(exist_ok=True, parents=True)
@@ -411,7 +459,7 @@ def log_activity(filepath: Path, action: str, item_type: str, items: list[str]):
     if not items:
         return
     log_file = filepath.parent / "activity_log.csv"
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = _now_str()
     new_rows = [{"Timestamp": timestamp, "Action": action, "Type": item_type, "Item": item} for item in items]
     df_new = pd.DataFrame(new_rows)
     header_needed = not log_file.exists()
@@ -434,30 +482,25 @@ def auto_enrich_devices(device_list):
     net_df = get_latest_network_info()
     net_map = {}
     if not net_df.empty:
-        # CHANGED: normalize network MACs so enrichment matches canonical MACs
-        net_df = net_df.copy()
-        if "mac" in net_df.columns:
-            net_df["mac"] = net_df["mac"].map(normalize_mac)
-            net_df = net_df.dropna(subset=["mac"])
         net_map = net_df.set_index("mac").to_dict(orient="index")
 
     changes_detected = False
 
     for device in device_list:
-        mac = normalize_mac(device.get("mac", ""))  # CHANGED
-
+        mac = normalize_mac(device.get("mac", ""))
         if not mac:
             continue
+        device["mac"] = mac
 
         if mac in net_map:
-            found_ip = str(net_map[mac].get("latest_ip", ""))
-            found_host = str(net_map[mac].get("latest_host", ""))
+            found_ip = str(net_map[mac].get("latest_ip", "") or "")
+            found_host = str(net_map[mac].get("latest_host", "") or "")
 
-            if found_ip and found_ip != "nan" and found_ip != device.get("ip"):
+            if found_ip and found_ip != "nan" and found_ip != device.get("ip", ""):
                 device["ip"] = found_ip
                 changes_detected = True
 
-            if found_host and found_host != "nan" and found_host != device.get("hostname"):
+            if found_host and found_host != "nan" and found_host != device.get("hostname", ""):
                 device["hostname"] = found_host
                 changes_detected = True
 
@@ -470,23 +513,51 @@ def auto_enrich_devices(device_list):
         if not device.get("date_modified"):
             device["date_modified"] = _now_str()
 
+    # dedupe, keep last
+    device_list = _dedupe_keep_last(device_list, "mac")
     return device_list, changes_detected
 
 # -----------------------------
-# 1) Device Manager
+# Robust Editor State Helpers (fix add/delete when filtered)
+# -----------------------------
+def _ensure_ids(rows: list[dict], id_key="_id") -> list[dict]:
+    out = []
+    for r in rows:
+        rr = dict(r)
+        if not rr.get(id_key):
+            rr[id_key] = str(uuid4())
+        out.append(rr)
+    return out
+
+def _rows_to_df(rows: list[dict], cols: list[str]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols].copy()
+
+# -----------------------------
+# 1) Device Manager (FIXED add/delete)
 # -----------------------------
 def render_device_manager(device_list: list[dict], filepath: Path):
     st.markdown("**Device Management**")
 
+    # Session key for stable IDs across reruns
+    if "device_rows_state" not in st.session_state:
+        st.session_state.device_rows_state = _ensure_ids(device_list)
+
+    # On first load, enrich once
     if "has_scanned" not in st.session_state:
         with st.spinner("Auto-detecting network metadata..."):
-            updated_list, changes = auto_enrich_devices(device_list)
+            updated_list, changes = auto_enrich_devices(st.session_state.device_rows_state)
             if changes:
-                device_list[:] = updated_list
-                save_devices(filepath, device_list)
+                st.session_state.device_rows_state = updated_list
+                # persist without IDs
+                save_devices(filepath, [{k: v for k, v in d.items() if k != "_id"} for d in updated_list])
                 st.toast("Network metadata updated automatically")
         st.session_state["has_scanned"] = True
 
+    # Filters
     f1, _ = st.columns([2, 3])
     with f1:
         date_filter = st.selectbox(
@@ -495,57 +566,55 @@ def render_device_manager(device_list: list[dict], filepath: Path):
             index=0
         )
 
+    # Quick add
     col_input, col_btn = st.columns([4, 1])
     with col_input:
         new_text = st.text_input(
             "Quick Add Device",
-            placeholder="Paste MAC Address",
-            label_visibility="collapsed"
+            placeholder="Paste MAC Address (you can paste multiple, separated by space/comma/newline)",
+            label_visibility="collapsed",
+            key="device_quick_add"
         )
     with col_btn:
         if st.button("Add Device", key="btn_import_mac", type="primary"):
-            if new_text:
-                entries = [normalize_mac(m) for m in re.split(r"[,\s\n]+", new_text) if normalize_mac(m)]  # CHANGED
-                existing_macs = {normalize_mac(d.get("mac")) for d in device_list if normalize_mac(d.get("mac"))}  # CHANGED
+            entries = [x for x in re.split(r"[,\s\n]+", (new_text or "")) if x.strip()]
+            entries = [normalize_mac(x) for x in entries]
+            entries = [m for m in entries if m and _mac_is_valid(m)]
 
-                added_count = 0
-                new_entries_for_log = []
+            existing = {normalize_mac(d.get("mac")) for d in st.session_state.device_rows_state}
+            added = []
+            for m in entries:
+                if m in existing:
+                    continue
+                st.session_state.device_rows_state.append({
+                    "_id": str(uuid4()),
+                    "mac": m,
+                    "ip": "",
+                    "hostname": "",
+                    "vendor": "",
+                    "date_modified": _now_str()
+                })
+                existing.add(m)
+                added.append(m)
 
-                for mac in entries:
-                    if not _mac_is_valid(mac):
-                        continue
-                    if mac in existing_macs:
-                        st.warning("MAC address already available")
-                        continue
-
-                    device_list.append({
-                        "mac": mac,
-                        "ip": "", "hostname": "", "vendor": "",
-                        "date_modified": _now_str()
-                    })
-                    existing_macs.add(mac)
-                    new_entries_for_log.append(mac)
-                    added_count += 1
-
-                if added_count > 0:
-                    if "has_scanned" in st.session_state:
-                        del st.session_state["has_scanned"]
-                    save_devices(filepath, device_list)
-                    log_activity(filepath, "Added", "Device", new_entries_for_log)
-                    st.toast(f"Added {added_count} new devices")
-                    st.rerun()
+            if added:
+                save_devices(filepath, [{k: v for k, v in d.items() if k != "_id"} for d in st.session_state.device_rows_state])
+                log_activity(filepath, "Added", "Device", added)
+                st.toast(f"Added {len(added)} device(s)")
+                st.rerun()
+            else:
+                st.info("No new valid MACs were added (duplicates/invalid).")
 
     st.divider()
 
-    search_query = st.text_input("Search Devices", placeholder="Search MAC Address..", label_visibility="collapsed")
+    search_query = st.text_input("Search Devices", placeholder="Search MAC / IP / Hostname..", label_visibility="collapsed")
 
-    df = pd.DataFrame(device_list)
-    if df.empty:
-        df = pd.DataFrame(columns=["mac", "ip", "hostname", "vendor", "date_modified"])
+    # Build DF from state
+    rows = st.session_state.device_rows_state
+    cols_all = ["_id", "mac", "ip", "hostname", "vendor", "date_modified"]
+    df = _rows_to_df(rows, cols_all)
 
-    if "date_modified" not in df.columns:
-        df["date_modified"] = ""
-
+    # Apply date filter (on df)
     if date_filter != "All" and not df.empty:
         df["_dt"] = df["date_modified"].apply(_parse_dt)
         now = datetime.datetime.now()
@@ -558,31 +627,29 @@ def render_device_manager(device_list: list[dict], filepath: Path):
         df = df[df["_dt"].notna() & (df["_dt"] >= start)].copy()
         df.drop(columns=["_dt"], inplace=True, errors="ignore")
 
+    # Search filter
     if search_query:
-        mask = df.apply(lambda x: x.astype(str).str.contains(search_query, case=False).any(), axis=1)
-        display_df = df[mask].copy()
-    else:
-        display_df = df.copy()
+        q = search_query.strip()
+        mask = df.apply(lambda r: r.astype(str).str.contains(q, case=False).any(), axis=1)
+        df = df[mask].copy()
 
-    display_df["_dt_sort"] = display_df["date_modified"].apply(_parse_dt)
-    display_df = display_df.sort_values(by="_dt_sort", ascending=False, na_position="last").drop(columns=["_dt_sort"])
+    # Sort by date_modified desc
+    df["_dt_sort"] = df["date_modified"].apply(_parse_dt)
+    df = df.sort_values(by="_dt_sort", ascending=False, na_position="last").drop(columns=["_dt_sort"])
 
-    # ✅ Use your own # and hide index (fix alignment / spacing)
-    display_df = _with_row_numbers(display_df)
-
-    editor_cols = ["#", "mac", "ip", "hostname", "date_modified"]
-    for c in editor_cols:
-        if c not in display_df.columns:
-            display_df[c] = ""
-    display_df = display_df[editor_cols]
+    # Show editor (include hidden _id for stable diff)
+    display_cols = ["_id", "mac", "ip", "hostname", "date_modified"]
+    editor_df = df[display_cols].copy()
+    editor_df = _with_row_numbers(editor_df)
 
     edited_df = _st_data_editor(
-        display_df,
+        editor_df,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
-            "mac": st.column_config.TextColumn("MAC Address", validate=MAC_REGEX_PATTERN, required=True, width="medium"),
+            "_id": st.column_config.TextColumn("_id", disabled=True, width="small"),  # hidden-ish identifier
+            "mac": st.column_config.TextColumn("MAC Address", required=True, width="medium"),
             "ip": st.column_config.TextColumn("IP Address", disabled=False, width="small"),
             "hostname": st.column_config.TextColumn("Host Name", disabled=False, width="medium"),
             "date_modified": st.column_config.TextColumn("Date Modified", disabled=True, width="medium"),
@@ -591,93 +658,188 @@ def render_device_manager(device_list: list[dict], filepath: Path):
         height=400
     )
 
-    st.write("")
+    st.caption("Tip: To delete, remove the row from the table then click **Save Device Changes**.")
+
     if st.button("Save Device Changes", type="secondary", key="save_devices"):
+        # Drop display "#"
         if "#" in edited_df.columns:
-            edited_df = edited_df.drop(columns=["#"])
+            edited_df = edited_df.drop(columns=["#"], errors="ignore")
 
-        new_state_dicts = edited_df.to_dict("records")
-        visible_macs = set([normalize_mac(x.get("mac")) for x in new_state_dicts if normalize_mac(x.get("mac"))])  # CHANGED
+        # Clean edited rows
+        edited_rows = edited_df.to_dict("records")
 
-        old_map = {normalize_mac(d.get("mac")): d for d in device_list if normalize_mac(d.get("mac"))}  # CHANGED
+        cleaned = []
+        invalid = []
+        seen_macs = set()
 
-        final_list = []
-        if search_query or date_filter != "All":
-            for item in device_list:
-                if normalize_mac(item.get("mac")) not in visible_macs:  # CHANGED
-                    final_list.append(item)
+        for r in edited_rows:
+            rid = str(r.get("_id", "")).strip()
+            mac = normalize_mac(r.get("mac", ""))
+            if not rid and not mac:
+                continue  # blank row from dynamic editor
 
-        for item in new_state_dicts:
-            if item.get("mac") and str(item["mac"]).strip():
-                mac_clean = (normalize_mac(item["mac"]) or "")  # CHANGED
-                ip_clean = str(item.get("ip", "")).strip()
-                host_clean = str(item.get("hostname", "")).strip()
+            if not mac or not _mac_is_valid(mac):
+                invalid.append(str(r.get("mac", "")))
+                continue
 
-                old = old_map.get(mac_clean, {})
-                changed = (ip_clean != str(old.get("ip", "")).strip()) or (host_clean != str(old.get("hostname", "")).strip())
+            if mac in seen_macs:
+                continue
+            seen_macs.add(mac)
 
-                vendor_val = str(old.get("vendor", "")).strip()
-                date_mod = str(old.get("date_modified", "")).strip() or _now_str()
-                if changed:
-                    date_mod = _now_str()
+            cleaned.append({
+                "_id": rid or str(uuid4()),
+                "mac": mac,
+                "ip": str(r.get("ip", "") or "").strip(),
+                "hostname": str(r.get("hostname", "") or "").strip(),
+                "date_modified": str(r.get("date_modified") or "").strip() or _now_str(),
+            })
 
-                final_list.append({
-                    "mac": mac_clean,
-                    "ip": ip_clean,
-                    "hostname": host_clean,
-                    "vendor": vendor_val,
-                    "date_modified": date_mod,
-                })
+        # Map current full state
+        full = st.session_state.device_rows_state
+        full_by_id = {str(x.get("_id")): x for x in full if x.get("_id")}
+        full_by_mac = {normalize_mac(x.get("mac")): x for x in full if normalize_mac(x.get("mac"))}
 
-        unique_map = {x["mac"]: x for x in final_list}
-        final_list = list(unique_map.values())
+        # IDs visible in current view before editing (for deletion detection limited to view)
+        view_ids_before = set(df["_id"].astype(str).tolist())
 
-        old_macs = set(d["mac"] for d in device_list if d.get("mac"))
-        new_macs = set(d["mac"] for d in final_list if d.get("mac"))
-        added = new_macs - old_macs
-        removed = old_macs - new_macs
+        # IDs after editing (still in view)
+        view_ids_after = set([str(x.get("_id", "")) for x in cleaned if x.get("_id")])
 
-        save_devices(filepath, final_list)
+        deleted_ids = view_ids_before - view_ids_after
 
-        if added:
-            log_activity(filepath, "Added", "Device", list(added))
-        if removed:
-            log_activity(filepath, "Deleted", "Device", list(removed))
+        # Apply deletions to full
+        new_full = [x for x in full if str(x.get("_id")) not in deleted_ids]
+
+        # Apply updates/additions from cleaned
+        added_macs = []
+        updated_macs = []
+
+        for row in cleaned:
+            mac = row["mac"]
+            rid = row["_id"]
+
+            # If this _id exists, update it
+            if rid in full_by_id:
+                old = full_by_id[rid]
+                changed = (row.get("ip", "") != str(old.get("ip", "") or "").strip()) or (row.get("hostname", "") != str(old.get("hostname", "") or "").strip())
+                # Keep vendor from old
+                vendor = str(old.get("vendor", "") or "").strip()
+                row_final = {
+                    "_id": rid,
+                    "mac": mac,
+                    "ip": row.get("ip", ""),
+                    "hostname": row.get("hostname", ""),
+                    "vendor": vendor,
+                    "date_modified": _now_str() if changed else str(old.get("date_modified") or _now_str()).strip(),
+                }
+                # replace in new_full
+                for i in range(len(new_full)):
+                    if str(new_full[i].get("_id")) == rid:
+                        new_full[i] = row_final
+                        break
+                updated_macs.append(mac)
+                continue
+
+            # Else if mac exists with different _id, treat as update/merge
+            if mac in full_by_mac:
+                old = full_by_mac[mac]
+                rid_old = str(old.get("_id"))
+                changed = (row.get("ip", "") != str(old.get("ip", "") or "").strip()) or (row.get("hostname", "") != str(old.get("hostname", "") or "").strip())
+                vendor = str(old.get("vendor", "") or "").strip()
+                row_final = {
+                    "_id": rid_old,
+                    "mac": mac,
+                    "ip": row.get("ip", ""),
+                    "hostname": row.get("hostname", ""),
+                    "vendor": vendor,
+                    "date_modified": _now_str() if changed else str(old.get("date_modified") or _now_str()).strip(),
+                }
+                for i in range(len(new_full)):
+                    if str(new_full[i].get("_id")) == rid_old:
+                        new_full[i] = row_final
+                        break
+                updated_macs.append(mac)
+                continue
+
+            # Brand new row
+            new_full.append({
+                "_id": rid or str(uuid4()),
+                "mac": mac,
+                "ip": row.get("ip", ""),
+                "hostname": row.get("hostname", ""),
+                "vendor": "",
+                "date_modified": _now_str(),
+            })
+            added_macs.append(mac)
+
+        # Dedupe full by mac (keep last)
+        new_full = _dedupe_keep_last(new_full, "mac")
+        new_full = _ensure_ids(new_full)
+
+        # Persist
+        st.session_state.device_rows_state = new_full
+        save_devices(filepath, [{k: v for k, v in d.items() if k != "_id"} for d in new_full])
+
+        # Logging
+        deleted_macs = []
+        for rid in deleted_ids:
+            old = full_by_id.get(rid)
+            if old:
+                m = normalize_mac(old.get("mac", ""))
+                if m:
+                    deleted_macs.append(m)
+
+        if added_macs:
+            log_activity(filepath, "Added", "Device", sorted(list(set(added_macs))))
+        if deleted_macs:
+            log_activity(filepath, "Deleted", "Device", sorted(list(set(deleted_macs))))
+
+        if invalid:
+            st.warning(f"Skipped invalid MAC(s): {', '.join([x for x in invalid if x])}")
 
         st.success("Device database updated successfully.")
         st.rerun()
 
 # -----------------------------
-# 2) Domain Whitelist Manager ✅ Date Modified ONLY (Category removed)
+# 2) Domain Whitelist Manager (FIXED add/delete)
 # -----------------------------
 def render_domain_manager(domain_rows: list[dict], filepath: Path):
     st.markdown("**Domain Whitelist**")
+
+    # Session state with stable ids
+    if "domain_rows_state" not in st.session_state:
+        rows = []
+        for r in domain_rows:
+            rr = dict(r)
+            rr["_id"] = rr.get("_id") or str(uuid4())
+            rows.append(rr)
+        st.session_state.domain_rows_state = rows
 
     col_input, col_btn = st.columns([4, 1])
     with col_input:
         new_domain = st.text_input("Add Domain", placeholder="example.com", label_visibility="collapsed", key="dom_add")
     with col_btn:
         if st.button("Add", key="btn_import_domain"):
-            if new_domain:
-                entries = [x.strip().lower() for x in re.split(r"[,\s\n]+", new_domain) if x.strip()]
-                existing = {r.get("domain", "").lower() for r in domain_rows}
+            entries = [x.strip().lower() for x in re.split(r"[,\s\n]+", (new_domain or "")) if x.strip()]
+            entries = [d for d in entries if _domain_is_valid(d)]
 
-                added = []
-                for dom in entries:
-                    if not _domain_is_valid(dom):
-                        continue
-                    if dom in existing:
-                        continue
+            existing = {str(r.get("domain", "")).strip().lower() for r in st.session_state.domain_rows_state}
+            added = []
+            for dom in entries:
+                if dom in existing:
+                    continue
+                st.session_state.domain_rows_state.append({"_id": str(uuid4()), "domain": dom, "date_modified": _now_str()})
+                existing.add(dom)
+                added.append(dom)
 
-                    domain_rows.append({"domain": dom, "date_modified": _now_str()})
-                    existing.add(dom)
-                    added.append(dom)
-
-                if added:
-                    save_domain_whitelist(filepath, domain_rows)
-                    log_activity(filepath, "Added", "Domain", added)
-                    st.toast(f"Added {len(added)} domain(s)")
-                    st.rerun()
+            if added:
+                # persist
+                save_domain_whitelist(filepath, [{k: v for k, v in r.items() if k != "_id"} for r in st.session_state.domain_rows_state])
+                log_activity(filepath, "Added", "Domain", added)
+                st.toast(f"Added {len(added)} domain(s)")
+                st.rerun()
+            else:
+                st.info("No new valid domains were added (duplicates/invalid).")
 
     st.divider()
 
@@ -686,88 +848,123 @@ def render_domain_manager(domain_rows: list[dict], filepath: Path):
         placeholder="Filter domains...",
         label_visibility="collapsed",
         key="dom_search"
-    )
+    ).strip().lower()
 
-    df = pd.DataFrame(domain_rows)
+    df = pd.DataFrame(st.session_state.domain_rows_state)
     if df.empty:
-        df = pd.DataFrame(columns=["domain", "date_modified"])
+        df = pd.DataFrame(columns=["_id", "domain", "date_modified"])
 
-    for c in ["domain", "date_modified"]:
+    for c in ["_id", "domain", "date_modified"]:
         if c not in df.columns:
             df[c] = ""
 
     if search_query:
-        q = search_query.strip().lower()
-        display_df = df[df["domain"].astype(str).str.lower().str.contains(q, na=False)].copy()
-    else:
-        display_df = df.copy()
+        df = df[df["domain"].astype(str).str.lower().str.contains(search_query, na=False)].copy()
 
-    display_df["_dt_sort"] = display_df["date_modified"].apply(_parse_dt)
-    display_df = display_df.sort_values(by="_dt_sort", ascending=False, na_position="last").drop(columns=["_dt_sort"])
+    df["_dt_sort"] = df["date_modified"].apply(_parse_dt)
+    df = df.sort_values(by="_dt_sort", ascending=False, na_position="last").drop(columns=["_dt_sort"])
 
-    # ✅ Use your own # and hide index (fix alignment / spacing)
-    display_df = _with_row_numbers(display_df)
+    editor_df = _with_row_numbers(df[["_id", "domain", "date_modified"]].copy())
 
     edited_df = _st_data_editor(
-        display_df[["#", "domain", "date_modified"]],
+        editor_df,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
-            "domain": st.column_config.TextColumn("Domain Name", validate=DOMAIN_REGEX_PATTERN, required=True, width="large"),
+            "_id": st.column_config.TextColumn("_id", disabled=True, width="small"),
+            "domain": st.column_config.TextColumn("Domain Name", required=True, width="large"),
             "date_modified": st.column_config.TextColumn("Date Modified", disabled=True, width="medium"),
         },
         key="domain_editor",
         height=400
     )
 
-    st.write("")
+    st.caption("Tip: To delete, remove the row from the table then click **Save Changes**.")
+
     if st.button("Save Changes", type="secondary", key="save_domain"):
         if "#" in edited_df.columns:
-            edited_df = edited_df.drop(columns=["#"])
+            edited_df = edited_df.drop(columns=["#"], errors="ignore")
 
-        old_map = {str(r.get("domain", "")).strip().lower(): r for r in domain_rows if r.get("domain")}
+        edited_rows = edited_df.to_dict("records")
 
-        visible_before = set(display_df["domain"].astype(str).str.strip().str.lower().tolist())
-        rows = edited_df.to_dict("records")
-        visible_after = set([str(r.get("domain", "")).strip().lower() for r in rows if r.get("domain")])
+        cleaned = []
+        invalid = []
+        seen = set()
 
-        deleted_from_view = visible_before - visible_after
-        final_map = {d: r for d, r in old_map.items() if d not in deleted_from_view}
-
-        for r in rows:
+        for r in edited_rows:
+            rid = str(r.get("_id", "")).strip()
             dom = str(r.get("domain", "")).strip().lower()
-            if not dom:
-                continue
-            if not _domain_is_valid(dom):
+            if not rid and not dom:
                 continue
 
-            old = old_map.get(dom, {})
-            date_mod = str(old.get("date_modified", "") or "").strip() or _now_str()
-            if dom not in old_map:
-                date_mod = _now_str()
+            if not dom or not _domain_is_valid(dom):
+                invalid.append(dom)
+                continue
 
-            final_map[dom] = {"domain": dom, "date_modified": date_mod}
+            if dom in seen:
+                continue
+            seen.add(dom)
 
-        final_list = sorted(list(final_map.values()), key=lambda x: x.get("domain", ""))
+            cleaned.append({"_id": rid or str(uuid4()), "domain": dom, "date_modified": str(r.get("date_modified") or "").strip() or _now_str()})
 
-        old_domains = set(old_map.keys())
-        new_domains = set(final_map.keys())
-        added = sorted(list(new_domains - old_domains))
-        removed = sorted(list(old_domains - new_domains))
+        full = st.session_state.domain_rows_state
+        full_by_id = {str(x.get("_id")): x for x in full if x.get("_id")}
+        view_ids_before = set(df["_id"].astype(str).tolist())
+        view_ids_after = set([x["_id"] for x in cleaned if x.get("_id")])
+        deleted_ids = view_ids_before - view_ids_after
 
-        save_domain_whitelist(filepath, final_list)
+        new_full = [x for x in full if str(x.get("_id")) not in deleted_ids]
+
+        # apply updates / additions
+        added = []
+        removed = []
+        for rid in deleted_ids:
+            old = full_by_id.get(rid)
+            if old and old.get("domain"):
+                removed.append(str(old["domain"]).strip().lower())
+
+        # update existing by id, else add
+        new_full_by_id = {str(x.get("_id")): x for x in new_full if x.get("_id")}
+        existing_domains = {str(x.get("domain", "")).strip().lower() for x in new_full}
+
+        for r in cleaned:
+            rid = r["_id"]
+            dom = r["domain"]
+            if rid in new_full_by_id:
+                new_full_by_id[rid]["domain"] = dom
+                # keep original date_modified unless new
+                if not new_full_by_id[rid].get("date_modified"):
+                    new_full_by_id[rid]["date_modified"] = _now_str()
+            else:
+                if dom in existing_domains:
+                    # skip duplicate domain
+                    continue
+                new_full.append({"_id": rid, "domain": dom, "date_modified": _now_str()})
+                existing_domains.add(dom)
+                added.append(dom)
+
+        # dedupe by domain
+        new_full = _dedupe_keep_last(new_full, "domain")
+
+        st.session_state.domain_rows_state = new_full
+        save_domain_whitelist(filepath, [{k: v for k, v in r.items() if k != "_id"} for r in new_full])
 
         if added:
-            log_activity(filepath, "Added", "Domain", added)
+            log_activity(filepath, "Added", "Domain", sorted(list(set(added))))
         if removed:
-            log_activity(filepath, "Deleted", "Domain", removed)
+            log_activity(filepath, "Deleted", "Domain", sorted(list(set(removed))))
+
+        if invalid:
+            bad = [x for x in invalid if x]
+            if bad:
+                st.warning(f"Skipped invalid domain(s): {', '.join(bad[:30])}")
 
         st.success("Domain whitelist updated.")
         st.rerun()
 
 # -----------------------------
-# 3) AI Signature Manager ✅ add '#' column + hide index
+# 3) AI Signature Manager (kept; minor safety)
 # -----------------------------
 def render_ai_signature_manager(yaml_path: Path):
     config = load_ai_config(yaml_path)
@@ -799,7 +996,6 @@ def render_ai_signature_manager(yaml_path: Path):
     if sig_df.empty:
         sig_df = pd.DataFrame(columns=["Provider", "Patterns"])
 
-    # ✅ Add your own # column, and hide the dataframe index (fix alignment / spacing)
     sig_df = _with_row_numbers(sig_df)
 
     edited_sigs = _st_data_editor(
@@ -832,43 +1028,50 @@ def render_ai_signature_manager(yaml_path: Path):
         st.success("AI policies updated successfully.")
 
 # -----------------------------
-# 4) Banning List Manager ✅ hide index + keep '#'
+# 4) Banning List Manager (FIXED add/delete)
 # -----------------------------
 def render_banning_list(ban_file: Path):
     st.markdown("**Banning List**")
 
-    ban_list = load_ban_list(ban_file)
+    if "ban_rows_state" not in st.session_state:
+        rows = []
+        for r in load_ban_list(ban_file):
+            rr = dict(r)
+            rr["_id"] = rr.get("_id") or str(uuid4())
+            rr["mac"] = normalize_mac(rr.get("mac", ""))
+            rows.append(rr)
+        st.session_state.ban_rows_state = rows
 
     col_input, col_btn = st.columns([4, 1])
     with col_input:
         new_text = st.text_input(
             "Add MAC to Ban List",
-            placeholder="Paste MAC Address",
+            placeholder="Paste MAC Address (supports multiple)",
             label_visibility="collapsed",
             key="ban_add_input"
         )
     with col_btn:
         if st.button("Enter", type="primary", key="ban_add_btn"):
-            if new_text:
-                entries = [normalize_mac(m) for m in re.split(r"[,\s\n]+", new_text) if normalize_mac(m)]  # CHANGED
-                existing = {normalize_mac(d.get("mac")) for d in ban_list if normalize_mac(d.get("mac"))}  # CHANGED
+            entries = [x for x in re.split(r"[,\s\n]+", (new_text or "")) if x.strip()]
+            entries = [normalize_mac(x) for x in entries]
+            entries = [m for m in entries if m and _mac_is_valid(m)]
 
-                added = []
-                for mac in entries:
-                    if not _mac_is_valid(mac):
-                        continue
-                    if mac in existing:
-                        st.warning("MAC address already available")
-                        continue
-                    ban_list.append({"mac": mac, "date_modified": _now_str()})
-                    existing.add(mac)
-                    added.append(mac)
+            existing = {normalize_mac(d.get("mac")) for d in st.session_state.ban_rows_state}
+            added = []
+            for m in entries:
+                if m in existing:
+                    continue
+                st.session_state.ban_rows_state.append({"_id": str(uuid4()), "mac": m, "date_modified": _now_str()})
+                existing.add(m)
+                added.append(m)
 
-                if added:
-                    save_ban_list(ban_file, ban_list)
-                    log_activity(ban_file, "Added", "Banned MAC", added)
-                    st.toast(f"Banned {len(added)} MAC(s)")
-                    st.rerun()
+            if added:
+                save_ban_list(ban_file, [{k: v for k, v in r.items() if k != "_id"} for r in st.session_state.ban_rows_state])
+                log_activity(ban_file, "Added", "Banned MAC", added)
+                st.toast(f"Banned {len(added)} MAC(s)")
+                st.rerun()
+            else:
+                st.info("No new valid MACs were added (duplicates/invalid).")
 
     st.divider()
 
@@ -877,11 +1080,15 @@ def render_banning_list(ban_file: Path):
         placeholder="Search MAC Address..",
         label_visibility="collapsed",
         key="ban_search"
-    )
+    ).strip().lower()
 
-    df = pd.DataFrame(ban_list)
+    df = pd.DataFrame(st.session_state.ban_rows_state)
     if df.empty:
-        df = pd.DataFrame(columns=["mac", "date_modified"])
+        df = pd.DataFrame(columns=["_id", "mac", "date_modified"])
+
+    for c in ["_id", "mac", "date_modified"]:
+        if c not in df.columns:
+            df[c] = ""
 
     if search_query:
         df = df[df["mac"].astype(str).str.contains(search_query, case=False, na=False)].copy()
@@ -889,46 +1096,97 @@ def render_banning_list(ban_file: Path):
     df["_dt_sort"] = df["date_modified"].apply(_parse_dt)
     df = df.sort_values(by="_dt_sort", ascending=False, na_position="last").drop(columns=["_dt_sort"])
 
-    # ✅ Add your own # and hide index (fix alignment / spacing)
-    df = _with_row_numbers(df)
+    editor_df = _with_row_numbers(df[["_id", "mac", "date_modified"]].copy())
 
     edited_df = _st_data_editor(
-        df[["#", "mac", "date_modified"]],
+        editor_df,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
-            "mac": st.column_config.TextColumn("MAC Address", validate=MAC_REGEX_PATTERN, required=True, width="medium"),
+            "_id": st.column_config.TextColumn("_id", disabled=True, width="small"),
+            "mac": st.column_config.TextColumn("MAC Address", required=True, width="medium"),
             "date_modified": st.column_config.TextColumn("Date Modified", disabled=True, width="medium"),
         },
         key="ban_editor",
         height=400
     )
 
-    st.write("")
+    st.caption("Tip: To delete, remove the row from the table then click **Save Ban List Changes**.")
+
     if st.button("Save Ban List Changes", type="secondary", key="ban_save"):
         if "#" in edited_df.columns:
-            edited_df = edited_df.drop(columns=["#"])
+            edited_df = edited_df.drop(columns=["#"], errors="ignore")
 
-        rows = edited_df.to_dict("records")
-        final = []
+        edited_rows = edited_df.to_dict("records")
+
+        cleaned = []
+        invalid = []
         seen = set()
-        old_map = {x["mac"]: x for x in ban_list}
 
-        for r in rows:
-            mac = (normalize_mac(r.get("mac")) or "")  # CHANGED
-            if not mac:
+        for r in edited_rows:
+            rid = str(r.get("_id", "")).strip()
+            mac = normalize_mac(r.get("mac", ""))
+            if not rid and not mac:
                 continue
-            if not _mac_is_valid(mac):
+
+            if not mac or not _mac_is_valid(mac):
+                invalid.append(str(r.get("mac", "")))
                 continue
+
             if mac in seen:
                 continue
             seen.add(mac)
 
-            date_mod = old_map.get(mac, {}).get("date_modified") or _now_str()
-            final.append({"mac": mac, "date_modified": date_mod})
+            dm = str(r.get("date_modified") or "").strip() or _now_str()
+            cleaned.append({"_id": rid or str(uuid4()), "mac": mac, "date_modified": dm})
 
-        save_ban_list(ban_file, final)
+        full = st.session_state.ban_rows_state
+        full_by_id = {str(x.get("_id")): x for x in full if x.get("_id")}
+        view_ids_before = set(df["_id"].astype(str).tolist())
+        view_ids_after = set([x["_id"] for x in cleaned if x.get("_id")])
+        deleted_ids = view_ids_before - view_ids_after
+
+        removed = []
+        for rid in deleted_ids:
+            old = full_by_id.get(rid)
+            if old and old.get("mac"):
+                removed.append(old["mac"])
+
+        new_full = [x for x in full if str(x.get("_id")) not in deleted_ids]
+
+        # Merge cleaned into new_full by _id or by mac
+        new_full_by_id = {str(x.get("_id")): x for x in new_full if x.get("_id")}
+        existing_macs = {normalize_mac(x.get("mac")) for x in new_full}
+        added = []
+
+        for r in cleaned:
+            rid = r["_id"]
+            mac = r["mac"]
+            if rid in new_full_by_id:
+                new_full_by_id[rid]["mac"] = mac
+                new_full_by_id[rid]["date_modified"] = new_full_by_id[rid].get("date_modified") or _now_str()
+            else:
+                if mac in existing_macs:
+                    continue
+                new_full.append({"_id": rid, "mac": mac, "date_modified": _now_str()})
+                existing_macs.add(mac)
+                added.append(mac)
+
+        # Dedupe by mac
+        new_full = _dedupe_keep_last(new_full, "mac")
+        st.session_state.ban_rows_state = new_full
+
+        save_ban_list(ban_file, [{k: v for k, v in r.items() if k != "_id"} for r in new_full])
+
+        if added:
+            log_activity(ban_file, "Added", "Banned MAC", sorted(list(set(added))))
+        if removed:
+            log_activity(ban_file, "Deleted", "Banned MAC", sorted(list(set(removed))))
+
+        if invalid:
+            st.warning(f"Skipped invalid MAC(s): {', '.join([x for x in invalid if x])}")
+
         st.success("Ban list updated successfully.")
         st.rerun()
 
@@ -947,7 +1205,7 @@ def render(mac_file: Path):
     ban_file = (mac_file.parent / "banned_macs.yaml").resolve()
 
     saved_devices = load_devices(mac_file)
-    saved_domains = load_domain_whitelist(domain_file)  # ✅ no category
+    saved_domains = load_domain_whitelist(domain_file)
     ai_config = load_ai_config(ai_yaml_file)
 
     st.title("Authorization Manager")
@@ -981,9 +1239,7 @@ def render(mac_file: Path):
                 hist_show,
                 use_container_width=True,
                 height=500,
-                column_config={
-                    "#": st.column_config.NumberColumn("#", width="small"),
-                }
+                column_config={"#": st.column_config.NumberColumn("#", width="small")}
             )
             if st.button("Clear Audit Log", type="secondary"):
                 (mac_file.parent / "activity_log.csv").unlink(missing_ok=True)

@@ -1,137 +1,189 @@
+from datetime import datetime
+
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_option_menu import option_menu
 
+MENU_OPTIONS = [
+    "Device Inspection",
+    "Traffic Monitoring",
+    "Zeek Logs",
+    "Alerts",
+    "Authorization",
+]
+
+MENU_ICONS = [
+    "pc-display",
+    "activity",
+    "file-earmark-text",
+    "bell",
+    "shield-lock",
+]
+
+DEFAULT_PAGE = MENU_OPTIONS[0]
+
+
 def render_sidebar(auto_refresh_interval=3600):
-    # -------------------------
-    # Inject CSS for uniform dark-grey sidebar
-    # -------------------------
+    if "sidebar_page" not in st.session_state or st.session_state.sidebar_page not in MENU_OPTIONS:
+        st.session_state.sidebar_page = DEFAULT_PAGE
+
+    default_index = MENU_OPTIONS.index(st.session_state.sidebar_page)
+    refresh_minutes = max(1, auto_refresh_interval // 60)
+
     st.markdown(
         """
         <style>
-        /* Sidebar container */
         [data-testid="stSidebar"] > div:first-child {
             padding-top: 0rem;
-            background-color: #191919;
+            background: linear-gradient(180deg, #171b24 0%, #11151d 100%);
+            border-right: 1px solid #242a35;
         }
 
-        /* Option menu container */
+        [data-testid="stSidebar"] .block-container {
+            padding-top: 1rem;
+            padding-bottom: 0.75rem;
+            padding-left: 0.75rem;
+            padding-right: 0.75rem;
+        }
+
+        .sidebar-brand {
+            margin-bottom: 0.7rem;
+            padding: 0.15rem 0.1rem 0.35rem 0.1rem;
+        }
+
+        .sidebar-brand-title {
+            color: #f7fbff;
+            font-size: 1.1rem;
+            font-weight: 700;
+            line-height: 1.2;
+            margin: 0;
+        }
+
+        .sidebar-brand-subtitle {
+            color: #a5b3c5;
+            font-size: 0.8rem;
+            margin-top: 0.2rem;
+        }
+
+        .sidebar-section-label {
+            color: #8e9bb0;
+            font-size: 0.74rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin: 0.4rem 0 0.45rem 0.2rem;
+        }
+
         .option-menu {
             display: flex;
             flex-direction: column;
-            justify-content: flex-start !important;
-            align-items: stretch;
-            background-color: #191919;
-            border-radius: 0 !important;
+            gap: 0.3rem;
+            background: transparent;
         }
 
-        /* Nav links */
         .option-menu .nav-link {
-            transition: all 0.2s ease;
-            border-bottom: 1px solid #191919;
-            background-color: #191919;
-            color: #cccccc;
+            transition: all 0.18s ease;
+            border: 1px solid transparent;
+            background: #1a202c;
+            color: #c0cbdb;
             margin: 0 !important;
-            border-radius: 0 !important;
+            border-radius: 10px !important;
+            font-weight: 500;
         }
 
-        /* Hover effect for nav links */
         .option-menu .nav-link:hover {
-            background-color: #2a2a2a;
-            color: #ffffff;
+            background: #222b39;
+            color: #edf3ff;
+            border-color: #2f3a4c;
         }
 
-        /* Selected nav link */
         .option-menu .nav-link-selected {
-            background-color: #2a2a2a;
-            font-weight: bold;
-            color: #ffffff;
-            border-radius: 0 !important;
+            background: #263246;
+            color: #f4f8ff;
+            border: 1px solid #3a4b66;
+            font-weight: 600;
+            box-shadow: inset 3px 0 0 #60a5fa;
         }
 
-        /* Sidebar title */
-        .sidebar-title {
-            color: #ffffff;
-            font-size: 20px;
-            font-weight: bold;
+        .sidebar-meta {
+            color: #a9bdd6;
+            font-size: 0.78rem;
+            margin-top: 0.85rem;
+            margin-left: 0.2rem;
+        }
+
+        .sidebar-footer {
+            color: #8f9eb2;
+            font-size: 0.72rem;
             text-align: center;
-            margin-bottom: 20px;
-            padding-top: 10px;
+            margin-top: 0.9rem;
         }
         </style>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     with st.sidebar:
-        # -------------------------
-        # Sidebar Title
-        # -------------------------
-        st.markdown("<div class='sidebar-title'>Zeek Dashboard</div>", unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-title">Zeek Dashboard</div>
+                <div class="sidebar-brand-subtitle">SOC Monitoring Console</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        # -------------------------
-        # Navigation Drawer
-        # -------------------------
-        if "sidebar_page" not in st.session_state:
-            st.session_state.sidebar_page = "Visual"
+        st.markdown("<div class='sidebar-section-label'>Navigation</div>", unsafe_allow_html=True)
 
-        # CORRECTED ICONS HERE  
         page = option_menu(
             menu_title=None,
-            options=["Device Inspection", "Traffic Monitoring", "Zeek Logs", "Alerts", "Authorization"],
-            icons=[
-                "pc-display",        # Device Inspection (endpoint/device icon)
-                "activity",          # Traffic Monitoring (network activity)
-                "file-earmark-text", # Zeek Logs
-                "bell",              # Alerts
-                "shield-lock"        # Authorization
-            ],
+            options=MENU_OPTIONS,
+            icons=MENU_ICONS,
             menu_icon=None,
-            default_index=0,
+            default_index=default_index,
             orientation="vertical",
             styles={
                 "container": {
                     "padding": "0!important",
-                    "background-color": "#191919",
+                    "background-color": "transparent",
                     "width": "100%",
-                    "border-radius": "0"
-                },
-                "icon": {"color": "#ffffff", "font-size": "18px"},
-                "nav-link": {
-                    "font-size": "16px",
-                    "text-align": "left",
-                    "padding": "10px 12px",
-                    "margin": "0",
                     "border-radius": "0",
-                    "border-bottom": "1px solid #191919",
-                    "background-color": "#191919",
-                    "color": "#cccccc",
-                    "--hover-color": "#2a2a2a"
+                },
+                "icon": {"color": "#d6e4f8", "font-size": "17px"},
+                "nav-link": {
+                    "font-size": "15px",
+                    "text-align": "left",
+                    "padding": "9px 12px",
+                    "margin": "0",
+                    "border-radius": "10px",
+                    "background-color": "#1a202c",
+                    "color": "#c0cbdb",
+                    "--hover-color": "#222b39",
                 },
                 "nav-link-selected": {
-                    "background-color": "#2a2a2a",
-                    "font-weight": "bold",
-                    "color": "#ffffff",
-                    "border-radius": "0"
-                }
-            }, 
-            key="sidebar_option_menu",  # CHANGED: prevents component_instance ID collisions
+                    "background-color": "#263246",
+                    "font-weight": "600",
+                    "color": "#f4f8ff",
+                    "border-radius": "10px",
+                },
+            },
+            key="sidebar_option_menu",
         )
 
-        # Update session state with current selection
         st.session_state.sidebar_page = page
 
-        # -------------------------
-        # Auto-refresh every 1 hour
-        # -------------------------
-        st_autorefresh(interval=auto_refresh_interval*1000, key="auto_refresh_timer")
-
-        # -------------------------
-        # Footer
-        # -------------------------
         st.markdown(
-            "<div style='color:#aaaaaa;font-size:12px;text-align:center;margin-top:20px;'>© 2026 Zeek SOC Dashboard</div>",
-            unsafe_allow_html=True
+            f"<div class='sidebar-meta'>Auto-refresh every {refresh_minutes} min</div>",
+            unsafe_allow_html=True,
+        )
+
+        st_autorefresh(interval=auto_refresh_interval * 1000, key="auto_refresh_timer")
+
+        today = datetime.now().strftime("%b %d, %Y")
+        st.markdown(
+            f"<div class='sidebar-footer'>&copy; 2026 Zeek SOC Dashboard<br>{today}</div>",
+            unsafe_allow_html=True,
         )
 
     return st.session_state.sidebar_page
