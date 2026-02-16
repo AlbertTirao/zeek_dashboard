@@ -187,6 +187,76 @@ except ImportError:
     st.stop()
 
 
+def _is_dark_theme() -> bool:
+    try:
+        base = st.get_option("theme.base")
+        if isinstance(base, str) and base.lower() in {"light", "dark"}:
+            return base.lower() == "dark"
+    except Exception:
+        pass
+    return True
+
+
+def get_shadow_aggrid_theme_and_css():
+    theme = "alpine-dark" if _is_dark_theme() else "alpine"
+    custom_css = {
+        ".ag-root-wrapper": {"background-color": "#050B16", "color": "#EAEAEA", "border": "1px solid #22324E"},
+        ".ag-header": {"background-color": "#0A1730", "color": "#EAF2FF", "border-bottom": "1px solid #29406A"},
+        ".ag-header-cell, .ag-header-group-cell": {
+            "background-color": "#0A1730",
+            "color": "#EAF2FF",
+            "border-right": "1px solid #20365A",
+        },
+        ".ag-header-cell-label": {"font-weight": "700", "letter-spacing": "0.02em"},
+        ".ag-cell": {"background-color": "#050B16", "color": "#EAEAEA", "border-color": "#13233D"},
+        ".ag-row": {"background-color": "#050B16"},
+        ".ag-row-odd": {"background-color": "#071224"},
+        ".ag-row-even": {"background-color": "#050E1D"},
+        ".ag-row-hover": {"background-color": "#0F203D"},
+        ".ag-row-selected": {"background-color": "#1E3A5F"},
+        ".ag-floating-filter-body input": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #32517F !important",
+            "border-radius": "6px !important",
+        },
+        ".ag-paging-panel": {"background-color": "#050B16", "color": "#EAEAEA", "border-top": "1px solid #22324E"},
+        ".ag-paging-row-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-paging-page-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-pagination": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-paging-page-size": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-page-size": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+            "outline": "none !important",
+        },
+        ".ag-paging-panel .ag-page-size option": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-select, .ag-paging-panel .ag-picker-field-wrapper": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+    }
+    custom_css.update(
+        {
+            ".ag-root-wrapper": {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"},
+            ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E"},
+            ".ag-header-cell, .ag-header-group-cell": {
+                "background-color": "#10213E",
+                "color": "#EAF2FF",
+                "border-right": "1px solid #2A466E",
+            },
+            ".ag-row-odd": {"background-color": "#07162A"},
+            ".ag-row-even": {"background-color": "#0A1C33"},
+            ".ag-row-hover": {"background-color": "#13305A"},
+            ".ag-row-selected": {"background-color": "#1B3F75"},
+        }
+    )
+    return theme, custom_css
+
+
 # =====================================================
 # 1) Load Visual Metrics from Parquet
 # =====================================================
@@ -682,11 +752,42 @@ def inject_page_css():
         }
 
         .grid-card {
-            border: 1px solid var(--panel-border);
-            background: var(--panel-bg);
-            border-radius: 18px;
-            padding: 10px 10px 2px 10px;
-            box-shadow: var(--panel-shadow);
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            background: linear-gradient(180deg, rgba(2,6,23,0.5), rgba(2,6,23,0.35));
+            border-radius: 12px;
+            padding: 0.56rem 0.62rem 0.46rem 0.62rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .grid-card [data-testid="stDataFrame"] {
+            border: 1px solid #2A466E !important;
+            border-radius: 10px !important;
+            overflow: hidden !important;
+            background: #061120 !important;
+        }
+
+        .grid-card [data-testid="stDataFrame"] table {
+            background: #050B16 !important;
+            color: #EAEAEA !important;
+        }
+
+        .grid-card [data-testid="stDataFrame"] thead tr th {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border-bottom: 1px solid #29406A !important;
+        }
+
+        .grid-card [data-testid="stDataFrame"] tbody tr:nth-child(odd) td {
+            background: #071224 !important;
+        }
+
+        .grid-card [data-testid="stDataFrame"] tbody tr:nth-child(even) td {
+            background: #050E1D !important;
+        }
+
+        .grid-card [data-testid="stDataFrame"] tbody tr td {
+            color: #EAEAEA !important;
+            border-color: #13233D !important;
         }
 
         div[data-testid="stDialog"] > div {
@@ -1082,6 +1183,7 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
     display_df = inv[["#", "mac", "ip", "host_name", "status", "last_seen_today_str"]].copy()
     display_df.rename(columns={"last_seen_today_str": "Last Seen (Today)"}, inplace=True)
 
+    ag_theme, ag_css = get_shadow_aggrid_theme_and_css()
     st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
 
     gb = GridOptionsBuilder.from_dataframe(display_df)
@@ -1098,8 +1200,11 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
         gridOptions=gb.build(),
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         height=420,
-        theme="streamlit",
+        theme=ag_theme,
+        custom_css=ag_css,
         allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=True,
+        reload_data=False,
     )
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1251,6 +1356,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         unsafe_allow_html=True,
     )
 
+    ag_theme, ag_css = get_shadow_aggrid_theme_and_css()
     st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
 
     gb = GridOptionsBuilder.from_dataframe(inventory)
@@ -1268,7 +1374,10 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         height=420,
         allow_unsafe_jscode=True,
-        theme="streamlit",
+        theme=ag_theme,
+        custom_css=ag_css,
+        fit_columns_on_grid_load=True,
+        reload_data=False,
     )
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1416,7 +1525,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
     top = activity_df["Destination"].value_counts().head(5).reset_index()
     top.columns = ["Destination", "Count"]
     top.index = top.index + 1
-    st.markdown("<div class='section-panel'>", unsafe_allow_html=True)
+    st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
     st.dataframe(top, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 

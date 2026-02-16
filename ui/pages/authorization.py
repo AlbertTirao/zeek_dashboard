@@ -46,14 +46,28 @@ def inject_custom_css():
         }
 
         /* Metric Styling */
+        [data-testid="stMetric"] {
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            padding: 0.55rem 0.75rem;
+        }
+
         div[data-testid="stMetricValue"] {
             font-size: 28px;
             font-weight: 600;
+            line-height: 1.1;
         }
         div[data-testid="stMetricLabel"] {
             font-size: 14px;
             font-weight: 500;
             color: #888;
+        }
+        [data-testid="stMetricLabel"] p {
+            font-size: 0.75rem;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            font-weight: 600;
         }
 
         /* Inputs & Tables */
@@ -174,6 +188,48 @@ def inject_custom_css():
             box-shadow: 0 0 10px rgba(0,247,255,0.8);
         }
 
+        .auth-metric-card {
+            height: 146px;
+            padding: 16px 16px;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.035);
+            box-shadow: 0 16px 45px rgba(0,0,0,0.28);
+            width: 100%;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            justify-content: flex-start;
+            text-align: left;
+        }
+
+        .auth-metric-label {
+            width: 100%;
+            font-size: 14px;
+            opacity: 0.82;
+            text-align: left;
+        }
+
+        .auth-metric-value {
+            width: 100%;
+            font-size: 44px;
+            font-weight: 800;
+            line-height: 1.05;
+            margin-top: 2px;
+            letter-spacing: -0.6px;
+            text-align: left;
+        }
+
+        .auth-metric-note {
+            width: 100%;
+            font-size: 12px;
+            opacity: 0.55;
+            margin-top: auto;
+            padding-top: 6px;
+            text-align: left;
+        }
+
         /* Spacing */
         .block-container {
             padding-top: 0.2rem !important;
@@ -216,6 +272,19 @@ def _open_shadow_table_shell() -> None:
 
 def _close_shadow_table_shell() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_auth_metric_card(label: str, value, note: str = "") -> None:
+    st.markdown(
+        f"""
+        <div class="auth-metric-card">
+            <div class="auth-metric-label">{label}</div>
+            <div class="auth-metric-value">{value}</div>
+            <div class="auth-metric-note">{note}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # -----------------------------
 # Helpers
@@ -1436,6 +1505,7 @@ def render(mac_file: Path):
     saved_devices = load_devices(mac_file)
     saved_domains = load_domain_whitelist(domain_file)
     ai_config = load_ai_config(ai_yaml_file)
+    saved_bans = load_ban_list(ban_file)
 
     updated_txt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st.markdown(
@@ -1451,10 +1521,15 @@ def render(mac_file: Path):
         unsafe_allow_html=True,
     )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Device Whitelist", len(saved_devices))
-    m2.metric("Domain Whitelist", len(saved_domains))
-    m3.metric("AI Policies", len(ai_config.get("ai_signatures", {})))
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        render_auth_metric_card("Device Whitelist", len(saved_devices), "Authorized MAC entries")
+    with m2:
+        render_auth_metric_card("Domain Whitelist", len(saved_domains), "Allowed domain entries")
+    with m3:
+        render_auth_metric_card("AI Policies", len(ai_config.get("ai_signatures", {})), "Detection signatures")
+    with m4:
+        render_auth_metric_card("Banned MACs", len(saved_bans), "Blocked devices")
 
     st.write("")
 
