@@ -1185,7 +1185,7 @@ def inject_shadow_sharing_css():
 
 def render_shadow_sharing(parquet_root: Path):
     inject_shadow_sharing_css()
-    st.markdown("### Shadow IT & Data Exfiltration Monitor")
+    st.markdown("### Data Exfiltration Monitoring")
     st.markdown(
         "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN telemetry to surface potential shadow sharing and exfiltration paths.</div>",
         unsafe_allow_html=True,
