@@ -1201,20 +1201,19 @@ def render_shadow_sharing(parquet_root: Path):
         st.warning("No logs found.")
         return
 
-    date_options = ["All Available Dates"] + available_dates
     top1, top2, top3 = st.columns([1.5, 2.3, 0.8])
     with top1:
         selected_date = st.selectbox(
             "Dataset Scope",
-            date_options,
-            index=1 if len(available_dates) > 0 else 0,
+            available_dates,
+            index=0,
             key="shadow_sharing_date",
         )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
     with top2:
-        scope_label = selected_date if selected_date != "All Available Dates" else f"All Available Dates ({len(available_dates)})"
+        scope_label = selected_date
         st.markdown(
-            f"<div class='shadow-day-chip'>Active scope: <strong>{scope_label}</strong></div>",
+            f"<div class='shadow-day-chip'>Active scope: &nbsp; <strong>{scope_label}</strong></div>",
             unsafe_allow_html=True,
         )
     with top3:
@@ -1273,7 +1272,7 @@ def render_shadow_sharing(parquet_root: Path):
     )
 
     # Date scope
-    target_dates = available_dates if selected_date == "All Available Dates" else ([selected_date] if selected_date else [])
+    target_dates = [selected_date] if selected_date else []
 
     with st.spinner("Analyzing telemetry (fast cache + DuckDB)..."):
         df = load_shadow_sharing_data(parquet_root, target_dates)
