@@ -16,18 +16,33 @@ MAC_REGEX_PATTERN = r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
 DOMAIN_REGEX_PATTERN = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
 PARQUET_ROOT = Path("data/parquet")
 MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # -----------------------------
 # Styling & Assets
 # -----------------------------
 def inject_custom_css():
-    """Injects strict, professional CSS for Enterprise Dark Mode."""
+    """Injects styling and aligns authorization tables with Shadow table shells."""
     st.markdown("""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
 
         html, body, [class*="css"] {
             font-family: 'Inter', sans-serif;
+        }
+
+        :root {
+            --panel-border: rgba(255,255,255,0.12);
+            --panel-bg: rgba(255,255,255,0.03);
+            --panel-shadow: 0 14px 38px rgba(0,0,0,0.25);
+            --accent-cyan: #00F7FF;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(1200px 550px at 10% -5%, rgba(0, 247, 255, 0.08), transparent 45%),
+                radial-gradient(900px 460px at 90% 8%, rgba(246, 48, 73, 0.08), transparent 42%),
+                #040B18;
         }
 
         /* Metric Styling */
@@ -46,16 +61,126 @@ def inject_custom_css():
             border-radius: 4px !important;
         }
 
+        /* Shadow-style table shell (align with shadow pages) */
+        .shadow-table-shell {
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            background: linear-gradient(180deg, rgba(2,6,23,0.5), rgba(2,6,23,0.35));
+            border-radius: 12px;
+            padding: 0.56rem 0.62rem 0.46rem 0.62rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"],
+        .shadow-table-shell [data-testid="stDataFrame"] {
+            border: 1px solid #2A466E !important;
+            border-radius: 10px !important;
+            overflow: hidden !important;
+            background: #061120 !important;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"] table,
+        .shadow-table-shell [data-testid="stDataFrame"] table {
+            background: #050B16 !important;
+            color: #EAEAEA !important;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"] thead tr th,
+        .shadow-table-shell [data-testid="stDataFrame"] thead tr th {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border-bottom: 1px solid #29406A !important;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"] tbody tr:nth-child(odd) td,
+        .shadow-table-shell [data-testid="stDataFrame"] tbody tr:nth-child(odd) td {
+            background: #071224 !important;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"] tbody tr:nth-child(even) td,
+        .shadow-table-shell [data-testid="stDataFrame"] tbody tr:nth-child(even) td {
+            background: #050E1D !important;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"] tbody tr td,
+        .shadow-table-shell [data-testid="stDataFrame"] tbody tr td {
+            color: #EAEAEA !important;
+            border-color: #13233D !important;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"] [role="grid"],
+        .shadow-table-shell [data-testid="stDataFrame"] [role="grid"] {
+            background: #061120 !important;
+        }
+
+        .shadow-table-shell [data-testid="stDataEditor"] input {
+            background: rgba(8, 20, 40, 0.8) !important;
+            border: 1px solid #35517d !important;
+            color: #e5eefc !important;
+        }
+
         /* Headers */
         h1, h2, h3 {
             font-weight: 600 !important;
             letter-spacing: -0.5px;
         }
 
+        .alerts-page-header {
+            display:flex;
+            align-items:flex-end;
+            justify-content:space-between;
+            gap: 20px;
+            margin-top: 15px;
+            margin-bottom: 14px;
+            padding: 18px 20px;
+            border-radius: 18px;
+            border: 1px solid var(--panel-border);
+            background:
+              radial-gradient(circle at top right, rgba(0,247,255,0.08), transparent 40%),
+              linear-gradient(135deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
+            box-shadow: var(--panel-shadow);
+        }
+
+        .alerts-page-title {
+            font-size: 44px;
+            font-weight: 900;
+            line-height: 1.0;
+            letter-spacing: -0.4px;
+        }
+
+        .alerts-page-sub {
+            opacity: 0.74;
+            font-size: 13px;
+            margin-top: 6px;
+        }
+
+        .alerts-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid rgba(255,255,255,0.18);
+            background: rgba(255,255,255,0.05);
+            border-radius: 999px;
+            padding: 7px 12px;
+            font-size: 12px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .alerts-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: var(--accent-cyan);
+            box-shadow: 0 0 10px rgba(0,247,255,0.8);
+        }
+
         /* Spacing */
         .block-container {
-            padding-top: 2rem;
-            padding-bottom: 3rem;
+            padding-top: 0.2rem !important;
+            padding-bottom: 1.05rem !important;
+            padding-left: 30px !important;
+            padding-right: 30px !important;
+            max-width: 100% !important;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -83,6 +208,14 @@ def _with_row_numbers(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy().reset_index(drop=True)
     out.insert(0, "#", pd.Series(range(1, len(out) + 1), dtype="int64"))
     return out
+
+
+def _open_shadow_table_shell() -> None:
+    st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
+
+
+def _close_shadow_table_shell() -> None:
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # -----------------------------
 # Helpers
@@ -135,6 +268,58 @@ def normalize_mac(value) -> str:
     if len(hx) != 12:
         return ""
     return ":".join(hx[i:i+2] for i in range(0, 12, 2))
+
+
+def _extract_date_from_dirname(name: str):
+    if DATE_DIR_RE.match(name):
+        return name
+    if name.startswith("date="):
+        tail = name.split("date=", 1)[1]
+        if DATE_DIR_RE.match(tail):
+            return tail
+    return None
+
+
+def iter_date_dirs(parquet_root: Path):
+    """Yield (date_str, path_to_date_dir). Only includes real date folders."""
+    if not parquet_root.exists():
+        return
+    for p in sorted((x for x in parquet_root.iterdir() if x.is_dir()), key=lambda z: z.name):
+        n = p.name.lower()
+        if n.startswith("_") or "cache" in n:
+            continue
+        d = _extract_date_from_dirname(p.name)
+        if d:
+            yield d, p
+
+
+def _coerce_ts_any(series: pd.Series) -> pd.Series:
+    """Robust timestamp coercion (seconds/ms/us/ns, datetime, string)."""
+    if series is None or len(series) == 0:
+        return pd.to_datetime(series, errors="coerce")
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+
+    if pd.api.types.is_object_dtype(series):
+        parsed = pd.to_datetime(series, errors="coerce", utc=False)
+        if parsed.notna().any():
+            return parsed
+
+    num = pd.to_numeric(series, errors="coerce")
+    if not num.notna().any():
+        return pd.to_datetime(series, errors="coerce")
+
+    m = float(num.dropna().abs().max())
+    if m > 1e17:
+        unit = "ns"
+    elif m > 1e14:
+        unit = "us"
+    elif m > 1e11:
+        unit = "ms"
+    else:
+        unit = "s"
+    return pd.to_datetime(num, unit=unit, errors="coerce")
 
 def _mac_is_valid(mac: str) -> bool:
     mac = normalize_mac(mac)
@@ -382,6 +567,7 @@ def get_mac_vendor(mac: str) -> str:
     except Exception:
         return "Unknown"
 
+@st.cache_data(show_spinner=False, ttl=30)
 def get_latest_network_info() -> pd.DataFrame:
     known_hosts_all = []
     dhcp_all = []
@@ -389,24 +575,47 @@ def get_latest_network_info() -> pd.DataFrame:
     if not PARQUET_ROOT.exists():
         return pd.DataFrame()
 
-    for day_dir in sorted(p for p in PARQUET_ROOT.iterdir() if p.is_dir()):
+    day_dirs = [p for _, p in iter_date_dirs(PARQUET_ROOT)]
+    if not day_dirs:
+        day_dirs = sorted((p for p in PARQUET_ROOT.iterdir() if p.is_dir()), key=lambda z: z.name)
+
+    for day_dir in day_dirs:
         kh = day_dir / "known_hosts.parquet"
         dh = day_dir / "dhcp.parquet"
         if kh.exists():
-            known_hosts_all.append(pd.read_parquet(kh))
+            try:
+                known_hosts_all.append(pd.read_parquet(kh))
+            except Exception:
+                pass
         if dh.exists():
-            dhcp_all.append(pd.read_parquet(dh))
+            try:
+                dhcp_all.append(pd.read_parquet(dh))
+            except Exception:
+                pass
 
     known_hosts = pd.concat(known_hosts_all, ignore_index=True) if known_hosts_all else pd.DataFrame()
     dhcp = pd.concat(dhcp_all, ignore_index=True) if dhcp_all else pd.DataFrame()
 
+    if known_hosts.empty or "mac" not in known_hosts.columns:
+        return pd.DataFrame()
+
+    known_hosts = known_hosts.copy()
+    known_hosts["mac"] = known_hosts["mac"].map(normalize_mac)
+    known_hosts = known_hosts[known_hosts["mac"] != ""]
     if known_hosts.empty:
         return pd.DataFrame()
 
-    if "mac" in known_hosts.columns:
-        known_hosts = known_hosts.copy()
-        known_hosts["mac"] = known_hosts["mac"].map(normalize_mac)
-        known_hosts = known_hosts[known_hosts["mac"] != ""]
+    if "ts" in known_hosts.columns:
+        known_hosts["ts"] = _coerce_ts_any(known_hosts["ts"])
+
+    ip_col = None
+    for c in ["host", "id.orig_h", "client_addr", "ip", "addr"]:
+        if c in known_hosts.columns:
+            ip_col = c
+            break
+    if ip_col is None:
+        known_hosts["host"] = ""
+        ip_col = "host"
 
     if not dhcp.empty:
         if "mac" in dhcp.columns:
@@ -414,25 +623,37 @@ def get_latest_network_info() -> pd.DataFrame:
             dhcp["mac"] = dhcp["mac"].map(normalize_mac)
             dhcp = dhcp[dhcp["mac"] != ""]
             dhcp_cols = [c for c in ["mac", "host_name"] if c in dhcp.columns]
-            dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"], keep="last")
-            merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
+            if "mac" in dhcp_cols:
+                dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"], keep="last")
+                merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
+            else:
+                merged = known_hosts.copy()
         else:
             dhcp_cols = [c for c in ["client_addr", "host_name"] if c in dhcp.columns]
-            dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"], keep="last")
-            merged = pd.merge(known_hosts, dhcp_norm, how="left", left_on="host", right_on="client_addr")
+            if "client_addr" in dhcp_cols:
+                dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"], keep="last")
+                merged = pd.merge(known_hosts, dhcp_norm, how="left", left_on=ip_col, right_on="client_addr")
+            else:
+                merged = known_hosts.copy()
     else:
         merged = known_hosts.copy()
+
+    if "host_name" not in merged.columns:
         merged["host_name"] = ""
+    else:
+        merged["host_name"] = merged["host_name"].fillna("")
 
     if "ts" in merged.columns:
-        merged = merged.sort_values("ts")
+        merged = merged.copy()
+        merged["ts"] = _coerce_ts_any(merged["ts"])
+        merged = merged.sort_values("ts", na_position="last")
 
     final_info = merged.groupby("mac").agg({
-        "host": "last",
+        ip_col: "last",
         "host_name": "last"
     }).reset_index()
 
-    final_info.rename(columns={"host": "latest_ip", "host_name": "latest_host"}, inplace=True)
+    final_info.rename(columns={ip_col: "latest_ip", "host_name": "latest_host"}, inplace=True)
     return final_info
 
 # -----------------------------
@@ -642,6 +863,7 @@ def render_device_manager(device_list: list[dict], filepath: Path):
     editor_df = df[display_cols].copy()
     editor_df = _with_row_numbers(editor_df)
 
+    _open_shadow_table_shell()
     edited_df = _st_data_editor(
         editor_df,
         num_rows="dynamic",
@@ -657,6 +879,7 @@ def render_device_manager(device_list: list[dict], filepath: Path):
         key="device_editor",
         height=400
     )
+    _close_shadow_table_shell()
 
     st.caption("Tip: To delete, remove the row from the table then click **Save Device Changes**.")
 
@@ -866,6 +1089,7 @@ def render_domain_manager(domain_rows: list[dict], filepath: Path):
 
     editor_df = _with_row_numbers(df[["_id", "domain", "date_modified"]].copy())
 
+    _open_shadow_table_shell()
     edited_df = _st_data_editor(
         editor_df,
         num_rows="dynamic",
@@ -879,6 +1103,7 @@ def render_domain_manager(domain_rows: list[dict], filepath: Path):
         key="domain_editor",
         height=400
     )
+    _close_shadow_table_shell()
 
     st.caption("Tip: To delete, remove the row from the table then click **Save Changes**.")
 
@@ -998,6 +1223,7 @@ def render_ai_signature_manager(yaml_path: Path):
 
     sig_df = _with_row_numbers(sig_df)
 
+    _open_shadow_table_shell()
     edited_sigs = _st_data_editor(
         sig_df[["#", "Provider", "Patterns"]],
         num_rows="dynamic",
@@ -1009,6 +1235,7 @@ def render_ai_signature_manager(yaml_path: Path):
         },
         key="ai_sig_editor"
     )
+    _close_shadow_table_shell()
 
     if st.button("Save AI Policies", type="primary", key="save_ai"):
         if "#" in edited_sigs.columns:
@@ -1098,6 +1325,7 @@ def render_banning_list(ban_file: Path):
 
     editor_df = _with_row_numbers(df[["_id", "mac", "date_modified"]].copy())
 
+    _open_shadow_table_shell()
     edited_df = _st_data_editor(
         editor_df,
         num_rows="dynamic",
@@ -1111,6 +1339,7 @@ def render_banning_list(ban_file: Path):
         key="ban_editor",
         height=400
     )
+    _close_shadow_table_shell()
 
     st.caption("Tip: To delete, remove the row from the table then click **Save Ban List Changes**.")
 
@@ -1208,7 +1437,19 @@ def render(mac_file: Path):
     saved_domains = load_domain_whitelist(domain_file)
     ai_config = load_ai_config(ai_yaml_file)
 
-    st.title("Authorization Manager")
+    updated_txt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.markdown(
+        f"""
+        <div class="alerts-page-header">
+          <div>
+            <div class="alerts-page-title">Authorization Overview</div>
+            <div class="alerts-page-sub">Device, domain, and AI policy controls | Updated: <b>{updated_txt}</b></div>
+          </div>
+          <div class="alerts-chip"><span class="alerts-dot"></span>Live monitoring</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Device Whitelist", len(saved_devices))
@@ -1235,12 +1476,14 @@ def render(mac_file: Path):
         history_df = load_history(mac_file)
         if not history_df.empty:
             hist_show = _with_row_numbers(history_df)
+            _open_shadow_table_shell()
             _st_dataframe(
                 hist_show,
                 use_container_width=True,
                 height=500,
                 column_config={"#": st.column_config.NumberColumn("#", width="small")}
             )
+            _close_shadow_table_shell()
             if st.button("Clear Audit Log", type="secondary"):
                 (mac_file.parent / "activity_log.csv").unlink(missing_ok=True)
                 st.rerun()

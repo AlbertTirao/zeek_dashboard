@@ -1,6 +1,7 @@
 
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -922,6 +923,301 @@ def style_status(val):
     return "color:#ff4b4b;font-weight:bold;" if str(val).startswith("Unauthorized") else ""
 
 
+def inject_alerts_page_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --alerts-panel-border: rgba(255,255,255,0.12);
+            --alerts-panel-bg: rgba(255,255,255,0.03);
+            --alerts-panel-shadow: 0 14px 38px rgba(0,0,0,0.25);
+            --alerts-accent-cyan: #00F7FF;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(1200px 550px at 10% -5%, rgba(0, 247, 255, 0.08), transparent 45%),
+                radial-gradient(900px 460px at 90% 8%, rgba(246, 48, 73, 0.08), transparent 42%),
+                #040B18;
+        }
+
+        .block-container,
+        .main .block-container,
+        [data-testid="stMainBlockContainer"] {
+            padding-top: 0.2rem !important;
+            padding-bottom: 1.05rem !important;
+            padding-left: 30px !important;
+            padding-right: 30px !important;
+            max-width: 100% !important;
+        }
+
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stAppViewContainer"] .main,
+        section.main {
+            padding-left: 0 !important;
+            padding-right: 0 !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            max-width: 100% !important;
+        }
+
+        .alerts-page-header {
+            display:flex;
+            align-items:flex-end;
+            justify-content:space-between;
+            gap: 18px;
+            margin-bottom: 14px;
+            padding: 18px 20px;
+            border-radius: 18px;
+            border: 1px solid var(--alerts-panel-border);
+            background:
+              radial-gradient(circle at top right, rgba(0,247,255,0.08), transparent 40%),
+              linear-gradient(135deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
+            box-shadow: var(--alerts-panel-shadow);
+        }
+
+        .alerts-page-title {
+            font-size: 44px;
+            font-weight: 900;
+            line-height: 1.0;
+            letter-spacing: -0.4px;
+        }
+
+        .alerts-page-sub {
+            opacity: 0.74;
+            font-size: 13px;
+            margin-top: 6px;
+        }
+
+        .alerts-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid rgba(255,255,255,0.18);
+            background: rgba(255,255,255,0.05);
+            border-radius: 999px;
+            padding: 7px 12px;
+            font-size: 12px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .alerts-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: var(--alerts-accent-cyan);
+            box-shadow: 0 0 10px rgba(0,247,255,0.8);
+        }
+
+        .alerts-toolbar {
+            border: 1px solid var(--alerts-panel-border);
+            background: var(--alerts-panel-bg);
+            border-radius: 16px;
+            padding: 12px 14px 10px 14px;
+            margin-bottom: 14px;
+            box-shadow: var(--alerts-panel-shadow);
+        }
+
+        .alerts-toolbar-title {
+            font-size: 15px;
+            font-weight: 800;
+            margin-bottom: 2px;
+        }
+
+        .alerts-toolbar-sub {
+            font-size: 12px;
+            opacity: 0.72;
+            margin-bottom: 8px;
+        }
+
+        .alerts-section-title {
+            font-size: 24px;
+            font-weight: 900;
+            margin: 14px 0 3px 0;
+        }
+
+        .alerts-section-sub {
+            opacity: 0.74;
+            font-size: 12px;
+            margin: 0 0 10px 0;
+        }
+
+        .alerts-table-meta {
+            opacity: 0.8;
+            font-size: 12px;
+            margin: 6px 1px 8px 1px;
+        }
+
+        .alerts-table-shell {
+            border: 1px solid var(--alerts-panel-border);
+            background: var(--alerts-panel-bg);
+            border-radius: 16px;
+            padding: 8px 8px 4px 8px;
+            box-shadow: var(--alerts-panel-shadow);
+        }
+
+        div[data-testid="stTextInput"] input { border-radius: 14px !important; }
+        div[data-testid="stSelectbox"] > div { border-radius: 14px !important; }
+        button { border-radius: 14px !important; }
+
+        div[data-testid="stDownloadButton"] button {
+            border-radius: 999px !important;
+            padding: 0.35rem 0.85rem !important;
+        }
+
+        @media (max-width: 1200px) {
+            .alerts-page-header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+            .alerts-page-title {
+                font-size: 36px;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def inject_alert_metric_card_css():
+    st.markdown(
+        """
+        <style>
+        .st-key-alert_card_total button,
+        .st-key-alert_card_verified button,
+        .st-key-alert_card_unauth button,
+        div[data-testid="stButton"].st-key-alert_card_total > button,
+        div[data-testid="stButton"].st-key-alert_card_verified > button,
+        div[data-testid="stButton"].st-key-alert_card_unauth > button,
+        div.st-key-alert_card_total > button,
+        div.st-key-alert_card_verified > button,
+        div.st-key-alert_card_unauth > button {
+            height: 146px !important;
+            min-height: 146px !important;
+            width: 100% !important;
+            padding: 0 !important;
+            border-radius: 20px !important;
+            border: 1px solid rgba(255,255,255,0.12) !important;
+            background: rgba(255,255,255,0.035) !important;
+            transition: 160ms ease;
+            cursor: pointer !important;
+            font-size: 0 !important;
+            line-height: 0 !important;
+            box-shadow: 0 16px 45px rgba(0,0,0,0.28);
+        }
+
+        .st-key-alert_card_total button:hover,
+        .st-key-alert_card_verified button:hover,
+        .st-key-alert_card_unauth button:hover,
+        div[data-testid="stButton"].st-key-alert_card_total > button:hover,
+        div[data-testid="stButton"].st-key-alert_card_verified > button:hover,
+        div[data-testid="stButton"].st-key-alert_card_unauth > button:hover,
+        div.st-key-alert_card_total > button:hover,
+        div.st-key-alert_card_verified > button:hover,
+        div.st-key-alert_card_unauth > button:hover {
+            transform: translateY(-2px);
+            border-color: rgba(0,247,255,0.26) !important;
+            background: rgba(255,255,255,0.055) !important;
+        }
+
+        .alerts-metric-overlay {
+            margin-top: -166px !important;
+            height: 146px !important;
+            padding: 16px 16px !important;
+            border-radius: 20px !important;
+            pointer-events: none !important;
+            position: relative !important;
+            z-index: 2 !important;
+            border: 1px solid transparent;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            box-sizing: border-box;
+            text-align: left;
+        }
+
+        .alerts-metric-overlay.is-active {
+            border-color: rgba(0,247,255,0.45);
+            background: rgba(0,247,255,0.06);
+        }
+
+        .alerts-metric-overlay.is-danger .alerts-metric-value { color: #ff6b6b; }
+        .alerts-metric-overlay.is-good .alerts-metric-value { color: #8df3ad; }
+
+        .alerts-metric-label {
+            font-size: 14px;
+            opacity: 0.82;
+        }
+
+        .alerts-metric-value {
+            font-size: 42px;
+            font-weight: 800;
+            line-height: 1.02;
+            margin-top: 2px;
+            letter-spacing: -0.5px;
+        }
+
+        .alerts-metric-note {
+            font-size: 12px;
+            opacity: 0.66;
+            margin-top: 5px;
+            min-height: 18px;
+        }
+
+        .alerts-metric-hint {
+            font-size: 11px;
+            opacity: 0.58;
+            margin-top: auto;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_alert_metric_card(
+    label: str,
+    value,
+    *,
+    note: str,
+    key: str,
+    view_name: str,
+    is_active: bool = False,
+    tone: str = "neutral",
+) -> None:
+    clicked = st.button(" ", key=key, use_container_width=True)
+
+    label_safe = html.escape(str(label))
+    value_safe = html.escape(str(value))
+    note_safe = html.escape(str(note))
+
+    tone_cls = ""
+    if tone == "danger":
+        tone_cls = "is-danger"
+    elif tone == "good":
+        tone_cls = "is-good"
+
+    active_cls = "is-active" if is_active else ""
+
+    st.markdown(
+        f"""
+        <div class="alerts-metric-overlay {active_cls} {tone_cls}">
+            <div class="alerts-metric-label">{label_safe}</div>
+            <div class="alerts-metric-value">{value_safe}</div>
+            <div class="alerts-metric-note">{note_safe}</div>
+            <div class="alerts-metric-hint">Click to view</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if clicked:
+        st.session_state["unauth_macs_view"] = view_name
+        st.rerun()
+
+
 # =============================================================================
 # MAIN RENDER
 # =============================================================================
@@ -942,6 +1238,29 @@ def render(parquet_root: str, authorized_macs_file: str):
     st.session_state.setdefault("alerts_time_mode", "Last 7 Days")
     st.session_state.setdefault("alerts_time_date", available_dates[0])
 
+    inject_alerts_page_css()
+    inject_alert_metric_card_css()
+
+    updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.markdown(
+        f"""
+        <div class="alerts-page-header">
+          <div>
+            <div class="alerts-page-title">Alerts Overview</div>
+            <div class="alerts-page-sub">Device trust posture and activity anomalies | Updated: <b>{updated_txt}</b></div>
+          </div>
+          <div class="alerts-chip"><span class="alerts-dot"></span>Live monitoring</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<div class='alerts-toolbar'>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='alerts-toolbar-title'>Filter Scope</div>"
+        "<div class='alerts-toolbar-sub'>Choose the time window used for counters and table results.</div>",
+        unsafe_allow_html=True,
+    )
     tr_col1, tr_col2 = st.columns([1.2, 2.8], vertical_alignment="center")
     with tr_col1:
         time_mode = st.selectbox(
@@ -965,7 +1284,8 @@ def render(parquet_root: str, authorized_macs_file: str):
                 key="alerts_time_date",
             )
         else:
-            st.write("")
+            st.markdown("<div style='height: 2.2rem;'></div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     allowed_macs = load_authorized_macs(authorized_macs_file)
 
@@ -1036,7 +1356,7 @@ def render(parquet_root: str, authorized_macs_file: str):
         )
         return
 
-    with st.spinner("Loading alerts (DuckDB cache)…"):
+    with st.spinner("Loading alerts (DuckDB cache)â€¦"):
         raw_events, known_hosts_norm = _load_cached_for_date_dirs(root, selected_date_dirs)
 
     events, range_label = _apply_time_filter(raw_events, time_mode, selected_date)
@@ -1164,46 +1484,67 @@ def _render_alerts_ui(
         unauth_df = pd.DataFrame()
 
     st.session_state.setdefault("unauth_macs_view", "Unauthorized")
+    view = st.session_state.get("unauth_macs_view", "Unauthorized")
 
-    st.divider()
+    seen_count = int(len(devices)) if devices is not None else 0
     colA, colB, colC = st.columns([1, 1, 1])
 
     with colA:
-        st.metric("Total Devices", int(inventory_total))  # CHANGED: inventory-based (matches Device Overview)
-        st.caption(f"Seen in {range_label}: {int(len(devices)) if devices is not None else 0}")  # CHANGED: keep alerts context
-        if st.button("View Total Devices", use_container_width=True, key="view_total_devices"):
-            st.session_state["unauth_macs_view"] = "Total"
+        render_alert_metric_card(
+            "Total Devices",
+            int(inventory_total),
+            note=f"Seen in selected range: {seen_count}",
+            key="alert_card_total",
+            view_name="Total",
+            is_active=view == "Total",
+        )
 
     with colB:
-        st.metric("Verified Devices", int(inventory_verified))  # CHANGED
-        if st.button("View Verified Devices", use_container_width=True, key="view_verified_devices"):
-            st.session_state["unauth_macs_view"] = "Verified"
+        render_alert_metric_card(
+            "Verified Devices",
+            int(inventory_verified),
+            note="Allowlisted in inventory",
+            key="alert_card_verified",
+            view_name="Verified",
+            is_active=view == "Verified",
+            tone="good",
+        )
 
     with colC:
-        st.metric("Unauthorized Devices", int(inventory_unauthorized))  # CHANGED
-        if st.button("View Unauthorized Devices", use_container_width=True, key="view_unauthorized_devices"):
-            st.session_state["unauth_macs_view"] = "Unauthorized"
+        render_alert_metric_card(
+            "Unauthorized Devices",
+            int(inventory_unauthorized),
+            note="Outside allowlist in inventory",
+            key="alert_card_unauth",
+            view_name="Unauthorized",
+            is_active=view == "Unauthorized",
+            tone="danger",
+        )
 
     # Priority alerts (removed allowlist still has highest priority)
     if removed_from_allowlist:
-        st.error(f"ALLOWLIST ALERT: {len(removed_from_allowlist)} MAC(s) REMOVED from allowlist — {range_label}")
+        st.error(f"ALLOWLIST ALERT: {len(removed_from_allowlist)} MAC(s) REMOVED from allowlist - {range_label}")
         st.caption("Removed MACs are included in the table below as 'Unauthorized' with note 'Removed from allowlist'.")
     elif len(unauth_df) > 0:
-        st.warning(f"Unauthorized devices present: {len(unauth_df)} — {range_label}")
+        st.warning(f"Unauthorized devices present: {len(unauth_df)} - {range_label}")
     else:
-        st.success(f"System Secure. No unauthorized devices detected — {range_label}")
-
-    view = st.session_state.get("unauth_macs_view", "Unauthorized")
+        st.success(f"System Secure. No unauthorized devices detected - {range_label}")
 
     if view == "Total":
-        st.subheader(f"All Devices (Latest Seen) — {range_label}")
+        section_title = f"All Devices (Latest Seen) - {range_label}"
         df_to_show = devices.copy()
     elif view == "Verified":
-        st.subheader(f"Verified Devices (Latest Seen) — {range_label}")
+        section_title = f"Verified Devices (Latest Seen) - {range_label}"
         df_to_show = verified_df
     else:
-        st.subheader(f"Unauthorized Devices (Latest Seen) — {range_label}")
+        section_title = f"Unauthorized Devices (Latest Seen) - {range_label}"
         df_to_show = unauth_df
+
+    st.markdown(f"<div class='alerts-section-title'>{html.escape(section_title)}</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='alerts-section-sub'>Search, filter by source, and export the current table view.</div>",
+        unsafe_allow_html=True,
+    )
 
     if df_to_show is None or df_to_show.empty:
         st.info("No records to display.")
@@ -1214,11 +1555,84 @@ def _render_alerts_ui(
 
     table = build_display_table(df_to_show)
 
+    if "Last Seen" in table.columns:
+        table = table.sort_values("Last Seen", ascending=False, na_position="last")
+
+    source_options = ["All Sources"]
+    if "Source" in table.columns:
+        source_values = sorted({str(v).strip() for v in table["Source"].dropna().astype(str) if str(v).strip()})
+        source_options.extend(source_values)
+
+    toolbar_col1, toolbar_col2, toolbar_col3 = st.columns([2.2, 1.2, 1.1], vertical_alignment="bottom")
+    with toolbar_col1:
+        search_query = st.text_input(
+            "Search table",
+            value="",
+            placeholder="MAC, IP, host, vendor",
+            key=f"alerts_table_search_{view.lower()}",
+        ).strip()
+    with toolbar_col2:
+        selected_source = st.selectbox(
+            "Source",
+            options=source_options,
+            index=0,
+            key=f"alerts_table_source_{view.lower()}",
+        )
+
+    filtered_table = table.copy()
+
+    if selected_source != "All Sources" and "Source" in filtered_table.columns:
+        target_source = selected_source.lower()
+        filtered_table = filtered_table[
+            filtered_table["Source"].astype(str).apply(
+                lambda cell: target_source in [x.strip().lower() for x in str(cell).split(",")]
+            )
+        ]
+
+    if search_query:
+        q = search_query.lower()
+        search_cols = [
+            c for c in ["MAC Address", "IP Address", "Vendor", "Host Name", "Source", "Status", "Note"]
+            if c in filtered_table.columns
+        ]
+        if search_cols:
+            mask = (
+                filtered_table[search_cols]
+                .fillna("")
+                .astype(str)
+                .apply(lambda row: row.str.lower().str.contains(q, regex=False), axis=1)
+                .any(axis=1)
+            )
+            filtered_table = filtered_table[mask]
+
+    with toolbar_col3:
+        csv_bytes = filtered_table.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download CSV",
+            data=csv_bytes,
+            file_name=f"alerts_{view.lower()}_devices.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"alerts_dl_{view.lower()}",
+        )
+
+    if filtered_table.empty:
+        st.info("No records matched the current filters.")
+        return
+
+    st.markdown(
+        f"<div class='alerts-table-meta'>Showing <b>{len(filtered_table)}</b> of <b>{len(table)}</b> rows.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='alerts-table-shell'>", unsafe_allow_html=True)
     st.dataframe(
-        table.style.map(style_status, subset=["Status"]),
+        filtered_table.style.map(style_status, subset=["Status"]),
         use_container_width=True,
         hide_index=True,
         column_config={
             "Last Seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss"),
         },
     )
+    st.markdown("</div>", unsafe_allow_html=True)
+    return
+
