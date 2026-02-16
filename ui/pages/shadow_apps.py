@@ -1651,7 +1651,7 @@ def render_shadow_apps(parquet_root: Path):
         )
     with day_hint_col:
         st.markdown(
-            f"<div class='shadow-day-chip'>Active date: <strong>{selected_day}</strong></div>",
+            f"<div class='shadow-day-chip'>Active date: &nbsp; <strong>{selected_day}</strong></div>",
             unsafe_allow_html=True,
         )
     target_dates = [selected_day]
