@@ -2,6 +2,7 @@
 import os
 import time
 import queue
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -20,6 +21,19 @@ from services.drive_services import sync_drive_to_parquet
 
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, devices, zeek_logs, alerts, authorization
+
+
+# =====================================================
+# Terminal logger
+# =====================================================
+
+APP_LOGGER = logging.getLogger("zeek_dashboard.app")
+if not APP_LOGGER.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    APP_LOGGER.addHandler(_handler)
+APP_LOGGER.setLevel(logging.INFO)
+APP_LOGGER.propagate = False
 
 
 # =====================================================
@@ -50,7 +64,7 @@ def _sync_log_queue():
     return st.session_state.sync_log_queue
 
 def _drain_sync_toasts(max_items: int = 4):
-    """Show Drive/Parquet logs as upper-right toasts."""
+    """Write queued Drive/Parquet messages to terminal logs."""
     q = _sync_log_queue()
     shown = 0
     while shown < max_items:
@@ -58,7 +72,7 @@ def _drain_sync_toasts(max_items: int = 4):
             msg = q.get_nowait()
         except queue.Empty:
             break
-        st.toast(msg)
+        APP_LOGGER.info(msg)
         shown += 1
 
 def _start_background_sync(reason: str):
@@ -76,9 +90,9 @@ def _start_background_sync(reason: str):
         client_secret_path=CLIENT_SECRET_FILE,
         folder_id=FOLDER_ID,
         parquet_root=PARQUET_DIR,
-        log_callback=_sync_log_queue().put,  # log → queue → toasts
+        log_callback=_sync_log_queue().put,  # log → queue → terminal logs
     )
-    st.toast(f"🔄 Sync started: {reason}")
+    APP_LOGGER.info(f"🔄 Sync started: {reason}")
 
 def _poll_background_sync():
     """When sync finishes, clear caches + mark warmup flag."""
@@ -95,13 +109,13 @@ def _poll_background_sync():
 
         # Important: pages use st.cache_data; clear so new parquet is reflected
         st.cache_data.clear()
-        st.toast(f"✅ Sync finished ({updated} logs updated)")
+        APP_LOGGER.info(f"✅ Sync finished ({updated} logs updated)")
 
         # refresh UI immediately to reflect new parquet
         st.rerun()
 
     except Exception as e:
-        st.toast(f"❌ Sync failed: {e}")
+        APP_LOGGER.error(f"❌ Sync failed: {e}")
     finally:
         st.session_state.pop("sync_future", None)
 
@@ -119,10 +133,10 @@ if not WARMUP_FLAG.exists():
     if "warmup_started" not in st.session_state:
         st.session_state.warmup_started = True
         _start_background_sync("initial warmup")
-        st.toast("🔥 Initializing Parquet cache in background...")
+        APP_LOGGER.info("🔥 Initializing Parquet cache in background...")
 else:
     if "warmup_notice_shown" not in st.session_state:
-        st.toast("⚡ Parquet cache already initialized — skipping Drive parse")
+        APP_LOGGER.info("⚡ Parquet cache already initialized — skipping Drive parse")
         st.session_state.warmup_notice_shown = True
 
 
