@@ -1245,9 +1245,22 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         if st.button("Close", key=f"dlg_list_close_{status_type.lower()}", use_container_width=True):
             _close_dialog()
 
+    available_dates_for_filter = list(available_dates_list or [])
+    if status_type == "Authorized":
+        auth_dates = sorted(
+            {
+                dtv.strftime("%Y-%m-%d")
+                for dtv in authorized_added_at_map.values()
+                if isinstance(dtv, datetime)
+            },
+            reverse=True,
+        )
+        if auth_dates:
+            available_dates_for_filter = sorted(set(available_dates_for_filter).union(auth_dates), reverse=True)
+
     # Toolbar: Search | Time Range | Date | Download
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
-    t1, t2, t3, t4 = st.columns([2.0, 1.1, 1.6, 1.1], vertical_alignment="bottom")
+    t1, t2, t3, t4 = st.columns([2.2, 1.2, 1.8, 1.0], vertical_alignment="bottom")
 
     with t1:
         mac_query = st.text_input(
@@ -1261,13 +1274,21 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         date_filter_mode = st.selectbox(
             "Time Range:",
             ["Last 7 Days", "Specific Date", "All Time"],
-            index=2,
+            index=0,
             key=f"popup_list_mode_{status_type.lower()}",
         )
 
     with t3:
         if date_filter_mode == "Specific Date":
-            spec_date = st.selectbox("Date:", available_dates_list, key=f"popup_list_spec_date_{status_type.lower()}")
+            if available_dates_for_filter:
+                spec_date = st.selectbox(
+                    "Date:",
+                    available_dates_for_filter,
+                    key=f"popup_list_spec_date_{status_type.lower()}",
+                )
+            else:
+                spec_date = None
+                st.caption("No dates available.")
         else:
             spec_date = None
             st.markdown("<div style='height: 2.55rem;'></div>", unsafe_allow_html=True)
@@ -1281,31 +1302,40 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     if not filtered_df.empty and "mac" in filtered_df.columns and banned_macs:
         filtered_df = filtered_df[~filtered_df["mac"].isin(banned_macs)]
 
-    if date_filter_mode == "Last 7 Days":
-        seven_days_ago = datetime.now().date() - timedelta(days=7)
-        if not filtered_df.empty and "date" in filtered_df.columns:
-            filtered_df = filtered_df[filtered_df["date"] >= seven_days_ago]
-    elif date_filter_mode == "Specific Date" and spec_date:
-        if not filtered_df.empty and "date" in filtered_df.columns:
-            filtered_df = filtered_df[filtered_df["date"].astype(str) == spec_date]
-
-    if filtered_df.empty:
+    if filtered_df.empty and status_type != "Authorized":
         st.markdown("</div>", unsafe_allow_html=True)
         st.info(f"No {status_type.lower()} devices found for this criteria.")
         return
 
-    inventory = (
-        filtered_df.sort_values("ts", ascending=False)
-        .groupby("mac")
-        .agg(
-            ip=("host", "first"),
-            host_name=("host_name", "first"),
-            last_seen=("ts", "max"),
+    if filtered_df.empty:
+        inventory = pd.DataFrame(columns=["mac", "ip", "host_name", "last_seen"])
+    else:
+        inventory = (
+            filtered_df.sort_values("ts", ascending=False)
+            .groupby("mac")
+            .agg(
+                ip=("host", "first"),
+                host_name=("host_name", "first"),
+                last_seen=("ts", "max"),
+            )
+            .reset_index()
         )
-        .reset_index()
-    ).sort_values("last_seen", ascending=False)
+    inventory["last_seen"] = _coerce_ts_any(inventory["last_seen"])
+    inventory["ip"] = inventory.get("ip", "-").fillna("-").astype(str)
+    inventory["host_name"] = inventory.get("host_name", "-").fillna("-").astype(str)
 
     if status_type == "Authorized":
+
+        existing_macs = set(inventory["mac"].astype(str).tolist())
+        missing_rows = []
+        for mac in authorized_added_at_map.keys():
+            m = normalize_mac(mac)
+            if not m or is_broadcast_mac(m) or m in existing_macs:
+                continue
+            missing_rows.append({"mac": m, "ip": "-", "host_name": "-", "last_seen": pd.NaT})
+
+        if missing_rows:
+            inventory = pd.concat([inventory, pd.DataFrame(missing_rows)], ignore_index=True)
 
         def _get_added_dt(mac: str):
             m = normalize_mac(mac)
@@ -1313,13 +1343,31 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
             return dtv if isinstance(dtv, datetime) else None
 
         inventory["authorized_at"] = inventory["mac"].map(_get_added_dt)
-        inventory["date_str"] = inventory["authorized_at"].apply(
-            lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, datetime) else "-"
-        )
+        inventory["sort_dt"] = _coerce_ts_any(inventory["authorized_at"])
     else:
-        inventory["date_str"] = inventory["last_seen"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        inventory["sort_dt"] = _coerce_ts_any(inventory["last_seen"])
 
-    inventory = inventory[["mac", "ip", "host_name", "date_str", "last_seen"]].copy()
+    inventory["vendor"] = inventory["mac"].map(get_mac_vendor)
+    inventory["vendor"] = inventory["vendor"].fillna("Unknown").astype(str)
+
+    if date_filter_mode == "Last 7 Days":
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        inventory = inventory[inventory["sort_dt"].notna() & (inventory["sort_dt"] >= seven_days_ago)]
+    elif date_filter_mode == "Specific Date":
+        if spec_date:
+            inventory = inventory[inventory["sort_dt"].dt.strftime("%Y-%m-%d") == spec_date]
+        else:
+            inventory = inventory.iloc[0:0]
+
+    if inventory.empty:
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.info(f"No {status_type.lower()} devices found for this criteria.")
+        return
+
+    # Default order stays newest-first; users can sort via AgGrid column menu.
+    inventory = inventory.sort_values("sort_dt", ascending=False, na_position="last")
+    inventory["date_str"] = inventory["sort_dt"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
+    inventory = inventory[["mac", "ip", "host_name", "vendor", "date_str", "last_seen", "sort_dt"]].copy()
 
     if mac_query_norm:
         inv = inventory.copy()
@@ -1338,10 +1386,11 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         inventory = inv
 
     inventory = inventory.reset_index(drop=True)
-    inventory.insert(0, "#", inventory.index + 1)
+    inventory.insert(0, "#", pd.RangeIndex(start=1, stop=len(inventory) + 1, step=1))
+    inventory["#"] = pd.to_numeric(inventory["#"], errors="coerce").fillna(0).astype(int)
 
     with t4:
-        csv_bytes = inventory.drop(columns=["last_seen"], errors="ignore").to_csv(index=False).encode("utf-8")
+        csv_bytes = inventory.drop(columns=["last_seen", "sort_dt"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download",
             data=csv_bytes,
@@ -1352,7 +1401,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         )
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown(
-        "<div class='dialog-note'>Tip: Metrics are all-time. If a device was last seen long ago, use <b>All Time</b>.</div>",
+        "<div class='dialog-note'>Tip: Authorized dates use authorization-added time. Unauthorized dates use last seen time.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1360,13 +1409,31 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
 
     gb = GridOptionsBuilder.from_dataframe(inventory)
+    gb.configure_default_column(
+        sortable=True,
+        sortingOrder=["asc", "desc"],
+        unSortIcon=True,
+        filter=False,
+        resizable=True,
+    )
+    gb.configure_grid_options(suppressMenuHide=True)
+    gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
     gb.configure_selection(selection_mode="single", use_checkbox=False)
-    gb.configure_column("#", header_name="#", width=52, pinned="left")
+    gb.configure_column(
+        "#",
+        header_name="#",
+        width=60,
+        pinned="left",
+        type=["numericColumn", "numberColumnFilter"],
+        sort="asc",
+    )
     gb.configure_column("mac", header_name="MAC Address", width=190)
     gb.configure_column("ip", header_name="IP Address", width=140)
     gb.configure_column("host_name", header_name="Host Name", width=220)
+    gb.configure_column("vendor", header_name="Vendor", width=220)
     gb.configure_column("date_str", header_name="Date", width=200)
     gb.configure_column("last_seen", hide=True)
+    gb.configure_column("sort_dt", hide=True)
 
     grid_response = AgGrid(
         inventory,

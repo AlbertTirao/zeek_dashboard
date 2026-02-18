@@ -20,7 +20,7 @@ authorized_macs:
   vendor: Super Micro Computer, Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: 02:35:19:a6:ce:46
-  ip: 192.168.201.171
+  ip: 192.168.201.216
   hostname: Irene-s
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -40,7 +40,7 @@ authorized_macs:
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
 - mac: 1c:87:e3:a3:4a:48
-  ip: 192.168.201.196
+  ip: 192.168.201.220
   hostname: TECNO-CAMON-16
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
@@ -60,7 +60,7 @@ authorized_macs:
   vendor: Ruijie Networks Co.,LTD
   date_modified: '2026-02-12 15:31:30'
 - mac: 2c:3b:70:9f:7b:73
-  ip: 192.168.201.205
+  ip: 192.168.201.223
   hostname: PC-02
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-14 15:42:55'
@@ -75,12 +75,12 @@ authorized_macs:
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:8f:30:9f:11:f3
-  ip: 192.168.201.197
+  ip: 192.168.201.219
   hostname: Lana-s-phone
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:d5:7a:78:15:5f
-  ip: 192.168.201.204
+  ip: 192.168.201.222
   hostname: Lana-HP
   vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
   date_modified: '2026-02-12 12:37:33'
@@ -95,7 +95,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.97
+  ip: 192.168.201.214
   hostname: JE-s-A06
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -135,7 +135,7 @@ authorized_macs:
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.75
+  ip: 192.168.201.218
   hostname: Auggys-Phone
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -155,7 +155,7 @@ authorized_macs:
   vendor: None
   date_modified: '2026-02-12 12:37:33'
 - mac: dc:41:a9:64:da:c5
-  ip: 192.168.201.198
+  ip: 192.168.201.221
   hostname: Shiraishi
   vendor: Intel Corporate
   date_modified: '2026-02-14 15:22:42'
@@ -180,12 +180,12 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.96
+  ip: 192.168.201.213
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: f8:5e:0b:7c:50:f5
-  ip: 192.168.201.201
+  ip: 192.168.201.224
   hostname: Realme-X
   vendor: Realme Chongqing Mobile Telecommunications Corp.,Ltd.
   date_modified: '2026-02-12 12:37:33'

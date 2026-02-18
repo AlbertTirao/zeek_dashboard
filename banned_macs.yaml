@@ -3,6 +3,8 @@ banned_macs:
   date_modified: '2026-02-11 09:07:34'
 - mac: 00:08:22:2c:ad:ff
   date_modified: '2026-02-13 09:53:07'
+- mac: 00:08:22:40:01:8b
+  date_modified: '2026-02-16 10:14:30'
 - mac: 00:08:22:40:7c:7c
   date_modified: '2026-02-13 10:11:20'
 - mac: 00:08:22:78:3c:cc
