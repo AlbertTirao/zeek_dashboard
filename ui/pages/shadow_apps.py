@@ -161,6 +161,21 @@ def get_aggrid_theme_and_css():
     return theme, custom_css
 
 
+def _table_height_for_rows(
+    n_rows: int,
+    *,
+    row_px: int = 34,
+    header_px: int = 48,
+    min_px: int = 220,
+    max_px: int = 520,
+) -> int:
+    try:
+        rows = max(int(n_rows), 1)
+    except Exception:
+        rows = 1
+    return max(min_px, min(max_px, header_px + rows * row_px))
+
+
 def get_plotly_template() -> str:
     return "plotly_dark" if _is_dark_theme() else "plotly_white"
 
@@ -1137,16 +1152,16 @@ def show_forensics_dialog(conn):
     params = [target_mac]
 
     if "App Run" in view_type:
-        where.append("source_log IN ('CONN','DNS')")
+        where.append("upper(source_log) IN ('CONN','DNS')")
     elif "App Usage" in view_type:
-        where.append("source_log IN ('HTTP','SSL')")
+        where.append("upper(source_log) IN ('HTTP','SSL')")
     elif "App Install" in view_type:
-        where.append("source_log IN ('FILES','SOFTWARE')")
+        where.append("upper(source_log) IN ('FILES','SOFTWARE')")
     elif "Suspicious" in view_type:
         where.append("""("App Status"='Unauthorized' OR "Risk Level" IN ('Critical','High','Medium'))""")
 
     if selected_f_source != "All":
-        where.append("source_log = ?")
+        where.append("upper(source_log) = upper(?)")
         params.append(selected_f_source)
 
     if forensic_risk:
@@ -1371,22 +1386,27 @@ def show_forensics_dialog(conn):
 
         ag_theme, ag_css = get_aggrid_theme_and_css()
         dlg_grid_options = gb_dlg.build()
-        dlg_grid_options["suppressHorizontalScroll"] = True
-        dlg_grid_options["alwaysShowHorizontalScroll"] = False
+        dlg_grid_options["suppressHorizontalScroll"] = False
+        dlg_grid_options["alwaysShowHorizontalScroll"] = True
+        dlg_grid_options["domLayout"] = "normal"
+        dlg_grid_options["alwaysShowVerticalScroll"] = True
         dlg_grid_options["tooltipShowDelay"] = 0
+        risk_key = "-".join(sorted(forensic_risk)) if forensic_risk else "none"
+        dlg_key_src = f"{view_type}|{selected_f_source}|{risk_key}|{forensic_search.lower()}"
+        dlg_key_suffix = re.sub(r"[^0-9A-Za-z_]+", "_", dlg_key_src).strip("_")[:96]
         st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
         AgGrid(
             final_df,
             gridOptions=dlg_grid_options,
             update_mode=GridUpdateMode.NO_UPDATE,
             data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            height=390,
+            height=_table_height_for_rows(len(final_df), min_px=240, max_px=520),
             theme=ag_theme,
             custom_css=ag_css,
             allow_unsafe_jscode=True,
-            fit_columns_on_grid_load=True,
+            fit_columns_on_grid_load=False,
             reload_data=False,
-            key=f"dlg_logs_grid_{target_mac}",
+            key=f"dlg_logs_grid_{target_mac}_{dlg_key_suffix}",
         )
         st.markdown("</div>", unsafe_allow_html=True)
         st.caption(f"{len(final_df):,} rows shown in detailed logs (limited to top 1,000).")
@@ -1402,7 +1422,7 @@ def show_forensics_dialog(conn):
 
     # Keep inventory aligned with user filters (source + risk)
     if selected_f_source != "All":
-        inv_where.append("source_log = ?")
+        inv_where.append("upper(source_log) = upper(?)")
         inv_params.append(selected_f_source)
 
     if forensic_risk:
@@ -1536,8 +1556,10 @@ def show_forensics_dialog(conn):
 
         ag_theme, ag_css = get_aggrid_theme_and_css()
         inv_grid_options = gb_inv.build()
-        inv_grid_options["suppressHorizontalScroll"] = True
-        inv_grid_options["alwaysShowHorizontalScroll"] = False
+        inv_grid_options["suppressHorizontalScroll"] = False
+        inv_grid_options["alwaysShowHorizontalScroll"] = True
+        inv_grid_options["domLayout"] = "normal"
+        inv_grid_options["alwaysShowVerticalScroll"] = True
         inv_grid_options["tooltipShowDelay"] = 0
 
         st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
@@ -1546,11 +1568,11 @@ def show_forensics_dialog(conn):
             gridOptions=inv_grid_options,
             update_mode=GridUpdateMode.NO_UPDATE,
             data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            height=370,
+            height=_table_height_for_rows(len(inv_grid), min_px=240, max_px=520),
             theme=ag_theme,
             custom_css=ag_css,
             allow_unsafe_jscode=True,
-            fit_columns_on_grid_load=True,
+            fit_columns_on_grid_load=False,
             reload_data=False,
             key=f"dlg_inventory_grid_{target_mac}",
         )
@@ -1994,6 +2016,10 @@ def render_shadow_apps(parquet_root: Path):
             grid_options["rowSelection"] = "single"
             grid_options["suppressRowClickSelection"] = False
             grid_options["rowMultiSelectWithClick"] = False
+            grid_options["domLayout"] = "normal"
+            grid_options["alwaysShowVerticalScroll"] = True
+            grid_options["suppressHorizontalScroll"] = False
+            grid_options["alwaysShowHorizontalScroll"] = True
 
             ag_theme, ag_css = get_aggrid_theme_and_css()
             audit_ag_css = dict(ag_css)
@@ -2017,11 +2043,11 @@ def render_shadow_apps(parquet_root: Path):
                 gridOptions=grid_options,
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                height=500,  # footer still appears
+                height=_table_height_for_rows(len(df_grid), min_px=240, max_px=520),
                 theme=ag_theme,
                 custom_css=audit_ag_css,
                 allow_unsafe_jscode=True,
-                fit_columns_on_grid_load=True,
+                fit_columns_on_grid_load=False,
                 reload_data=False,
                 key=grid_key,
             )
@@ -2145,6 +2171,7 @@ def render_shadow_apps(parquet_root: Path):
                 ),
                 use_container_width=True,
                 hide_index=True,
+                height=_table_height_for_rows(len(usage_df), row_px=36, header_px=44, min_px=190, max_px=360),
             )
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2169,20 +2196,25 @@ def render_shadow_apps(parquet_root: Path):
             gb2 = GridOptionsBuilder.from_dataframe(license_df)
             gb2.configure_default_column(filter=True, sortable=True, resizable=True)
             gb2.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+            license_grid_options = gb2.build()
+            license_grid_options["domLayout"] = "normal"
+            license_grid_options["alwaysShowVerticalScroll"] = True
+            license_grid_options["suppressHorizontalScroll"] = False
+            license_grid_options["alwaysShowHorizontalScroll"] = True
 
             ag_theme, ag_css = get_aggrid_theme_and_css()
 
             st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
             AgGrid(
                 license_df,
-                gridOptions=gb2.build(),
+                gridOptions=license_grid_options,
                 update_mode=GridUpdateMode.NO_UPDATE,
                 data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                height=420,
+                height=_table_height_for_rows(len(license_df), min_px=240, max_px=520),
                 theme=ag_theme,
                 custom_css=ag_css,
                 allow_unsafe_jscode=False,
-                fit_columns_on_grid_load=True,
+                fit_columns_on_grid_load=False,
                 reload_data=False,
                 key="license_devices_grid",
             )
@@ -2593,19 +2625,24 @@ def render_shadow_apps(parquet_root: Path):
             gb_threat.configure_column("bytes_received", header_name="Download (Bytes)", width=150, cellStyle=bytes_style)
             gb_threat.configure_column("Risk Level", header_name="Threat Risk", width=118, cellStyle=threat_risk_style)
             gb_threat.configure_column("Risk Basis", header_name="Risk Basis", minWidth=220)
+            threat_grid_options = gb_threat.build()
+            threat_grid_options["domLayout"] = "normal"
+            threat_grid_options["alwaysShowVerticalScroll"] = True
+            threat_grid_options["suppressHorizontalScroll"] = False
+            threat_grid_options["alwaysShowHorizontalScroll"] = True
 
             ag_theme, ag_css = get_aggrid_theme_and_css()
             st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
             AgGrid(
                 detail_grid,
-                gridOptions=gb_threat.build(),
+                gridOptions=threat_grid_options,
                 update_mode=GridUpdateMode.NO_UPDATE,
                 data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                height=430,
+                height=_table_height_for_rows(len(detail_grid), min_px=240, max_px=520),
                 theme=ag_theme,
                 custom_css=ag_css,
                 allow_unsafe_jscode=True,
-                fit_columns_on_grid_load=True,
+                fit_columns_on_grid_load=False,
                 reload_data=False,
                 key="exfil_threat_details_grid",
             )

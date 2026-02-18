@@ -1,51 +1,120 @@
-# drive_services.py
 import os
 import time
-import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
+
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import streamlit as st
-import duckdb  # <--- NEW: The Speed Engine
+import duckdb
+
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from pydrive2.files import ApiRequestError
 
+
 # =====================================================
-# 1. AUTHENTICATION & API HELPERS
+# 1) AUTHENTICATION (BOTH OPTIONS) + RETRY HELPERS
 # =====================================================
 
 @st.cache_resource
-def authenticate_drive(client_secret_path):
+def authenticate_drive_oauth(client_secret_path: str, credentials_file: str) -> GoogleDrive:
+    """
+    OAuth flow:
+    - First run: browser login
+    - Next runs: silent (loads/saves token to credentials_file)
+    """
+    cred_path = Path(credentials_file)
+    cred_path.parent.mkdir(parents=True, exist_ok=True)
+
     gauth = GoogleAuth()
-
-    # Explicit client config
     gauth.settings["client_config_file"] = client_secret_path
-    gauth.settings["oauth_scope"] = [
-        "https://www.googleapis.com/auth/drive.readonly"
-    ]
+    gauth.settings["oauth_scope"] = ["https://www.googleapis.com/auth/drive.readonly"]
 
-    # 🔴 CRITICAL SETTINGS (THIS FIXES YOUR ERROR)
+    # Needed to obtain refresh token (first login) so future runs don't prompt
     gauth.settings["get_refresh_token"] = True
     gauth.settings["access_type"] = "offline"
-    gauth.settings["approval_prompt"] = "force"
+    # IMPORTANT: do NOT force consent every run
+    gauth.settings["approval_prompt"] = "auto"
 
-    # Do NOT refresh if no credentials yet
+    # Load saved credentials if they exist
+    if cred_path.exists():
+        try:
+            gauth.LoadCredentialsFile(str(cred_path))
+        except Exception:
+            # If the file is corrupted, ignore and re-auth once
+            gauth.credentials = None
+
+    # Authenticate / refresh silently if possible
     if gauth.credentials is None:
+        # First time only -> opens browser
         gauth.LocalWebserverAuth()
     else:
-        if gauth.credentials.refresh_token:
+        if gauth.access_token_expired:
             gauth.Refresh()
         else:
-            # Force re-auth if refresh token is missing
-            gauth.LocalWebserverAuth()
+            gauth.Authorize()
+
+    # Save for future runs
+    try:
+        gauth.SaveCredentialsFile(str(cred_path))
+    except Exception:
+        # If it can't save (permissions), OAuth will re-prompt next run
+        pass
 
     return GoogleDrive(gauth)
 
-def list_files_with_retry(drive, query, max_retries=5):
+
+@st.cache_resource
+def authenticate_drive_service_account(service_account_json_path: str) -> GoogleDrive:
+    """
+    Service account flow (NO browser login, ever).
+    Requirement: the Drive folder must be shared with the service account email.
+    """
+    sa_path = Path(service_account_json_path)
+    if not sa_path.exists():
+        raise FileNotFoundError(f"Service account JSON not found: {service_account_json_path}")
+
+    settings = {
+        "client_config_backend": "service",
+        "service_config": {"client_json_file_path": str(sa_path)},
+        "oauth_scope": ["https://www.googleapis.com/auth/drive.readonly"],
+    }
+    gauth = GoogleAuth(settings=settings)
+    gauth.ServiceAuth()
+    return GoogleDrive(gauth)
+
+
+def authenticate_drive_auto(
+    mode: str,
+    client_secret_path: str,
+    oauth_credentials_file: str,
+    service_account_file: str,
+) -> GoogleDrive:
+    """
+    mode:
+      - "service": always service account
+      - "oauth": always oauth
+      - "auto": try service first, fallback to oauth
+    """
+    mode = (mode or "auto").strip().lower()
+
+    if mode == "service":
+        return authenticate_drive_service_account(service_account_file)
+
+    if mode == "oauth":
+        return authenticate_drive_oauth(client_secret_path, oauth_credentials_file)
+
+    # auto fallback: service -> oauth
+    try:
+        return authenticate_drive_service_account(service_account_file)
+    except Exception:
+        return authenticate_drive_oauth(client_secret_path, oauth_credentials_file)
+
+
+def list_files_with_retry(drive: GoogleDrive, query: str, max_retries: int = 5):
     """
     Exponential backoff for Google Drive API 500/503 errors.
     """
@@ -54,132 +123,148 @@ def list_files_with_retry(drive, query, max_retries=5):
             return drive.ListFile({"q": query}).GetList()
         except ApiRequestError as e:
             error_str = str(e)
-            if '500' in error_str or '503' in error_str:
-                wait_time = (2 ** n)
-                time.sleep(wait_time)
+            if "500" in error_str or "503" in error_str:
+                time.sleep(2 ** n)
             else:
-                raise e
+                raise
     return []
 
+
 # =====================================================
-# 2. STREAMING INGEST (The Pipeline Engine)
+# 2) STREAMING INGEST (LOG -> PARQUET)
 # =====================================================
 
-def stream_zeek_log_to_parquet(drive, file_obj, parquet_path: Path, chunk_size=100_000):
+def stream_zeek_log_to_parquet(drive: GoogleDrive, file_obj, parquet_path: Path, chunk_size: int = 100_000):
     """
-    Downloads a Zeek log, parses it line-by-line, and streams it 
+    Downloads a Zeek log, parses it line-by-line, and streams it
     into a Parquet file with Snappy compression.
     """
-    # Ensure parent directory exists (Partitioning)
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # create temp file for download (Windows safe: delete=False)
+
+    # create temp file for download (Windows safe)
     fd, tmp_path = tempfile.mkstemp()
-    os.close(fd) 
+    os.close(fd)
 
     try:
-        # 1. Download Content
+        # 1) Download Content
         file_obj.GetContentFile(tmp_path)
-        
+
         rows = []
         headers = []
         writer = None
-        
-        # 2. Stream Parse (Python is best here to handle Zeek's #fields header)
+
+        # 2) Stream Parse
         with open(tmp_path, "r", errors="ignore", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#close"): 
+                if not line or line.startswith("#close"):
                     continue
-                
-                # Extract Headers
+
+                # Extract headers
                 if line.startswith("#fields"):
                     headers = line.split("\t")[1:]
                     continue
-                
-                # Skip comments or unset headers
-                if line.startswith("#") or not headers: 
+
+                # Skip comments or until headers appear
+                if line.startswith("#") or not headers:
                     continue
 
-                # Parse Data
                 parts = line.split("\t")
+
                 # Pad missing columns with None
                 if len(parts) < len(headers):
                     parts += [None] * (len(headers) - len(parts))
-                
+
                 rows.append(dict(zip(headers, parts)))
 
-                # 3. Flush Chunk to Parquet
+                # 3) Flush chunk
                 if len(rows) >= chunk_size:
                     writer = _flush_chunk(rows, parquet_path, writer)
-                    rows.clear() # Free memory
+                    rows.clear()
 
-        # 4. Flush Remaining Rows
+        # 4) Flush remaining
         if rows:
             writer = _flush_chunk(rows, parquet_path, writer)
-        
-        # 5. Handle Empty Files (Metadata only)
+
+        # 5) Handle empty logs
         if writer is None and not parquet_path.exists():
-            # Create a placeholder empty parquet so we don't re-download it
             pd.DataFrame({"status": ["empty"]}).to_parquet(parquet_path)
 
         if writer:
             writer.close()
 
     finally:
-        # Cleanup temp file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-def _flush_chunk(rows, path, writer):
+
+def _flush_chunk(rows, path: Path, writer):
     """
-    Helper: Writes a list of dicts to the Parquet writer. 
+    Helper: Writes a list of dicts to the Parquet writer.
     Initializes the writer if it doesn't exist.
     """
     if not rows:
         return writer
 
     df = pd.DataFrame(rows)
-    # Convert object columns to compatible types where possible, 
-    # but for logs, string (object) is usually safest to start.
     table = pa.Table.from_pandas(df)
 
     if writer is None:
-        # Snappy is fast and provides decent compression
-        writer = pq.ParquetWriter(path, table.schema, compression='snappy')
-    
+        writer = pq.ParquetWriter(path, table.schema, compression="snappy")
+
     writer.write_table(table)
     return writer
 
+
 # =====================================================
-# 3. ORCHESTRATION (Incremental Sync)
+# 3) ORCHESTRATION (INCREMENTAL SYNC)
 # =====================================================
-def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root: Path, log_callback=None):
+
+def sync_drive_to_parquet(
+    client_secret_path: str,
+    folder_id: str,
+    parquet_root: Path,
+    log_callback=None,
+):
     """
-    Main function to sync Google Drive logs to local Parquet cache.
+    Sync Google Drive logs to local Parquet cache.
     - Skips historical logs that already exist.
     - Overwrites today's logs to capture new events.
     """
-    drive = authenticate_drive(client_secret_path)
-    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    files_processed = 0
+    # Import config here to avoid circular imports elsewhere
+    from config.client import DRIVE_AUTH_MODE, DRIVE_CREDENTIALS_FILE, SERVICE_ACCOUNT_FILE
 
-    # CHANGED: unified logger (toasts in UI OR queue callback for background thread)
+    # Unified logger (toast in UI OR callback)
     def _log(msg: str):
         try:
             if callable(log_callback):
                 log_callback(msg)
             else:
-                st.toast(msg)  # upper-right notification UI
+                st.toast(msg)
         except Exception:
             pass
+
+    # Authenticate with chosen mode
+    try:
+        drive = authenticate_drive_auto(
+            DRIVE_AUTH_MODE,
+            client_secret_path=client_secret_path,
+            oauth_credentials_file=DRIVE_CREDENTIALS_FILE,
+            service_account_file=SERVICE_ACCOUNT_FILE,
+        )
+    except Exception as e:
+        _log(f"❌ Drive authentication failed: {e}")
+        raise
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    files_processed = 0
 
     # Recursive generator
     def walk_folder(fid):
         items = list_files_with_retry(drive, f"'{fid}' in parents and trashed=false")
         for item in items:
-            if item["mimeType"] == "application/vnd.google-apps.folder":
+            if item.get("mimeType") == "application/vnd.google-apps.folder":
                 yield from walk_folder(item["id"])
             else:
                 yield item
@@ -193,7 +278,7 @@ def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root:
 
         log_type = name.replace(".log", "")
 
-        # Determine Partition Date
+        # Determine partition date
         try:
             mod_time = f["modifiedDate"]
             dt_obj = datetime.strptime(mod_time.split(".")[0], "%Y-%m-%dT%H:%M:%S")
@@ -203,16 +288,17 @@ def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root:
 
         target_path = parquet_root / log_date / f"{log_type}.parquet"
 
-        # === INCREMENTAL LOGIC ===
+        # Incremental logic
         if target_path.exists():
+            # Skip old dates entirely
             if log_date != today_str:
                 continue
+            # Rebuild today's log to capture latest
             try:
                 os.remove(target_path)
             except OSError:
                 pass
 
-        # CHANGED: log via toast/queue (no st.empty/progress UI)
         _log(f"📥 Ingesting: {log_date} / {name} ...")
 
         try:
@@ -221,67 +307,58 @@ def sync_drive_to_parquet(client_secret_path: str, folder_id: str, parquet_root:
         except Exception as e:
             _log(f"❌ Error on {name}: {e}")
 
-    # CHANGED: final status via toast/queue
     if files_processed > 0:
         _log(f"✅ Sync Complete: {files_processed} new logs.")
     else:
         _log("⚡ Cache is up to date.")
 
-    # CHANGED: return count so app.py can toast a clean “finished” message
     return files_processed
 
+
 # =====================================================
-# 4. LAZY LOADING & DUCKDB INTEGRATION (Read API)
+# 4) LAZY LOADING & DUCKDB INTEGRATION (READ API)
 # =====================================================
 
 def get_parquet_catalog(parquet_root: Path):
     """
     Fast metadata scan. Returns a nested dict of what exists.
-    Structure: { '2023-10-27': ['conn', 'dns', 'http'] }
+    Structure: { 'YYYY-MM-DD': [{type,size_mb}, ...] }
     """
     catalog = {}
     if not parquet_root.exists():
         return catalog
 
-    # Sort dates descending
     for date_dir in sorted(parquet_root.iterdir(), reverse=True):
         if date_dir.is_dir():
             logs = []
             for pq_file in date_dir.glob("*.parquet"):
-                # Get file size for UI hints
                 size_mb = pq_file.stat().st_size / (1024 * 1024)
-                logs.append({
-                    "type": pq_file.stem,
-                    "size_mb": round(size_mb, 2)
-                })
-            
+                logs.append({"type": pq_file.stem, "size_mb": round(size_mb, 2)})
+
             if logs:
                 logs.sort(key=lambda x: x["type"])
                 catalog[date_dir.name] = logs
-    
+
     return catalog
+
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_single_log(parquet_root: Path, selected_date: str, log_type: str):
     """
-    DUCKDB UPGRADE: Reads Parquet using DuckDB engine.
-    This replaces standard Pandas IO for better performance.
+    Reads Parquet using DuckDB (fast), with fallback to pandas.
     """
     path = parquet_root / selected_date / f"{log_type}.parquet"
     if path.exists():
-        # Using DuckDB to read Parquet is significantly faster and uses less RAM
         try:
             return duckdb.read_parquet(str(path)).df()
         except Exception:
-            # Fallback to pandas if file is weird/locked
             return pd.read_parquet(path)
-            
     return pd.DataFrame()
+
 
 def run_duckdb_query(query: str):
     """
     Execute raw SQL against an in-memory DuckDB instance.
-    Useful for complex joins across multiple parquet files.
     """
     try:
         return duckdb.sql(query).df()
@@ -289,8 +366,9 @@ def run_duckdb_query(query: str):
         st.error(f"Query Error: {e}")
         return pd.DataFrame()
 
+
 # =====================================================
-# 5. DEBUGGING
+# 5) DEBUGGING
 # =====================================================
 
 def debug_print_catalog(parquet_root: Path):
@@ -298,23 +376,22 @@ def debug_print_catalog(parquet_root: Path):
     Prints the catalog structure to Streamlit without crashing memory.
     """
     catalog = get_parquet_catalog(parquet_root)
-    
+
     if not catalog:
         st.warning("Cache is empty. Run Sync.")
         return
 
     st.markdown("### 🗂️ Data Catalog (Lazy Index)")
-    
-    # Iterate dates
+
     for date, files in catalog.items():
         with st.expander(f"📅 {date} ({len(files)} files)"):
             df_files = pd.DataFrame(files)
             st.dataframe(
-                df_files, 
+                df_files,
                 column_config={
                     "type": "Log Type",
-                    "size_mb": st.column_config.NumberColumn("Size (MB)", format="%.2f MB")
+                    "size_mb": st.column_config.NumberColumn("Size (MB)", format="%.2f MB"),
                 },
                 hide_index=True,
-                use_container_width=True
+                use_container_width=True,
             )

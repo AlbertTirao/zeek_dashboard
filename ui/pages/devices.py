@@ -257,6 +257,21 @@ def get_shadow_aggrid_theme_and_css():
     return theme, custom_css
 
 
+def _table_height_for_rows(
+    n_rows: int,
+    *,
+    row_px: int = 34,
+    header_px: int = 48,
+    min_px: int = 220,
+    max_px: int = 520,
+) -> int:
+    try:
+        rows = max(int(n_rows), 1)
+    except Exception:
+        rows = 1
+    return max(min_px, min(max_px, header_px + rows * row_px))
+
+
 # =====================================================
 # 1) Load Visual Metrics from Parquet
 # =====================================================
@@ -1194,12 +1209,15 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
     gb.configure_column("host_name", header_name="Host Name", width=220)
     gb.configure_column("status", header_name="Status", width=140)
     gb.configure_column("Last Seen (Today)", width=200)
+    grid_options = gb.build()
+    grid_options["domLayout"] = "normal"
+    grid_options["alwaysShowVerticalScroll"] = True
 
     grid_response = AgGrid(
         display_df,
-        gridOptions=gb.build(),
+        gridOptions=grid_options,
         update_mode=GridUpdateMode.SELECTION_CHANGED,
-        height=420,
+        height=_table_height_for_rows(len(display_df), min_px=240, max_px=520),
         theme=ag_theme,
         custom_css=ag_css,
         allow_unsafe_jscode=True,
@@ -1433,13 +1451,12 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     gb.configure_column("vendor", header_name="Vendor", width=220)
     gb.configure_column("date_str", header_name="Date", width=200)
     gb.configure_column("last_seen", hide=True)
-    gb.configure_column("sort_dt", hide=True)
 
     grid_response = AgGrid(
         inventory,
-        gridOptions=gb.build(),
+        gridOptions=grid_options,
         update_mode=GridUpdateMode.SELECTION_CHANGED,
-        height=420,
+        height=_table_height_for_rows(len(inventory), min_px=240, max_px=520),
         allow_unsafe_jscode=True,
         theme=ag_theme,
         custom_css=ag_css,
@@ -1593,7 +1610,11 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
     top.columns = ["Destination", "Count"]
     top.index = top.index + 1
     st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
-    st.dataframe(top, use_container_width=True)
+    st.dataframe(
+        top,
+        use_container_width=True,
+        height=_table_height_for_rows(len(top), row_px=36, header_px=44, min_px=190, max_px=360),
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
