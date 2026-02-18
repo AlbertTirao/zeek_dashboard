@@ -544,6 +544,68 @@ def _save_auth_history_store(authorized_mac_file: Path, store: dict) -> None:
     fp.write_text(json.dumps(store, indent=2), encoding="utf-8")
 
 
+def _activity_log_file(authorized_mac_file: Path) -> Path:
+    return authorized_mac_file.with_name("activity_log.csv")
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def _load_device_change_history_cached(log_file_str: str, sig: tuple) -> pd.DataFrame:
+    _ = sig
+    log_file = Path(log_file_str)
+    empty = pd.DataFrame(columns=["change_type", "who", "when_str", "ts"])
+    if not log_file.exists():
+        return empty
+
+    try:
+        df = pd.read_csv(log_file)
+    except Exception:
+        return empty
+
+    if df.empty:
+        return empty
+
+    col_map = {str(c).strip().lower(): c for c in df.columns}
+    ts_col = col_map.get("timestamp")
+    action_col = col_map.get("action")
+    type_col = col_map.get("type")
+    item_col = col_map.get("item")
+    if not (ts_col and action_col and type_col and item_col):
+        return empty
+
+    out = df[[ts_col, action_col, type_col, item_col]].copy()
+    out.columns = ["timestamp", "action", "type", "item"]
+
+    out["type"] = out["type"].astype(str).str.strip().str.lower()
+    out["action"] = out["action"].astype(str).str.strip().str.lower()
+    out = out[(out["type"] == "device") & (out["action"].isin(["added", "deleted", "removed"]))].copy()
+    if out.empty:
+        return empty
+
+    out["change_type"] = out["action"].map({"added": "Added", "deleted": "Removed", "removed": "Removed"})
+    out["who"] = out["item"].astype(str).str.strip()
+    out["who"] = out["who"].map(lambda v: normalize_mac(v) or v)
+    out["ts"] = _coerce_ts_any(out["timestamp"])
+    out["when_str"] = out["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    out["when_str"] = out["when_str"].fillna(out["timestamp"].astype(str))
+
+    out = out[["change_type", "who", "when_str", "ts"]].copy()
+    out = out.drop_duplicates()
+    out = out.sort_values("ts", ascending=False, na_position="last").reset_index(drop=True)
+    return out
+
+
+def load_device_change_history(authorized_mac_file: Path) -> pd.DataFrame:
+    log_file = _activity_log_file(authorized_mac_file)
+    if not log_file.exists():
+        return pd.DataFrame(columns=["change_type", "who", "when_str", "ts"])
+    try:
+        st_ = log_file.stat()
+        sig = (float(st_.st_mtime), int(st_.st_size))
+    except Exception:
+        sig = (0.0, 0)
+    return _load_device_change_history_cached(str(log_file), sig)
+
+
 def _parse_any_dt(value):
     if value is None:
         return None
@@ -1244,7 +1306,15 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
 # Dialog: Device list popup (Authorized / Unauthorized)
 # =====================================================
 @st.dialog(" ", width="large", dismissible=False)
-def device_list_popup(status_type, df, parquet_root, available_dates_list, banned_macs: set, authorized_added_at_map: dict):
+def device_list_popup(
+    status_type,
+    df,
+    parquet_root,
+    available_dates_list,
+    banned_macs: set,
+    authorized_added_at_map: dict,
+    auth_change_history_df: pd.DataFrame,
+):
     hide_dialog_header()
     inject_page_css()
 
@@ -1276,9 +1346,9 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         if auth_dates:
             available_dates_for_filter = sorted(set(available_dates_for_filter).union(auth_dates), reverse=True)
 
-    # Toolbar: Search | Time Range | Date | Download
+    # Toolbar: Search | Time Range | History | Date | Download
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
-    t1, t2, t3, t4 = st.columns([2.2, 1.2, 1.8, 1.0], vertical_alignment="bottom")
+    t1, t2, t3, t4, t5 = st.columns([2.0, 1.15, 1.15, 1.8, 0.9], vertical_alignment="bottom")
 
     with t1:
         mac_query = st.text_input(
@@ -1297,6 +1367,14 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         )
 
     with t3:
+        history_filter_mode = st.selectbox(
+            "History:",
+            ["Hide", "Last 7 Days", "All"],
+            index=0,
+            key=f"popup_list_history_mode_{status_type.lower()}",
+        )
+
+    with t4:
         if date_filter_mode == "Specific Date":
             if available_dates_for_filter:
                 spec_date = st.selectbox(
@@ -1407,7 +1485,7 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     inventory.insert(0, "#", pd.RangeIndex(start=1, stop=len(inventory) + 1, step=1))
     inventory["#"] = pd.to_numeric(inventory["#"], errors="coerce").fillna(0).astype(int)
 
-    with t4:
+    with t5:
         csv_bytes = inventory.drop(columns=["last_seen", "sort_dt"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download",
@@ -1422,6 +1500,67 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
         "<div class='dialog-note'>Tip: Authorized dates use authorization-added time. Unauthorized dates use last seen time.</div>",
         unsafe_allow_html=True,
     )
+
+    if history_filter_mode != "Hide":
+        history_view = auth_change_history_df.copy() if isinstance(auth_change_history_df, pd.DataFrame) else pd.DataFrame()
+        if not history_view.empty:
+            if history_filter_mode == "Last 7 Days":
+                seven_days_ago_hist = datetime.now() - timedelta(days=7)
+                history_view = history_view[
+                    history_view["ts"].notna() & (history_view["ts"] >= seven_days_ago_hist)
+                ]
+
+        st.markdown(
+            "<div class='dialog-note'><b>History:</b> Authorization list Added/Removed events.</div>",
+            unsafe_allow_html=True,
+        )
+
+        if history_view.empty:
+            st.caption("No add/remove history found for this selection.")
+        else:
+            history_view = history_view.reset_index(drop=True)
+            history_view.insert(0, "#", pd.RangeIndex(start=1, stop=len(history_view) + 1, step=1))
+            history_show = history_view[["#", "change_type", "who", "when_str"]].copy()
+            history_show = history_show.rename(
+                columns={"change_type": "Action", "who": "Device", "when_str": "When"}
+            )
+
+            hist_theme, hist_css = get_shadow_aggrid_theme_and_css()
+            st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
+            gb_hist = GridOptionsBuilder.from_dataframe(history_show)
+            gb_hist.configure_default_column(
+                sortable=True,
+                sortingOrder=["asc", "desc"],
+                unSortIcon=True,
+                filter=False,
+                resizable=True,
+            )
+            gb_hist.configure_grid_options(suppressMenuHide=True)
+            gb_hist.configure_pagination(paginationAutoPageSize=False, paginationPageSize=8)
+            gb_hist.configure_column(
+                "#",
+                header_name="#",
+                width=60,
+                pinned="left",
+                type=["numericColumn", "numberColumnFilter"],
+                sort="desc",
+            )
+            gb_hist.configure_column("Action", width=110)
+            gb_hist.configure_column("Device", width=220)
+            gb_hist.configure_column("When", width=210)
+
+            AgGrid(
+                history_show,
+                gridOptions=gb_hist.build(),
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                height=220,
+                allow_unsafe_jscode=True,
+                theme=hist_theme,
+                custom_css=hist_css,
+                fit_columns_on_grid_load=True,
+                reload_data=False,
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
 
     ag_theme, ag_css = get_shadow_aggrid_theme_and_css()
     st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
@@ -1451,6 +1590,10 @@ def device_list_popup(status_type, df, parquet_root, available_dates_list, banne
     gb.configure_column("vendor", header_name="Vendor", width=220)
     gb.configure_column("date_str", header_name="Date", width=200)
     gb.configure_column("last_seen", hide=True)
+    gb.configure_column("sort_dt", hide=True)
+    grid_options = gb.build()
+    grid_options["domLayout"] = "normal"
+    grid_options["alwaysShowVerticalScroll"] = True
 
     grid_response = AgGrid(
         inventory,
@@ -1645,6 +1788,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
     )
+    auth_change_history_df = load_device_change_history(authorized_mac_file)
 
     BAN_FILE = authorized_mac_file.with_name("banned_macs.yaml")
     banned_macs = load_banned_macs(BAN_FILE)
@@ -1960,6 +2104,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             raw_dates,
             banned_macs,
             authorized_added_at_map,
+            auth_change_history_df,
         )
 
     elif st.session_state.active_dialog == "active_today":
