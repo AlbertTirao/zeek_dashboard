@@ -35,7 +35,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 14:5a:fc:78:57:9b
-  ip: 192.168.201.199
+  ip: 192.168.201.24
   hostname: Mikamiks
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
@@ -45,7 +45,7 @@ authorized_macs:
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
 - mac: 1c:ce:51:c6:ee:35
-  ip: 192.168.201.162
+  ip: 192.168.201.231
   hostname: Mayt
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
@@ -80,12 +80,12 @@ authorized_macs:
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:d5:7a:78:15:5f
-  ip: 192.168.201.222
+  ip: 192.168.201.25
   hostname: Lana-HP
   vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: 40:d1:33:7c:27:a7
-  ip: 192.168.201.210
+  ip: 192.168.201.28
   hostname: LAPTOP-8SDVCIRA
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -105,7 +105,7 @@ authorized_macs:
   vendor: D-Link International
   date_modified: '2026-02-12 12:37:33'
 - mac: 50:bb:b5:32:16:9c
-  ip: 192.168.201.208
+  ip: 192.168.201.30
   hostname: LAPTOP-250P3062
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
@@ -125,7 +125,7 @@ authorized_macs:
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: a0:02:a5:1d:14:15
-  ip: 192.168.201.211
+  ip: 192.168.201.31
   hostname: Lester
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -140,7 +140,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: c0:35:32:b5:43:5f
-  ip: 192.168.201.207
+  ip: 192.168.201.26
   hostname: chesca
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
