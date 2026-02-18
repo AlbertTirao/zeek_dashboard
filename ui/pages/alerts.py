@@ -1,5 +1,3 @@
-
-
 import hashlib
 import html
 import json
@@ -26,7 +24,7 @@ except Exception:
 # =============================================================================
 # CONFIG
 # =============================================================================
-CACHE_VERSION = "alerts-cache-v2-duckdb-tsfix-schemaprobe-tzfix-ui2"
+CACHE_VERSION = "alerts-cache-v3-fastload-ui"
 CACHE_DIRNAME = "_cache_alerts"
 
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -140,6 +138,7 @@ def normalize_mac(x) -> Optional[str]:
 
 def is_broadcast_mac(mac: Optional[str]) -> bool:
     return mac == "ff:ff:ff:ff:ff:ff"
+
 
 # =============================================================================
 # CHANGED: BANNED MACS (shared across pages) + INVENTORY MAC SET (known_hosts)
@@ -570,7 +569,7 @@ def _build_cache_for_date_dir(
         (
             "conn",
             conn_path,
-            ["orig_l2_addr", "resp_l2_addr", "orig_mac", "resp_mac", "mac"],
+            ["orig_l2_addr", "resp_l2_addr", "orig_mac", "resp_mac", "hardware_address"],
             ["id.orig_h", "id.resp_h", "src_ip", "dst_ip", "ip"],
             ["host_name", "hostname", "host"],
             ["ts", "timestamp", "time"],
@@ -740,6 +739,19 @@ def _load_cached_for_date_dirs(
     return events, known_hosts
 
 
+@st.cache_data(show_spinner=False, ttl=120)
+def _load_cached_for_date_dirs_cached(
+    parquet_root_str: str,
+    selected_date_dirs_str: Tuple[Tuple[str, str], ...],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Cache loaded/aggregated frames briefly to avoid rebuilding on every UI rerun
+    (search, source filter, view toggle, etc.).
+    """
+    selected = [(d, Path(p)) for d, p in selected_date_dirs_str]
+    return _load_cached_for_date_dirs(Path(parquet_root_str), selected)
+
+
 # =============================================================================
 # BUSINESS LOGIC
 # =============================================================================
@@ -772,7 +784,10 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
         tmp = tmp[(tmp["ts_dt"] >= start) & (tmp["ts_dt"] < end)]
         return tmp, f"Specific Date ({selected_date})"
 
-    return tmp, "All Time"
+    # No legacy removed mode: default to Last 7 Days semantics if an unexpected mode is passed.
+    cutoff = now - pd.Timedelta(days=7)
+    tmp = tmp[tmp["ts_dt"] >= cutoff]
+    return tmp, f"Last 7 Days (since {cutoff.strftime('%Y-%m-%d %H:%M')})"
 
 
 def build_known_maps(known_hosts_df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -813,42 +828,16 @@ def build_device_table(events: pd.DataFrame, mac_to_ip: Dict[str, str]) -> pd.Da
             ["None", "none", "-", "nan", "0.0.0.0", "Unknown IP", ""], pd.NA
         )
 
-    tmp_sorted = tmp.sort_values("ts_dt")
-    latest = tmp_sorted.drop_duplicates(subset=["mac_norm"], keep="last").copy()
-
-    host_last = (
-        tmp_sorted.dropna(subset=["host"])
-        .groupby("mac_norm")["host"]
-        .last()
+    # Events are already "latest per MAC" from DuckDB. Keep this step lightweight.
+    latest = (
+        tmp.sort_values("ts_dt", ascending=False)
+        .drop_duplicates(subset=["mac_norm"], keep="first")
+        .copy()
     )
-    latest["host"] = latest["mac_norm"].map(host_last)
-
-    ip_last = (
-        tmp_sorted.dropna(subset=["ip"])
-        .groupby("mac_norm")["ip"]
-        .last()
+    latest["ip"] = latest["mac_norm"].map(mac_to_ip).fillna(latest["ip"])
+    latest["seen_in"] = (
+        latest["source"].fillna("").astype(str) if "source" in latest.columns else ""
     )
-    latest["ip"] = latest["mac_norm"].map(ip_last)
-
-    latest["ip"] = latest.apply(
-        lambda r: mac_to_ip.get(str(r["mac_norm"])) if pd.isna(r.get("ip")) else r.get("ip"),
-        axis=1,
-    )
-
-    # "source" is still present; build seen_in from it
-    if "source" in tmp_sorted.columns:
-        src_agg = (
-            tmp_sorted.dropna(subset=["source"])
-            .assign(source=lambda d: d["source"].astype(str))
-            .drop_duplicates(subset=["mac_norm", "source"])
-            .groupby("mac_norm")["source"]
-            .apply(lambda s: ", ".join(sorted(set(map(str, s)))))
-            .to_dict()
-        )
-    else:
-        src_agg = {}
-
-    latest["seen_in"] = latest["mac_norm"].map(lambda m: src_agg.get(str(m), ""))
 
     return latest.sort_values("ts_dt", ascending=False)
 
@@ -1238,6 +1227,10 @@ def render(parquet_root: str, authorized_macs_file: str):
     st.session_state.setdefault("alerts_time_mode", "Last 7 Days")
     st.session_state.setdefault("alerts_time_date", available_dates[0])
 
+    # Ensure legacy saved values (e.g., a removed mode) do not break the UI after removing options.
+    if st.session_state.get("alerts_time_mode") not in ["Last 7 Days", "Specific Date"]:
+        st.session_state["alerts_time_mode"] = "Last 7 Days"
+
     inject_alerts_page_css()
     inject_alert_metric_card_css()
 
@@ -1265,9 +1258,9 @@ def render(parquet_root: str, authorized_macs_file: str):
     with tr_col1:
         time_mode = st.selectbox(
             "Time Range:",
-            ["Last 7 Days", "Specific Date", "All Time"],
-            index=["Last 7 Days", "Specific Date", "All Time"].index(st.session_state["alerts_time_mode"])
-            if st.session_state["alerts_time_mode"] in ["Last 7 Days", "Specific Date", "All Time"]
+            ["Last 7 Days", "Specific Date"],
+            index=["Last 7 Days", "Specific Date"].index(st.session_state["alerts_time_mode"])
+            if st.session_state["alerts_time_mode"] in ["Last 7 Days", "Specific Date"]
             else 0,
             key="alerts_time_mode",
         )
@@ -1290,7 +1283,9 @@ def render(parquet_root: str, authorized_macs_file: str):
     allowed_macs = load_authorized_macs(authorized_macs_file)
 
     # =============================================================================
-    # CHANGED: Use the same device inventory + ban list as Device Overview for counts
+    # CHANGED (FIX): Keep ban list for filtering, but DO NOT use global inventory
+    # counts for the cards, because they don't change for "Specific Date".
+    # Cards are now computed from the filtered scoped table inside _render_alerts_ui.
     # =============================================================================
     auth_path = Path(authorized_macs_file)
     if auth_path.suffix != ".yaml":
@@ -1300,13 +1295,10 @@ def render(parquet_root: str, authorized_macs_file: str):
     ban_file = auth_path.with_name("banned_macs.yaml")
     banned_macs = load_banned_macs(ban_file)
 
-    inventory = load_inventory_macs(str(root))
-    if banned_macs:
-        inventory = inventory - set(banned_macs)
-
-    inventory_total = int(len(inventory))
-    inventory_verified = int(len(inventory.intersection(set(allowed_macs))))
-    inventory_unauthorized = int(len(inventory - set(allowed_macs)))
+    # Keep these parameters for compatibility, but they no longer drive the UI cards.
+    inventory_total = 0
+    inventory_verified = 0
+    inventory_unauthorized = 0
 
     # Allowlist-change detection (session-based)
     st.session_state.setdefault("_alerts_prev_allowed_set", None)
@@ -1320,11 +1312,7 @@ def render(parquet_root: str, authorized_macs_file: str):
     # Select dirs
     selected_date_dirs: List[Tuple[str, Path]] = []
 
-    if time_mode == "All Time":
-        for d in available_dates:
-            for p in by_date[d]:
-                selected_date_dirs.append((d, p))
-    elif time_mode == "Specific Date" and selected_date:
+    if time_mode == "Specific Date" and selected_date:
         for p in by_date.get(selected_date, []):
             selected_date_dirs.append((selected_date, p))
     else:
@@ -1356,8 +1344,9 @@ def render(parquet_root: str, authorized_macs_file: str):
         )
         return
 
-    with st.spinner("Loading alerts (DuckDB cache)â€¦"):
-        raw_events, known_hosts_norm = _load_cached_for_date_dirs(root, selected_date_dirs)
+    selected_date_dirs_key = tuple((d, str(p)) for d, p in selected_date_dirs)
+    with st.spinner("Loading alerts (DuckDB cache)…"):
+        raw_events, known_hosts_norm = _load_cached_for_date_dirs_cached(str(root), selected_date_dirs_key)
 
     events, range_label = _apply_time_filter(raw_events, time_mode, selected_date)
 
@@ -1366,7 +1355,7 @@ def render(parquet_root: str, authorized_macs_file: str):
         columns=["ts_dt", "ip", "mac_norm", "host", "seen_in", "source"]
     )
 
-    # CHANGED: exclude banned devices from alert tables (keeps device sets consistent)
+    # exclude banned devices from alert tables
     if not devices.empty and banned_macs and "mac_norm" in devices.columns:
         devices = devices[~devices["mac_norm"].astype(str).isin(banned_macs)].copy()
 
@@ -1434,13 +1423,18 @@ def _render_alerts_ui(
         ev["ts_dt"] = pd.to_datetime(ev["ts_dt"], errors="coerce")
         ev = ev.dropna(subset=["mac_norm", "ts_dt"])
         if not ev.empty:
-            ev = ev.sort_values("ts_dt")
-            last_seen_map = ev.groupby("mac_norm")["ts_dt"].last().to_dict()
-            last_ip_map = ev.dropna(subset=["ip"]).groupby("mac_norm")["ip"].last().to_dict()
-            last_host_map = ev.dropna(subset=["host"]).groupby("mac_norm")["host"].last().to_dict()
-            last_src_map = ev.groupby("mac_norm")["source"].apply(
-                lambda s: ", ".join(sorted(set(map(str, s))))
-            ).to_dict()
+            ev["mac_norm"] = ev["mac_norm"].astype(str)
+            ev = ev.sort_values("ts_dt", ascending=False).drop_duplicates(subset=["mac_norm"], keep="first")
+            last_seen_map = dict(zip(ev["mac_norm"], ev["ts_dt"]))
+            if "ip" in ev.columns:
+                ip_series = ev["ip"].where(ev["ip"].notna())
+                last_ip_map = dict(zip(ev["mac_norm"], ip_series))
+            if "host" in ev.columns:
+                host_series = ev["host"].where(ev["host"].notna())
+                last_host_map = dict(zip(ev["mac_norm"], host_series))
+            if "source" in ev.columns:
+                src_series = ev["source"].fillna("").astype(str)
+                last_src_map = dict(zip(ev["mac_norm"], src_series))
 
     # Synthetic rows for removed allowlist MACs not currently in devices table (ALWAYS ON)
     if removed_from_allowlist:
@@ -1486,14 +1480,21 @@ def _render_alerts_ui(
     st.session_state.setdefault("unauth_macs_view", "Unauthorized")
     view = st.session_state.get("unauth_macs_view", "Unauthorized")
 
-    seen_count = int(len(devices)) if devices is not None else 0
+    # =============================================================================
+    # CHANGED (FIX): Cards must be scope-aware (Specific Date / Last 7 Days)
+    # Use the filtered + augmented tables for the card numbers.
+    # =============================================================================
+    scope_total = int(len(devices)) if devices is not None else 0
+    scope_verified = int(len(verified_df))
+    scope_unauthorized = int(len(unauth_df))
+
     colA, colB, colC = st.columns([1, 1, 1])
 
     with colA:
         render_alert_metric_card(
             "Total Devices",
-            int(inventory_total),
-            note=f"Seen in selected range: {seen_count}",
+            scope_total,
+            note=f"Scope: {range_label}",
             key="alert_card_total",
             view_name="Total",
             is_active=view == "Total",
@@ -1502,8 +1503,8 @@ def _render_alerts_ui(
     with colB:
         render_alert_metric_card(
             "Verified Devices",
-            int(inventory_verified),
-            note="Allowlisted in inventory",
+            scope_verified,
+            note="Allowlisted in selected scope",
             key="alert_card_verified",
             view_name="Verified",
             is_active=view == "Verified",
@@ -1513,8 +1514,8 @@ def _render_alerts_ui(
     with colC:
         render_alert_metric_card(
             "Unauthorized Devices",
-            int(inventory_unauthorized),
-            note="Outside allowlist in inventory",
+            scope_unauthorized,
+            note="Outside allowlist in selected scope",
             key="alert_card_unauth",
             view_name="Unauthorized",
             is_active=view == "Unauthorized",
@@ -1591,10 +1592,7 @@ def _render_alerts_ui(
 
     if search_query:
         q = search_query.lower()
-        search_cols = [
-            c for c in ["MAC Address", "IP Address", "Vendor", "Host Name", "Source", "Status", "Note"]
-            if c in filtered_table.columns
-        ]
+        search_cols = [c for c in ["MAC Address", "IP Address", "Vendor", "Host Name", "Source", "Status", "Note"] if c in filtered_table.columns]
         if search_cols:
             mask = (
                 filtered_table[search_cols]
@@ -1635,4 +1633,3 @@ def _render_alerts_ui(
     )
     st.markdown("</div>", unsafe_allow_html=True)
     return
-

@@ -95,7 +95,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.214
+  ip: 192.168.201.140
   hostname: JE-s-A06
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -125,7 +125,7 @@ authorized_macs:
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: a0:02:a5:1d:14:15
-  ip: 192.168.201.211
+  ip: 192.168.201.182
   hostname: Lester
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -135,7 +135,7 @@ authorized_macs:
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.218
+  ip: 192.168.201.143
   hostname: Auggys-Phone
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -180,7 +180,7 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.213
+  ip: 192.168.201.141
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
