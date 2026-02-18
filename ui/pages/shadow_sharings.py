@@ -1006,12 +1006,37 @@ def render_shadow_aggrid(
     update_mode=GridUpdateMode.SELECTION_CHANGED,
 ):
     grid_options = gb.build()
+    default_col_def = dict(grid_options.get("defaultColDef") or {})
+    # Keep sorting available via column menu (three-dot menu).
+    default_col_def["sortable"] = True
+    default_col_def["filter"] = "agSetColumnFilter"
+    default_col_def["floatingFilter"] = False
+    default_col_def.setdefault("minWidth", 96)
+    default_col_def["menuTabs"] = ["filterMenuTab", "generalMenuTab"]
+    filter_params = dict(default_col_def.get("filterParams") or {})
+    filter_params.setdefault("excelMode", "windows")
+    filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
+    filter_params.setdefault("closeOnApply", True)
+    filter_params.setdefault("suppressMiniFilter", False)
+    default_col_def["filterParams"] = filter_params
+    grid_options["defaultColDef"] = default_col_def
+    grid_options["suppressMenuHide"] = False
+    grid_options["enableCellTextSelection"] = True
+    grid_options["ensureDomOrder"] = True
+    grid_options["enableRtl"] = False
+    grid_options["suppressColumnVirtualisation"] = True
+
     autofit_js = JsCode(
         """
         function(params) {
             setTimeout(function() {
-                if (params && params.api) {
-                    params.api.sizeColumnsToFit();
+                if (!params) return;
+                if (params.columnApi) {
+                    const cols = params.columnApi.getAllColumns ? params.columnApi.getAllColumns() : [];
+                    const colIds = cols.map(function(c) { return c.getColId ? c.getColId() : c.colId; }).filter(Boolean);
+                    if (colIds.length) {
+                        try { params.columnApi.autoSizeColumns(colIds, false); } catch (e) {}
+                    }
                 }
             }, 0);
         }
@@ -1025,8 +1050,19 @@ def render_shadow_aggrid(
     table_css.update(
         {
             ".ag-root-wrapper": {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"},
-            ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E"},
-            ".ag-header-cell, .ag-header-group-cell": {"background-color": "#10213E", "color": "#EAF2FF", "border-right": "1px solid #2A466E"},
+            ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E", "direction": "ltr !important"},
+            ".ag-header-cell, .ag-header-group-cell": {
+                "background-color": "#10213E",
+                "color": "#EAF2FF",
+                "border-right": "1px solid #2A466E",
+                "direction": "ltr !important",
+            },
+            ".ag-header-cell-label": {"white-space": "nowrap"},
+            ".ag-header-cell-label .ag-header-cell-text": {
+                "white-space": "nowrap",
+                "overflow": "hidden",
+                "text-overflow": "ellipsis",
+            },
             ".ag-row-odd": {"background-color": "#07162A"},
             ".ag-row-even": {"background-color": "#0A1C33"},
             ".ag-row-hover": {"background-color": "#13305A"},
@@ -1044,7 +1080,8 @@ def render_shadow_aggrid(
         theme=ag_theme,
         custom_css=table_css,
         allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=True,
+        enable_enterprise_modules=True,
+        fit_columns_on_grid_load=False,
         reload_data=True,
         key=key,
     )
@@ -1142,6 +1179,10 @@ def inject_shadow_sharing_css():
             border: 1px solid var(--panel-border);
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
+            min-height: 125px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
         }
 
         [data-testid="stMetricLabel"] p {
@@ -1149,10 +1190,18 @@ def inject_shadow_sharing_css():
             letter-spacing: 0.06em;
             text-transform: uppercase;
             font-weight: 600;
+            min-height: 2.15em;
         }
 
         [data-testid="stMetricValue"] {
             line-height: 1.1;
+            min-height: 2.5rem;
+            display: flex;
+            align-items: center;
+        }
+
+        [data-testid="stMetricDelta"] {
+            min-height: 1.5rem;
         }
 
         .stTabs [data-baseweb="tab-list"] {
@@ -1183,6 +1232,350 @@ def inject_shadow_sharing_css():
 # UI
 # -----------------------------------------------------------------------------
 
+
+def _close_shadow_sharing_dialog() -> None:
+    st.session_state["shadow_sharing_dialog_open"] = False
+    st.session_state["shadow_sharing_dialog_mac"] = None
+    st.session_state["shadow_sharing_last_selected_mac"] = None
+    st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
+
+
+def _extract_selected_mac(selected_rows) -> Optional[str]:
+    selected_mac = None
+    if isinstance(selected_rows, pd.DataFrame):
+        if not selected_rows.empty and "mac" in selected_rows.columns:
+            selected_mac = selected_rows.iloc[0]["mac"]
+    elif isinstance(selected_rows, list):
+        if len(selected_rows) > 0 and isinstance(selected_rows[0], dict):
+            selected_mac = selected_rows[0].get("mac")
+
+    if selected_mac is None:
+        return None
+
+    selected_mac = str(selected_mac).strip().lower()
+    if not selected_mac:
+        return None
+    return selected_mac
+
+
+@st.dialog("Device Forensics Details", width="large")
+def show_shadow_sharing_device_dialog(
+    filtered: pd.DataFrame,
+    *,
+    selected_scope_key: str,
+):
+    target_mac = str(st.session_state.get("shadow_sharing_dialog_mac") or "").strip().lower()
+    if not target_mac:
+        st.info("No MAC selected.")
+        return
+
+    mac_key = re.sub(r"[^0-9A-Za-z_]+", "_", target_mac).strip("_") or "mac"
+
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] > div[role="dialog"] {
+            width: min(95vw, 1450px) !important;
+            max-width: min(95vw, 1450px) !important;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            background: linear-gradient(180deg, rgba(3,10,23,0.96), rgba(2,8,20,0.97));
+        }
+        div[data-testid="stDialog"] div[role="dialog"] .stDialogContent {
+            padding-left: 1.05rem !important;
+            padding-right: 1.05rem !important;
+            padding-bottom: 0.8rem !important;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-hero {
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
+            border-radius: 12px;
+            padding: 0.58rem 0.76rem;
+            margin-bottom: 0.4rem;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-title {
+            color: #e7efff;
+            font-weight: 800;
+            letter-spacing: 0.02em;
+            font-size: 1rem;
+            line-height: 1.2;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-subtitle {
+            color: #b8cae6;
+            font-size: 0.8rem;
+            margin-top: 0.22rem;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-subtitle code {
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            background: rgba(8, 20, 40, 0.78);
+            color: #dbeafe;
+            border-radius: 999px;
+            padding: 0.12rem 0.52rem;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.42rem;
+            margin: 0.05rem 0 0.5rem 0;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-chip {
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            background: rgba(255,255,255,0.04);
+            border-radius: 999px;
+            padding: 0.21rem 0.58rem;
+            font-size: 0.72rem;
+            color: #c7d6eb;
+            line-height: 1.1;
+        }
+        div[data-testid="stDialog"] .stTabs [data-baseweb="tab-list"] {
+            gap: 0.42rem;
+            margin-bottom: 0.4rem;
+        }
+        div[data-testid="stDialog"] .stTabs [data-baseweb="tab"] {
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            background: rgba(255,255,255,0.03);
+            border-radius: 999px;
+            padding: 0.32rem 0.8rem;
+            font-size: 0.82rem;
+        }
+        div[data-testid="stDialog"] .stTabs [data-baseweb="tab"][aria-selected="true"] {
+            background: rgba(255,255,255,0.08);
+            border-color: rgba(186, 207, 234, 0.42);
+            font-weight: 700;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if "mac" not in filtered.columns:
+        st.warning("MAC column is not available in this dataset.")
+        return
+
+    scoped = filtered.copy()
+    scoped["mac"] = scoped["mac"].astype(str).str.strip().str.lower()
+    scoped = scoped[scoped["mac"] == target_mac].copy()
+    if scoped.empty:
+        st.warning("No records found for this MAC with current page filters.")
+        return
+
+    scoped["mac"] = target_mac
+    scoped_ts = pd.to_datetime(scoped["ts"], errors="coerce")
+    first_seen = scoped_ts.min()
+    last_seen = scoped_ts.max()
+    total_mb = float(scoped["bytes"].sum()) / 1024 / 1024
+    unapproved = int((scoped["Allowed"] == False).sum())  # noqa: E712
+    unique_dest = int(scoped["destination"].replace({"": None, "Unknown": None}).dropna().nunique())
+    high_crit = int(scoped["Severity"].isin(["CRITICAL", "HIGH"]).sum())
+
+    top = st.columns([1.0, 5.0])
+    with top[0]:
+        if st.button("Close", use_container_width=True, type="primary", key=f"shadow_sharing_dlg_close_{selected_scope_key}_{mac_key}"):
+            _close_shadow_sharing_dialog()
+            st.rerun()
+    with top[1]:
+        st.markdown(
+            f"""
+            <div class='shadow-dialog-hero'>
+                <div class='shadow-dialog-title'>Device Forensics Drilldown</div>
+                <div class='shadow-dialog-subtitle'>Scope locked to MAC <code>{target_mac}</code></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    first_seen_txt = first_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(first_seen) else "-"
+    last_seen_txt = last_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(last_seen) else "-"
+    st.markdown(
+        f"""
+        <div class='shadow-dialog-chips'>
+            <span class='shadow-dialog-chip'>First Seen: <strong>{first_seen_txt}</strong></span>
+            <span class='shadow-dialog-chip'>Last Seen: <strong>{last_seen_txt}</strong></span>
+            <span class='shadow-dialog-chip'>Unique Destinations: <strong>{unique_dest:,}</strong></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    dm1, dm2, dm3, dm4 = st.columns(4)
+    dm1.metric("Scoped Events", f"{len(scoped):,}")
+    dm2.metric("Unapproved", unapproved, delta="Investigate" if unapproved > 0 else "Clear", delta_color="inverse")
+    dm3.metric("Critical / High", f"{high_crit:,}", delta="High Risk" if high_crit > 0 else "None", delta_color="inverse")
+    dm4.metric("Total Volume", f"{total_mb:.2f} MB")
+
+    tab_dest, tab_bursts, tab_log = st.tabs(["By Destination", "Bursts", "Event Log"])
+
+    with tab_dest:
+        st.markdown("#### Destination Forensics")
+
+        dest = scoped.groupby("destination", dropna=False).agg(
+            Category=("Category", lambda x: x.value_counts().index[0] if len(x) else "Unknown"),
+            Allowed=("Allowed", lambda x: bool(x.value_counts().index[0]) if len(x) else False),
+            Allow_Basis=("Allow_Basis", lambda x: next((v for v in x.astype(str) if v), "")),
+            Last_Seen=("ts", "max"),
+            Events=("ts", "count"),
+            Unique_Devices=("mac", lambda x: x.replace({"": None}).dropna().nunique()),
+            Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
+            Max_Risk=("Risk_Score", "max"),
+            Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
+        ).reset_index().sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False)
+
+        dest_grid = dest.copy()
+        dest_grid.insert(0, "#", range(1, len(dest_grid) + 1))
+        dest_grid["Last_Seen"] = pd.to_datetime(dest_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
+        dest_grid["Total_MB"] = pd.to_numeric(dest_grid["Total_MB"], errors="coerce").fillna(0).round(2)
+
+        gb_dest = GridOptionsBuilder.from_dataframe(dest_grid)
+        gb_dest.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
+        gb_dest.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+        gb_dest.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
+        gb_dest.configure_column("destination", header_name="Destination", minWidth=200)
+        gb_dest.configure_column("Category", width=130)
+        gb_dest.configure_column("Allowed", width=98, cellStyle=_allowed_cellstyle())
+        gb_dest.configure_column("Allow_Basis", header_name="Allow Basis", minWidth=210)
+        gb_dest.configure_column("Last_Seen", header_name="Last Seen", width=150)
+        gb_dest.configure_column("Events", width=88)
+        gb_dest.configure_column("Unique_Devices", header_name="Devices", width=90)
+        gb_dest.configure_column("Total_MB", header_name="Total MB", width=116)
+        gb_dest.configure_column("Max_Risk", header_name="Max Risk", width=96, cellStyle=_risk_score_cellstyle())
+        gb_dest.configure_column("Top_Action", header_name="Top Action", minWidth=145)
+
+        render_shadow_aggrid(
+            dest_grid,
+            gb_dest,
+            key=f"shadow_sharing_dest_grid_{selected_scope_key}_{mac_key}",
+            height=430,
+            update_mode=GridUpdateMode.NO_UPDATE,
+        )
+
+    with tab_bursts:
+        st.markdown("#### Burst Detection (5-minute windows)")
+        b = scoped.copy()
+        b["bucket"] = b["ts"].dt.floor("5min")
+        b["mac"] = target_mac
+
+        bursts = b.groupby(["bucket", "mac"], dropna=False).agg(
+            bytes=("bytes", "sum"),
+            events=("ts", "count"),
+            max_risk=("Risk_Score", "max"),
+            host=("host_name", lambda x: next((v for v in x.astype(str) if v), "")),
+        ).reset_index()
+
+        top_bursts = bursts.sort_values(["max_risk", "bytes", "events"], ascending=False).head(200)
+
+        if top_bursts.empty:
+            st.info("No burst windows for this MAC.")
+        else:
+            fig = px.scatter(
+                top_bursts,
+                x="bucket",
+                y="mac",
+                size="bytes",
+                color="max_risk",
+                hover_data=["host", "events"],
+                template=get_plotly_template(),
+                render_mode="webgl" if len(top_bursts) > 2000 else "auto",
+                title="Top bursts (size=bytes, color=max risk)",
+            )
+            style_plotly_figure(fig, height=395, show_legend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+            burst_grid = top_bursts.copy()
+            burst_grid.insert(0, "#", range(1, len(burst_grid) + 1))
+            burst_grid["bucket"] = pd.to_datetime(burst_grid["bucket"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
+            burst_grid["bytes"] = pd.to_numeric(burst_grid["bytes"], errors="coerce").fillna(0).astype(int)
+
+            gb_burst = GridOptionsBuilder.from_dataframe(burst_grid)
+            gb_burst.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
+            gb_burst.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+            gb_burst.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
+            gb_burst.configure_column("bucket", header_name="Window", width=150)
+            gb_burst.configure_column("mac", header_name="MAC", minWidth=150)
+            gb_burst.configure_column("host", header_name="Host", minWidth=160)
+            gb_burst.configure_column("events", header_name="Events", width=90)
+            gb_burst.configure_column("bytes", header_name="Bytes", width=130)
+            gb_burst.configure_column("max_risk", header_name="Max Risk", width=100, cellStyle=_risk_score_cellstyle())
+
+            render_shadow_aggrid(
+                burst_grid,
+                gb_burst,
+                key=f"shadow_sharing_burst_grid_{selected_scope_key}_{mac_key}",
+                height=430,
+                update_mode=GridUpdateMode.NO_UPDATE,
+            )
+
+    with tab_log:
+        head, btn = st.columns([4, 1])
+        with head:
+            st.markdown("#### Detailed Event Log (export-ready)")
+        with btn:
+            csv_data = scoped.to_csv(index=False).encode("utf-8")
+            st.download_button("Export CSV", csv_data, f"shadow_sharing_log_{mac_key}.csv", "text/csv")
+
+        st.markdown(
+            f"<div class='shadow-filter-hint'>Showing up to <strong>{MAX_ROWS_DISPLAY:,}</strong> rows from <strong>{len(scoped):,}</strong> matched events for <strong>{target_mac}</strong>.</div>",
+            unsafe_allow_html=True,
+        )
+
+        cols = [
+            "ts", "host_name", "mac", "Identity_Confidence", "id.orig_h",
+            "destination", "vt_link",
+            "Allowed", "Allow_Basis",
+            "Category", "Action", "Action_Basis",
+            "bytes",
+            "Client_Type",
+            "Risk_Score", "Severity", "Risk_Basis",
+            "log_source",
+            "method", "uri",
+            "DNS_Exfil_Add", "DNS_Exfil_Reason",
+        ]
+
+        log_src = scoped.copy()
+        for c in cols:
+            if c not in log_src.columns:
+                log_src[c] = ""
+
+        view = log_src[cols].copy()
+        log_grid = view.head(MAX_ROWS_DISPLAY).copy()
+        log_grid.insert(0, "#", range(1, len(log_grid) + 1))
+        log_grid["ts"] = pd.to_datetime(log_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+        log_grid["bytes"] = pd.to_numeric(log_grid["bytes"], errors="coerce").fillna(0).astype(int)
+        log_grid["Risk_Score"] = pd.to_numeric(log_grid["Risk_Score"], errors="coerce").fillna(0).astype(int)
+
+        gb_log = GridOptionsBuilder.from_dataframe(log_grid)
+        gb_log.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
+        gb_log.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+        gb_log.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
+        gb_log.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
+        gb_log.configure_column("host_name", header_name="Host", minWidth=140, flex=1.2)
+        gb_log.configure_column("mac", header_name="MAC", minWidth=145, flex=1.15)
+        gb_log.configure_column("Identity_Confidence", header_name="Identity", minWidth=120, flex=1.0)
+        gb_log.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
+        gb_log.configure_column("destination", header_name="Destination", minWidth=180, flex=1.6)
+        gb_log.configure_column("vt_link", header_name="VirusTotal", minWidth=105, flex=0.9, cellRenderer=_link_cell_renderer())
+        gb_log.configure_column("Allowed", minWidth=95, flex=0.8, cellStyle=_allowed_cellstyle())
+        gb_log.configure_column("Allow_Basis", header_name="Allow Basis", minWidth=200, flex=1.8)
+        gb_log.configure_column("Category", minWidth=120, flex=1.0)
+        gb_log.configure_column("Action", minWidth=130, flex=1.1)
+        gb_log.configure_column("bytes", header_name="Bytes", minWidth=110, flex=1.0)
+        gb_log.configure_column("Client_Type", header_name="Client", minWidth=120, flex=1.0)
+        gb_log.configure_column("Risk_Score", header_name="Risk", minWidth=85, flex=0.8, cellStyle=_risk_score_cellstyle())
+        gb_log.configure_column("Severity", minWidth=95, flex=0.9, cellStyle=_severity_cellstyle())
+        gb_log.configure_column("log_source", header_name="Source", minWidth=95, flex=0.9)
+        gb_log.configure_column("method", header_name="Method", minWidth=90, flex=0.9)
+        gb_log.configure_column("uri", header_name="URI", minWidth=220, flex=2.0)
+        gb_log.configure_column("Risk_Basis", header_name="Risk Basis", minWidth=220, flex=2.0)
+        gb_log.configure_column("Action_Basis", header_name="Action Basis", minWidth=210, flex=1.9)
+        gb_log.configure_column("DNS_Exfil_Reason", header_name="DNS Exfil Reason", minWidth=220, flex=2.0)
+
+        render_shadow_aggrid(
+            log_grid,
+            gb_log,
+            key=f"shadow_sharing_log_grid_{selected_scope_key}_{mac_key}",
+            height=520,
+            update_mode=GridUpdateMode.NO_UPDATE,
+        )
+
+
 def render_shadow_sharing(parquet_root: Path):
     inject_shadow_sharing_css()
     st.markdown("### Data Exfiltration Monitoring")
@@ -1210,6 +1603,10 @@ def render_shadow_sharing(parquet_root: Path):
             key="shadow_sharing_date",
         )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
+    st.session_state.setdefault("shadow_sharing_dialog_open", False)
+    st.session_state.setdefault("shadow_sharing_dialog_mac", None)
+    st.session_state.setdefault("shadow_sharing_last_selected_mac", None)
+    st.session_state.setdefault("shadow_sharing_grid_nonce", 0)
     with top2:
         scope_label = selected_date
         st.markdown(
@@ -1343,10 +1740,8 @@ def render_shadow_sharing(parquet_root: Path):
         unsafe_allow_html=True,
     )
 
-    # Tabs
-    tab_overview, tab_device, tab_dest, tab_bursts, tab_log = st.tabs(
-        ["Overview", "By Device", "By Destination", "Bursts", "Event Log"]
-    )
+    # Tabs (main page)
+    tab_overview, tab_device = st.tabs(["Overview", "By Device"])
 
     # -------------------------------------------------------------------------
     # Overview
@@ -1451,6 +1846,10 @@ def render_shadow_sharing(parquet_root: Path):
     # -------------------------------------------------------------------------
     with tab_device:
         st.markdown("#### Device Forensics (MAC preferred)")
+        st.markdown(
+            "<div class='shadow-callout'>Click a MAC row to open Destination, Bursts, and Event Log for that specific MAC only.</div>",
+            unsafe_allow_html=True,
+        )
 
         use_mac = filtered["mac"].replace({"": None}).dropna().nunique() > 0
         key = "mac" if use_mac else "id.orig_h"
@@ -1474,8 +1873,24 @@ def render_shadow_sharing(parquet_root: Path):
         gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
         gb_dev.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
         gb_dev.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+        gb_dev.configure_selection(selection_mode="single", use_checkbox=False)
         gb_dev.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
-        gb_dev.configure_column(key, header_name="MAC" if key == "mac" else "IP", minWidth=140)
+        if key == "mac":
+            clickable_mac_style = JsCode(
+                """
+                function(params) {
+                    return {
+                        'color': '#8AB4F8',
+                        'fontWeight': '700',
+                        'cursor': 'pointer',
+                        'textDecoration': 'underline'
+                    };
+                }
+                """
+            )
+            gb_dev.configure_column("mac", header_name="MAC (Click)", minWidth=160, cellStyle=clickable_mac_style)
+        else:
+            gb_dev.configure_column("id.orig_h", header_name="IP", minWidth=140)
         gb_dev.configure_column("Host", minWidth=160)
         gb_dev.configure_column("Last_Seen", header_name="Last Seen", width=150)
         gb_dev.configure_column("Events", width=90)
@@ -1485,197 +1900,29 @@ def render_shadow_sharing(parquet_root: Path):
         gb_dev.configure_column("Top_Dest", header_name="Top Destination", minWidth=180)
         gb_dev.configure_column("Max_Risk", header_name="Max Risk", width=96, cellStyle=_risk_score_cellstyle())
 
-        render_shadow_aggrid(
+        dev_response = render_shadow_aggrid(
             dev_grid,
             gb_dev,
-            key=f"shadow_sharing_device_grid_{selected_scope_key}",
+            key=f"shadow_sharing_device_grid_{selected_scope_key}_{int(st.session_state.get('shadow_sharing_grid_nonce', 0))}",
             height=430,
         )
 
-    # -------------------------------------------------------------------------
-    # By Destination
-    # -------------------------------------------------------------------------
-    with tab_dest:
-        st.markdown("#### Destination Forensics")
+        if key == "mac":
+            selected_mac = _extract_selected_mac(dev_response.get("selected_rows", None))
+            if selected_mac:
+                prev = st.session_state.get("shadow_sharing_last_selected_mac")
+                if selected_mac != prev:
+                    st.session_state["shadow_sharing_last_selected_mac"] = selected_mac
+                    st.session_state["shadow_sharing_dialog_mac"] = selected_mac
+                    st.session_state["shadow_sharing_dialog_open"] = True
+                    st.rerun()
+            else:
+                st.session_state["shadow_sharing_last_selected_mac"] = None
+        else:
+            st.info("MAC values are not available in this scope, so MAC drilldown dialog is disabled.")
 
-        dest = filtered.groupby("destination", dropna=False).agg(
-            Category=("Category", lambda x: x.value_counts().index[0] if len(x) else "Unknown"),
-            Allowed=("Allowed", lambda x: bool(x.value_counts().index[0]) if len(x) else False),
-            Allow_Basis=("Allow_Basis", lambda x: next((v for v in x.astype(str) if v), "")),
-            Last_Seen=("ts", "max"),
-            Events=("ts", "count"),
-            Unique_Devices=("mac", lambda x: x.replace({"": None}).dropna().nunique()),
-            Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
-            Max_Risk=("Risk_Score", "max"),
-            Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
-        ).reset_index().sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False)
-
-        dest_grid = dest.copy()
-        dest_grid.insert(0, "#", range(1, len(dest_grid) + 1))
-        dest_grid["Last_Seen"] = pd.to_datetime(dest_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
-        dest_grid["Total_MB"] = pd.to_numeric(dest_grid["Total_MB"], errors="coerce").fillna(0).round(2)
-
-        gb_dest = GridOptionsBuilder.from_dataframe(dest_grid)
-        gb_dest.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
-        gb_dest.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
-        gb_dest.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
-        gb_dest.configure_column("destination", header_name="Destination", minWidth=200)
-        gb_dest.configure_column("Category", width=130)
-        gb_dest.configure_column("Allowed", width=98, cellStyle=_allowed_cellstyle())
-        gb_dest.configure_column("Allow_Basis", header_name="Allow Basis", minWidth=210)
-        gb_dest.configure_column("Last_Seen", header_name="Last Seen", width=150)
-        gb_dest.configure_column("Events", width=88)
-        gb_dest.configure_column("Unique_Devices", header_name="Devices", width=90)
-        gb_dest.configure_column("Total_MB", header_name="Total MB", width=116)
-        gb_dest.configure_column("Max_Risk", header_name="Max Risk", width=96, cellStyle=_risk_score_cellstyle())
-        gb_dest.configure_column("Top_Action", header_name="Top Action", minWidth=145)
-
-        render_shadow_aggrid(
-            dest_grid,
-            gb_dest,
-            key=f"shadow_sharing_dest_grid_{selected_scope_key}",
-            height=430,
-        )
-
-    # -------------------------------------------------------------------------
-    # Bursts
-    # -------------------------------------------------------------------------
-    with tab_bursts:
-        st.markdown("#### Burst Detection (5-minute windows)")
-        # bucket time to 5 minutes
-        b = filtered.copy()
-        b["bucket"] = b["ts"].dt.floor("5min")
-        use_mac = b["mac"].replace({"": None}).dropna().nunique() > 0
-        dev_key = "mac" if use_mac else "id.orig_h"
-
-        bursts = b.groupby(["bucket", dev_key], dropna=False).agg(
-            bytes=("bytes", "sum"),
-            events=("ts", "count"),
-            max_risk=("Risk_Score", "max"),
-            host=("host_name", lambda x: next((v for v in x.astype(str) if v), "")),
-        ).reset_index()
-
-        # show top bursts
-        top_bursts = bursts.sort_values(["max_risk", "bytes", "events"], ascending=False).head(200)
-
-        fig = px.scatter(
-            top_bursts,
-            x="bucket",
-            y=dev_key,
-            size="bytes",
-            color="max_risk",
-            hover_data=["host", "events"],
-            template=get_plotly_template(),
-            render_mode="webgl" if len(top_bursts) > 2000 else "auto",
-            title="Top bursts (size=bytes, color=max risk)",
-        )
-        style_plotly_figure(fig, height=395, show_legend=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-        burst_grid = top_bursts.copy()
-        burst_grid.insert(0, "#", range(1, len(burst_grid) + 1))
-        burst_grid["bucket"] = pd.to_datetime(burst_grid["bucket"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
-        burst_grid["bytes"] = pd.to_numeric(burst_grid["bytes"], errors="coerce").fillna(0).astype(int)
-
-        gb_burst = GridOptionsBuilder.from_dataframe(burst_grid)
-        gb_burst.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
-        gb_burst.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-        gb_burst.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
-        gb_burst.configure_column("bucket", header_name="Window", width=150)
-        gb_burst.configure_column(dev_key, header_name="MAC" if dev_key == "mac" else "IP", minWidth=150)
-        gb_burst.configure_column("host", header_name="Host", minWidth=160)
-        gb_burst.configure_column("events", header_name="Events", width=90)
-        gb_burst.configure_column("bytes", header_name="Bytes", width=130)
-        gb_burst.configure_column("max_risk", header_name="Max Risk", width=100, cellStyle=_risk_score_cellstyle())
-
-        render_shadow_aggrid(
-            burst_grid,
-            gb_burst,
-            key=f"shadow_sharing_burst_grid_{selected_scope_key}",
-            height=430,
-        )
-
-    # -------------------------------------------------------------------------
-    # Event Log
-    # -------------------------------------------------------------------------
-    with tab_log:
-        head, btn = st.columns([4, 1])
-        with head:
-            st.markdown("#### Detailed Event Log (export-ready)")
-        with btn:
-            csv_data = filtered.to_csv(index=False).encode("utf-8")
-            st.download_button("Export CSV", csv_data, "shadow_sharing_log.csv", "text/csv")
-
-        st.markdown(
-            f"<div class='shadow-filter-hint'>Showing up to <strong>{MAX_ROWS_DISPLAY:,}</strong> rows from <strong>{len(filtered):,}</strong> matched events.</div>",
-            unsafe_allow_html=True,
-        )
-
-        cols = [
-            "ts", "host_name", "mac", "Identity_Confidence", "id.orig_h",
-            "destination", "vt_link",
-            "Allowed", "Allow_Basis",
-            "Category", "Action", "Action_Basis",
-            "bytes",
-            "Client_Type",
-            "Risk_Score", "Severity", "Risk_Basis",
-            "log_source",
-            "method", "uri",
-            "DNS_Exfil_Add", "DNS_Exfil_Reason",
-        ]
-        for c in cols:
-            if c not in filtered.columns:
-                filtered[c] = ""
-
-        view = filtered[cols].copy()
-        log_grid = view.head(MAX_ROWS_DISPLAY).copy()
-        log_grid.insert(0, "#", range(1, len(log_grid) + 1))
-        log_grid["ts"] = pd.to_datetime(log_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-        log_grid["bytes"] = pd.to_numeric(log_grid["bytes"], errors="coerce").fillna(0).astype(int)
-        log_grid["Risk_Score"] = pd.to_numeric(log_grid["Risk_Score"], errors="coerce").fillna(0).astype(int)
-
-        gb_log = GridOptionsBuilder.from_dataframe(log_grid)
-        gb_log.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
-        gb_log.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-        gb_log.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
-        gb_log.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
-        gb_log.configure_column("host_name", header_name="Host", minWidth=140, flex=1.2)
-        gb_log.configure_column("mac", header_name="MAC", minWidth=145, flex=1.15)
-        gb_log.configure_column("Identity_Confidence", header_name="Identity", minWidth=120, flex=1.0)
-        gb_log.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
-        gb_log.configure_column(
-            "destination",
-            header_name="Destination",
-            minWidth=180,
-            flex=1.6,
-        )
-        gb_log.configure_column("vt_link", header_name="VirusTotal", minWidth=105, flex=0.9, cellRenderer=_link_cell_renderer())
-        gb_log.configure_column("Allowed", minWidth=95, flex=0.8, cellStyle=_allowed_cellstyle())
-        gb_log.configure_column(
-            "Allow_Basis",
-            header_name="Allow Basis",
-            minWidth=200,
-            flex=1.8,
-        )
-        gb_log.configure_column("Category", minWidth=120, flex=1.0)
-        gb_log.configure_column("Action", minWidth=130, flex=1.1)
-        gb_log.configure_column("bytes", header_name="Bytes", minWidth=110, flex=1.0)
-        gb_log.configure_column("Client_Type", header_name="Client", minWidth=120, flex=1.0)
-        gb_log.configure_column("Risk_Score", header_name="Risk", minWidth=85, flex=0.8, cellStyle=_risk_score_cellstyle())
-        gb_log.configure_column("Severity", minWidth=95, flex=0.9, cellStyle=_severity_cellstyle())
-        gb_log.configure_column("log_source", header_name="Source", minWidth=95, flex=0.9)
-        gb_log.configure_column("method", header_name="Method", minWidth=90, flex=0.9)
-        gb_log.configure_column("uri", header_name="URI", minWidth=220, flex=2.0)
-        gb_log.configure_column("Risk_Basis", header_name="Risk Basis", minWidth=220, flex=2.0)
-        gb_log.configure_column("Action_Basis", header_name="Action Basis", minWidth=210, flex=1.9)
-        gb_log.configure_column("DNS_Exfil_Reason", header_name="DNS Exfil Reason", minWidth=220, flex=2.0)
-
-        render_shadow_aggrid(
-            log_grid,
-            gb_log,
-            key=f"shadow_sharing_log_grid_{selected_scope_key}",
-            height=520,
-        )
+    if st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac"):
+        show_shadow_sharing_device_dialog(filtered, selected_scope_key=selected_scope_key)
 
 
 # Backward compatibility if your app imports render_shadow_uploads
