@@ -1284,7 +1284,7 @@ def render_shadow_ai(parquet_root: Path):
     with top2:
         scope_label = selected_date if selected_date != "All Available Dates" else f"All Available Dates ({len(available_dates)})"
         st.markdown(
-            f"<div class='shadow-day-chip'>Active scope: <strong>{scope_label}</strong></div>",
+            f"<div class='shadow-day-chip'>Active scope:&nbsp;<strong>{scope_label}</strong></div>",
             unsafe_allow_html=True,
         )
     with top3:
