@@ -8,19 +8,6 @@ from pathlib import Path
 
 import streamlit as st
 
-from core.auth import (
-    AUTHORIZATION_PAGE,
-    can_access_authorization,
-    can_access_page,
-    get_allowed_pages,
-    get_current_role,
-    get_current_user,
-    init_auth_state,
-    is_authenticated,
-    logout,
-    render_login_form,
-)
-
 # CHANGED: import PARQUET_DIR from config (single source of truth)
 from config.client import (
     CLIENT_SECRET_FILE,
@@ -32,7 +19,7 @@ from config.client import (
 # CHANGED: import once
 from services.drive_services import sync_drive_to_parquet
 
-from ui.sidebar import MENU_OPTIONS, render_sidebar
+from ui.sidebar import render_sidebar
 from ui.pages import analytics, devices, zeek_logs, alerts, authorization
 
 
@@ -47,13 +34,6 @@ if not APP_LOGGER.handlers:
     APP_LOGGER.addHandler(_handler)
 APP_LOGGER.setLevel(logging.INFO)
 APP_LOGGER.propagate = False
-
-# Login Gate
-# =====================================================
-init_auth_state()
-if not is_authenticated():
-    render_login_form()
-    st.stop()
 
 
 # =====================================================
@@ -177,20 +157,8 @@ if "initialized" not in st.session_state:
     st.session_state.initialized = True
 
 # render sidebar ONCE and persist selection (fixes DuplicateElementId)
-allowed_pages = get_allowed_pages(MENU_OPTIONS)
-selected_page, logout_clicked = render_sidebar(
-    auto_refresh_interval=AUTO_REFRESH_INTERVAL,
-    menu_options=allowed_pages,
-    current_user=get_current_user(),
-    current_role=get_current_role(),
-)
-if logout_clicked:
-    logout()
-
+selected_page = render_sidebar(auto_refresh_interval=AUTO_REFRESH_INTERVAL)
 st.session_state.current_page = selected_page
-if st.session_state.current_page not in allowed_pages:
-    st.session_state.current_page = allowed_pages[0]
-    st.rerun()
 
 # force refresh schedules background sync + keeps dashboard visible
 if st.sidebar.button("🔄 Force Refresh Data"):
@@ -201,9 +169,6 @@ if st.sidebar.button("🔄 Force Refresh Data"):
 
 def render_current_page():
     page = st.session_state.current_page
-    if not can_access_page(page):
-        st.error("Access denied for this account.")
-        return
 
     # NOTE: Ensure your page modules (devices, tables, etc.)
     # are updated to accept PARQUET_DIR (Path object)
@@ -221,10 +186,7 @@ def render_current_page():
     elif page == "Alerts":
         alerts.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
-    elif page == AUTHORIZATION_PAGE:
-        if not can_access_authorization():
-            st.error("Authorization page is admin-only.")
-            return
+    elif page == "Authorization":
         authorization.render(AUTHORIZED_MACS_FILE)
 
 

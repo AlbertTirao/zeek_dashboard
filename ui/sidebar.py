@@ -12,31 +12,22 @@ MENU_OPTIONS = [
     "Authorization",
 ]
 
-MENU_ICON_BY_PAGE = {
-    "Device Inspection": "pc-display",
-    "Traffic Monitoring": "activity",
-    "Zeek Logs": "file-earmark-text",
-    "Alerts": "bell",
-    "Authorization": "shield-lock",
-}
+MENU_ICONS = [
+    "pc-display",
+    "activity",
+    "file-earmark-text",
+    "bell",
+    "shield-lock",
+]
 
 DEFAULT_PAGE = MENU_OPTIONS[0]
 
 
-def render_sidebar(
-    auto_refresh_interval=3600,
-    menu_options=None,
-    current_user: str = "",
-    current_role: str = "",
-):
-    resolved_menu = list(menu_options) if menu_options else list(MENU_OPTIONS)
-    if not resolved_menu:
-        resolved_menu = [DEFAULT_PAGE]
+def render_sidebar(auto_refresh_interval=3600):
+    if "sidebar_page" not in st.session_state or st.session_state.sidebar_page not in MENU_OPTIONS:
+        st.session_state.sidebar_page = DEFAULT_PAGE
 
-    if "sidebar_page" not in st.session_state or st.session_state.sidebar_page not in resolved_menu:
-        st.session_state.sidebar_page = resolved_menu[0]
-
-    default_index = resolved_menu.index(st.session_state.sidebar_page)
+    default_index = MENU_OPTIONS.index(st.session_state.sidebar_page)
     refresh_minutes = max(1, auto_refresh_interval // 60)
 
     st.markdown(
@@ -147,8 +138,8 @@ def render_sidebar(
 
         page = option_menu(
             menu_title=None,
-            options=resolved_menu,
-            icons=[MENU_ICON_BY_PAGE.get(x, "circle") for x in resolved_menu],
+            options=MENU_OPTIONS,
+            icons=MENU_ICONS,
             menu_icon=None,
             default_index=default_index,
             orientation="vertical",
@@ -187,14 +178,6 @@ def render_sidebar(
             unsafe_allow_html=True,
         )
 
-        if current_user:
-            st.markdown(
-                f"<div class='sidebar-meta'>Signed in as <b>{current_user}</b> ({current_role})</div>",
-                unsafe_allow_html=True,
-            )
-
-        logout_clicked = st.button("Logout", key="sidebar_logout_btn", use_container_width=True)
-
         st_autorefresh(interval=auto_refresh_interval * 1000, key="auto_refresh_timer")
 
         today = datetime.now().strftime("%b %d, %Y")
@@ -203,4 +186,4 @@ def render_sidebar(
             unsafe_allow_html=True,
         )
 
-    return st.session_state.sidebar_page, logout_clicked
+    return st.session_state.sidebar_page
