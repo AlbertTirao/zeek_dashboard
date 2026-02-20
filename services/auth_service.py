@@ -5,16 +5,16 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlparse
 
-import psycopg2
 import streamlit as st
-from psycopg2.extras import RealDictCursor
+from pymongo import ASCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 
 PBKDF2_ALG = "sha256"
 PBKDF2_ITERATIONS = 260_000
 PBKDF2_SALT_BYTES = 16
+MONGO_TIMEOUT_MS = 6000
 
 
 @dataclass(frozen=True)
@@ -45,19 +45,32 @@ def _first_non_empty(values):
     return None
 
 
-def get_database_url() -> Optional[str]:
+def get_mongodb_uri() -> Optional[str]:
     return _first_non_empty(
         [
-            os.getenv("AUTH_DATABASE_URL"),
-            os.getenv("DATABASE_URL"),
-            _get_secret("auth.database_url"),
-            _get_secret("database_url"),
-            _get_secret("AUTH_DATABASE_URL"),
-            _get_secret("DATABASE_URL"),
-            _get_secret("postgres.database_url"),
-            _get_secret("postgres.url"),
-            _get_secret("db.url"),
+            os.getenv("AUTH_MONGODB_URI"),
+            os.getenv("MONGODB_URI"),
+            _get_secret("auth.mongodb_uri"),
+            _get_secret("mongodb_uri"),
+            _get_secret("AUTH_MONGODB_URI"),
+            _get_secret("MONGODB_URI"),
         ]
+    )
+
+
+def _get_database_name() -> str:
+    return (
+        _first_non_empty(
+            [
+                os.getenv("AUTH_MONGODB_DB"),
+                os.getenv("MONGODB_DB"),
+                _get_secret("auth.mongodb_db"),
+                _get_secret("mongodb_db"),
+                _get_secret("AUTH_MONGODB_DB"),
+                _get_secret("MONGODB_DB"),
+            ]
+        )
+        or "zeek_auth"
     )
 
 
@@ -83,20 +96,23 @@ def _get_bootstrap_admin_password() -> Optional[str]:
     )
 
 
-def _get_conn():
-    database_url = get_database_url()
-    if not database_url or not str(database_url).strip():
+def _get_db():
+    mongodb_uri = get_mongodb_uri()
+    if not mongodb_uri:
         raise RuntimeError(
-            "PostgreSQL is not configured. Set AUTH_DATABASE_URL (or DATABASE_URL) in environment variables or Streamlit secrets."
+            "MongoDB is not configured. Set AUTH_MONGODB_URI (or MONGODB_URI) in environment variables or Streamlit secrets."
         )
-    parsed = urlparse(str(database_url).strip())
-    placeholder_hosts = {"host", "hostname", "your_host", "<host>"}
-    if (parsed.hostname or "").strip().lower() in placeholder_hosts:
+
+    try:
+        client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=MONGO_TIMEOUT_MS)
+        client.admin.command("ping")
+    except PyMongoError as exc:
         raise RuntimeError(
-            "Invalid PostgreSQL host in database URL. Replace HOST with a real hostname "
-            "(for local PostgreSQL usually 'localhost' or '127.0.0.1')."
-        )
-    return psycopg2.connect(database_url)
+            "Could not connect to MongoDB. Check MONGODB_URI, database user/password, and Atlas IP access settings."
+        ) from exc
+
+    db_name = _get_database_name()
+    return client[db_name]
 
 
 def hash_password(password: str) -> str:
@@ -123,31 +139,11 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def init_auth_schema() -> None:
-    sql = """
-    CREATE TABLE IF NOT EXISTS app_users (
-        id BIGSERIAL PRIMARY KEY,
-        username VARCHAR(100) UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'staff')),
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        last_login_at TIMESTAMPTZ NULL,
-        created_by VARCHAR(100) NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS auth_login_audit (
-        id BIGSERIAL PRIMARY KEY,
-        username VARCHAR(100) NOT NULL,
-        success BOOLEAN NOT NULL,
-        reason VARCHAR(120) NULL,
-        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-        conn.commit()
+    db = _get_db()
+    users = db["app_users"]
+    audit = db["auth_login_audit"]
+    users.create_index([("username", ASCENDING)], unique=True, name="ux_app_users_username")
+    audit.create_index([("occurred_at", ASCENDING)], name="ix_auth_login_audit_occurred_at")
 
 
 def seed_bootstrap_admin() -> None:
@@ -156,31 +152,37 @@ def seed_bootstrap_admin() -> None:
     if not username or not password:
         return
 
-    with _get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT COUNT(*)::int AS total FROM app_users;")
-            total = cur.fetchone()["total"]
-            if total > 0:
-                return
-            cur.execute(
-                """
-                INSERT INTO app_users (username, password_hash, role, is_active, created_by)
-                VALUES (%s, %s, 'admin', TRUE, 'bootstrap')
-                """,
-                (username.strip().lower(), hash_password(password)),
-            )
-        conn.commit()
+    db = _get_db()
+    users = db["app_users"]
+    if users.count_documents({}) > 0:
+        return
+
+    now = datetime.now(timezone.utc)
+    users.insert_one(
+        {
+            "username": username.strip().lower(),
+            "password_hash": hash_password(password),
+            "role": "admin",
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+            "last_login_at": None,
+            "created_by": "bootstrap",
+        }
+    )
 
 
 def _audit_login(username: str, success: bool, reason: str = "") -> None:
     try:
-        with _get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO auth_login_audit (username, success, reason) VALUES (%s, %s, %s)",
-                    (username.strip().lower(), success, reason[:120] if reason else None),
-                )
-            conn.commit()
+        db = _get_db()
+        db["auth_login_audit"].insert_one(
+            {
+                "username": (username or "unknown").strip().lower(),
+                "success": bool(success),
+                "reason": (reason or "")[:120],
+                "occurred_at": datetime.now(timezone.utc),
+            }
+        )
     except Exception:
         return
 
@@ -191,39 +193,31 @@ def authenticate_user(username: str, password: str) -> Optional[AuthUser]:
         _audit_login(clean_user or "unknown", False, "missing_credentials")
         return None
 
-    with _get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT username, password_hash, role, is_active
-                FROM app_users
-                WHERE username = %s
-                LIMIT 1
-                """,
-                (clean_user,),
-            )
-            row = cur.fetchone()
+    db = _get_db()
+    row = db["app_users"].find_one({"username": clean_user})
 
     if not row:
         _audit_login(clean_user, False, "user_not_found")
         return None
-    if not row["is_active"]:
+    if not bool(row.get("is_active", False)):
         _audit_login(clean_user, False, "inactive_user")
         return None
-    if not verify_password(password, row["password_hash"]):
+    if not verify_password(password, row.get("password_hash", "")):
         _audit_login(clean_user, False, "invalid_password")
         return None
 
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE app_users SET last_login_at = NOW(), updated_at = NOW() WHERE username = %s",
-                (clean_user,),
-            )
-        conn.commit()
+    now = datetime.now(timezone.utc)
+    db["app_users"].update_one(
+        {"username": clean_user},
+        {"$set": {"last_login_at": now, "updated_at": now}},
+    )
 
     _audit_login(clean_user, True, "ok")
-    return AuthUser(username=row["username"], role=row["role"], is_active=bool(row["is_active"]))
+    return AuthUser(
+        username=str(row.get("username", clean_user)),
+        role=str(row.get("role", "staff")),
+        is_active=bool(row.get("is_active", True)),
+    )
 
 
 def create_user(username: str, password: str, role: str, created_by: str) -> None:
@@ -234,51 +228,42 @@ def create_user(username: str, password: str, role: str, created_by: str) -> Non
     if clean_role not in {"admin", "staff"}:
         raise ValueError("Role must be admin or staff.")
 
-    with _get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT 1 FROM app_users WHERE username=%s LIMIT 1", (clean_user,))
-            if cur.fetchone():
-                raise ValueError("Username already exists.")
-            cur.execute(
-                """
-                INSERT INTO app_users (username, password_hash, role, is_active, created_by)
-                VALUES (%s, %s, %s, TRUE, %s)
-                """,
-                (clean_user, hash_password(password), clean_role, created_by),
-            )
-        conn.commit()
+    now = datetime.now(timezone.utc)
+    try:
+        _get_db()["app_users"].insert_one(
+            {
+                "username": clean_user,
+                "password_hash": hash_password(password),
+                "role": clean_role,
+                "is_active": True,
+                "created_at": now,
+                "updated_at": now,
+                "last_login_at": None,
+                "created_by": (created_by or "").strip().lower(),
+            }
+        )
+    except DuplicateKeyError as exc:
+        raise ValueError("Username already exists.") from exc
 
 
 def set_user_status(username: str, is_active: bool) -> None:
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE app_users SET is_active=%s, updated_at=NOW() WHERE username=%s",
-                (bool(is_active), username.strip().lower()),
-            )
-        conn.commit()
+    clean_user = (username or "").strip().lower()
+    _get_db()["app_users"].update_one(
+        {"username": clean_user},
+        {"$set": {"is_active": bool(is_active), "updated_at": datetime.now(timezone.utc)}},
+    )
 
 
 def list_users():
-    with _get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT username, role, is_active, created_at, last_login_at, created_by
-                FROM app_users
-                ORDER BY username
-                """
-            )
-            rows = cur.fetchall()
-
+    rows = _get_db()["app_users"].find({}, {"_id": 0, "password_hash": 0}).sort("username", ASCENDING)
     users = []
     for row in rows:
         users.append(
             {
-                "username": row["username"],
-                "role": row["role"],
-                "is_active": bool(row["is_active"]),
-                "created_by": row["created_by"] or "",
+                "username": row.get("username", ""),
+                "role": row.get("role", ""),
+                "is_active": bool(row.get("is_active")),
+                "created_by": row.get("created_by", "") or "",
                 "created_at": _fmt_dt(row.get("created_at")),
                 "last_login_at": _fmt_dt(row.get("last_login_at")),
             }

@@ -18,3 +18,4 @@ data/
 
 # --- Local app secrets ---
 .env
+.streamlit/secrets.toml

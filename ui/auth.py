@@ -179,7 +179,7 @@ def require_authentication() -> None:
         except Exception as e:
             st.error("Login service is unavailable.")
             st.caption(
-                "Check AUTH_DATABASE_URL / DATABASE_URL and database connectivity."
+                "Check AUTH_MONGODB_URI / MONGODB_URI and MongoDB connectivity."
             )
             st.code(str(e))
             st.stop()

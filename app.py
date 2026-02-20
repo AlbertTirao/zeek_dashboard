@@ -41,7 +41,7 @@ APP_LOGGER.propagate = False
 
 
 # =====================================================
-# Authentication (PostgreSQL)
+# Authentication (MongoDB via Python)
 # =====================================================
 
 if "auth_schema_initialized" not in st.session_state:
@@ -52,7 +52,7 @@ if "auth_schema_initialized" not in st.session_state:
     except Exception as e:
         st.error("Authentication service is not available.")
         st.caption(
-            "Set AUTH_DATABASE_URL (or DATABASE_URL). "
+            "Set AUTH_MONGODB_URI (or MONGODB_URI). "
             "Optional first-run admin: BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD."
         )
         st.code(str(e))
