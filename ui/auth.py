@@ -1,8 +1,169 @@
-import streamlit as st
-from pathlib import Path
 import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+from pathlib import Path
+from typing import Optional
 
+import streamlit as st
+
+from services import auth_service
 from services.auth_service import authenticate_user
+
+
+PERSISTENT_AUTH_QUERY_KEY = "auth"
+DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def _get_secret(path: str, default=None):
+    try:
+        current = st.secrets
+        for part in path.split("."):
+            if part not in current:
+                return default
+            current = current[part]
+        return current
+    except Exception:
+        return default
+
+
+def _first_non_empty(values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if value:
+            return value
+    return None
+
+
+def _session_secret() -> Optional[bytes]:
+    secret = _first_non_empty(
+        [
+            os.getenv("AUTH_SESSION_SECRET"),
+            os.getenv("SESSION_SECRET"),
+            _get_secret("auth.session_secret"),
+            _get_secret("auth_session_secret"),
+            os.getenv("STREAMLIT_SERVER_COOKIE_SECRET"),
+        ]
+    )
+    if not secret:
+        # Fallback keeps persistence working without extra setup in local environments.
+        secret = auth_service.get_mongodb_uri()
+    if not secret:
+        return None
+    return str(secret).encode("utf-8")
+
+
+def _session_ttl_seconds() -> int:
+    raw = _first_non_empty(
+        [
+            os.getenv("AUTH_SESSION_TTL_SECONDS"),
+            _get_secret("auth.session_ttl_seconds"),
+            _get_secret("auth_session_ttl_seconds"),
+        ]
+    )
+    if raw is None:
+        return DEFAULT_SESSION_TTL_SECONDS
+    try:
+        ttl = int(raw)
+        if ttl >= 300:
+            return ttl
+    except Exception:
+        pass
+    return DEFAULT_SESSION_TTL_SECONDS
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _issue_persistent_auth_token(username: str) -> Optional[str]:
+    clean_username = (username or "").strip().lower()
+    secret = _session_secret()
+    if not clean_username or not secret:
+        return None
+    now = int(time.time())
+    payload = {"u": clean_username, "iat": now, "exp": now + _session_ttl_seconds()}
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    signature = hmac.new(secret, payload_bytes, hashlib.sha256).digest()
+    return f"{_b64url_encode(payload_bytes)}.{_b64url_encode(signature)}"
+
+
+def _verify_persistent_auth_token(token: str) -> Optional[str]:
+    secret = _session_secret()
+    if not secret or not token:
+        return None
+    try:
+        payload_part, signature_part = token.split(".", 1)
+        payload_bytes = _b64url_decode(payload_part)
+        provided_signature = _b64url_decode(signature_part)
+        expected_signature = hmac.new(secret, payload_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(provided_signature, expected_signature):
+            return None
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        username = str(payload.get("u", "")).strip().lower()
+        exp = int(payload.get("exp", 0))
+        if not username or exp < int(time.time()):
+            return None
+        return username
+    except Exception:
+        return None
+
+
+def _query_param_auth_token() -> Optional[str]:
+    token = st.query_params.get(PERSISTENT_AUTH_QUERY_KEY)
+    if isinstance(token, list):
+        token = token[0] if token else ""
+    token = str(token or "").strip()
+    return token or None
+
+
+def persist_auth_session(username: str) -> None:
+    token = _issue_persistent_auth_token(username)
+    if token:
+        st.query_params[PERSISTENT_AUTH_QUERY_KEY] = token
+
+
+def clear_persistent_auth_session() -> None:
+    if PERSISTENT_AUTH_QUERY_KEY in st.query_params:
+        del st.query_params[PERSISTENT_AUTH_QUERY_KEY]
+
+
+def _restore_user_from_persistent_auth() -> None:
+    if is_authenticated():
+        return
+
+    token = _query_param_auth_token()
+    if not token:
+        return
+
+    username = _verify_persistent_auth_token(token)
+    if not username:
+        clear_persistent_auth_session()
+        return
+
+    try:
+        user = auth_service.get_active_user(username)
+    except Exception:
+        # Keep the token if backend is temporarily unavailable.
+        return
+
+    if user is None:
+        clear_persistent_auth_session()
+        return
+
+    st.session_state.auth_user = {
+        "username": user.username,
+        "role": user.role,
+        "is_active": user.is_active,
+    }
 
 
 def current_user():
@@ -15,6 +176,7 @@ def is_authenticated() -> bool:
 
 
 def require_authentication() -> None:
+    _restore_user_from_persistent_auth()
     if is_authenticated():
         return
 
@@ -192,6 +354,7 @@ def require_authentication() -> None:
             "role": user.role,
             "is_active": user.is_active,
         }
+        persist_auth_session(user.username)
         st.rerun()
     st.stop()
 

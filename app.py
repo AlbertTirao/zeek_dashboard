@@ -22,7 +22,7 @@ from config.client import (
 from services.drive_services import sync_drive_to_parquet
 from services import auth_service
 
-from ui.auth import require_authentication, current_user
+from ui.auth import require_authentication, current_user, clear_persistent_auth_session
 from ui.sidebar import render_sidebar
 from ui.pages import analytics, devices, zeek_logs, alerts, authorization, user_management
 
@@ -305,6 +305,7 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
         if st.button("Logout", use_container_width=True):
+            clear_persistent_auth_session()
             # Reset all transient UI/session state so the login page always
             # renders with a clean layout after logout.
             preserve_keys = {"auth_schema_initialized"}

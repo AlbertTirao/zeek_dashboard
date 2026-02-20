@@ -152,6 +152,7 @@ def _inject_user_management_css() -> None:
         .um-table-shell [data-testid="stDataFrame"] table {
             background: #050b16 !important;
         }
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -169,6 +170,60 @@ def _render_metric_card(label: str, value: str, note: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _with_row_numbers(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy().reset_index(drop=True)
+    out.insert(0, "#", pd.Series(range(1, len(out) + 1), dtype="int64"))
+    return out
+
+
+@st.dialog("Edit User")
+def _render_edit_user_dialog(
+    target_username: str,
+    current_username: str,
+) -> None:
+    users = auth_service.list_users()
+    user_map = {str(u.get("username", "")).strip().lower(): u for u in users}
+    target = (target_username or "").strip().lower()
+    current = (current_username or "").strip().lower()
+
+    if target not in user_map:
+        st.error("Selected user no longer exists.")
+        if st.button("Close", use_container_width=True):
+            st.session_state.pop("um_edit_target", None)
+            st.rerun()
+        return
+
+    with st.form("um_edit_user_modal_form", clear_on_submit=False):
+        new_username = st.text_input("Username", value=target, placeholder="Username")
+        new_password = st.text_input(
+            "New Password",
+            type="password",
+            placeholder="Leave blank to keep current password",
+        )
+        submit = st.form_submit_button("Save User Changes", use_container_width=True)
+
+    if submit:
+        try:
+            clean_new_username = (new_username or "").strip().lower()
+            auth_service.update_user(
+                username=target,
+                new_username=clean_new_username,
+                password=(new_password.strip() if new_password.strip() else None),
+            )
+
+            if target == current and clean_new_username != current:
+                if "auth_user" in st.session_state and isinstance(st.session_state["auth_user"], dict):
+                    st.session_state["auth_user"]["username"] = clean_new_username
+
+            st.success("User updated successfully.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    if st.button("Cancel", use_container_width=True, key="um_edit_cancel"):
+        st.rerun()
 
 
 def render(current_username: str):
@@ -238,22 +293,135 @@ def render(current_username: str):
     )
 
     if users:
-        df = pd.DataFrame(users)
-        df = df.rename(
-            columns={
-                "username": "Username",
-                "role": "Role",
-                "is_active": "Status",
-                "created_by": "Created By",
-                "created_at": "Created At",
-                "last_login_at": "Last Login",
-            }
+        table_rows = []
+        for row in users:
+            username = str(row.get("username", "")).strip().lower()
+            table_rows.append(
+                {
+                    "Username": username,
+                    "Role": str(row.get("role", "staff")).strip().lower(),
+                    "Created By": str(row.get("created_by", "") or ""),
+                    "Created At": str(row.get("created_at", "") or ""),
+                    "Last Login": str(row.get("last_login_at", "") or ""),
+                    "Edit": False,
+                }
+            )
+
+        df = pd.DataFrame(table_rows)
+        editor_df = _with_row_numbers(
+            df[["Username", "Role", "Created By", "Created At", "Last Login", "Edit"]].copy()
         )
-        df["Status"] = df["Status"].map({True: "Active", False: "Inactive"})
 
         st.markdown("<div class='um-table-shell'>", unsafe_allow_html=True)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        edited_df = st.data_editor(
+            editor_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key="um_user_editor",
+            column_config={
+                "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
+                "Username": st.column_config.TextColumn("Username", disabled=True, width="medium"),
+                "Role": st.column_config.SelectboxColumn("Role", options=["staff", "admin"], required=True),
+                "Created By": st.column_config.TextColumn("Created By", disabled=True, width="medium"),
+                "Created At": st.column_config.TextColumn("Created At", disabled=True, width="medium"),
+                "Last Login": st.column_config.TextColumn("Last Login", disabled=True, width="medium"),
+                "Edit": st.column_config.CheckboxColumn(
+                    "Edit",
+                    help="Tick one user to open edit modal.",
+                    width="small",
+                ),
+            },
+            height=420,
+        )
         st.markdown("</div>", unsafe_allow_html=True)
+
+        st.caption("Tip: Tick Edit to open modal for username/password. To delete a user, remove the row then click Save Changes.")
+
+        edit_candidates = []
+        for row in edited_df.to_dict("records"):
+            if bool(row.get("Edit", False)):
+                username = str(row.get("Username", "")).strip().lower()
+                if username:
+                    edit_candidates.append(username)
+
+        current_edit_set = sorted(set(edit_candidates))
+        if "um_prev_edit_users" not in st.session_state:
+            st.session_state["um_prev_edit_users"] = current_edit_set
+        else:
+            prev_edit_set = set(st.session_state.get("um_prev_edit_users", []))
+            newly_checked = [u for u in current_edit_set if u not in prev_edit_set]
+            if newly_checked:
+                st.session_state["um_edit_target"] = newly_checked[0]
+            st.session_state["um_prev_edit_users"] = current_edit_set
+
+        if st.button("Save Changes", use_container_width=True, key="save_user_table_changes"):
+            try:
+                if "#" in edited_df.columns:
+                    edited_df = edited_df.drop(columns=["#"], errors="ignore")
+
+                updated_rows = {}
+                for row in edited_df.to_dict("records"):
+                    username = str(row.get("Username", "")).strip().lower()
+                    if not username:
+                        continue
+
+                    role_value = str(row.get("Role", "staff")).strip().lower()
+                    if role_value not in {"admin", "staff"}:
+                        raise ValueError(f"Invalid role for '{username}'.")
+
+                    updated_rows[username] = {
+                        "role": role_value,
+                    }
+
+                before_map = {
+                    str(u.get("username", "")).strip().lower(): {
+                        "role": str(u.get("role", "staff")).strip().lower(),
+                        "is_active": bool(u.get("is_active", True)),
+                    }
+                    for u in users
+                }
+
+                before_usernames = set(before_map.keys())
+                after_usernames = set(updated_rows.keys())
+                deleted_usernames = before_usernames - after_usernames
+                common_usernames = before_usernames & after_usernames
+
+                clean_current_user = (current_username or "").strip().lower()
+                if clean_current_user in deleted_usernames:
+                    raise ValueError("You cannot delete your own account.")
+
+                final_admin_count = 0
+                for username in after_usernames:
+                    role_value = updated_rows[username]["role"]
+                    if role_value == "admin":
+                        final_admin_count += 1
+                if final_admin_count == 0:
+                    raise ValueError("At least one admin account must remain.")
+
+                for username in sorted(deleted_usernames):
+                    auth_service.delete_user(username=username)
+
+                for username in sorted(common_usernames):
+                    before = before_map[username]
+                    after = updated_rows[username]
+                    if before["role"] != after["role"]:
+                        auth_service.update_user(
+                            username=username,
+                            role=after["role"],
+                        )
+
+                st.success("User table updated successfully.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+        edit_target = st.session_state.pop("um_edit_target", None)
+        if edit_target:
+            _render_edit_user_dialog(
+                target_username=str(edit_target),
+                current_username=current_username,
+            )
     else:
         st.info("No accounts available.")
 

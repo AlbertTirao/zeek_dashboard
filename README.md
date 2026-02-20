@@ -86,12 +86,15 @@ mongodb_uri = "mongodb+srv://<db_user>:<db_password>@<cluster-host>/?appName=Clu
 mongodb_db = "zeek_auth"
 bootstrap_admin_username = "admin"
 bootstrap_admin_password = "AdminPass123!"
+session_secret = "replace-with-a-long-random-secret"
+session_ttl_seconds = 604800
 ```
 
 Notes:
 
 1. URL-encode special characters in password.
 2. `mongodb_db` is the database name used by the app.
+3. `session_secret` enables login persistence across browser reloads.
 
 ### Option B: Local MongoDB With Docker
 
@@ -109,6 +112,8 @@ mongodb_uri = "mongodb://zeek_root:zeek_root_dev@localhost:27017/?authSource=adm
 mongodb_db = "zeek_auth"
 bootstrap_admin_username = "admin"
 bootstrap_admin_password = "AdminPass123!"
+session_secret = "replace-with-a-long-random-secret"
+session_ttl_seconds = 604800
 ```
 
 3. Stop local MongoDB:

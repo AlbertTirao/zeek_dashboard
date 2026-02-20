@@ -220,6 +220,24 @@ def authenticate_user(username: str, password: str) -> Optional[AuthUser]:
     )
 
 
+def get_active_user(username: str) -> Optional[AuthUser]:
+    clean_user = (username or "").strip().lower()
+    if not clean_user:
+        return None
+
+    row = _get_db()["app_users"].find_one({"username": clean_user})
+    if not row:
+        return None
+    if not bool(row.get("is_active", False)):
+        return None
+
+    return AuthUser(
+        username=str(row.get("username", clean_user)),
+        role=str(row.get("role", "staff")),
+        is_active=bool(row.get("is_active", True)),
+    )
+
+
 def create_user(username: str, password: str, role: str, created_by: str) -> None:
     clean_user = (username or "").strip().lower()
     clean_role = (role or "").strip().lower()
@@ -252,6 +270,59 @@ def set_user_status(username: str, is_active: bool) -> None:
         {"username": clean_user},
         {"$set": {"is_active": bool(is_active), "updated_at": datetime.now(timezone.utc)}},
     )
+
+
+def update_user(
+    username: str,
+    *,
+    new_username: Optional[str] = None,
+    role: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    password: Optional[str] = None,
+) -> None:
+    clean_user = (username or "").strip().lower()
+    if not clean_user:
+        raise ValueError("Username is required.")
+
+    updates = {}
+    if new_username is not None:
+        clean_new_username = (new_username or "").strip().lower()
+        if not clean_new_username:
+            raise ValueError("Username is required.")
+        if clean_new_username != clean_user:
+            updates["username"] = clean_new_username
+    if role is not None:
+        clean_role = (role or "").strip().lower()
+        if clean_role not in {"admin", "staff"}:
+            raise ValueError("Role must be admin or staff.")
+        updates["role"] = clean_role
+    if is_active is not None:
+        updates["is_active"] = bool(is_active)
+    if password is not None:
+        if not password:
+            raise ValueError("Password must be at least 8 characters.")
+        updates["password_hash"] = hash_password(password)
+
+    if not updates:
+        raise ValueError("No updates were provided.")
+
+    updates["updated_at"] = datetime.now(timezone.utc)
+    try:
+        result = _get_db()["app_users"].update_one({"username": clean_user}, {"$set": updates})
+    except DuplicateKeyError as exc:
+        raise ValueError("Username already exists.") from exc
+    if result.matched_count == 0:
+        raise ValueError("User not found.")
+
+
+def delete_user(username: str) -> None:
+    clean_user = (username or "").strip().lower()
+    if not clean_user:
+        raise ValueError("Username is required.")
+
+    result = _get_db()["app_users"].delete_one({"username": clean_user})
+    if result.deleted_count == 0:
+        raise ValueError("User not found.")
 
 
 def list_users():

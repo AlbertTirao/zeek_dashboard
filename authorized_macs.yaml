@@ -140,7 +140,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: c0:35:32:b5:43:5f
-  ip: 192.168.201.107
+  ip: 192.168.201.72
   hostname: chesca
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
