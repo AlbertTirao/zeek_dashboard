@@ -17,5 +17,4 @@ data/parquet/pickle/
 data/
 
 # --- Local app secrets ---
-.streamlit/secrets.toml
 .env
