@@ -1,5 +1,3 @@
-from datetime import datetime
-
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_option_menu import option_menu
@@ -31,8 +29,6 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
         st.session_state.sidebar_page = DEFAULT_PAGE
 
     default_index = options.index(st.session_state.sidebar_page)
-    refresh_minutes = max(1, auto_refresh_interval // 60)
-
     st.markdown(
         """
         <style>
@@ -60,21 +56,6 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             font-weight: 700;
             line-height: 1.2;
             margin: 0;
-        }
-
-        .sidebar-brand-subtitle {
-            color: #a5b3c5;
-            font-size: 0.8rem;
-            margin-top: 0.2rem;
-        }
-
-        .sidebar-section-label {
-            color: #8e9bb0;
-            font-size: 0.74rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            margin: 0.4rem 0 0.45rem 0.2rem;
         }
 
         .option-menu {
@@ -108,19 +89,6 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             box-shadow: inset 3px 0 0 #60a5fa;
         }
 
-        .sidebar-meta {
-            color: #a9bdd6;
-            font-size: 0.78rem;
-            margin-top: 0.85rem;
-            margin-left: 0.2rem;
-        }
-
-        .sidebar-footer {
-            color: #8f9eb2;
-            font-size: 0.72rem;
-            text-align: center;
-            margin-top: 0.9rem;
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -131,13 +99,10 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             """
             <div class="sidebar-brand">
                 <div class="sidebar-brand-title">Zeek Dashboard</div>
-                <div class="sidebar-brand-subtitle">SOC Monitoring Console</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-
-        st.markdown("<div class='sidebar-section-label'>Navigation</div>", unsafe_allow_html=True)
 
         page = option_menu(
             menu_title=None,
@@ -176,17 +141,6 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
 
         st.session_state.sidebar_page = page
 
-        st.markdown(
-            f"<div class='sidebar-meta'>Auto-refresh every {refresh_minutes} min</div>",
-            unsafe_allow_html=True,
-        )
-
         st_autorefresh(interval=auto_refresh_interval * 1000, key="auto_refresh_timer")
-
-        today = datetime.now().strftime("%b %d, %Y")
-        st.markdown(
-            f"<div class='sidebar-footer'>&copy; 2026 Zeek SOC Dashboard<br>{today}</div>",
-            unsafe_allow_html=True,
-        )
 
     return st.session_state.sidebar_page

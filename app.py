@@ -227,22 +227,96 @@ selected_page = render_sidebar(
 st.session_state.current_page = selected_page
 
 with st.sidebar:
-    st.markdown("---")
-    st.caption(f"Signed in as `{auth_user['username']}` ({auth_user['role']})")
-    if st.button("Logout", use_container_width=True):
-        # Reset all transient UI/session state so the login page always
-        # renders with a clean layout after logout.
-        preserve_keys = {"auth_schema_initialized"}
-        for key in list(st.session_state.keys()):
-            if key not in preserve_keys:
-                st.session_state.pop(key, None)
-        st.rerun()
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] .block-container {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
 
-# force refresh schedules background sync + keeps dashboard visible
-if st.sidebar.button("🔄 Force Refresh Data"):
-    st.session_state.pop("data_synced", None)
-    _start_background_sync("manual refresh")
-    st.rerun()
+        [data-testid="stSidebar"] .block-container > div {
+            min-height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"]:has(.sidebar-account-marker) {
+            margin-top: auto;
+            padding-top: 1rem;
+            border-top: 1px solid #334255;
+        }
+
+        .sidebar-user-card {
+            margin-top: 0.8rem;
+            margin-bottom: 0.55rem;
+            padding: 0.65rem 0.75rem;
+            border: 1px solid #2f3f57;
+            border-radius: 12px;
+            background: linear-gradient(160deg, #1f2d3f 0%, #182233 100%);
+        }
+
+        .sidebar-user-label {
+            color: #90a2ba;
+            font-size: 0.69rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 0.25rem;
+        }
+
+        .sidebar-user-name {
+            color: #eef5ff;
+            font-size: 0.95rem;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+
+        .sidebar-user-role {
+            color: #9ec8ff;
+            font-size: 0.78rem;
+            font-weight: 600;
+            margin-top: 0.15rem;
+        }
+
+        [data-testid="stSidebar"] .stButton {
+            margin-top: 0.35rem;
+        }
+
+        [data-testid="stSidebar"] .stButton > button {
+            border-radius: 14px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    account_actions = st.container()
+    with account_actions:
+        st.markdown("<div class='sidebar-account-marker'></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="sidebar-user-card">
+                <div class="sidebar-user-label">Signed in</div>
+                <div class="sidebar-user-name">{auth_user["username"]}</div>
+                <div class="sidebar-user-role">{auth_user["role"].title()}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Logout", use_container_width=True):
+            # Reset all transient UI/session state so the login page always
+            # renders with a clean layout after logout.
+            preserve_keys = {"auth_schema_initialized"}
+            for key in list(st.session_state.keys()):
+                if key not in preserve_keys:
+                    st.session_state.pop(key, None)
+            st.rerun()
+        # force refresh schedules background sync + keeps dashboard visible
+        if st.button("🔄 Force Refresh Data", use_container_width=True):
+            st.session_state.pop("data_synced", None)
+            _start_background_sync("manual refresh")
+            st.rerun()
 
 
 def render_current_page():
