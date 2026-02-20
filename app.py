@@ -1,5 +1,4 @@
 # app.py
-import os
 import time
 import queue
 import logging
@@ -7,6 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import streamlit as st
+
+# Use one global page layout so auth/logout cycles render consistently.
+st.set_page_config(page_title="Zeek Dashboard", layout="wide")
 
 # CHANGED: import PARQUET_DIR from config (single source of truth)
 from config.client import (
@@ -18,9 +20,11 @@ from config.client import (
 
 # CHANGED: import once
 from services.drive_services import sync_drive_to_parquet
+from services import auth_service
 
+from ui.auth import require_authentication, current_user
 from ui.sidebar import render_sidebar
-from ui.pages import analytics, devices, zeek_logs, alerts, authorization
+from ui.pages import analytics, devices, zeek_logs, alerts, authorization, user_management
 
 
 # =====================================================
@@ -34,6 +38,30 @@ if not APP_LOGGER.handlers:
     APP_LOGGER.addHandler(_handler)
 APP_LOGGER.setLevel(logging.INFO)
 APP_LOGGER.propagate = False
+
+
+# =====================================================
+# Authentication (PostgreSQL)
+# =====================================================
+
+if "auth_schema_initialized" not in st.session_state:
+    try:
+        auth_service.init_auth_schema()
+        auth_service.seed_bootstrap_admin()
+        st.session_state.auth_schema_initialized = True
+    except Exception as e:
+        st.error("Authentication service is not available.")
+        st.caption(
+            "Set AUTH_DATABASE_URL (or DATABASE_URL). "
+            "Optional first-run admin: BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD."
+        )
+        st.code(str(e))
+        st.stop()
+
+require_authentication()
+auth_user = current_user()
+if not auth_user:
+    st.stop()
 
 
 # =====================================================
@@ -156,9 +184,59 @@ if "initialized" not in st.session_state:
     st.session_state.current_page = "Device Inspection"
     st.session_state.initialized = True
 
+if auth_user["role"] == "admin":
+    menu_options = [
+        "Device Inspection",
+        "Traffic Monitoring",
+        "Zeek Logs",
+        "Alerts",
+        "Authorization",
+        "User Management",
+    ]
+    menu_icons = [
+        "pc-display",
+        "activity",
+        "file-earmark-text",
+        "bell",
+        "shield-lock",
+        "people",
+    ]
+else:
+    menu_options = [
+        "Device Inspection",
+        "Traffic Monitoring",
+        "Zeek Logs",
+        "Alerts",
+    ]
+    menu_icons = [
+        "pc-display",
+        "activity",
+        "file-earmark-text",
+        "bell",
+    ]
+
+if st.session_state.current_page not in menu_options:
+    st.session_state.current_page = menu_options[0]
+
 # render sidebar ONCE and persist selection (fixes DuplicateElementId)
-selected_page = render_sidebar(auto_refresh_interval=AUTO_REFRESH_INTERVAL)
+selected_page = render_sidebar(
+    auto_refresh_interval=AUTO_REFRESH_INTERVAL,
+    menu_options=menu_options,
+    menu_icons=menu_icons,
+)
 st.session_state.current_page = selected_page
+
+with st.sidebar:
+    st.markdown("---")
+    st.caption(f"Signed in as `{auth_user['username']}` ({auth_user['role']})")
+    if st.button("Logout", use_container_width=True):
+        # Reset all transient UI/session state so the login page always
+        # renders with a clean layout after logout.
+        preserve_keys = {"auth_schema_initialized"}
+        for key in list(st.session_state.keys()):
+            if key not in preserve_keys:
+                st.session_state.pop(key, None)
+        st.rerun()
 
 # force refresh schedules background sync + keeps dashboard visible
 if st.sidebar.button("🔄 Force Refresh Data"):
@@ -187,7 +265,16 @@ def render_current_page():
         alerts.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
     elif page == "Authorization":
+        if auth_user["role"] != "admin":
+            st.error("Admin role is required for this page.")
+            return
         authorization.render(AUTHORIZED_MACS_FILE)
+
+    elif page == "User Management":
+        if auth_user["role"] != "admin":
+            st.error("Admin role is required for this page.")
+            return
+        user_management.render(current_username=auth_user["username"])
 
 
 # =====================================================
@@ -195,3 +282,4 @@ def render_current_page():
 # =====================================================
 
 render_current_page()
+

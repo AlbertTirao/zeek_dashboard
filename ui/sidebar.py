@@ -23,11 +23,14 @@ MENU_ICONS = [
 DEFAULT_PAGE = MENU_OPTIONS[0]
 
 
-def render_sidebar(auto_refresh_interval=3600):
-    if "sidebar_page" not in st.session_state or st.session_state.sidebar_page not in MENU_OPTIONS:
+def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=None):
+    options = menu_options or MENU_OPTIONS
+    icons = menu_icons or MENU_ICONS
+
+    if "sidebar_page" not in st.session_state or st.session_state.sidebar_page not in options:
         st.session_state.sidebar_page = DEFAULT_PAGE
 
-    default_index = MENU_OPTIONS.index(st.session_state.sidebar_page)
+    default_index = options.index(st.session_state.sidebar_page)
     refresh_minutes = max(1, auto_refresh_interval // 60)
 
     st.markdown(
@@ -138,8 +141,8 @@ def render_sidebar(auto_refresh_interval=3600):
 
         page = option_menu(
             menu_title=None,
-            options=MENU_OPTIONS,
-            icons=MENU_ICONS,
+            options=options,
+            icons=icons,
             menu_icon=None,
             default_index=default_index,
             orientation="vertical",

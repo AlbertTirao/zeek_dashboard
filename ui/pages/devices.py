@@ -1765,8 +1765,6 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
 # Main Render
 # =====================================================
 def render(logs_root: Path, authorized_mac_file: Path):
-    st.set_page_config(page_title="Network Overview", layout="wide")
-
     # session state
     if "active_dialog" not in st.session_state:
         st.session_state.active_dialog = None
