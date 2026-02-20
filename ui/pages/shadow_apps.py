@@ -96,9 +96,43 @@ def _close_shadow_dialog(reset_grid: bool = True):
     st.session_state["shadow_dialog_mac"] = None
     st.session_state["shadow_last_selected_mac"] = None
     st.session_state.pop("shadow_dialog_origin", None)
+    _close_inventory_allow_dialog()
+    _close_inventory_app_dialog()
 
     if reset_grid:
         st.session_state["shadow_grid_nonce"] = int(st.session_state.get("shadow_grid_nonce", 0)) + 1
+
+
+def _close_inventory_allow_dialog():
+    st.session_state["shadow_allow_dialog_open"] = False
+    st.session_state.pop("shadow_allow_candidate", None)
+
+
+def _open_inventory_allow_dialog(candidate: dict):
+    st.session_state["shadow_allow_candidate"] = candidate
+    st.session_state["shadow_allow_dialog_open"] = True
+    st.session_state["shadow_dialog_origin"] = "dialog"
+
+
+def _close_inventory_app_dialog():
+    st.session_state["shadow_app_detail_dialog_open"] = False
+    st.session_state.pop("shadow_app_detail_context", None)
+    st.session_state["shadow_inv_grid_nonce"] = int(st.session_state.get("shadow_inv_grid_nonce", 0)) + 1
+
+
+def _open_inventory_app_dialog(context: dict):
+    st.session_state["shadow_app_detail_context"] = context
+    st.session_state["shadow_app_detail_dialog_open"] = True
+    st.session_state["shadow_dialog_origin"] = "dialog"
+
+
+def _coerce_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    return s in {"1", "true", "yes", "y", "on"}
 
 
 # -----------------------------
@@ -174,6 +208,54 @@ def _table_height_for_rows(
     except Exception:
         rows = 1
     return max(min_px, min(max_px, header_px + rows * row_px))
+
+
+def _apply_shadow_grid_filter_sort(grid_options: dict) -> dict:
+    opts = dict(grid_options or {})
+    default_col_def = dict(opts.get("defaultColDef") or {})
+
+    # Match shadow_sharings filtering/sorting behavior.
+    default_col_def["sortable"] = True
+    default_col_def["filter"] = "agSetColumnFilter"
+    default_col_def["floatingFilter"] = False
+    default_col_def.setdefault("minWidth", 96)
+    default_col_def["menuTabs"] = ["filterMenuTab", "generalMenuTab"]
+    default_col_def["suppressMenu"] = False
+
+    filter_params = dict(default_col_def.get("filterParams") or {})
+    filter_params.setdefault("excelMode", "windows")
+    filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
+    filter_params.setdefault("closeOnApply", True)
+    filter_params.setdefault("suppressMiniFilter", False)
+    default_col_def["filterParams"] = filter_params
+
+    opts["defaultColDef"] = default_col_def
+    opts["suppressMenuHide"] = False
+    opts["enableCellTextSelection"] = True
+    opts["ensureDomOrder"] = True
+    opts["enableRtl"] = False
+    opts["suppressColumnVirtualisation"] = True
+
+    autosize_js = JsCode(
+        """
+        function(params) {
+            setTimeout(function() {
+                if (!params || !params.columnApi) return;
+                const cols = params.columnApi.getAllColumns ? params.columnApi.getAllColumns() : [];
+                const colIds = cols
+                    .map(function(c) { return c.getColId ? c.getColId() : c.colId; })
+                    .filter(Boolean);
+                if (!colIds.length) return;
+                try {
+                    params.columnApi.autoSizeColumns(colIds, false);
+                } catch (e) {}
+            }, 0);
+        }
+        """
+    )
+    opts["onFirstDataRendered"] = autosize_js
+    opts["onGridSizeChanged"] = autosize_js
+    return opts
 
 
 def get_plotly_template() -> str:
@@ -527,6 +609,56 @@ def load_allowlist():
     except Exception:
         pass
     return sorted(list(approved))
+
+
+def _pick_allowlist_key(data: dict) -> str:
+    preferred = [
+        "trusted_domains",
+        "whitelist_domains",
+        "domains",
+        "allowed_domains",
+        "whitelist",
+        "allowlist",
+        WHITELIST_FILE.stem,
+    ]
+    for k in preferred:
+        if isinstance(data.get(k), list):
+            return k
+    for k, v in data.items():
+        if isinstance(v, list):
+            return str(k)
+    return "trusted_domains"
+
+
+def add_domain_to_allowlist(domain_value: str) -> tuple[bool, str]:
+    domain = extract_domain(domain_value)
+    if not domain or domain in {"unknown", "unidentified_activity", "-"}:
+        return False, "Invalid application/domain for allowlist."
+
+    data = read_yaml(WHITELIST_FILE)
+    if not isinstance(data, dict):
+        data = {}
+
+    allow_key = _pick_allowlist_key(data)
+    existing_list = data.get(allow_key)
+    if not isinstance(existing_list, list):
+        existing_list = []
+
+    existing_norm = []
+    existing_set = set()
+    for item in existing_list:
+        d = extract_domain(str(item))
+        if d and d not in existing_set:
+            existing_set.add(d)
+            existing_norm.append(d)
+
+    if domain in existing_set:
+        return True, f"{domain} is already allowlisted."
+
+    existing_norm.append(domain)
+    data[allow_key] = existing_norm
+    write_yaml(WHITELIST_FILE, data)
+    return True, f"{domain} added to allowlist."
 
 
 def compile_allow_regex(approved: list[str]):
@@ -1055,6 +1187,205 @@ def _sql_fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
 # =============================================================================
 # Dialog
 # =============================================================================
+@st.dialog("Allow Application / Software", width="small", dismissible=False)
+def show_inventory_allow_dialog():
+    candidate = st.session_state.get("shadow_allow_candidate") or {}
+    target_mac = str(candidate.get("mac") or "").strip().lower()
+    destination_raw = str(candidate.get("destination") or "").strip()
+    app_or_id = str(candidate.get("application_or_identifier") or "").strip()
+    destination = extract_domain(destination_raw)
+    invalid_target = destination in {"", "unknown", "unidentified_activity", "-"}
+
+    st.markdown(
+        f"Confirm allowlisting for MAC `{target_mac or 'unknown'}`."
+    )
+    st.markdown(f"- Destination: `{destination_raw or '-'}`")
+    st.markdown(f"- Application / Identifier: `{app_or_id or '-'}`")
+    st.caption(
+        "This will update whitelist_domains.yaml and refresh statuses to Authorized after cache rebuild."
+    )
+
+    if invalid_target:
+        st.error("This row has no valid destination domain to allowlist.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button(
+            "Allow This App/Software",
+            type="primary",
+            use_container_width=True,
+            disabled=invalid_target,
+            key="shadow_allow_confirm_btn",
+        ):
+            ok, message = add_domain_to_allowlist(destination)
+            if ok:
+                st.session_state["shadow_dialog_origin"] = "dialog"
+                _close_inventory_allow_dialog()
+                st.success(message)
+                st.rerun()
+            st.error(message)
+    with c2:
+        if st.button("Cancel", use_container_width=True, key="shadow_allow_cancel_btn"):
+            st.session_state["shadow_dialog_origin"] = "dialog"
+            _close_inventory_allow_dialog()
+            st.rerun()
+
+
+@st.dialog("Application Usage Details", width="large", dismissible=False)
+def show_inventory_app_dialog(conn):
+    ctx = st.session_state.get("shadow_app_detail_context") or {}
+    target_mac = str(ctx.get("mac") or "").strip().lower()
+    sel_dest = str(ctx.get("destination") or "").strip()
+    sel_app = str(ctx.get("application_or_identifier") or "").strip()
+    selected_f_source = str(ctx.get("selected_f_source") or "All").strip() or "All"
+    forensic_risk = ctx.get("forensic_risk") or []
+    if not isinstance(forensic_risk, list):
+        forensic_risk = []
+    forensic_search = str(ctx.get("forensic_search") or "").strip()
+
+    top = st.columns([1, 6])
+    with top[0]:
+        if st.button("Close", use_container_width=True, type="primary", key="shadow_app_detail_close_btn"):
+            st.session_state["shadow_dialog_origin"] = "dialog"
+            _close_inventory_app_dialog()
+            st.rerun()
+    with top[1]:
+        st.markdown(
+            f"<div class='shadow-dialog-banner'>Application usage scope: <strong>{sel_app or '-'}</strong></div>",
+            unsafe_allow_html=True,
+        )
+
+    if not target_mac or not sel_dest or not sel_app:
+        st.warning("Missing application context. Please select an Application / Identifier row again.")
+        return
+
+    app_where = [
+        "lower(mac) = lower(?)",
+        "domain_clean = ?",
+        "COALESCE(NULLIF(app_identifier,''), domain_clean) = ?",
+    ]
+    app_params = [target_mac, sel_dest, sel_app]
+
+    if selected_f_source != "All":
+        app_where.append("upper(source_log) = upper(?)")
+        app_params.append(selected_f_source)
+
+    if forensic_risk:
+        app_in = _build_in_clause(forensic_risk, app_params)
+        app_where.append(f""""Risk Level" IN {app_in}""")
+
+    if forensic_search:
+        q = f"%{forensic_search}%"
+        app_where.append("(domain_clean ILIKE ? OR app_identifier ILIKE ? OR ip ILIKE ? OR hostname ILIKE ? OR Info ILIKE ?)")
+        app_params.extend([q, q, q, q, q])
+
+    app_where_sql = " AND ".join(app_where)
+    app_df = _sql_fetch_df(
+        conn,
+        f"""
+        SELECT
+            datetime,
+            source_log,
+            "Risk Level",
+            "Risk Basis",
+            "Behavior",
+            "App Status",
+            bytes_sent,
+            bytes_received,
+            dst_port,
+            Info
+        FROM shadow_events
+        WHERE {app_where_sql}
+        ORDER BY datetime DESC
+        """,
+        app_params,
+    )
+
+    if app_df.empty:
+        st.info("No events found for this application with current filters.")
+        return
+
+    app_df["datetime"] = pd.to_datetime(app_df["datetime"], errors="coerce")
+    invalid_ts = int(app_df["datetime"].isna().sum())
+    if invalid_ts > 0:
+        st.warning(f"{invalid_ts:,} events were excluded from trend charts due to invalid timestamps.")
+
+    app_metrics = st.columns(4)
+    app_metrics[0].metric("Events", f"{len(app_df):,}")
+    app_metrics[1].metric("Unauthorized", f"{int((app_df['App Status'] == 'Unauthorized').sum()):,}")
+    app_metrics[2].metric("Critical / High", f"{int(app_df['Risk Level'].isin(['Critical', 'High']).sum()):,}")
+    app_metrics[3].metric("Distinct Sources", f"{int(app_df['source_log'].nunique(dropna=True)):,}")
+
+    trend = app_df.dropna(subset=["datetime"]).copy()
+    trend = trend.set_index("datetime").resample("1H").size().reset_index(name="events")
+
+    risk_counts = (
+        app_df.assign(**{"Risk Level": app_df["Risk Level"].fillna("Safe").astype(str)})
+        .groupby("Risk Level", as_index=False)
+        .size()
+        .rename(columns={"size": "Events"})
+    )
+    if not risk_counts.empty:
+        risk_order = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Safe": 0}
+        risk_counts["rank"] = risk_counts["Risk Level"].map(risk_order).fillna(-1)
+        risk_counts = risk_counts.sort_values(["rank", "Events"], ascending=[False, False])
+
+    usage_col, risk_col = st.columns([1.8, 1.2])
+    with usage_col:
+        st.markdown("#### Usage Over Time (Hourly)")
+        if not trend.empty:
+            fig_app_usage = px.area(
+                trend,
+                x="datetime",
+                y="events",
+                title="Application usage trend",
+                color_discrete_sequence=["#60a5fa"],
+            )
+            style_plotly_figure(fig_app_usage, height=310, show_legend=False)
+            fig_app_usage.update_xaxes(title=None)
+            fig_app_usage.update_yaxes(title="Events")
+            st.plotly_chart(fig_app_usage, use_container_width=True)
+        else:
+            st.info("No valid timestamps for this application usage trend.")
+
+    with risk_col:
+        st.markdown("#### Risk Level Distribution")
+        if not risk_counts.empty:
+            fig_app_risk = px.bar(
+                risk_counts,
+                x="Risk Level",
+                y="Events",
+                color="Risk Level",
+                color_discrete_map=RISK_COLORS,
+            )
+            style_plotly_figure(fig_app_risk, height=310, show_legend=False)
+            fig_app_risk.update_xaxes(categoryorder="array", categoryarray=["Critical", "High", "Medium", "Low", "Safe"])
+            st.plotly_chart(fig_app_risk, use_container_width=True)
+        else:
+            st.info("No risk-level data available.")
+
+    st.markdown("#### Why This Risk Level")
+    reason_df = (
+        app_df.assign(
+            risk_basis=app_df["Risk Basis"].fillna("").astype(str).str.strip().replace("", "No explicit basis captured"),
+            risk_level=app_df["Risk Level"].fillna("Safe").astype(str),
+        )
+        .groupby(["risk_level", "risk_basis"], as_index=False)
+        .size()
+        .rename(columns={"size": "Events", "risk_level": "Risk Level", "risk_basis": "Risk Basis"})
+        .sort_values("Events", ascending=False)
+        .head(12)
+    )
+    if not reason_df.empty:
+        top_reason = reason_df.iloc[0]
+        st.caption(
+            f"Top observed cause: {top_reason['Risk Level']} - {top_reason['Risk Basis']} ({int(top_reason['Events']):,} events)."
+        )
+        st.dataframe(reason_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No risk basis details available for this application.")
+
+
 @st.dialog("Shadow App Forensics Details", width="large", dismissible=False)
 def show_forensics_dialog(conn):
     target_mac = st.session_state.get("shadow_dialog_mac")
@@ -1102,28 +1433,18 @@ def show_forensics_dialog(conn):
         return
 
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    f_top_left, f_top_right = st.columns([2.8, 1.2])
-    with f_top_left:
-        view_type = st.radio(
-            "Activity Type",
-            ["App Run (Connectivity)", "App Usage (Interaction)", "App Install (Files)", "Suspicious Behavior"],
-            horizontal=True,
-            key=f"dlg_view_{target_mac}",
-            on_change=_mark_dialog_origin,
-        )
-    with f_top_right:
-        src_df = _sql_fetch_df(
-            conn,
-            "SELECT DISTINCT source_log FROM shadow_events WHERE lower(mac) = lower(?) ORDER BY 1",
-            [target_mac],
-        )
-        f_raw_sources = src_df["source_log"].dropna().tolist() if not src_df.empty else []
-        selected_f_source = st.selectbox(
-            "Filter Source",
-            ["All"] + f_raw_sources,
-            key=f"dlg_src_{target_mac}",
-            on_change=_mark_dialog_origin,
-        )
+    src_df = _sql_fetch_df(
+        conn,
+        "SELECT DISTINCT source_log FROM shadow_events WHERE lower(mac) = lower(?) ORDER BY 1",
+        [target_mac],
+    )
+    f_raw_sources = src_df["source_log"].dropna().tolist() if not src_df.empty else []
+    selected_f_source = st.selectbox(
+        "Filter Source",
+        ["All"] + f_raw_sources,
+        key=f"dlg_src_{target_mac}",
+        on_change=_mark_dialog_origin,
+    )
     f_bottom_left, f_bottom_right = st.columns([1.4, 2.6])
     with f_bottom_left:
         forensic_risk = risk_multiselect(
@@ -1144,21 +1465,13 @@ def show_forensics_dialog(conn):
     risk_summary = ", ".join(forensic_risk) if forensic_risk else "None"
     source_summary = selected_f_source if selected_f_source != "All" else "All Sources"
     st.markdown(
-        f"<div class='shadow-filter-hint'>View: <strong>{view_type}</strong> | Source: <strong>{source_summary}</strong> | Risk: <strong>{risk_summary}</strong> | Search: <strong>{'On' if forensic_search else 'Off'}</strong></div>",
+        f"<div class='shadow-filter-hint'>Source: <strong>{source_summary}</strong> | Risk: <strong>{risk_summary}</strong> | Search: <strong>{'On' if forensic_search else 'Off'}</strong></div>",
         unsafe_allow_html=True,
     )
+    st.caption("Graphs below are computed from the current MAC + Source/Risk/Search filters.")
 
     where = ["lower(mac) = lower(?)"]
     params = [target_mac]
-
-    if "App Run" in view_type:
-        where.append("upper(source_log) IN ('CONN','DNS')")
-    elif "App Usage" in view_type:
-        where.append("upper(source_log) IN ('HTTP','SSL')")
-    elif "App Install" in view_type:
-        where.append("upper(source_log) IN ('FILES','SOFTWARE')")
-    elif "Suspicious" in view_type:
-        where.append("""("App Status"='Unauthorized' OR "Risk Level" IN ('Critical','High','Medium'))""")
 
     if selected_f_source != "All":
         where.append("upper(source_log) = upper(?)")
@@ -1184,7 +1497,6 @@ def show_forensics_dialog(conn):
         FROM shadow_events
         WHERE {where_sql}
         ORDER BY datetime DESC
-        LIMIT 200000
         """,
         params,
     )
@@ -1198,6 +1510,13 @@ def show_forensics_dialog(conn):
     forensic_unauthorized = int((forensic_df["App Status"] == "Unauthorized").sum())
     forensic_critical_high = int(forensic_df["Risk Level"].isin(["Critical", "High"]).sum())
 
+    forensic_df["datetime"] = pd.to_datetime(forensic_df["datetime"], errors="coerce")
+    invalid_timestamps = int(forensic_df["datetime"].isna().sum())
+    if invalid_timestamps > 0:
+        st.warning(
+            f"{invalid_timestamps:,} events were excluded from the timeline due to invalid timestamps."
+        )
+
     d1, d2, d3, d4 = st.columns(4)
     d1.metric("Events", f"{forensic_total:,}")
     d2.metric("Unique Destinations", f"{forensic_domains:,}")
@@ -1205,7 +1524,7 @@ def show_forensics_dialog(conn):
     d4.metric("Critical / High", f"{forensic_critical_high:,}")
 
     # =============================================================================
-    # Dialog analytics: Timeline + Top Destinations + Detailed Logs
+    # Dialog analytics: Timeline + Top Destinations
     # =============================================================================
     st.markdown("#### Activity Timeline")
     tl_cfg_1, tl_cfg_2 = st.columns([1.2, 1.8])
@@ -1227,9 +1546,7 @@ def show_forensics_dialog(conn):
         )
 
     bucket_rule = {"5 min": "5min", "10 min": "10min", "30 min": "30min", "1 hour": "1H"}[timeline_grain]
-    timeline = forensic_df.copy()
-    timeline["datetime"] = pd.to_datetime(timeline["datetime"], errors="coerce")
-    timeline = timeline.dropna(subset=["datetime"])
+    timeline = forensic_df.dropna(subset=["datetime"]).copy()
 
     if not timeline.empty:
         if timeline_mode == "Status Split":
@@ -1266,150 +1583,36 @@ def show_forensics_dialog(conn):
     else:
         st.warning("No valid timestamps for timeline.")
 
-    low_col1, low_col2 = st.columns([1.15, 1.85])
-    with low_col1:
-        st.markdown("#### Top Destinations")
-        top_dest = (
-            forensic_df.assign(domain_clean=forensic_df["domain_clean"].fillna("Unknown"))
-            .groupby("domain_clean", as_index=False)
-            .size()
-            .rename(columns={"size": "Hits", "domain_clean": "Destination"})
-            .sort_values("Hits", ascending=False)
-            .head(10)
+    st.markdown("#### Top Destinations")
+    top_dest = (
+        forensic_df.assign(
+            domain_clean=forensic_df["domain_clean"]
+            .fillna("Unknown")
+            .astype(str)
+            .str.strip()
+            .replace("", "Unknown")
         )
-        if not top_dest.empty:
-            fig_dest = px.bar(
-                top_dest,
-                x="Hits",
-                y="Destination",
-                orientation="h",
-                color="Hits",
-                color_continuous_scale="Blues",
-            )
-            style_plotly_figure(fig_dest, height=330, show_legend=False)
-            fig_dest.update_layout(yaxis_title=None, xaxis_title="Hits", coloraxis_showscale=False)
-            fig_dest.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig_dest, use_container_width=True)
-        else:
-            st.info("No destination data for the selected filters.")
-
-    with low_col2:
-        st.markdown(f"#### Detailed Logs ({view_type})")
-        final_df = forensic_df.head(1000).copy()
-        final_df["datetime"] = pd.to_datetime(final_df["datetime"], errors="coerce")
-        final_df["datetime"] = final_df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        final_df["datetime"] = final_df["datetime"].fillna("")
-        dialog_cols = [
-            "datetime",
-            "source_log",
-            "ip",
-            "domain_clean",
-            "dst_port",
-            "Behavior",
-            "App Status",
-            "Risk Level",
-            "Info",
-            "Risk Basis",
-        ]
-        dialog_cols = [c for c in dialog_cols if c in final_df.columns]
-        final_df = final_df[dialog_cols]
-
-        dlg_risk_style = JsCode(
-            """
-            function(params) {
-                const v = (params.value || '').toString();
-                if (v === 'Critical') return {color: '#ef4444', fontWeight: '800'};
-                if (v === 'High') return {color: '#f97316', fontWeight: '800'};
-                if (v === 'Medium') return {color: '#f59e0b', fontWeight: '700'};
-                if (v === 'Low') return {color: '#eab308', fontWeight: '700'};
-                if (v === 'Safe') return {color: '#22c55e', fontWeight: '700'};
-                return {};
-            }
-            """
+        .groupby("domain_clean", as_index=False)
+        .size()
+        .rename(columns={"size": "Hits", "domain_clean": "Destination"})
+        .sort_values("Hits", ascending=False)
+        .head(10)
+    )
+    if not top_dest.empty:
+        fig_dest = px.bar(
+            top_dest,
+            x="Hits",
+            y="Destination",
+            orientation="h",
+            color="Hits",
+            color_continuous_scale="Blues",
         )
-        dlg_status_style = JsCode(
-            """
-            function(params) {
-                const v = (params.value || '').toString();
-                if (v === 'Unauthorized') return {color: '#ef4444', fontWeight: '800'};
-                if (v === 'Authorized') return {color: '#22c55e', fontWeight: '700'};
-                return {};
-            }
-            """
-        )
-
-        gb_dlg = GridOptionsBuilder.from_dataframe(final_df)
-        gb_dlg.configure_default_column(filter=True, sortable=True, resizable=True, minWidth=150)
-        gb_dlg.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-        if "datetime" in final_df.columns:
-            gb_dlg.configure_column("datetime", header_name="Time", width=150)
-        if "source_log" in final_df.columns:
-            gb_dlg.configure_column("source_log", header_name="Source", width=92)
-        if "ip" in final_df.columns:
-            gb_dlg.configure_column("ip", header_name="IP", width=122)
-        if "domain_clean" in final_df.columns:
-            gb_dlg.configure_column(
-                "domain_clean",
-                header_name="Destination",
-                minWidth=165,
-                flex=1.15,
-                tooltipField="domain_clean",
-            )
-        if "dst_port" in final_df.columns:
-            gb_dlg.configure_column("dst_port", header_name="Port", width=78)
-        if "Behavior" in final_df.columns:
-            gb_dlg.configure_column("Behavior", header_name="Behavior", minWidth=108, flex=0.85)
-        if "App Status" in final_df.columns:
-            gb_dlg.configure_column("App Status", header_name="Status", width=102, cellStyle=dlg_status_style)
-        if "Risk Level" in final_df.columns:
-            gb_dlg.configure_column("Risk Level", header_name="Risk", width=96, cellStyle=dlg_risk_style)
-        if "Info" in final_df.columns:
-            gb_dlg.configure_column(
-                "Info",
-                header_name="Context",
-                minWidth=175,
-                flex=1.2,
-                wrapText=True,
-                autoHeight=True,
-                tooltipField="Info",
-            )
-        if "Risk Basis" in final_df.columns:
-            gb_dlg.configure_column(
-                "Risk Basis",
-                header_name="Risk Basis",
-                minWidth=175,
-                flex=1.2,
-                wrapText=True,
-                autoHeight=True,
-                tooltipField="Risk Basis",
-            )
-
-        ag_theme, ag_css = get_aggrid_theme_and_css()
-        dlg_grid_options = gb_dlg.build()
-        dlg_grid_options["suppressHorizontalScroll"] = False
-        dlg_grid_options["alwaysShowHorizontalScroll"] = True
-        dlg_grid_options["domLayout"] = "normal"
-        dlg_grid_options["alwaysShowVerticalScroll"] = True
-        dlg_grid_options["tooltipShowDelay"] = 0
-        risk_key = "-".join(sorted(forensic_risk)) if forensic_risk else "none"
-        dlg_key_src = f"{view_type}|{selected_f_source}|{risk_key}|{forensic_search.lower()}"
-        dlg_key_suffix = re.sub(r"[^0-9A-Za-z_]+", "_", dlg_key_src).strip("_")[:96]
-        st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-        AgGrid(
-            final_df,
-            gridOptions=dlg_grid_options,
-            update_mode=GridUpdateMode.NO_UPDATE,
-            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            height=_table_height_for_rows(len(final_df), min_px=240, max_px=520),
-            theme=ag_theme,
-            custom_css=ag_css,
-            allow_unsafe_jscode=True,
-            fit_columns_on_grid_load=False,
-            reload_data=False,
-            key=f"dlg_logs_grid_{target_mac}_{dlg_key_suffix}",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.caption(f"{len(final_df):,} rows shown in detailed logs (limited to top 1,000).")
+        style_plotly_figure(fig_dest, height=330, show_legend=False)
+        fig_dest.update_layout(yaxis_title=None, xaxis_title="Hits", coloraxis_showscale=False)
+        fig_dest.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_dest, use_container_width=True)
+    else:
+        st.info("No destination data for the selected filters.")
 
     # =============================================================================
     # MOVED: Applications / Software inventory table (BOTTOM)
@@ -1428,6 +1631,11 @@ def show_forensics_dialog(conn):
     if forensic_risk:
         inv_in = _build_in_clause(forensic_risk, inv_params)
         inv_where.append(f""""Risk Level" IN {inv_in}""")
+
+    if forensic_search:
+        q_inv = f"%{forensic_search}%"
+        inv_where.append("(domain_clean ILIKE ? OR app_identifier ILIKE ?)")
+        inv_params.extend([q_inv, q_inv])
 
     inv_where_sql = " AND ".join(inv_where)
 
@@ -1490,6 +1698,15 @@ def show_forensics_dialog(conn):
     else:
         inv_grid = inventory_df.copy()
         inv_grid.insert(0, "#", range(1, len(inv_grid) + 1))
+        inv_grid["Allowed"] = inv_grid["status"].astype(str).str.lower().eq("authorized")
+        inv_grid["_allow_key"] = (
+            inv_grid["destination"].fillna("").astype(str).str.lower().str.strip()
+            + "|"
+            + inv_grid["application_or_identifier"].fillna("").astype(str).str.lower().str.strip()
+        )
+        inv_original_allowed = {
+            str(k): _coerce_bool(v) for k, v in zip(inv_grid["_allow_key"].tolist(), inv_grid["Allowed"].tolist())
+        }
         inv_grid["first_seen"] = pd.to_datetime(inv_grid["first_seen"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         inv_grid["last_seen"] = pd.to_datetime(inv_grid["last_seen"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         inv_grid["first_seen"] = inv_grid["first_seen"].fillna("")
@@ -1518,10 +1735,37 @@ def show_forensics_dialog(conn):
             }
             """
         )
+        inv_allow_editable = JsCode(
+            """
+            function(params) {
+                const status = (params.data && params.data.status ? params.data.status : '').toString().toLowerCase();
+                return status !== 'authorized';
+            }
+            """
+        )
+        inv_app_click_style = JsCode(
+            """
+            function(params) {
+                return {
+                    color: '#8AB4F8',
+                    fontWeight: '700',
+                    cursor: 'pointer',
+                    textDecoration: 'underline'
+                };
+            }
+            """
+        )
 
         gb_inv = GridOptionsBuilder.from_dataframe(inv_grid)
-        gb_inv.configure_default_column(filter=True, sortable=True, resizable=True, minWidth=88)
+        gb_inv.configure_default_column(
+            filter=True,
+            sortable=True,
+            resizable=True,
+            minWidth=88,
+            suppressMenu=False,
+        )
         gb_inv.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+        gb_inv.configure_selection(selection_mode="single", use_checkbox=False)
         gb_inv.configure_column("#", header_name="#", width=52, pinned="left", suppressMovable=True)
         gb_inv.configure_column(
             "destination",
@@ -1538,6 +1782,7 @@ def show_forensics_dialog(conn):
             wrapText=True,
             autoHeight=True,
             tooltipField="application_or_identifier",
+            cellStyle=inv_app_click_style,
         )
         gb_inv.configure_column(
             "sources",
@@ -1548,14 +1793,26 @@ def show_forensics_dialog(conn):
             autoHeight=True,
             tooltipField="sources",
         )
+        gb_inv.configure_column(
+            "Allowed",
+            header_name="Allowed",
+            width=96,
+            editable=inv_allow_editable,
+            cellRenderer="agCheckboxCellRenderer",
+            cellEditor="agCheckboxCellEditor",
+            singleClickEdit=True,
+            filter=False,
+            sortable=False,
+        )
         gb_inv.configure_column("status", header_name="Status", width=104, cellStyle=inv_status_style)
         gb_inv.configure_column("first_seen", header_name="First Seen", width=152)
         gb_inv.configure_column("last_seen", header_name="Last Seen", width=152)
         gb_inv.configure_column("hits", header_name="Hits", width=72)
         gb_inv.configure_column("max_risk", header_name="Max Risk", width=94, cellStyle=inv_risk_style)
+        gb_inv.configure_column("_allow_key", hide=True)
 
         ag_theme, ag_css = get_aggrid_theme_and_css()
-        inv_grid_options = gb_inv.build()
+        inv_grid_options = _apply_shadow_grid_filter_sort(gb_inv.build())
         inv_grid_options["suppressHorizontalScroll"] = False
         inv_grid_options["alwaysShowHorizontalScroll"] = True
         inv_grid_options["domLayout"] = "normal"
@@ -1563,21 +1820,83 @@ def show_forensics_dialog(conn):
         inv_grid_options["tooltipShowDelay"] = 0
 
         st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-        AgGrid(
+        inv_grid_response = AgGrid(
             inv_grid,
             gridOptions=inv_grid_options,
-            update_mode=GridUpdateMode.NO_UPDATE,
+            update_mode=GridUpdateMode.MODEL_CHANGED,
             data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
             height=_table_height_for_rows(len(inv_grid), min_px=240, max_px=520),
             theme=ag_theme,
             custom_css=ag_css,
             allow_unsafe_jscode=True,
-            fit_columns_on_grid_load=False,
+            enable_enterprise_modules=True,
+            fit_columns_on_grid_load=True,
             reload_data=False,
-            key=f"dlg_inventory_grid_{target_mac}",
+            key=f"dlg_inventory_grid_{target_mac}_{int(st.session_state.get('shadow_inv_grid_nonce', 0))}",
         )
         st.markdown("</div>", unsafe_allow_html=True)
+        st.caption("Click Application / Identifier to open a popup dialog with app usage and risk-cause details.")
+        st.caption("Check Allowed for an unauthorized row to open allowlist confirmation.")
         st.caption(f"{len(inv_grid):,} rows shown in application inventory.")
+
+        edited_inv = inv_grid_response.get("data", None)
+        if isinstance(edited_inv, pd.DataFrame):
+            edited_df = edited_inv.copy()
+        elif isinstance(edited_inv, list):
+            edited_df = pd.DataFrame(edited_inv)
+        else:
+            edited_df = pd.DataFrame()
+
+        if (
+            not edited_df.empty
+            and "Allowed" in edited_df.columns
+            and "_allow_key" in edited_df.columns
+            and not st.session_state.get("shadow_allow_dialog_open")
+        ):
+            edited_df["Allowed"] = edited_df["Allowed"].apply(_coerce_bool)
+            edited_df["_was_allowed"] = edited_df["_allow_key"].astype(str).map(
+                lambda k: bool(inv_original_allowed.get(k, False))
+            )
+            newly_allowed = edited_df[(edited_df["Allowed"]) & (~edited_df["_was_allowed"])]
+            if not newly_allowed.empty:
+                pick = newly_allowed.iloc[0]
+                _open_inventory_allow_dialog(
+                    {
+                        "mac": target_mac,
+                        "destination": str(pick.get("destination", "")),
+                        "application_or_identifier": str(pick.get("application_or_identifier", "")),
+                    }
+                )
+                st.rerun()
+
+        selected_rows_inv = inv_grid_response.get("selected_rows", None)
+        selected_inv = None
+        if isinstance(selected_rows_inv, pd.DataFrame):
+            if not selected_rows_inv.empty:
+                selected_inv = selected_rows_inv.iloc[0].to_dict()
+        elif isinstance(selected_rows_inv, list):
+            if selected_rows_inv and isinstance(selected_rows_inv[0], dict):
+                selected_inv = selected_rows_inv[0]
+
+        if (
+            isinstance(selected_inv, dict)
+            and not st.session_state.get("shadow_allow_dialog_open")
+            and not st.session_state.get("shadow_app_detail_dialog_open")
+        ):
+            sel_dest = str(selected_inv.get("destination", "") or "").strip()
+            sel_app = str(selected_inv.get("application_or_identifier", "") or "").strip()
+            if sel_dest and sel_app:
+                _open_inventory_app_dialog(
+                    {
+                        "mac": target_mac,
+                        "destination": sel_dest,
+                        "application_or_identifier": sel_app,
+                        "selected_f_source": selected_f_source,
+                        "forensic_risk": list(forensic_risk),
+                        "forensic_search": forensic_search,
+                    }
+                )
+                st.rerun()
 
         st.download_button(
             "Download Application Inventory CSV",
@@ -1648,6 +1967,11 @@ def render_shadow_apps(parquet_root: Path):
     st.session_state.setdefault("shadow_dialog_mac", None)
     st.session_state.setdefault("shadow_last_selected_mac", None)
     st.session_state.setdefault("shadow_grid_nonce", 0)
+    st.session_state.setdefault("shadow_inv_grid_nonce", 0)
+    st.session_state.setdefault("shadow_allow_dialog_open", False)
+    st.session_state.setdefault("shadow_allow_candidate", None)
+    st.session_state.setdefault("shadow_app_detail_dialog_open", False)
+    st.session_state.setdefault("shadow_app_detail_context", None)
 
     # --- auto-close stale dialogs ---
     origin = st.session_state.pop("shadow_dialog_origin", None)
@@ -1661,6 +1985,8 @@ def render_shadow_apps(parquet_root: Path):
 
     def _on_day_change():
         _close_shadow_dialog(reset_grid=True)
+        _close_inventory_allow_dialog()
+        _close_inventory_app_dialog()
 
     day_col, day_hint_col = st.columns([1.2, 2])
     with day_col:
@@ -1694,7 +2020,11 @@ def render_shadow_apps(parquet_root: Path):
     register_shadow_view(conn, cached_files)
 
     # --- render dialog only when allowed for this rerun ---
-    if st.session_state.get("shadow_dialog_open") and st.session_state.get("shadow_dialog_mac") and origin in ("grid", "dialog"):
+    if st.session_state.get("shadow_allow_dialog_open") and st.session_state.get("shadow_allow_candidate"):
+        show_inventory_allow_dialog()
+    elif st.session_state.get("shadow_app_detail_dialog_open") and st.session_state.get("shadow_app_detail_context"):
+        show_inventory_app_dialog(conn)
+    elif st.session_state.get("shadow_dialog_open") and st.session_state.get("shadow_dialog_mac") and origin in ("grid", "dialog"):
         show_forensics_dialog(conn)
 
     # Metrics
@@ -1782,12 +2112,12 @@ def render_shadow_apps(parquet_root: Path):
         else:
             st.info("No data for source chart.")
 
-    t1, t2 = st.tabs(["Application Audit & License", "Data Exfiltration Threats"])
+    tab_main = st.tabs(["Application Audit & License"])[0]
 
     # =============================================================================
     # TAB 1: AgGrid (CLICK ROW -> OPEN DIALOG)
     # =============================================================================
-    with t1:
+    with tab_main:
         st.markdown("### Application Audit Log")
         st.markdown(
             "<div class='shadow-callout'>Click a row to open the per-device forensics dialog for that MAC address.</div>",
@@ -1795,20 +2125,11 @@ def render_shadow_apps(parquet_root: Path):
         )
 
         st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-        top_filter_col1, top_filter_col2 = st.columns([3.2, 1.8])
-        with top_filter_col1:
-            search_query_audit = st.text_input(
-                "Search (MAC, Hostname, IP, Domain)",
-                placeholder="e.g., 192.168.1.14 or github.com",
-                key="audit_search",
-            ).strip()
-        with top_filter_col2:
-            status_filter = st.radio(
-                "Filter Status",
-                ["All", "Authorized", "Unauthorized"],
-                horizontal=True,
-                key="audit_status_filter",
-            )
+        search_query_audit = st.text_input(
+            "Search (MAC, Hostname, IP, Domain)",
+            placeholder="e.g., 192.168.1.14 or github.com",
+            key="audit_search",
+        ).strip()
         bottom_filter_col1, bottom_filter_col2 = st.columns([2.2, 2.2])
         with bottom_filter_col1:
             audit_risk_filter = risk_multiselect(
@@ -1831,10 +2152,6 @@ def render_shadow_apps(parquet_root: Path):
         where = []
         params = []
 
-        if status_filter != "All":
-            where.append(""""App Status" = ?""")
-            params.append(status_filter)
-
         if audit_risk_filter:
             in_clause = _build_in_clause(audit_risk_filter, params)
             where.append(f""""Risk Level" IN {in_clause}""")
@@ -1852,7 +2169,7 @@ def render_shadow_apps(parquet_root: Path):
         source_summary = f"{len(audit_source_filter)} selected" if audit_source_filter else "None"
         search_summary = "On" if search_query_audit else "Off"
         st.markdown(
-            f"<div class='shadow-filter-hint'>Status: <strong>{status_filter}</strong> | Risk: <strong>{risk_summary}</strong> | Sources: <strong>{source_summary}</strong> | Search: <strong>{search_summary}</strong></div>",
+            f"<div class='shadow-filter-hint'>Risk: <strong>{risk_summary}</strong> | Sources: <strong>{source_summary}</strong> | Search: <strong>{search_summary}</strong></div>",
             unsafe_allow_html=True,
         )
 
@@ -1866,7 +2183,6 @@ def render_shadow_apps(parquet_root: Path):
                 hostname,
                 ip,
                 source_log,
-                "App Status" AS "App Status",
                 datetime,
                 _risk_score,
                 "Risk Basis" AS risk_basis
@@ -1880,13 +2196,12 @@ def render_shadow_apps(parquet_root: Path):
                 hostname,
                 ip,
                 source_log,
-                "App Status",
                 MIN(datetime) AS First_Seen,
                 MAX(datetime) AS Last_Seen,
                 COUNT(*) AS Hits,
                 MAX(_risk_score) AS Max_Risk_Score
             FROM base
-            GROUP BY 1,2,3,4,5,6
+            GROUP BY 1,2,3,4,5
         ),
         pick_basis AS (
             SELECT
@@ -1895,10 +2210,9 @@ def render_shadow_apps(parquet_root: Path):
                 hostname,
                 ip,
                 source_log,
-                "App Status",
                 risk_basis AS Max_Risk_Basis,
                 ROW_NUMBER() OVER (
-                    PARTITION BY domain_clean, mac, hostname, ip, source_log, "App Status"
+                    PARTITION BY domain_clean, mac, hostname, ip, source_log
                     ORDER BY _risk_score DESC, datetime DESC
                 ) AS rn
             FROM base
@@ -1909,7 +2223,6 @@ def render_shadow_apps(parquet_root: Path):
             a.hostname,
             a.ip,
             a.source_log,
-            a."App Status",
             a.First_Seen,
             a.Last_Seen,
             a.Hits,
@@ -1928,7 +2241,6 @@ def render_shadow_apps(parquet_root: Path):
            AND a.hostname=b.hostname
            AND a.ip=b.ip
            AND a.source_log=b.source_log
-           AND a."App Status"=b."App Status"
         ORDER BY a.Max_Risk_Score DESC, a.Hits DESC
         LIMIT 1000
         """
@@ -1982,25 +2294,9 @@ def render_shadow_apps(parquet_root: Path):
                 """
             )
 
-            status_cellstyle = JsCode(
-                """
-                function(params) {
-                    const v = (params.value || '').toString();
-                    if (v === 'Unauthorized') {
-                        return { 'color': '#ef4444', 'fontWeight': '800' };
-                    }
-                    if (v === 'Authorized') {
-                        return { 'color': '#22c55e', 'fontWeight': '700' };
-                    }
-                    return {};
-                }
-                """
-            )
-
             # Column formatting (match)
             gb.configure_column("#", header_name="#", width=70, pinned="left", suppressMovable=True, resizable=False)
             gb.configure_column("mac", header_name="MAC Address (Click)", cellStyle=mac_cellstyle)
-            gb.configure_column("App Status", header_name="Status", cellStyle=status_cellstyle, width=125)
             gb.configure_column("Max_Risk", header_name="Risk Level", cellStyle=risk_cellstyle)
 
             # Optional: tighten these widths (feel more like a fixed enterprise table)
@@ -2012,7 +2308,7 @@ def render_shadow_apps(parquet_root: Path):
             gb.configure_column("First_Seen", header_name="First Seen", width=170)
             gb.configure_column("Last_Seen", header_name="Last Seen", width=170)
 
-            grid_options = gb.build()
+            grid_options = _apply_shadow_grid_filter_sort(gb.build())
             grid_options["rowSelection"] = "single"
             grid_options["suppressRowClickSelection"] = False
             grid_options["rowMultiSelectWithClick"] = False
@@ -2047,7 +2343,8 @@ def render_shadow_apps(parquet_root: Path):
                 theme=ag_theme,
                 custom_css=audit_ag_css,
                 allow_unsafe_jscode=True,
-                fit_columns_on_grid_load=False,
+                enable_enterprise_modules=True,
+                fit_columns_on_grid_load=True,
                 reload_data=False,
                 key=grid_key,
             )
@@ -2196,7 +2493,7 @@ def render_shadow_apps(parquet_root: Path):
             gb2 = GridOptionsBuilder.from_dataframe(license_df)
             gb2.configure_default_column(filter=True, sortable=True, resizable=True)
             gb2.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
-            license_grid_options = gb2.build()
+            license_grid_options = _apply_shadow_grid_filter_sort(gb2.build())
             license_grid_options["domLayout"] = "normal"
             license_grid_options["alwaysShowVerticalScroll"] = True
             license_grid_options["suppressHorizontalScroll"] = False
@@ -2213,8 +2510,9 @@ def render_shadow_apps(parquet_root: Path):
                 height=_table_height_for_rows(len(license_df), min_px=240, max_px=520),
                 theme=ag_theme,
                 custom_css=ag_css,
-                allow_unsafe_jscode=False,
-                fit_columns_on_grid_load=False,
+                allow_unsafe_jscode=True,
+                enable_enterprise_modules=True,
+                fit_columns_on_grid_load=True,
                 reload_data=False,
                 key="license_devices_grid",
             )
@@ -2229,422 +2527,3 @@ def render_shadow_apps(parquet_root: Path):
         else:
             st.info("No license usage detected for the selected day.")
 
-    # =============================================================================
-    # TAB 2 (kept: your existing content can remain here)
-    # =============================================================================
-    with t2:
-        st.markdown("### Unauthorized Threat Dashboard")
-        st.markdown(
-            "<div class='shadow-callout'>Focused view of unauthorized apps, exfiltration indicators, and risk concentration.</div>",
-            unsafe_allow_html=True,
-        )
-
-        unauth_stats = _sql_fetch_df(
-            conn,
-            """
-            SELECT
-                COUNT(*) AS unauthorized_events,
-                COUNT(DISTINCT domain_clean) AS unauthorized_apps,
-                COUNT(*) FILTER (WHERE "Risk Level" IN ('Critical','High')) AS crit_high,
-                SUM(COALESCE(bytes_sent,0)) AS total_sent,
-                SUM(COALESCE(bytes_received,0)) AS total_recv
-            FROM shadow_events
-            WHERE "App Status"='Unauthorized'
-            """,
-        )
-
-        unauth_events = int(unauth_stats.loc[0, "unauthorized_events"]) if not unauth_stats.empty else 0
-        if unauth_events == 0:
-            st.success("No Unauthorized applications detected. System is clean.")
-            return
-
-        unauth_apps = int(unauth_stats.loc[0, "unauthorized_apps"])
-        crit_high_unauth = int(unauth_stats.loc[0, "crit_high"])
-        total_sent_gb = float(unauth_stats.loc[0, "total_sent"]) / 1_000_000_000
-        total_recv_gb = float(unauth_stats.loc[0, "total_recv"]) / 1_000_000_000
-
-        top_off = _sql_fetch_df(
-            conn,
-            """
-            SELECT mac, COUNT(*) AS cnt
-            FROM shadow_events
-            WHERE "App Status"='Unauthorized'
-            GROUP BY 1
-            ORDER BY 2 DESC
-            LIMIT 1
-            """,
-        )
-        top_offender = str(top_off.loc[0, "mac"]) if not top_off.empty else "Unknown"
-        top_offender_cnt = int(top_off.loc[0, "cnt"]) if not top_off.empty else 0
-
-        u_metrics1, u_metrics2, u_metrics3 = st.columns(3)
-        with u_metrics1:
-            st.metric("Active Unauthorized Apps", f"{unauth_apps:,}")
-        with u_metrics2:
-            st.metric("Top Offender (MAC)", top_offender, delta=f"{top_offender_cnt:,} events", delta_color="inverse")
-        with u_metrics3:
-            st.metric("Critical / High Risks", f"{crit_high_unauth:,}", delta="Requires attention", delta_color="inverse")
-
-        st.divider()
-
-        exfil_scope_where_sql = """"App Status"='Unauthorized'"""
-        exfil_scope_params = []
-
-        with st.expander("Data Exfiltration Monitor (High Volume Traffic)", expanded=True):
-            st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-            exf_top_1, exf_top_2, exf_top_3 = st.columns([1.4, 1.6, 2.2])
-            with exf_top_1:
-                exfil_risk_filter = risk_multiselect(
-                    "Exfiltration Risk",
-                    key="exfil_risk_filter",
-                    default=["Critical", "High", "Medium", "Low", "Safe"],
-                )
-            with exf_top_2:
-                behavior_df = _sql_fetch_df(
-                    conn,
-                    """
-                    SELECT DISTINCT COALESCE(Behavior, 'Unknown') AS Behavior
-                    FROM shadow_events
-                    WHERE "App Status"='Unauthorized'
-                    ORDER BY 1
-                    """,
-                )
-                behavior_options = behavior_df["Behavior"].dropna().tolist() if not behavior_df.empty else []
-                exfil_behavior_filter = st.multiselect(
-                    "Behavior",
-                    behavior_options,
-                    default=behavior_options,
-                    key="exfil_behavior_filter",
-                )
-            with exf_top_3:
-                exfil_search = st.text_input(
-                    "Search Exfiltration (MAC/IP/Domain/Host)",
-                    placeholder="e.g., suspicious.com or 192.168.1.44",
-                    key="exfil_search",
-                ).strip()
-
-            max_bytes_df = _sql_fetch_df(
-                conn,
-                """
-                SELECT COALESCE(MAX(bytes_sent), 0) AS max_bytes
-                FROM shadow_events
-                WHERE "App Status"='Unauthorized' AND COALESCE(bytes_sent,0) > 0
-                """,
-            )
-            max_bytes = int(max_bytes_df.loc[0, "max_bytes"]) if not max_bytes_df.empty else 0
-            max_mb = int(max(10, min(5000, max_bytes / 1_000_000 if max_bytes > 0 else 10)))
-
-            exf_bottom_1, exf_bottom_2 = st.columns([1.4, 2.0])
-            with exf_bottom_1:
-                exfil_min_mb = st.slider("Min Upload (MB)", 0, max_mb, min(5, max_mb), key="exfil_min_mb")
-            with exf_bottom_2:
-                exfil_chart_mode = st.radio(
-                    "Graph Type",
-                    ["Bubble by Port", "Hourly Upload Trend"],
-                    horizontal=True,
-                    key="exfil_chart_mode",
-                )
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            exfil_scope_where = [""""App Status"='Unauthorized'"""]
-            exfil_scope_params = []
-            if exfil_risk_filter:
-                in_clause = _build_in_clause(exfil_risk_filter, exfil_scope_params)
-                exfil_scope_where.append(f""""Risk Level" IN {in_clause}""")
-            if exfil_behavior_filter:
-                in_clause = _build_in_clause(exfil_behavior_filter, exfil_scope_params)
-                exfil_scope_where.append(f"COALESCE(Behavior, 'Unknown') IN {in_clause}")
-            if exfil_search:
-                q = f"%{exfil_search}%"
-                exfil_scope_where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
-                exfil_scope_params.extend([q, q, q, q])
-
-            exfil_scope_where_sql = " AND ".join(exfil_scope_where)
-            exfil_where = list(exfil_scope_where)
-            exfil_params = list(exfil_scope_params)
-            min_upload_bytes = int(exfil_min_mb * 1_000_000)
-            if min_upload_bytes > 0:
-                exfil_where.append("COALESCE(bytes_sent,0) >= ?")
-                exfil_params.append(min_upload_bytes)
-            else:
-                exfil_where.append("COALESCE(bytes_sent,0) > 0")
-
-            exfil_where_sql = " AND ".join(exfil_where)
-            exfil_points = _sql_fetch_df(
-                conn,
-                f"""
-                SELECT datetime, dst_port, bytes_sent, bytes_received, COALESCE(Behavior,'Unknown') AS Behavior,
-                       domain_clean, mac, hostname, "Risk Level"
-                FROM shadow_events
-                WHERE {exfil_where_sql}
-                ORDER BY bytes_sent DESC
-                LIMIT 5000
-                """,
-                exfil_params,
-            )
-
-            filtered_sent_gb = float(exfil_points["bytes_sent"].sum()) / 1_000_000_000 if not exfil_points.empty else 0.0
-            filtered_recv_gb = float(exfil_points["bytes_received"].sum()) / 1_000_000_000 if not exfil_points.empty else 0.0
-
-            st.markdown(
-                f"<div class='shadow-filter-hint'>Risk: <strong>{', '.join(exfil_risk_filter) if exfil_risk_filter else 'None'}</strong> | Behavior: <strong>{len(exfil_behavior_filter)} selected</strong> | Search: <strong>{'On' if exfil_search else 'Off'}</strong> | Min Upload: <strong>{exfil_min_mb} MB</strong></div>",
-                unsafe_allow_html=True,
-            )
-
-            exfil_c1, exfil_c2 = st.columns([1, 2])
-            with exfil_c1:
-                st.metric("Filtered Upload", f"{filtered_sent_gb:.2f} GB", delta="Potential leak", delta_color="inverse")
-                st.metric("Filtered Download", f"{filtered_recv_gb:.2f} GB")
-                st.metric("Filtered Events", f"{len(exfil_points):,}")
-
-            with exfil_c2:
-                if not exfil_points.empty:
-                    if exfil_chart_mode == "Bubble by Port":
-                        fig_exfil = px.scatter(
-                            exfil_points,
-                            x="dst_port",
-                            y="bytes_sent",
-                            size="bytes_sent",
-                            color="Risk Level",
-                            color_discrete_map=RISK_COLORS,
-                            hover_data=["domain_clean", "mac", "hostname", "Behavior"],
-                            title="Outbound Data Volume by Port",
-                        )
-                        style_plotly_figure(fig_exfil, height=360)
-                        fig_exfil.update_xaxes(title="Destination Port")
-                        fig_exfil.update_yaxes(title="Bytes Sent")
-                    else:
-                        trend = exfil_points.copy()
-                        trend["datetime"] = pd.to_datetime(trend["datetime"], errors="coerce")
-                        trend = trend.dropna(subset=["datetime"])
-                        if trend.empty:
-                            fig_exfil = None
-                        else:
-                            trend["hour"] = trend["datetime"].dt.floor("1H")
-                            trend = trend.groupby("hour", as_index=False)["bytes_sent"].sum()
-                            fig_exfil = px.line(
-                                trend,
-                                x="hour",
-                                y="bytes_sent",
-                                markers=True,
-                                color_discrete_sequence=["#38bdf8"],
-                                title="Hourly Outbound Upload Volume",
-                            )
-                            style_plotly_figure(fig_exfil, height=360, show_legend=False)
-                            fig_exfil.update_xaxes(title=None)
-                            fig_exfil.update_yaxes(title="Bytes Sent")
-
-                    if fig_exfil is None:
-                        st.info("No timestamped events available for trend graph.")
-                    else:
-                        st.plotly_chart(fig_exfil, use_container_width=True)
-                else:
-                    st.info("No significant outbound traffic detected with current filters.")
-
-        st.divider()
-
-        u_chart1, u_chart2 = st.columns([2, 1])
-        with u_chart1:
-            st.markdown("#### Top Unauthorized Domains")
-            top_unauth = _sql_fetch_df(
-                conn,
-                f"""
-                SELECT domain_clean AS Domain, COUNT(*) AS Hits
-                FROM shadow_events
-                WHERE {exfil_scope_where_sql}
-                GROUP BY 1
-                ORDER BY 2 DESC
-                LIMIT 10
-                """,
-                exfil_scope_params,
-            )
-            if not top_unauth.empty:
-                fig_u1 = px.bar(
-                    top_unauth,
-                    x="Hits",
-                    y="Domain",
-                    orientation="h",
-                    color_discrete_sequence=["#f97316"],
-                )
-                style_plotly_figure(fig_u1, height=360, show_legend=False)
-                fig_u1.update_layout(yaxis={"categoryorder": "total ascending"})
-                st.plotly_chart(fig_u1, use_container_width=True)
-            else:
-                st.info("No unauthorized domains found.")
-
-        with u_chart2:
-            st.markdown("#### Risk Distribution")
-            risk_counts = _sql_fetch_df(
-                conn,
-                f"""
-                SELECT "Risk Level" AS Risk, COUNT(*) AS Count
-                FROM shadow_events
-                WHERE {exfil_scope_where_sql}
-                GROUP BY 1
-                ORDER BY 2 DESC
-                """,
-                exfil_scope_params,
-            )
-            if not risk_counts.empty:
-                fig_u2 = px.pie(
-                    risk_counts,
-                    values="Count",
-                    names="Risk",
-                    color="Risk",
-                    color_discrete_map=RISK_COLORS,
-                    hole=0.6,
-                )
-                style_plotly_figure(fig_u2, height=360)
-                st.plotly_chart(fig_u2, use_container_width=True)
-            else:
-                st.info("No risk distribution data.")
-
-        st.divider()
-
-        st.markdown("### Threat Details")
-        st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-        af_top_1, af_top_2 = st.columns([1.25, 1.75])
-        af_bottom_1, _ = st.columns([3, 1])
-
-        with af_top_1:
-            filter_risk = risk_multiselect("Filter by Risk", key="unauth_risk_filter", default=["Critical", "High", "Medium", "Low"])
-
-        with af_top_2:
-            src_list = _sql_fetch_df(
-                conn,
-                """
-                SELECT DISTINCT source_log
-                FROM shadow_events
-                WHERE "App Status"='Unauthorized'
-                ORDER BY 1
-                """,
-            )
-            sources = src_list["source_log"].dropna().tolist() if not src_list.empty else []
-            filter_source = st.multiselect("Filter by Log Source", sources, default=sources)
-
-        with af_bottom_1:
-            search_query_unauth = st.text_input(
-                "Search (IP, MAC, Domain)",
-                placeholder="e.g., be:18:78:9d:3f:b1 or suspicious-domain.com",
-                key="unauth_search",
-            ).strip()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        where = [""""App Status"='Unauthorized'"""]
-        params = []
-
-        if filter_risk:
-            in_clause = _build_in_clause(filter_risk, params)
-            where.append(f""""Risk Level" IN {in_clause}""")
-
-        if filter_source:
-            in_clause = _build_in_clause(filter_source, params)
-            where.append(f"source_log IN {in_clause}")
-
-        if search_query_unauth:
-            q = f"%{search_query_unauth}%"
-            where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
-            params.extend([q, q, q, q])
-
-        threat_risk_summary = ", ".join(filter_risk) if filter_risk else "None"
-        threat_source_summary = f"{len(filter_source)} selected" if filter_source else "None"
-        threat_search_summary = "On" if search_query_unauth else "Off"
-        st.markdown(
-            f"<div class='shadow-filter-hint'>Risk: <strong>{threat_risk_summary}</strong> | Sources: <strong>{threat_source_summary}</strong> | Search: <strong>{threat_search_summary}</strong></div>",
-            unsafe_allow_html=True,
-        )
-
-        where_sql = " AND ".join(where)
-
-        detail_table = _sql_fetch_df(
-            conn,
-            f"""
-            SELECT
-                datetime,
-                mac,
-                hostname,
-                ip,
-                domain_clean,
-                source_log,
-                Info,
-                dst_port,
-                bytes_sent,
-                bytes_received,
-                Behavior,
-                "Risk Level",
-                "Risk Basis"
-            FROM shadow_events
-            WHERE {where_sql}
-            ORDER BY datetime DESC
-            LIMIT 1000
-            """,
-            params,
-        )
-
-        if detail_table.empty:
-            st.info("No rows match your filters.")
-        else:
-            detail_grid = detail_table.copy()
-            detail_grid["datetime"] = pd.to_datetime(detail_grid["datetime"], errors="coerce")
-            detail_grid["datetime"] = detail_grid["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            detail_grid["datetime"] = detail_grid["datetime"].fillna("")
-
-            threat_risk_style = JsCode(
-                """
-                function(params) {
-                    const v = (params.value || '').toString();
-                    if (v === 'Critical') return {color: '#ef4444', fontWeight: '800'};
-                    if (v === 'High') return {color: '#f97316', fontWeight: '800'};
-                    if (v === 'Medium') return {color: '#f59e0b', fontWeight: '700'};
-                    if (v === 'Low') return {color: '#eab308', fontWeight: '700'};
-                    if (v === 'Safe') return {color: '#22c55e', fontWeight: '700'};
-                    return {};
-                }
-                """
-            )
-            bytes_style = JsCode(
-                """
-                function(params) {
-                    const v = Number(params.value || 0);
-                    if (v > 100000000) return {color: '#fb7185', fontWeight: '700'};
-                    if (v > 10000000) return {color: '#f59e0b', fontWeight: '700'};
-                    return {color: '#93c5fd'};
-                }
-                """
-            )
-
-            gb_threat = GridOptionsBuilder.from_dataframe(detail_grid)
-            gb_threat.configure_default_column(filter=True, sortable=True, resizable=True)
-            gb_threat.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-            gb_threat.configure_column("datetime", header_name="Timestamp", width=170)
-            gb_threat.configure_column("domain_clean", header_name="Unauthorized Domain", minWidth=210)
-            gb_threat.configure_column("source_log", header_name="Source", width=110)
-            gb_threat.configure_column("Info", header_name="Context", minWidth=230)
-            gb_threat.configure_column("dst_port", header_name="Port", width=90)
-            gb_threat.configure_column("bytes_sent", header_name="Upload (Bytes)", width=140, cellStyle=bytes_style)
-            gb_threat.configure_column("bytes_received", header_name="Download (Bytes)", width=150, cellStyle=bytes_style)
-            gb_threat.configure_column("Risk Level", header_name="Threat Risk", width=118, cellStyle=threat_risk_style)
-            gb_threat.configure_column("Risk Basis", header_name="Risk Basis", minWidth=220)
-            threat_grid_options = gb_threat.build()
-            threat_grid_options["domLayout"] = "normal"
-            threat_grid_options["alwaysShowVerticalScroll"] = True
-            threat_grid_options["suppressHorizontalScroll"] = False
-            threat_grid_options["alwaysShowHorizontalScroll"] = True
-
-            ag_theme, ag_css = get_aggrid_theme_and_css()
-            st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-            AgGrid(
-                detail_grid,
-                gridOptions=threat_grid_options,
-                update_mode=GridUpdateMode.NO_UPDATE,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                height=_table_height_for_rows(len(detail_grid), min_px=240, max_px=520),
-                theme=ag_theme,
-                custom_css=ag_css,
-                allow_unsafe_jscode=True,
-                fit_columns_on_grid_load=False,
-                reload_data=False,
-                key="exfil_threat_details_grid",
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.caption(f"{len(detail_table):,} threat events shown (limited to 1,000).")

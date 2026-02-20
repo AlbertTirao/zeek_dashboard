@@ -16,7 +16,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v5"
+CACHE_VERSION = "shadow-sharing-cache-v7-exfil-files"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -272,7 +272,7 @@ def _collect_known_files(parquet_root: Path) -> List[Path]:
 
 
 def _collect_date_files(date_dir: Path) -> Dict[str, List[Path]]:
-    buckets = {"http": [], "ssl": [], "dns": [], "conn": [], "dhcp": []}
+    buckets = {"http": [], "ssl": [], "dns": [], "conn": [], "files": [], "dhcp": []}
     if not date_dir.exists():
         return buckets
 
@@ -287,6 +287,8 @@ def _collect_date_files(date_dir: Path) -> Dict[str, List[Path]]:
                 buckets["dns"].append(f)
             elif n.startswith("conn"):
                 buckets["conn"].append(f)
+            elif n.startswith("files"):
+                buckets["files"].append(f)
             elif n.startswith("dhcp"):
                 buckets["dhcp"].append(f)
     except Exception:
@@ -509,6 +511,10 @@ def _detect_action(log_source: str, method: str, uri: str, user_agent: str, dest
     if ls == "conn":
         return ("Raw Connection", "conn telemetry")
 
+    # FILES: explicit file transfer metadata from Zeek files.log
+    if ls == "files":
+        return ("File Transfer", "files telemetry")
+
     # HTTP:
     # Upload
     if m in ("POST", "PUT", "PATCH"):
@@ -664,11 +670,64 @@ def _risk_score_row(row: pd.Series) -> Tuple[int, str]:
         basis = ["baseline"]
     return score, "; ".join(basis)
 
+
+def _detect_exfil_signal_row(row: pd.Series) -> Tuple[bool, str]:
+    """
+    Returns (is_exfil_signal, detection_basis) using explicit exfil indicators.
+    """
+    reasons: List[str] = []
+
+    action = str(row.get("Action", "") or "")
+    log_source = str(row.get("log_source", "") or "").lower()
+    severity = str(row.get("Severity", "") or "").upper()
+    dns_reason = str(row.get("DNS_Exfil_Reason", "") or "").strip()
+    allowed = bool(row.get("Allowed", False))
+    bytes_v = float(row.get("bytes", 0) or 0)
+
+    if action in {"Upload", "Post Data", "Paste/Share", "File Transfer"}:
+        reasons.append(f"action={action}")
+
+    if dns_reason:
+        reasons.append("dns exfil heuristic")
+
+    if not allowed and action in {"Remote Access", "Automated Access"} and bytes_v >= 10 * 1024 * 1024:
+        reasons.append(f"{action.lower()} with >=10MB")
+
+    if not allowed and log_source == "conn" and bytes_v >= 100 * 1024 * 1024:
+        reasons.append("large raw connection >=100MB")
+
+    if not allowed and severity in {"CRITICAL", "HIGH"} and bytes_v >= 50 * 1024 * 1024:
+        reasons.append("high-risk large transfer")
+
+    if not reasons:
+        return False, ""
+    return True, "; ".join(reasons)
+
 # -----------------------------------------------------------------------------
 # Builders
 # -----------------------------------------------------------------------------
 
 def _destination_from_df(df: pd.DataFrame, log_source: str) -> pd.Series:
+    def _first_vector_value(v: object) -> str:
+        if isinstance(v, list):
+            if not v:
+                return ""
+            v = v[0]
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        s = str(v).strip()
+        if not s or s in {"nan", "None", "[]"}:
+            return ""
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1].strip()
+            if "," in s:
+                s = s.split(",", 1)[0]
+            s = s.strip().strip("'").strip('"').strip()
+        return s
+
     ls = log_source.lower()
     if ls == "http":
         if "host" in df.columns:
@@ -689,6 +748,18 @@ def _destination_from_df(df: pd.DataFrame, log_source: str) -> pd.Series:
         p = df["id.resp_p"].astype(str).fillna("") if "id.resp_p" in df.columns else pd.Series([""] * len(df))
         out = (h + ":" + p).replace({":": ""})
         return out
+    if ls == "files":
+        for col in ["rx_hosts", "tx_hosts", "id.resp_h", "host", "server_name", "id.orig_h"]:
+            if col not in df.columns:
+                continue
+            if col in {"rx_hosts", "tx_hosts"}:
+                s = df[col].apply(_first_vector_value)
+            else:
+                s = df[col].astype(str).fillna("").str.strip()
+            s = s.replace({"nan": "", "None": "", "[]": ""})
+            if (s != "").any():
+                return s
+        return pd.Series([""] * len(df))
     return pd.Series([""] * len(df))
 
 
@@ -704,6 +775,12 @@ def _bytes_from_df(df: pd.DataFrame, log_source: str) -> pd.Series:
         if "orig_bytes" in df.columns:
             return pd.to_numeric(df["orig_bytes"], errors="coerce").fillna(0)
         return pd.Series([0] * len(df))
+    if ls == "files":
+        if "total_bytes" in df.columns:
+            return pd.to_numeric(df["total_bytes"], errors="coerce").fillna(0)
+        if "seen_bytes" in df.columns:
+            return pd.to_numeric(df["seen_bytes"], errors="coerce").fillna(0)
+        return pd.Series([0] * len(df))
     return pd.Series([0] * len(df))
 
 
@@ -716,6 +793,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         "ssl": _file_signature(buckets["ssl"]),
         "dns": _file_signature(buckets["dns"]),
         "conn": _file_signature(buckets["conn"]),
+        "files": _file_signature(buckets["files"]),
         "dhcp": _file_signature(buckets["dhcp"]),
         "known": _file_signature(known_files),
     }
@@ -739,7 +817,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     ip_map, mac_map = _build_identity_maps(buckets["dhcp"], buckets["conn"], known_files)
 
     frames: List[pd.DataFrame] = []
-    for src in ["http", "ssl", "dns", "conn"]:
+    for src in ["http", "ssl", "dns", "conn", "files"]:
         paths = buckets.get(src, [])
         if not paths:
             continue
@@ -778,6 +856,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
             "method", "uri", "user_agent", "content_type",
             "orig_l2_addr",
             "host", "server_name", "query",
+            "filename", "mime_type", "source", "fuid", "tx_hosts", "rx_hosts", "seen_bytes", "total_bytes",
         ]
         keep = [c for c in keep if c in df.columns]
         frames.append(df[keep].copy())
@@ -831,6 +910,11 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     out["Risk_Score"] = rs.apply(lambda x: int(x[0]))
     out["Risk_Basis"] = rs.apply(lambda x: str(x[1]))
     out["Severity"] = out["Risk_Score"].apply(_severity_label)
+
+    # explicit exfil signal detector (used by Data Exfiltration Threats tab)
+    ex = out.apply(_detect_exfil_signal_row, axis=1)
+    out["Exfil_Indicator"] = ex.apply(lambda x: bool(x[0]))
+    out["Exfil_Detection_Basis"] = ex.apply(lambda x: str(x[1]))
 
     # VirusTotal link for domain/SNI/query
     out["vt_link"] = "https://www.virustotal.com/gui/domain/" + out["destination"].astype(str)
@@ -1423,6 +1507,9 @@ def show_shadow_sharing_device_dialog(
         dest_grid.insert(0, "#", range(1, len(dest_grid) + 1))
         dest_grid["Last_Seen"] = pd.to_datetime(dest_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
         dest_grid["Total_MB"] = pd.to_numeric(dest_grid["Total_MB"], errors="coerce").fillna(0).round(2)
+        dest_grid["Max_Risk"] = pd.to_numeric(dest_grid["Max_Risk"], errors="coerce").fillna(0).astype(int)
+        dest_grid["Max_Risk_Level"] = dest_grid["Max_Risk"].apply(_severity_label)
+        dest_grid = dest_grid.drop(columns=["Max_Risk"])
 
         gb_dest = GridOptionsBuilder.from_dataframe(dest_grid)
         gb_dest.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
@@ -1436,7 +1523,7 @@ def show_shadow_sharing_device_dialog(
         gb_dest.configure_column("Events", width=88)
         gb_dest.configure_column("Unique_Devices", header_name="Devices", width=90)
         gb_dest.configure_column("Total_MB", header_name="Total MB", width=116)
-        gb_dest.configure_column("Max_Risk", header_name="Max Risk", width=96, cellStyle=_risk_score_cellstyle())
+        gb_dest.configure_column("Max_Risk_Level", header_name="Risk Level", width=130, cellStyle=_severity_cellstyle())
         gb_dest.configure_column("Top_Action", header_name="Top Action", minWidth=145)
 
         render_shadow_aggrid(
@@ -1483,6 +1570,9 @@ def show_shadow_sharing_device_dialog(
             burst_grid.insert(0, "#", range(1, len(burst_grid) + 1))
             burst_grid["bucket"] = pd.to_datetime(burst_grid["bucket"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
             burst_grid["bytes"] = pd.to_numeric(burst_grid["bytes"], errors="coerce").fillna(0).astype(int)
+            burst_grid["max_risk"] = pd.to_numeric(burst_grid["max_risk"], errors="coerce").fillna(0).astype(int)
+            burst_grid["max_risk_level"] = burst_grid["max_risk"].apply(_severity_label)
+            burst_grid = burst_grid.drop(columns=["max_risk"])
 
             gb_burst = GridOptionsBuilder.from_dataframe(burst_grid)
             gb_burst.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
@@ -1493,7 +1583,7 @@ def show_shadow_sharing_device_dialog(
             gb_burst.configure_column("host", header_name="Host", minWidth=160)
             gb_burst.configure_column("events", header_name="Events", width=90)
             gb_burst.configure_column("bytes", header_name="Bytes", width=130)
-            gb_burst.configure_column("max_risk", header_name="Max Risk", width=100, cellStyle=_risk_score_cellstyle())
+            gb_burst.configure_column("max_risk_level", header_name="Max Risk Level", width=130, cellStyle=_severity_cellstyle())
 
             render_shadow_aggrid(
                 burst_grid,
@@ -1558,8 +1648,8 @@ def show_shadow_sharing_device_dialog(
         gb_log.configure_column("Action", minWidth=130, flex=1.1)
         gb_log.configure_column("bytes", header_name="Bytes", minWidth=110, flex=1.0)
         gb_log.configure_column("Client_Type", header_name="Client", minWidth=120, flex=1.0)
-        gb_log.configure_column("Risk_Score", header_name="Risk", minWidth=85, flex=0.8, cellStyle=_risk_score_cellstyle())
-        gb_log.configure_column("Severity", minWidth=95, flex=0.9, cellStyle=_severity_cellstyle())
+        gb_log.configure_column("Risk_Score", header_name="Risk Score", minWidth=95, flex=0.85, cellStyle=_risk_score_cellstyle())
+        gb_log.configure_column("Severity", header_name="Risk Level", minWidth=105, flex=0.95, cellStyle=_severity_cellstyle())
         gb_log.configure_column("log_source", header_name="Source", minWidth=95, flex=0.9)
         gb_log.configure_column("method", header_name="Method", minWidth=90, flex=0.9)
         gb_log.configure_column("uri", header_name="URI", minWidth=220, flex=2.0)
@@ -1580,7 +1670,7 @@ def render_shadow_sharing(parquet_root: Path):
     inject_shadow_sharing_css()
     st.markdown("### Data Exfiltration Monitoring")
     st.markdown(
-        "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN telemetry to surface potential shadow sharing and exfiltration paths.</div>",
+        "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN/FILES telemetry to surface potential shadow sharing and exfiltration paths.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1623,21 +1713,21 @@ def render_shadow_sharing(parquet_root: Path):
 
     with st.expander("Detection basis (what this page detects)", expanded=False):
         st.write(
-            "This page correlates Zeek telemetry (HTTP/SSL/DNS/CONN) and flags potential Shadow Sharing / Exfiltration.\n"
+            "This page correlates Zeek telemetry (HTTP/SSL/DNS/CONN/FILES) and flags potential Shadow Sharing / Exfiltration.\n"
             "- Allowed/Unapproved is based on whitelist_domains.yaml (Allow_Basis shows which entry matched).\n"
-            "- Action is inferred from HTTP method/URI patterns and client type.\n"
+            "- Action is inferred from HTTP method/URI patterns, client type, and files telemetry.\n"
             "- DNS exfil heuristics flag tunneling-like query patterns.\n"
-            "- Risk_Score/Severity is computed with an explainable Risk_Basis string."
+            "- Risk_Score/Risk Level is computed with an explainable Risk_Basis string."
         )
 
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns([2.0, 1.35, 1.55, 1.2])
     with c1:
-        selected_sources = st.multiselect("Protocols", ["http", "ssl", "dns", "conn"], default=["http", "ssl", "dns"])
+        selected_sources = st.multiselect("Protocols", ["http", "ssl", "dns", "conn", "files"], default=["http", "ssl", "dns", "files"])
     with c2:
         show_only_unapproved = st.checkbox("Only Unapproved", value=False)
     with c3:
-        min_sev = st.multiselect("Severity", ["CRITICAL", "HIGH", "MEDIUM", "LOW"], default=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
+        selected_risk_levels = st.multiselect("Risk Level", ["CRITICAL", "HIGH", "MEDIUM", "LOW"], default=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
     with c4:
         min_bytes_mb = st.number_input("Min Bytes (MB)", min_value=0, value=0, step=10)
 
@@ -1645,7 +1735,7 @@ def render_shadow_sharing(parquet_root: Path):
     with c5:
         action_filter = st.multiselect(
             "Action",
-            ["Upload", "Post Data", "Paste/Share", "Remote Access", "Automated Access", "Browse", "Encrypted Access", "Raw Connection", "DNS Lookup"],
+            ["Upload", "Post Data", "Paste/Share", "File Transfer", "Remote Access", "Automated Access", "Browse", "Encrypted Access", "Raw Connection", "DNS Lookup"],
             default=[],
             placeholder="All actions",
         )
@@ -1661,10 +1751,10 @@ def render_shadow_sharing(parquet_root: Path):
     st.markdown("</div>", unsafe_allow_html=True)
 
     source_summary = ", ".join(selected_sources) if selected_sources else "None"
-    sev_summary = ", ".join(min_sev) if min_sev else "None"
+    risk_level_summary = ", ".join(selected_risk_levels) if selected_risk_levels else "None"
     search_summary = "On" if (search_q or "").strip() else "Off"
     st.markdown(
-        f"<div class='shadow-filter-hint'>Protocols: <strong>{source_summary}</strong> | Severity: <strong>{sev_summary}</strong> | Only Unapproved: <strong>{'Yes' if show_only_unapproved else 'No'}</strong> | Search: <strong>{search_summary}</strong></div>",
+        f"<div class='shadow-filter-hint'>Protocols: <strong>{source_summary}</strong> | Risk Level: <strong>{risk_level_summary}</strong> | Only Unapproved: <strong>{'Yes' if show_only_unapproved else 'No'}</strong> | Search: <strong>{search_summary}</strong></div>",
         unsafe_allow_html=True,
     )
 
@@ -1687,8 +1777,8 @@ def render_shadow_sharing(parquet_root: Path):
     if show_only_unapproved:
         filtered = filtered[filtered["Allowed"] == False]  # noqa: E712
 
-    if min_sev:
-        filtered = filtered[filtered["Severity"].isin(min_sev)]
+    if selected_risk_levels:
+        filtered = filtered[filtered["Severity"].isin(selected_risk_levels)]
 
     if min_bytes_mb > 0:
         filtered = filtered[filtered["bytes"] >= float(min_bytes_mb) * 1024 * 1024]
@@ -1741,7 +1831,7 @@ def render_shadow_sharing(parquet_root: Path):
     )
 
     # Tabs (main page)
-    tab_overview, tab_device = st.tabs(["Overview", "By Device"])
+    tab_overview, tab_device, tab_threat = st.tabs(["Overview", "By Device", "Data Exfiltration Threats"])
 
     # -------------------------------------------------------------------------
     # Overview
@@ -1816,6 +1906,7 @@ def render_shadow_sharing(parquet_root: Path):
                 hover_data={"events": True, "avg_risk": ":.1f"},
             )
             style_plotly_figure(fig_timeline, height=395)
+            fig_timeline.update_layout(legend_title_text="Risk Level")
             fig_timeline.update_xaxes(title=f"Time ({bucket} buckets)")
             fig_timeline.update_yaxes(title="Events")
             st.plotly_chart(fig_timeline, use_container_width=True)
@@ -1869,6 +1960,9 @@ def render_shadow_sharing(parquet_root: Path):
         dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
         dev_grid["Last_Seen"] = pd.to_datetime(dev_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
         dev_grid["Total_MB"] = pd.to_numeric(dev_grid["Total_MB"], errors="coerce").fillna(0).round(2)
+        dev_grid["Max_Risk"] = pd.to_numeric(dev_grid["Max_Risk"], errors="coerce").fillna(0).astype(int)
+        dev_grid["Max_Risk_Level"] = dev_grid["Max_Risk"].apply(_severity_label)
+        dev_grid = dev_grid.drop(columns=["Max_Risk"])
 
         gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
         gb_dev.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
@@ -1898,7 +1992,7 @@ def render_shadow_sharing(parquet_root: Path):
         gb_dev.configure_column("Total_MB", header_name="Total MB", width=116)
         gb_dev.configure_column("Top_Action", header_name="Top Action", minWidth=145)
         gb_dev.configure_column("Top_Dest", header_name="Top Destination", minWidth=180)
-        gb_dev.configure_column("Max_Risk", header_name="Max Risk", width=96, cellStyle=_risk_score_cellstyle())
+        gb_dev.configure_column("Max_Risk_Level", header_name="Max Risk Level", width=130, cellStyle=_severity_cellstyle())
 
         dev_response = render_shadow_aggrid(
             dev_grid,
@@ -1920,6 +2014,365 @@ def render_shadow_sharing(parquet_root: Path):
                 st.session_state["shadow_sharing_last_selected_mac"] = None
         else:
             st.info("MAC values are not available in this scope, so MAC drilldown dialog is disabled.")
+
+    # -------------------------------------------------------------------------
+    # Data Exfiltration Threats (moved from shadow_apps)
+    # -------------------------------------------------------------------------
+    with tab_threat:
+        st.markdown("#### Data Exfiltration Threats")
+        st.markdown(
+            "<div class='shadow-callout'>Focused view of logs/events that triggered explicit exfiltration detection signals.</div>",
+            unsafe_allow_html=True,
+        )
+
+        threat_base = filtered.copy()
+        if "Exfil_Indicator" not in threat_base.columns:
+            ex = threat_base.apply(_detect_exfil_signal_row, axis=1)
+            threat_base["Exfil_Indicator"] = ex.apply(lambda x: bool(x[0]))
+            threat_base["Exfil_Detection_Basis"] = ex.apply(lambda x: str(x[1]))
+        elif "Exfil_Detection_Basis" not in threat_base.columns:
+            threat_base["Exfil_Detection_Basis"] = ""
+
+        threat_base = threat_base[
+            (threat_base["Allowed"] == False) & (threat_base["Exfil_Indicator"] == True)  # noqa: E712
+        ].copy()
+        if threat_base.empty:
+            st.success("No exfiltration signals detected in current scope.")
+        else:
+            threat_base["bytes"] = pd.to_numeric(threat_base["bytes"], errors="coerce").fillna(0)
+
+            has_mac = threat_base["mac"].replace({"": None}).dropna().nunique() > 0
+            offender_key = "mac" if has_mac else "id.orig_h"
+            top_off = (
+                threat_base.groupby(offender_key, dropna=False)
+                .size()
+                .reset_index(name="events")
+                .sort_values("events", ascending=False)
+                .head(1)
+            )
+            top_offender = (
+                str(top_off.iloc[0][offender_key])
+                if not top_off.empty and str(top_off.iloc[0][offender_key]).strip()
+                else "Unknown"
+            )
+            top_offender_cnt = int(top_off.iloc[0]["events"]) if not top_off.empty else 0
+
+            tm1, tm2, tm3 = st.columns(3)
+            tm1.metric("Detected Exfil Destinations", f"{int(threat_base['destination'].replace({'': None, 'Unknown': None}).dropna().nunique()):,}")
+            tm2.metric(
+                f"Top Offender ({'MAC' if offender_key == 'mac' else 'IP'})",
+                top_offender,
+                delta=f"{top_offender_cnt:,} events",
+                delta_color="inverse",
+            )
+            tm3.metric(
+                "Critical / High Risks",
+                f"{int(threat_base['Severity'].isin(['CRITICAL', 'HIGH']).sum()):,}",
+                delta="Requires attention",
+                delta_color="inverse",
+            )
+
+            st.divider()
+
+            with st.expander("Data Exfiltration Monitor (High Volume Traffic)", expanded=True):
+                st.caption("Scope uses logs/events flagged by exfiltration detection signals only.")
+                st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+                exf_top_1, exf_top_2, exf_top_3 = st.columns([1.4, 1.8, 2.2])
+                with exf_top_1:
+                    exfil_risk_filter = st.multiselect(
+                        "Exfiltration Risk",
+                        ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+                        default=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+                        key=f"sharing_exfil_risk_{selected_scope_key}",
+                    )
+                with exf_top_2:
+                    action_options = sorted(threat_base["Action"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
+                    exfil_action_filter = st.multiselect(
+                        "Action",
+                        action_options,
+                        default=action_options,
+                        key=f"sharing_exfil_action_{selected_scope_key}",
+                    )
+                with exf_top_3:
+                    exfil_search = st.text_input(
+                        "Search Exfiltration (MAC/IP/Host/Destination/Basis)",
+                        placeholder="e.g., suspicious.com or 192.168.1.44",
+                        key=f"sharing_exfil_search_{selected_scope_key}",
+                    ).strip()
+
+                max_bytes = int(threat_base["bytes"].max()) if not threat_base.empty else 0
+                max_mb = int(max(10, min(5000, math.ceil(max_bytes / (1024 * 1024)) if max_bytes > 0 else 10)))
+
+                exf_bottom_1, exf_bottom_2 = st.columns([1.4, 2.0])
+                with exf_bottom_1:
+                    exfil_min_mb = st.slider(
+                        "Min Transfer (MB)",
+                        0,
+                        max_mb,
+                        min(5, max_mb),
+                        key=f"sharing_exfil_min_mb_{selected_scope_key}",
+                    )
+                with exf_bottom_2:
+                    exfil_chart_mode = st.radio(
+                        "Graph Type",
+                        ["Bubble by Destination", "Hourly Transfer Trend"],
+                        horizontal=True,
+                        key=f"sharing_exfil_chart_mode_{selected_scope_key}",
+                    )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                exfil_points = threat_base.copy()
+                if exfil_risk_filter:
+                    exfil_points = exfil_points[exfil_points["Severity"].isin(exfil_risk_filter)]
+                if exfil_action_filter:
+                    exfil_points = exfil_points[exfil_points["Action"].isin(exfil_action_filter)]
+                if exfil_search:
+                    q = exfil_search.lower()
+                    exfil_points = exfil_points[
+                        exfil_points["mac"].astype(str).str.lower().str.contains(q, na=False)
+                        | exfil_points["host_name"].astype(str).str.lower().str.contains(q, na=False)
+                        | exfil_points["id.orig_h"].astype(str).str.lower().str.contains(q, na=False)
+                        | exfil_points["destination"].astype(str).str.lower().str.contains(q, na=False)
+                        | exfil_points["Exfil_Detection_Basis"].astype(str).str.lower().str.contains(q, na=False)
+                        | exfil_points["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False)
+                        | exfil_points["Action_Basis"].astype(str).str.lower().str.contains(q, na=False)
+                    ]
+                min_upload_bytes = int(exfil_min_mb * 1024 * 1024)
+                if min_upload_bytes > 0:
+                    exfil_points = exfil_points[exfil_points["bytes"] >= min_upload_bytes]
+                else:
+                    exfil_points = exfil_points[exfil_points["bytes"] > 0]
+                exfil_points = exfil_points.sort_values("bytes", ascending=False).head(5000)
+
+                st.markdown(
+                    f"<div class='shadow-filter-hint'>Risk: <strong>{', '.join(exfil_risk_filter) if exfil_risk_filter else 'None'}</strong> | Action: <strong>{len(exfil_action_filter)} selected</strong> | Search: <strong>{'On' if exfil_search else 'Off'}</strong> | Min Transfer: <strong>{exfil_min_mb} MB</strong></div>",
+                    unsafe_allow_html=True,
+                )
+
+                exfil_c1, exfil_c2 = st.columns([1, 2])
+                with exfil_c1:
+                    filtered_mb = float(exfil_points["bytes"].sum()) / 1024 / 1024 if not exfil_points.empty else 0.0
+                    exfil_c1.metric("Filtered Transfer", f"{filtered_mb:,.2f} MB", delta="Potential leak", delta_color="inverse")
+                    exfil_c1.metric("Filtered Events", f"{len(exfil_points):,}")
+                    exfil_c1.metric(
+                        "Detected Exfil Destinations",
+                        f"{int(exfil_points['destination'].replace({'': None, 'Unknown': None}).dropna().nunique()):,}" if not exfil_points.empty else "0",
+                    )
+
+                with exfil_c2:
+                    if not exfil_points.empty:
+                        if exfil_chart_mode == "Bubble by Destination":
+                            bubble_df = exfil_points.head(400)
+                            fig_exfil = px.scatter(
+                                bubble_df,
+                                x="destination",
+                                y="bytes",
+                                size="bytes",
+                                color="Severity",
+                                color_discrete_map=SEVERITY_COLORS,
+                                hover_data=["mac", "host_name", "id.orig_h", "Action"],
+                                title="Outbound Transfer by Destination",
+                            )
+                            style_plotly_figure(fig_exfil, height=360)
+                            fig_exfil.update_xaxes(title="Destination")
+                            fig_exfil.update_yaxes(title="Bytes")
+                        else:
+                            trend = exfil_points.copy()
+                            trend = trend.dropna(subset=["ts"])
+                            if trend.empty:
+                                fig_exfil = None
+                            else:
+                                trend["hour"] = trend["ts"].dt.floor("1H")
+                                trend = trend.groupby("hour", as_index=False)["bytes"].sum()
+                                fig_exfil = px.line(
+                                    trend,
+                                    x="hour",
+                                    y="bytes",
+                                    markers=True,
+                                    color_discrete_sequence=["#38bdf8"],
+                                    title="Hourly Outbound Transfer Volume",
+                                )
+                                style_plotly_figure(fig_exfil, height=360, show_legend=False)
+                                fig_exfil.update_xaxes(title=None)
+                                fig_exfil.update_yaxes(title="Bytes")
+
+                        if fig_exfil is None:
+                            st.info("No timestamped events available for trend graph.")
+                        else:
+                            st.plotly_chart(fig_exfil, use_container_width=True)
+                    else:
+                        st.info("No significant outbound traffic detected with current filters.")
+
+            st.divider()
+
+            u_chart1, u_chart2 = st.columns([2, 1])
+            with u_chart1:
+                st.markdown("#### Top Exfiltration Destinations")
+                top_unauth = (
+                    threat_base.groupby("destination", dropna=False)
+                    .size()
+                    .reset_index(name="Hits")
+                    .sort_values("Hits", ascending=False)
+                    .head(10)
+                    .rename(columns={"destination": "Domain"})
+                )
+                if not top_unauth.empty:
+                    fig_u1 = px.bar(
+                        top_unauth,
+                        x="Hits",
+                        y="Domain",
+                        orientation="h",
+                        color_discrete_sequence=["#f97316"],
+                    )
+                    style_plotly_figure(fig_u1, height=360, show_legend=False)
+                    fig_u1.update_layout(yaxis={"categoryorder": "total ascending"})
+                    st.plotly_chart(fig_u1, use_container_width=True)
+                else:
+                    st.info("No exfiltration destinations found.")
+
+            with u_chart2:
+                st.markdown("#### Risk Distribution")
+                risk_counts = (
+                    threat_base.groupby("Severity", dropna=False)
+                    .size()
+                    .reset_index(name="Count")
+                    .rename(columns={"Severity": "Risk"})
+                    .sort_values("Count", ascending=False)
+                )
+                if not risk_counts.empty:
+                    fig_u2 = px.pie(
+                        risk_counts,
+                        values="Count",
+                        names="Risk",
+                        color="Risk",
+                        color_discrete_map=SEVERITY_COLORS,
+                        hole=0.6,
+                    )
+                    style_plotly_figure(fig_u2, height=360)
+                    st.plotly_chart(fig_u2, use_container_width=True)
+                else:
+                    st.info("No risk distribution data.")
+
+            st.divider()
+
+            st.markdown("#### Threat Details")
+            st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+            af_top_1, af_top_2 = st.columns([1.25, 1.75])
+            af_bottom_1, _ = st.columns([3, 1])
+
+            with af_top_1:
+                detail_risk = st.multiselect(
+                    "Filter by Risk",
+                    ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+                    default=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+                    key=f"sharing_threat_risk_{selected_scope_key}",
+                )
+
+            with af_top_2:
+                detail_sources = sorted(threat_base["log_source"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
+                detail_source_filter = st.multiselect(
+                    "Filter by Log Source",
+                    detail_sources,
+                    default=detail_sources,
+                    key=f"sharing_threat_src_{selected_scope_key}",
+                )
+
+            with af_bottom_1:
+                detail_search = st.text_input(
+                    "Search (IP, MAC, Destination, Host, Detection Basis)",
+                    placeholder="e.g., be:18:78:9d:3f:b1 or suspicious-domain.com",
+                    key=f"sharing_threat_search_{selected_scope_key}",
+                ).strip()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            detail_df = threat_base.copy()
+            if detail_risk:
+                detail_df = detail_df[detail_df["Severity"].isin(detail_risk)]
+            if detail_source_filter:
+                detail_df = detail_df[detail_df["log_source"].isin(detail_source_filter)]
+            if detail_search:
+                q = detail_search.lower()
+                detail_df = detail_df[
+                    detail_df["mac"].astype(str).str.lower().str.contains(q, na=False)
+                    | detail_df["host_name"].astype(str).str.lower().str.contains(q, na=False)
+                    | detail_df["id.orig_h"].astype(str).str.lower().str.contains(q, na=False)
+                    | detail_df["destination"].astype(str).str.lower().str.contains(q, na=False)
+                    | detail_df["Exfil_Detection_Basis"].astype(str).str.lower().str.contains(q, na=False)
+                    | detail_df["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False)
+                ]
+            detail_df = detail_df.sort_values("ts", ascending=False).head(MAX_ROWS_DISPLAY).copy()
+
+            detail_risk_summary = ", ".join(detail_risk) if detail_risk else "None"
+            detail_source_summary = f"{len(detail_source_filter)} selected" if detail_source_filter else "None"
+            detail_search_summary = "On" if detail_search else "Off"
+            st.markdown(
+                f"<div class='shadow-filter-hint'>Risk: <strong>{detail_risk_summary}</strong> | Sources: <strong>{detail_source_summary}</strong> | Search: <strong>{detail_search_summary}</strong></div>",
+                unsafe_allow_html=True,
+            )
+
+            if detail_df.empty:
+                st.info("No rows match your filters.")
+            else:
+                detail_df["ts"] = pd.to_datetime(detail_df["ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+                detail_df["bytes"] = pd.to_numeric(detail_df["bytes"], errors="coerce").fillna(0).astype(int)
+
+                detail_cols = [
+                    "ts",
+                    "mac",
+                    "host_name",
+                    "id.orig_h",
+                    "destination",
+                    "log_source",
+                    "Action",
+                    "Category",
+                    "bytes",
+                    "Severity",
+                    "Exfil_Detection_Basis",
+                    "Risk_Basis",
+                    "DNS_Exfil_Reason",
+                ]
+                detail_cols = [c for c in detail_cols if c in detail_df.columns]
+                detail_grid = detail_df[detail_cols].copy()
+                detail_grid.insert(0, "#", range(1, len(detail_grid) + 1))
+
+                bytes_style = JsCode(
+                    """
+                    function(params) {
+                        const v = Number(params.value || 0);
+                        if (v > 100000000) return {color: '#fb7185', fontWeight: '700'};
+                        if (v > 10000000) return {color: '#f59e0b', fontWeight: '700'};
+                        return {color: '#93c5fd'};
+                    }
+                    """
+                )
+
+                gb_threat = GridOptionsBuilder.from_dataframe(detail_grid)
+                gb_threat.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
+                gb_threat.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
+                gb_threat.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
+                if "ts" in detail_grid.columns:
+                    gb_threat.configure_column("ts", header_name="Timestamp", minWidth=160, flex=1.1)
+                if "destination" in detail_grid.columns:
+                    gb_threat.configure_column("destination", header_name="Destination", minWidth=200, flex=1.5)
+                if "bytes" in detail_grid.columns:
+                    gb_threat.configure_column("bytes", header_name="Transfer (Bytes)", minWidth=130, flex=1.0, cellStyle=bytes_style)
+                if "Severity" in detail_grid.columns:
+                    gb_threat.configure_column("Severity", header_name="Risk Level", minWidth=110, flex=0.9, cellStyle=_severity_cellstyle())
+                if "Exfil_Detection_Basis" in detail_grid.columns:
+                    gb_threat.configure_column("Exfil_Detection_Basis", header_name="Detection Basis", minWidth=240, flex=1.8)
+                if "Risk_Basis" in detail_grid.columns:
+                    gb_threat.configure_column("Risk_Basis", header_name="Risk Basis", minWidth=220, flex=1.8)
+                if "DNS_Exfil_Reason" in detail_grid.columns:
+                    gb_threat.configure_column("DNS_Exfil_Reason", header_name="DNS Exfil Reason", minWidth=220, flex=1.8)
+
+                render_shadow_aggrid(
+                    detail_grid,
+                    gb_threat,
+                    key=f"shadow_sharing_threat_grid_{selected_scope_key}",
+                    height=460,
+                    update_mode=GridUpdateMode.NO_UPDATE,
+                )
+                st.caption(f"{len(detail_grid):,} detected exfil events shown (limited to {MAX_ROWS_DISPLAY:,}).")
 
     if st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac"):
         show_shadow_sharing_device_dialog(filtered, selected_scope_key=selected_scope_key)

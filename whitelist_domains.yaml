@@ -1,86 +1,88 @@
 trusted_domains:
-  - "acme-v02.api.letsencrypt.org"
-  - "akamai"
-  - "api.cloudflare"
-  - "asana"
-  - "atlassian.net"
-  - "auth0"
-  - "aws.amazon"
-  - "azure.microsoft"
-  - "bitbucket.org"
-  - "box"
-  - "clients2.google"
-  - "cloud.google"
-  - "cloudflare"
-  - "confluence.example"
-  - "connectivity-check.ubuntu"
-  - "connectivitycheck.gstatic"
-  - "datadoghq"
-  - "device-api.palmplaystore"
-  - "digicert"
-  - "digitalocean"
-  - "docker"
-  - "docs.google"
-  - "drive.google"
-  - "dropbox"
-  - "fastly"
-  - "force"
-  - "gcr.io"
-  - "github"
-  - "gitlab"
-  - "google-analytics"
-  - "google."
-  - "grafana"
-  - "hetzner"
-  - "hub.docker"
-  - "internal.example"
-  - "intranetpany"
-  - "jira.example"
-  - "lazada"
-  - "letsencrypt.org"
-  - "linode"
-  - "matomo.org"
-  - "microsoft"
-  - "newrelic"
-  - "notion.so"
-  - "npmjs"
-  - "ocsp.globalsign"
-  - "office"
-  - "okta"
-  - "onelogin"
-  - "otyfastapi.dangsfly"
-  - "ovh"
-  - "pagerduty"
-  - "pypi.org"
-  - "quay.io"
-  - "raw.githubusercontent"
-  - "registry.npmjs.org"
-  - "rubygems.org"
-  - "s3.amazonaws"
-  - "sadownload.mcafee:443"
-  - "salesforce"
-  - "sdx.microsoft"
-  - "sectigo"
-  - "sentry.io"
-  - "settings-win.data.microsoft:443"
-  - "sharepoint"
-  - "slack"
-  - "stackoverflow"
-  - "statuspage.io"
-  - "tas02.sls.update.microsoft:443"
-  - "teams.microsoft"
-  - "trello"
-  - "ubuntu"
-  - "us05das.zoom.us:443"
-  - "us05web.zoom.us:443"
-  - "v10.events.data.microsoft:443"
-  - "vultr"
-  - "web.vortex.data.microsoft"
-  - "webex"
-  - "wiki.example"
-  - "www.google-analytics"
-  - "www.google-analytics:443"
-  - "www.googleapis.cn"
-  - "www.msftconnecttest"
-  - "www.msftncsi"
-  - "zoom.us"
+- acme-v02.api.letsencrypt.org
+- akamai
+- api.cloudflare
+- asana
+- atlassian.net
+- auth0
+- aws.amazon
+- azure.microsoft
+- bitbucket.org
+- box
+- clients2.google
+- cloud.google
+- cloudflare
+- confluence.example
+- connectivity-check.ubuntu
+- connectivitycheck.gstatic
+- datadoghq
+- device-api.palmplaystore
+- digicert
+- digitalocean
+- docker
+- docs.google
+- drive.google
+- dropbox
+- fastly
+- force
+- gcr.io
+- github
+- gitlab
+- google-analytics
+- google
+- grafana
+- hetzner
+- hub.docker
+- internal.example
+- intranetpany
+- jira.example
+- lazada
+- letsencrypt.org
+- linode
+- matomo.org
+- microsoft
+- newrelic
+- notion.so
+- npmjs
+- ocsp.globalsign
+- office
+- okta
+- onelogin
+- otyfastapi.dangsfly
+- ovh
+- pagerduty
+- pypi.org
+- quay.io
+- raw.githubusercontent
+- registry.npmjs.org
+- rubygems.org
+- s3.amazonaws
+- sadownload.mcafee
+- salesforce
+- sdx.microsoft
+- sectigo
+- sentry.io
+- settings-win.data.microsoft
+- sharepoint
+- slack
+- stackoverflow
+- statuspage.io
+- tas02.sls.update.microsoft
+- teams.microsoft
+- trello
+- ubuntu
+- us05das.zoom.us
+- us05web.zoom.us
+- v10.events.data.microsoft
+- vultr
+- web.vortex.data.microsoft
+- webex
+- wiki.example
+- googleapis.cn
+- msftconnecttest
+- msftncsi
+- zoom.us
+- play.google.com
+- _spotify-connect._tcp.local
+- google.com
+- connectivity-check.ubuntu.com
