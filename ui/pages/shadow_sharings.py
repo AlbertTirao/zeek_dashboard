@@ -2,6 +2,7 @@
 import re
 import math
 import warnings
+import ipaddress
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -16,7 +17,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v7-exfil-files"
+CACHE_VERSION = "shadow-sharing-cache-v9-hostname-parity"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -137,17 +138,19 @@ def _safe_yaml_load(path: Path) -> dict:
 def _extract_whitelist_domains(y: dict) -> List[str]:
     """
     Supports common shapes:
+      - {trusted_domains: [..]}
       - {whitelist_domains: [..]}
       - {domains: [..]}
       - {[..]} (not dict) -> handled in loader by returning {}
     """
-    for k in ["whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]:
+    for k in ["trusted_domains", "whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]:
         v = y.get(k)
         if isinstance(v, list):
             return [str(x).strip().lower() for x in v if str(x).strip()]
     # also allow dict form: {domain: true}
-    if "whitelist_domains" in y and isinstance(y["whitelist_domains"], dict):
-        return [str(x).strip().lower() for x in y["whitelist_domains"].keys()]
+    for k in ["trusted_domains", "whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]:
+        if k in y and isinstance(y[k], dict):
+            return [str(x).strip().lower() for x in y[k].keys()]
     return []
 
 
@@ -194,6 +197,21 @@ def normalize_mac(value) -> Optional[str]:
 def _clean_str_series(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.strip()
     return s.replace({"": None, "-": None, "nan": None, "None": None})
+
+
+def _is_ip_literal(value: object) -> bool:
+    s = str(value or "").strip()
+    if not s:
+        return False
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+    if s.lower() in {"nan", "none", "unknown", "-"}:
+        return False
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except Exception:
+        return False
 
 
 def _ensure_ts_datetime(df: pd.DataFrame) -> pd.DataFrame:
@@ -306,37 +324,58 @@ def _build_identity_maps(dhcp_files: List[Path], conn_files: List[Path], known_f
     ip_map: Dict[str, Tuple[Optional[str], str]] = {}
     mac_map: Dict[str, str] = {}
 
-    def ingest(df: pd.DataFrame) -> None:
+    def ingest(df: pd.DataFrame, source_hint: str) -> None:
         nonlocal ip_map, mac_map
         if df.empty:
             return
+
+        # Some sources may expose duplicate column names; keep first occurrence.
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated()].copy()
 
         df = _ensure_ts_datetime(df)
         if "ts" in df.columns:
             df = df.sort_values("ts")
 
-        ip_col = next((c for c in ["assigned_addr", "client_addr", "id.orig_h", "addr", "ip"] if c in df.columns), None)
-        mac_col = next((c for c in ["mac", "orig_l2_addr", "l2_addr", "src_mac", "hwaddr"] if c in df.columns), None)
-        host_col = next((c for c in ["host_name", "hostname", "device_name", "host"] if c in df.columns), None)
+        if source_hint == "dhcp":
+            ip_candidates = ["client_addr", "assigned_addr", "requested_addr", "ip", "id.orig_h", "orig_h"]
+            mac_candidates = ["mac", "client_chaddr", "hardware_address", "hwaddr", "chaddr", "orig_l2_addr", "l2_addr", "src_mac"]
+            host_candidates = ["host_name", "hostname", "client_hostname", "client_fqdn", "client_name", "name", "device_name", "host"]
+        elif source_hint == "known":
+            ip_candidates = ["host", "ip", "ip_addr", "addr", "id.orig_h", "orig_h", "client_addr", "assigned_addr"]
+            mac_candidates = ["mac", "mac_addr", "hwaddr", "client_chaddr", "client_mac", "orig_l2_addr", "l2_addr", "src_mac"]
+            host_candidates = ["host_name", "hostname", "name", "device_name", "client_hostname", "client_fqdn", "client_name"]
+        else:
+            ip_candidates = ["id.orig_h", "orig_h", "src_ip", "ip", "client_addr", "assigned_addr", "addr"]
+            mac_candidates = ["orig_l2_addr", "l2_addr", "src_mac", "mac", "orig_mac", "id.orig_mac", "hwaddr", "mac_addr"]
+            host_candidates = ["host_name", "hostname", "device_name", "host", "name"]
+
+        ip_col = next((c for c in ip_candidates if c in df.columns), None)
+        mac_col = next((c for c in mac_candidates if c in df.columns), None)
+        host_col = next((c for c in host_candidates if c in df.columns), None)
+        if host_col in {ip_col, mac_col}:
+            host_col = None
 
         if ip_col is None and mac_col is None:
             return
 
         if ip_col is not None:
             df[ip_col] = _clean_str_series(df[ip_col])
+            df[ip_col] = df[ip_col].where(df[ip_col].apply(_is_ip_literal), None)
         if mac_col is not None:
             df[mac_col] = df[mac_col].apply(normalize_mac)
         if host_col is not None:
             df[host_col] = df[host_col].astype(str).replace({"nan": "", "None": "", "-": ""}).str.strip()
+            df[host_col] = df[host_col].where(~df[host_col].apply(_is_ip_literal), "")
         else:
             host_col = "__host"
             df[host_col] = ""
 
         # ip -> (mac, host) last seen
         if ip_col is not None:
-            sub_cols = [ip_col, host_col] + ([mac_col] if mac_col is not None else [])
+            sub_cols = list(dict.fromkeys([ip_col, host_col] + ([mac_col] if mac_col is not None else [])))
             if "ts" in df.columns:
-                sub_cols = ["ts"] + sub_cols
+                sub_cols = list(dict.fromkeys(["ts"] + sub_cols))
             sub = df[sub_cols].dropna(subset=[ip_col]).copy()
             if "ts" in sub.columns:
                 sub = sub.sort_values("ts")
@@ -347,6 +386,7 @@ def _build_identity_maps(dhcp_files: List[Path], conn_files: List[Path], known_f
 
             def last_non_empty_host(x: pd.Series):
                 x = x.astype(str).replace({"nan": "", "None": "", "-": ""})
+                x = x.where(~x.apply(_is_ip_literal), "")
                 x = x[x != ""]
                 return x.iloc[-1] if len(x) else ""
 
@@ -361,9 +401,10 @@ def _build_identity_maps(dhcp_files: List[Path], conn_files: List[Path], known_f
 
         # mac -> host
         if mac_col is not None:
-            subm_cols = [mac_col, host_col] + (["ts"] if "ts" in df.columns else [])
+            subm_cols = list(dict.fromkeys([mac_col, host_col] + (["ts"] if "ts" in df.columns else [])))
             subm = df[subm_cols].dropna(subset=[mac_col]).copy()
             subm[host_col] = subm[host_col].astype(str).replace({"nan": "", "None": "", "-": ""})
+            subm[host_col] = subm[host_col].where(~subm[host_col].apply(_is_ip_literal), "")
             subm = subm[subm[host_col] != ""]
             if not subm.empty:
                 if "ts" in subm.columns:
@@ -374,11 +415,11 @@ def _build_identity_maps(dhcp_files: List[Path], conn_files: List[Path], known_f
                         mac_map[str(mac)] = r["host"]
 
     if dhcp_files:
-        ingest(_duck_read_parquet_union(dhcp_files))
+        ingest(_duck_read_parquet_union(dhcp_files), "dhcp")
     if conn_files:
-        ingest(_duck_read_parquet_union(conn_files))
+        ingest(_duck_read_parquet_union(conn_files), "conn")
     if known_files:
-        ingest(_duck_read_parquet_union(known_files))
+        ingest(_duck_read_parquet_union(known_files), "known")
 
     return ip_map, mac_map
 
@@ -392,7 +433,17 @@ def _enrich_identity(events: pd.DataFrame, ip_map: Dict[str, Tuple[Optional[str]
     if "host_name" not in events.columns:
         events["host_name"] = None
 
-    for c in ["orig_l2_addr", "l2_addr", "src_mac"]:
+    def _is_valid_host(value: object) -> bool:
+        s = str(value or "").strip()
+        if not s:
+            return False
+        if s.lower() in {"nan", "none", "unknown", "-"}:
+            return False
+        if _is_ip_literal(s):
+            return False
+        return True
+
+    for c in ["orig_l2_addr", "l2_addr", "src_mac", "mac", "orig_mac", "id.orig_mac", "mac_addr", "client_chaddr", "hardware_address", "hwaddr", "chaddr"]:
         if c in events.columns:
             tmp = events[c].apply(normalize_mac)
             events["mac"] = events["mac"].where(events["mac"].notna() & (events["mac"] != ""), tmp)
@@ -407,7 +458,7 @@ def _enrich_identity(events: pd.DataFrame, ip_map: Dict[str, Tuple[Optional[str]
 
         events["mac"] = events["mac"].where(events["mac"].notna(), mac_from_ip)
         events["host_name"] = events["host_name"].where(
-            events["host_name"].notna() & (events["host_name"] != ""),
+            events["host_name"].apply(_is_valid_host),
             host_from_ip,
         )
 
@@ -415,13 +466,15 @@ def _enrich_identity(events: pd.DataFrame, ip_map: Dict[str, Tuple[Optional[str]
     macs = events["mac"].astype(str).replace({"nan": "", "None": ""})
     host_from_mac = macs.map(lambda m: mac_map.get(m, "") if m else "")
     events["host_name"] = events["host_name"].where(
-        events["host_name"].notna() & (events["host_name"] != ""),
+        events["host_name"].apply(_is_valid_host),
         host_from_mac,
     )
 
-    # don't force "Unknown" (leave empty if truly unresolved)
     events["mac"] = events["mac"].astype(str).fillna("").replace({"None": "", "nan": ""})
-    events["host_name"] = events["host_name"].astype(str).fillna("").replace({"None": "", "nan": ""})
+    events["host_name"] = events["host_name"].astype(str).fillna("").replace({"None": "", "nan": "", "-": ""})
+    events["host_name"] = events["host_name"].where(~events["host_name"].apply(_is_ip_literal), "")
+    events["host_name"] = events["host_name"].replace({"": "Unknown"})
+    events.loc[events["host_name"].str.lower().isin(["nan", "none"]), "host_name"] = "Unknown"
     return events
 
 
@@ -930,15 +983,25 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     return out
 
 
-def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
-    parquet_root = Path(parquet_root)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=24)
+def _load_shadow_sharing_data_cached(
+    parquet_root_str: str,
+    target_dates: Tuple[str, ...],
+    cache_version: str,
+    whitelist_mtime_ns: int,
+) -> pd.DataFrame:
+    # cache_version + whitelist_mtime_ns are explicit cache-busters.
+    _ = cache_version
+    _ = whitelist_mtime_ns
+
+    parquet_root = Path(parquet_root_str)
     if not parquet_root.exists():
         return pd.DataFrame()
 
     known_files = _collect_known_files(parquet_root)
 
     frames: List[pd.DataFrame] = []
-    for d in (target_dates or []):
+    for d in target_dates:
         if not d or not DATE_DIR_RE.match(str(d)):
             continue
         df_d = _build_one_date(parquet_root, str(d), known_files)
@@ -951,6 +1014,17 @@ def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.
     out = pd.concat(frames, ignore_index=True)
     out = _ensure_ts_datetime(out)
     return out.sort_values("ts", ascending=False)
+
+
+def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
+    parquet_root = Path(parquet_root)
+    dates_key = tuple(str(d) for d in (target_dates or []) if d and DATE_DIR_RE.match(str(d)))
+    return _load_shadow_sharing_data_cached(
+        str(parquet_root),
+        dates_key,
+        CACHE_VERSION,
+        int(WHITELIST_MTIME_NS),
+    )
 
 
 def _is_dark_theme() -> bool:
@@ -1321,6 +1395,8 @@ def _close_shadow_sharing_dialog() -> None:
     st.session_state["shadow_sharing_dialog_open"] = False
     st.session_state["shadow_sharing_dialog_mac"] = None
     st.session_state["shadow_sharing_last_selected_mac"] = None
+    st.session_state.pop("shadow_sharing_dialog_base_df", None)
+    st.session_state.pop("shadow_sharing_dialog_base_key", None)
     st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
 
 
@@ -1340,6 +1416,35 @@ def _extract_selected_mac(selected_rows) -> Optional[str]:
     if not selected_mac:
         return None
     return selected_mac
+
+
+def _normalized_token_tuple(values, *, upper: bool = False) -> Tuple[str, ...]:
+    items = values if isinstance(values, list) else []
+    out: List[str] = []
+    seen = set()
+    for raw in items:
+        s = str(raw).strip()
+        if not s:
+            continue
+        s = s.upper() if upper else s.lower()
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    out.sort()
+    return tuple(out)
+
+
+def _build_text_search_blob(df: pd.DataFrame, columns: List[str]) -> pd.Series:
+    if df.empty:
+        return pd.Series([], index=df.index, dtype="object")
+    cols = [c for c in columns if c in df.columns]
+    if not cols:
+        return pd.Series([""] * len(df), index=df.index, dtype="object")
+    blob = df[cols[0]].astype(str).str.lower()
+    for c in cols[1:]:
+        blob = blob + " | " + df[c].astype(str).str.lower()
+    return blob.fillna("")
 
 
 @st.dialog("Device Forensics Details", width="large")
@@ -1435,21 +1540,24 @@ def show_shadow_sharing_device_dialog(
         st.warning("MAC column is not available in this dataset.")
         return
 
-    scoped = filtered.copy()
-    scoped["mac"] = scoped["mac"].astype(str).str.strip().str.lower()
-    scoped = scoped[scoped["mac"] == target_mac].copy()
+    dialog_base_key = f"{selected_scope_key}:{target_mac}:{len(filtered)}"
+    cached_base = st.session_state.get("shadow_sharing_dialog_base_df")
+    cached_base_key = st.session_state.get("shadow_sharing_dialog_base_key")
+
+    if isinstance(cached_base, pd.DataFrame) and cached_base_key == dialog_base_key:
+        scoped = cached_base.copy()
+    else:
+        mac_norm = filtered["mac"].astype(str).str.strip().str.lower()
+        scoped = filtered.loc[mac_norm == target_mac].copy()
+        scoped["mac"] = target_mac
+        st.session_state["shadow_sharing_dialog_base_df"] = scoped.copy()
+        st.session_state["shadow_sharing_dialog_base_key"] = dialog_base_key
+
     if scoped.empty:
         st.warning("No records found for this MAC with current page filters.")
         return
 
     scoped["mac"] = target_mac
-    scoped_ts = pd.to_datetime(scoped["ts"], errors="coerce")
-    first_seen = scoped_ts.min()
-    last_seen = scoped_ts.max()
-    total_mb = float(scoped["bytes"].sum()) / 1024 / 1024
-    unapproved = int((scoped["Allowed"] == False).sum())  # noqa: E712
-    unique_dest = int(scoped["destination"].replace({"": None, "Unknown": None}).dropna().nunique())
-    high_crit = int(scoped["Severity"].isin(["CRITICAL", "HIGH"]).sum())
 
     top = st.columns([1.0, 5.0])
     with top[0]:
@@ -1466,6 +1574,68 @@ def show_shadow_sharing_device_dialog(
             """,
             unsafe_allow_html=True,
         )
+
+    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+    dlg_f1, dlg_f2 = st.columns([2.5, 1.0])
+    with dlg_f1:
+        dialog_search = st.text_input(
+            "Search In Device Scope",
+            placeholder="destination, IP, host, action, URI, risk basis...",
+            key=f"shadow_sharing_dlg_search_{selected_scope_key}_{mac_key}",
+        ).strip()
+    with dlg_f2:
+        row_options = [5000, 10000, 25000, 50000, 100000]
+        default_rows = 10000 if len(scoped) > 10000 else next((n for n in row_options if len(scoped) <= n), row_options[-1])
+        dialog_row_limit = st.selectbox(
+            "Rows To Analyze",
+            options=row_options,
+            index=row_options.index(default_rows),
+            key=f"shadow_sharing_dlg_rows_{selected_scope_key}_{mac_key}",
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    scoped_all = scoped.copy()
+    if dialog_search:
+        q = dialog_search.lower()
+        search_cols = [
+            "host_name",
+            "id.orig_h",
+            "destination",
+            "log_source",
+            "Category",
+            "Action",
+            "Allow_Basis",
+            "Action_Basis",
+            "Risk_Basis",
+            "method",
+            "uri",
+            "DNS_Exfil_Reason",
+        ]
+        mask = pd.Series(False, index=scoped_all.index)
+        for col in search_cols:
+            if col in scoped_all.columns:
+                mask = mask | scoped_all[col].astype(str).str.lower().str.contains(q, na=False)
+        scoped_all = scoped_all[mask].copy()
+
+    if scoped_all.empty:
+        st.info("No records match your dialog search.")
+        return
+
+    scoped_ts = pd.to_datetime(scoped_all["ts"], errors="coerce")
+    first_seen = scoped_ts.min()
+    last_seen = scoped_ts.max()
+    total_mb = float(scoped_all["bytes"].sum()) / 1024 / 1024
+    unapproved = int((scoped_all["Allowed"] == False).sum())  # noqa: E712
+    unique_dest = int(scoped_all["destination"].replace({"": None, "Unknown": None}).dropna().nunique())
+    high_crit = int(scoped_all["Severity"].isin(["CRITICAL", "HIGH"]).sum())
+
+    scoped = scoped_all.sort_values("ts", ascending=False).copy()
+    matched_events = int(len(scoped))
+    if len(scoped) > int(dialog_row_limit):
+        scoped = scoped.head(int(dialog_row_limit)).copy()
+        st.caption(f"Performance mode: loaded latest {len(scoped):,} of {matched_events:,} matched events.")
+    else:
+        st.caption(f"Loaded {len(scoped):,} matched events.")
 
     first_seen_txt = first_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(first_seen) else "-"
     last_seen_txt = last_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(last_seen) else "-"
@@ -1493,11 +1663,10 @@ def show_shadow_sharing_device_dialog(
 
         dest = scoped.groupby("destination", dropna=False).agg(
             Category=("Category", lambda x: x.value_counts().index[0] if len(x) else "Unknown"),
-            Allowed=("Allowed", lambda x: bool(x.value_counts().index[0]) if len(x) else False),
             Allow_Basis=("Allow_Basis", lambda x: next((v for v in x.astype(str) if v), "")),
             Last_Seen=("ts", "max"),
             Events=("ts", "count"),
-            Unique_Devices=("mac", lambda x: x.replace({"": None}).dropna().nunique()),
+            Unique_IPs=("id.orig_h", lambda x: x.astype(str).str.strip().replace({"": None, "nan": None, "None": None, "none": None, "-": None}).dropna().nunique()),
             Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
             Max_Risk=("Risk_Score", "max"),
             Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
@@ -1517,11 +1686,10 @@ def show_shadow_sharing_device_dialog(
         gb_dest.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
         gb_dest.configure_column("destination", header_name="Destination", minWidth=200)
         gb_dest.configure_column("Category", width=130)
-        gb_dest.configure_column("Allowed", width=98, cellStyle=_allowed_cellstyle())
         gb_dest.configure_column("Allow_Basis", header_name="Allow Basis", minWidth=210)
         gb_dest.configure_column("Last_Seen", header_name="Last Seen", width=150)
         gb_dest.configure_column("Events", width=88)
-        gb_dest.configure_column("Unique_Devices", header_name="Devices", width=90)
+        gb_dest.configure_column("Unique_IPs", header_name="IPs", width=90)
         gb_dest.configure_column("Total_MB", header_name="Total MB", width=116)
         gb_dest.configure_column("Max_Risk_Level", header_name="Risk Level", width=130, cellStyle=_severity_cellstyle())
         gb_dest.configure_column("Top_Action", header_name="Top Action", minWidth=145)
@@ -1539,6 +1707,19 @@ def show_shadow_sharing_device_dialog(
         b = scoped.copy()
         b["bucket"] = b["ts"].dt.floor("5min")
         b["mac"] = target_mac
+        b["bytes"] = pd.to_numeric(b["bytes"], errors="coerce").fillna(0)
+        if "destination" not in b.columns:
+            b["destination"] = "Unknown"
+        b["destination"] = b["destination"].astype(str).replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
+
+        top_app = (
+            b.groupby(["bucket", "mac", "destination"], dropna=False)["bytes"]
+            .sum()
+            .reset_index(name="top_app_bytes")
+            .sort_values(["bucket", "mac", "top_app_bytes", "destination"], ascending=[True, True, False, True])
+            .drop_duplicates(["bucket", "mac"], keep="first")
+            .rename(columns={"destination": "top_application"})
+        )
 
         bursts = b.groupby(["bucket", "mac"], dropna=False).agg(
             bytes=("bytes", "sum"),
@@ -1546,6 +1727,9 @@ def show_shadow_sharing_device_dialog(
             max_risk=("Risk_Score", "max"),
             host=("host_name", lambda x: next((v for v in x.astype(str) if v), "")),
         ).reset_index()
+        bursts = bursts.merge(top_app, on=["bucket", "mac"], how="left")
+        bursts["top_application"] = bursts["top_application"].fillna("Unknown").astype(str)
+        bursts["top_app_bytes"] = pd.to_numeric(bursts["top_app_bytes"], errors="coerce").fillna(0).astype(int)
 
         top_bursts = bursts.sort_values(["max_risk", "bytes", "events"], ascending=False).head(200)
 
@@ -1558,7 +1742,7 @@ def show_shadow_sharing_device_dialog(
                 y="mac",
                 size="bytes",
                 color="max_risk",
-                hover_data=["host", "events"],
+                hover_data=["host", "events", "top_application", "top_app_bytes"],
                 template=get_plotly_template(),
                 render_mode="webgl" if len(top_bursts) > 2000 else "auto",
                 title="Top bursts (size=bytes, color=max risk)",
@@ -1571,6 +1755,7 @@ def show_shadow_sharing_device_dialog(
             burst_grid["bucket"] = pd.to_datetime(burst_grid["bucket"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
             burst_grid["bytes"] = pd.to_numeric(burst_grid["bytes"], errors="coerce").fillna(0).astype(int)
             burst_grid["max_risk"] = pd.to_numeric(burst_grid["max_risk"], errors="coerce").fillna(0).astype(int)
+            burst_grid["top_app_bytes"] = pd.to_numeric(burst_grid["top_app_bytes"], errors="coerce").fillna(0).astype(int)
             burst_grid["max_risk_level"] = burst_grid["max_risk"].apply(_severity_label)
             burst_grid = burst_grid.drop(columns=["max_risk"])
 
@@ -1581,6 +1766,8 @@ def show_shadow_sharing_device_dialog(
             gb_burst.configure_column("bucket", header_name="Window", width=150)
             gb_burst.configure_column("mac", header_name="MAC", minWidth=150)
             gb_burst.configure_column("host", header_name="Host", minWidth=160)
+            gb_burst.configure_column("top_application", header_name="Top Application / Software", minWidth=220)
+            gb_burst.configure_column("top_app_bytes", header_name="Top App Bytes", width=140)
             gb_burst.configure_column("events", header_name="Events", width=90)
             gb_burst.configure_column("bytes", header_name="Bytes", width=130)
             gb_burst.configure_column("max_risk_level", header_name="Max Risk Level", width=130, cellStyle=_severity_cellstyle())
@@ -1602,14 +1789,14 @@ def show_shadow_sharing_device_dialog(
             st.download_button("Export CSV", csv_data, f"shadow_sharing_log_{mac_key}.csv", "text/csv")
 
         st.markdown(
-            f"<div class='shadow-filter-hint'>Showing up to <strong>{MAX_ROWS_DISPLAY:,}</strong> rows from <strong>{len(scoped):,}</strong> matched events for <strong>{target_mac}</strong>.</div>",
+            f"<div class='shadow-filter-hint'>Showing up to <strong>{MAX_ROWS_DISPLAY:,}</strong> rows from <strong>{len(scoped):,}</strong> loaded events (<strong>{matched_events:,}</strong> matched) for <strong>{target_mac}</strong>.</div>",
             unsafe_allow_html=True,
         )
 
         cols = [
             "ts", "host_name", "mac", "Identity_Confidence", "id.orig_h",
             "destination", "vt_link",
-            "Allowed", "Allow_Basis",
+            "Allow_Basis",
             "Category", "Action", "Action_Basis",
             "bytes",
             "Client_Type",
@@ -1642,7 +1829,6 @@ def show_shadow_sharing_device_dialog(
         gb_log.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
         gb_log.configure_column("destination", header_name="Destination", minWidth=180, flex=1.6)
         gb_log.configure_column("vt_link", header_name="VirusTotal", minWidth=105, flex=0.9, cellRenderer=_link_cell_renderer())
-        gb_log.configure_column("Allowed", minWidth=95, flex=0.8, cellStyle=_allowed_cellstyle())
         gb_log.configure_column("Allow_Basis", header_name="Allow Basis", minWidth=200, flex=1.8)
         gb_log.configure_column("Category", minWidth=120, flex=1.0)
         gb_log.configure_column("Action", minWidth=130, flex=1.1)
@@ -1696,7 +1882,12 @@ def render_shadow_sharing(parquet_root: Path):
     st.session_state.setdefault("shadow_sharing_dialog_open", False)
     st.session_state.setdefault("shadow_sharing_dialog_mac", None)
     st.session_state.setdefault("shadow_sharing_last_selected_mac", None)
+    st.session_state.setdefault("shadow_sharing_dialog_base_df", None)
+    st.session_state.setdefault("shadow_sharing_dialog_base_key", None)
     st.session_state.setdefault("shadow_sharing_grid_nonce", 0)
+    st.session_state.setdefault("shadow_sharing_threat_base_df", None)
+    st.session_state.setdefault("shadow_sharing_threat_cache_key", None)
+    st.session_state.setdefault("shadow_sharing_threat_summary", None)
     with top2:
         scope_label = selected_date
         st.markdown(
@@ -1709,6 +1900,9 @@ def render_shadow_sharing(parquet_root: Path):
         if st.button("Refresh", key="shadow_sharing_refresh"):
             st.cache_data.clear()
             st.cache_resource.clear()
+            st.session_state.pop("shadow_sharing_threat_base_df", None)
+            st.session_state.pop("shadow_sharing_threat_cache_key", None)
+            st.session_state.pop("shadow_sharing_threat_summary", None)
             st.rerun()
 
     with st.expander("Detection basis (what this page detects)", expanded=False):
@@ -1761,8 +1955,7 @@ def render_shadow_sharing(parquet_root: Path):
     # Date scope
     target_dates = [selected_date] if selected_date else []
 
-    with st.spinner("Analyzing telemetry (fast cache + DuckDB)..."):
-        df = load_shadow_sharing_data(parquet_root, target_dates)
+    df = load_shadow_sharing_data(parquet_root, target_dates)
 
     if df.empty:
         st.info("No data detected for the selected timeframe.")
@@ -1793,18 +1986,30 @@ def render_shadow_sharing(parquet_root: Path):
         q = search_q.lower().strip()
         if q:
             filtered = filtered[
-                filtered["mac"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["destination"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Action_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Allow_Basis"].astype(str).str.lower().str.contains(q, na=False)
+                filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                | filtered["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                | filtered["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                | filtered["Action_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                | filtered["Allow_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
             ]
 
     if filtered.empty:
         st.warning("No data matches your filters.")
         return
+
+    main_filter_cache_key = (
+        selected_scope_key,
+        _normalized_token_tuple(selected_sources),
+        bool(show_only_unapproved),
+        _normalized_token_tuple(selected_risk_levels, upper=True),
+        int(min_bytes_mb),
+        _normalized_token_tuple(action_filter),
+        _normalized_token_tuple(category_filter),
+        str(search_q or "").strip().lower(),
+        int(len(filtered)),
+    )
 
     # Metrics
     st.divider()
@@ -1816,9 +2021,11 @@ def render_shadow_sharing(parquet_root: Path):
     critical = int((filtered["Severity"] == "CRITICAL").sum())
     autom = int((filtered["Client_Type"] == "Automation / SDK").sum())
 
-    uniq_mac = filtered["mac"].replace({"": None}).dropna().nunique()
-    uniq_ip = filtered["id.orig_h"].replace({"": None}).dropna().nunique()
-    uniq_dev = int(uniq_mac if uniq_mac > 0 else uniq_ip)
+    metric_mac = filtered["mac"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
+    metric_ip = filtered["id.orig_h"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
+    metric_device = metric_mac.where(metric_mac != "", "ip:" + metric_ip)
+    metric_device = metric_device.where(metric_device != "ip:", None)
+    uniq_dev = int(metric_device.dropna().nunique())
 
     m1.metric("Selected Events", f"{len(filtered):,}")
     m2.metric("Unapproved Events", unapproved, delta="Risk" if unapproved > 0 else "Clear", delta_color="inverse")
@@ -1942,37 +2149,94 @@ def render_shadow_sharing(parquet_root: Path):
             unsafe_allow_html=True,
         )
 
-        use_mac = filtered["mac"].replace({"": None}).dropna().nunique() > 0
-        key = "mac" if use_mac else "id.orig_h"
+        def _first_valid_mac(vals: pd.Series) -> str:
+            for raw in vals.astype(str):
+                v = raw.strip().lower()
+                if v and v not in {"nan", "none"} and v != "-":
+                    return v
+            return ""
 
-        dev = filtered.groupby(key, dropna=False).agg(
-            Host=("host_name", lambda x: next((v for v in x.astype(str) if v), "")),
-            Last_Seen=("ts", "max"),
-            Events=("ts", "count"),
-            Unapproved=("Allowed", lambda x: int((x == False).sum())),  # noqa: E712
-            Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
-            Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
-            Top_Dest=("destination", lambda x: x.value_counts().index[0] if len(x) else ""),
-            Max_Risk=("Risk_Score", "max"),
-        ).reset_index().sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False)
+        def _first_valid_ip(vals: pd.Series) -> str:
+            for raw in vals.astype(str):
+                v = raw.strip()
+                if v and v.lower() not in {"nan", "none"} and v != "-":
+                    return v
+            return ""
 
-        dev_grid = dev.copy()
-        dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
-        dev_grid["Last_Seen"] = pd.to_datetime(dev_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
-        dev_grid["Total_MB"] = pd.to_numeric(dev_grid["Total_MB"], errors="coerce").fillna(0).round(2)
-        dev_grid["Max_Risk"] = pd.to_numeric(dev_grid["Max_Risk"], errors="coerce").fillna(0).astype(int)
-        dev_grid["Max_Risk_Level"] = dev_grid["Max_Risk"].apply(_severity_label)
-        dev_grid = dev_grid.drop(columns=["Max_Risk"])
+        def _first_device_name(vals: pd.Series) -> str:
+            for raw in vals.astype(str):
+                v = raw.strip()
+                if v and v.lower() not in {"nan", "none", "unknown"} and v != "-" and not _is_ip_literal(v):
+                    return v
+            return "Unknown"
 
-        gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
-        gb_dev.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
-        gb_dev.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
-        gb_dev.configure_selection(selection_mode="single", use_checkbox=False)
-        gb_dev.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
-        if key == "mac":
+        dev_src = filtered.copy()
+        dev_src["__mac"] = dev_src["mac"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
+        dev_src["__ip"] = dev_src["id.orig_h"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
+        dev_src = dev_src[(dev_src["__mac"] != "") | (dev_src["__ip"] != "")].copy()
+
+        if dev_src.empty:
+            st.info("No identifiable MAC/IP rows are available in this scope.")
+            st.session_state["shadow_sharing_last_selected_mac"] = None
+        else:
+            dev_src["bytes"] = pd.to_numeric(dev_src["bytes"], errors="coerce").fillna(0)
+            dev_src["Risk_Score"] = pd.to_numeric(dev_src["Risk_Score"], errors="coerce").fillna(0)
+            dev_src["__device_key"] = dev_src["__mac"].where(dev_src["__mac"] != "", "ip:" + dev_src["__ip"])
+
+            top_dest = (
+                dev_src.groupby(["__device_key", "destination"], dropna=False)
+                .agg(
+                    dest_events=("ts", "count"),
+                    dest_bytes=("bytes", "sum"),
+                    Top_Dest_Max_Risk=("Risk_Score", "max"),
+                )
+                .reset_index()
+                .sort_values(
+                    ["__device_key", "dest_events", "dest_bytes", "Top_Dest_Max_Risk", "destination"],
+                    ascending=[True, False, False, False, True],
+                )
+                .drop_duplicates("__device_key", keep="first")
+                .rename(columns={"destination": "Top_Dest"})
+            )
+
+            dev = dev_src.groupby("__device_key", dropna=False).agg(
+                mac=("__mac", _first_valid_mac),
+                IP=("__ip", _first_valid_ip),
+                Hostname=("host_name", _first_device_name),
+                Last_Seen=("ts", "max"),
+                Events=("ts", "count"),
+                Unapproved=("Allowed", lambda x: int((x == False).sum())),  # noqa: E712
+                Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
+                Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
+                Max_Risk=("Risk_Score", "max"),
+            ).reset_index()
+
+            dev = dev.merge(top_dest[["__device_key", "Top_Dest", "Top_Dest_Max_Risk"]], on="__device_key", how="left")
+            dev["Top_Dest"] = dev["Top_Dest"].astype(str).replace({"nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
+            dev["Top_Dest_Max_Risk"] = pd.to_numeric(dev["Top_Dest_Max_Risk"], errors="coerce").fillna(0).astype(int)
+            dev = dev.sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False).drop(columns=["__device_key"])
+
+            dev_grid = dev.copy()
+            dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
+            dev_grid["Last_Seen"] = pd.to_datetime(dev_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
+            dev_grid["Total_MB"] = pd.to_numeric(dev_grid["Total_MB"], errors="coerce").fillna(0).round(2)
+            dev_grid["Max_Risk"] = pd.to_numeric(dev_grid["Max_Risk"], errors="coerce").fillna(0).astype(int)
+            dev_grid["Top_Dest_Max_Risk"] = pd.to_numeric(dev_grid["Top_Dest_Max_Risk"], errors="coerce").fillna(0).astype(int)
+            dev_grid["Max_Risk_Level"] = dev_grid["Max_Risk"].apply(_severity_label)
+            dev_grid["Top_Dest_Risk_Level"] = dev_grid["Top_Dest_Max_Risk"].apply(_severity_label)
+            dev_grid = dev_grid.drop(columns=["Max_Risk"])
+            dev_grid = dev_grid.drop(columns=["Top_Dest_Max_Risk"])
+
+            gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
+            gb_dev.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
+            gb_dev.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
+            gb_dev.configure_selection(selection_mode="single", use_checkbox=False)
+            gb_dev.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
             clickable_mac_style = JsCode(
                 """
                 function(params) {
+                    const v = String(params.value || '').trim();
+                    if (!v) return { 'color': '#93A6BF' };
                     return {
                         'color': '#8AB4F8',
                         'fontWeight': '700',
@@ -1983,37 +2247,45 @@ def render_shadow_sharing(parquet_root: Path):
                 """
             )
             gb_dev.configure_column("mac", header_name="MAC (Click)", minWidth=160, cellStyle=clickable_mac_style)
-        else:
-            gb_dev.configure_column("id.orig_h", header_name="IP", minWidth=140)
-        gb_dev.configure_column("Host", minWidth=160)
-        gb_dev.configure_column("Last_Seen", header_name="Last Seen", width=150)
-        gb_dev.configure_column("Events", width=90)
-        gb_dev.configure_column("Unapproved", width=108)
-        gb_dev.configure_column("Total_MB", header_name="Total MB", width=116)
-        gb_dev.configure_column("Top_Action", header_name="Top Action", minWidth=145)
-        gb_dev.configure_column("Top_Dest", header_name="Top Destination", minWidth=180)
-        gb_dev.configure_column("Max_Risk_Level", header_name="Max Risk Level", width=130, cellStyle=_severity_cellstyle())
+            gb_dev.configure_column("IP", header_name="IP", minWidth=140)
+            gb_dev.configure_column("Hostname", minWidth=170)
+            gb_dev.configure_column("Last_Seen", header_name="Last Seen", width=150)
+            gb_dev.configure_column("Events", width=90)
+            gb_dev.configure_column("Unapproved", width=108)
+            gb_dev.configure_column("Total_MB", header_name="Total MB", width=116)
+            gb_dev.configure_column("Top_Action", header_name="Top Action", minWidth=145)
+            gb_dev.configure_column("Top_Dest", header_name="Top Destination", minWidth=180)
+            gb_dev.configure_column("Top_Dest_Risk_Level", header_name="Top Dest Risk Level", width=150, cellStyle=_severity_cellstyle())
+            gb_dev.configure_column("Max_Risk_Level", header_name="Device Max Risk Level", width=170, cellStyle=_severity_cellstyle())
 
-        dev_response = render_shadow_aggrid(
-            dev_grid,
-            gb_dev,
-            key=f"shadow_sharing_device_grid_{selected_scope_key}_{int(st.session_state.get('shadow_sharing_grid_nonce', 0))}",
-            height=430,
-        )
+            dev_response = render_shadow_aggrid(
+                dev_grid,
+                gb_dev,
+                key=f"shadow_sharing_device_grid_{selected_scope_key}_{int(st.session_state.get('shadow_sharing_grid_nonce', 0))}",
+                height=430,
+            )
 
-        if key == "mac":
             selected_mac = _extract_selected_mac(dev_response.get("selected_rows", None))
             if selected_mac:
                 prev = st.session_state.get("shadow_sharing_last_selected_mac")
                 if selected_mac != prev:
+                    mac_norm = filtered["mac"].astype(str).str.strip().str.lower()
+                    dialog_base = filtered.loc[mac_norm == selected_mac].copy()
+                    dialog_base["mac"] = selected_mac
+                    st.session_state["shadow_sharing_dialog_base_df"] = dialog_base
+                    st.session_state["shadow_sharing_dialog_base_key"] = f"{selected_scope_key}:{selected_mac}:{len(filtered)}"
                     st.session_state["shadow_sharing_last_selected_mac"] = selected_mac
                     st.session_state["shadow_sharing_dialog_mac"] = selected_mac
                     st.session_state["shadow_sharing_dialog_open"] = True
                     st.rerun()
             else:
                 st.session_state["shadow_sharing_last_selected_mac"] = None
-        else:
-            st.info("MAC values are not available in this scope, so MAC drilldown dialog is disabled.")
+                st.session_state.pop("shadow_sharing_dialog_base_df", None)
+                st.session_state.pop("shadow_sharing_dialog_base_key", None)
+
+            has_mac_rows = dev_grid["mac"].astype(str).str.strip().replace({"": None, "nan": None, "none": None}).dropna().nunique() > 0
+            if not has_mac_rows:
+                st.info("MAC values are not available in this scope, so MAC drilldown dialog is disabled.")
 
     # -------------------------------------------------------------------------
     # Data Exfiltration Threats (moved from shadow_apps)
@@ -2025,49 +2297,146 @@ def render_shadow_sharing(parquet_root: Path):
             unsafe_allow_html=True,
         )
 
-        threat_base = filtered.copy()
-        if "Exfil_Indicator" not in threat_base.columns:
-            ex = threat_base.apply(_detect_exfil_signal_row, axis=1)
-            threat_base["Exfil_Indicator"] = ex.apply(lambda x: bool(x[0]))
-            threat_base["Exfil_Detection_Basis"] = ex.apply(lambda x: str(x[1]))
-        elif "Exfil_Detection_Basis" not in threat_base.columns:
-            threat_base["Exfil_Detection_Basis"] = ""
+        threat_cache_key = ("threat-base",) + main_filter_cache_key
+        cached_threat_base = st.session_state.get("shadow_sharing_threat_base_df")
+        cached_threat_key = st.session_state.get("shadow_sharing_threat_cache_key")
+        cached_threat_summary = st.session_state.get("shadow_sharing_threat_summary")
 
-        threat_base = threat_base[
-            (threat_base["Allowed"] == False) & (threat_base["Exfil_Indicator"] == True)  # noqa: E712
-        ].copy()
+        if (
+            cached_threat_key == threat_cache_key
+            and isinstance(cached_threat_base, pd.DataFrame)
+            and isinstance(cached_threat_summary, dict)
+        ):
+            threat_base = cached_threat_base
+            threat_summary = cached_threat_summary
+        else:
+            threat_base = filtered
+            if "Exfil_Indicator" not in threat_base.columns:
+                threat_base = threat_base.copy()
+                ex = threat_base.apply(_detect_exfil_signal_row, axis=1)
+                threat_base["Exfil_Indicator"] = ex.apply(lambda x: bool(x[0]))
+                threat_base["Exfil_Detection_Basis"] = ex.apply(lambda x: str(x[1]))
+            elif "Exfil_Detection_Basis" not in threat_base.columns:
+                threat_base = threat_base.copy()
+                threat_base["Exfil_Detection_Basis"] = ""
+
+            threat_base = threat_base[
+                (threat_base["Allowed"] == False) & (threat_base["Exfil_Indicator"] == True)  # noqa: E712
+            ].copy()
+
+            threat_summary = {}
+            if not threat_base.empty:
+                threat_base["bytes"] = pd.to_numeric(threat_base["bytes"], errors="coerce").fillna(0)
+                threat_base = threat_base.sort_values("ts", ascending=False)
+                threat_base["__search_blob"] = _build_text_search_blob(
+                    threat_base,
+                    ["mac", "host_name", "id.orig_h", "destination", "Exfil_Detection_Basis", "Risk_Basis", "Action_Basis"],
+                )
+
+                action_options = sorted(
+                    threat_base["Action"]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                    .replace("", pd.NA)
+                    .dropna()
+                    .unique()
+                    .tolist()
+                )
+                detail_sources = sorted(
+                    threat_base["log_source"]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                    .replace("", pd.NA)
+                    .dropna()
+                    .unique()
+                    .tolist()
+                )
+
+                mac_norm = threat_base["mac"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
+                ip_norm = threat_base["id.orig_h"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
+                offender_id = mac_norm.where(mac_norm != "", ip_norm)
+                offender_type = pd.Series("Unknown", index=threat_base.index, dtype="object")
+                offender_type.loc[mac_norm != ""] = "MAC"
+                offender_type.loc[(mac_norm == "") & (ip_norm != "")] = "IP"
+                offender_src = pd.DataFrame({"__offender_id": offender_id, "__offender_type": offender_type})
+                offender_src = offender_src[offender_src["__offender_id"] != ""]
+
+                top_off = (
+                    offender_src.groupby(["__offender_id", "__offender_type"], dropna=False)
+                    .size()
+                    .reset_index(name="events")
+                    .sort_values("events", ascending=False)
+                    .head(1)
+                )
+                top_offender = (
+                    str(top_off.iloc[0]["__offender_id"])
+                    if not top_off.empty and str(top_off.iloc[0]["__offender_id"]).strip()
+                    else "Unknown"
+                )
+                top_offender_type = str(top_off.iloc[0]["__offender_type"]) if not top_off.empty else "Unknown"
+                top_offender_cnt = int(top_off.iloc[0]["events"]) if not top_off.empty else 0
+
+                top_unauth = (
+                    threat_base.groupby("destination", dropna=False)
+                    .size()
+                    .reset_index(name="Hits")
+                    .sort_values("Hits", ascending=False)
+                    .head(10)
+                    .rename(columns={"destination": "Domain"})
+                )
+
+                risk_counts = (
+                    threat_base.groupby("Severity", dropna=False)
+                    .size()
+                    .reset_index(name="Count")
+                    .rename(columns={"Severity": "Risk"})
+                    .sort_values("Count", ascending=False)
+                )
+
+                threat_summary = {
+                    "action_options": action_options,
+                    "detail_sources": detail_sources,
+                    "top_offender": top_offender,
+                    "top_offender_type": top_offender_type,
+                    "top_offender_cnt": top_offender_cnt,
+                    "detected_destinations": int(
+                        threat_base["destination"].replace({"": None, "Unknown": None}).dropna().nunique()
+                    ),
+                    "high_crit_count": int(threat_base["Severity"].isin(["CRITICAL", "HIGH"]).sum()),
+                    "top_unauth": top_unauth,
+                    "risk_counts": risk_counts,
+                }
+
+            st.session_state["shadow_sharing_threat_base_df"] = threat_base
+            st.session_state["shadow_sharing_threat_cache_key"] = threat_cache_key
+            st.session_state["shadow_sharing_threat_summary"] = threat_summary
+
         if threat_base.empty:
             st.success("No exfiltration signals detected in current scope.")
         else:
-            threat_base["bytes"] = pd.to_numeric(threat_base["bytes"], errors="coerce").fillna(0)
-
-            has_mac = threat_base["mac"].replace({"": None}).dropna().nunique() > 0
-            offender_key = "mac" if has_mac else "id.orig_h"
-            top_off = (
-                threat_base.groupby(offender_key, dropna=False)
-                .size()
-                .reset_index(name="events")
-                .sort_values("events", ascending=False)
-                .head(1)
-            )
-            top_offender = (
-                str(top_off.iloc[0][offender_key])
-                if not top_off.empty and str(top_off.iloc[0][offender_key]).strip()
-                else "Unknown"
-            )
-            top_offender_cnt = int(top_off.iloc[0]["events"]) if not top_off.empty else 0
+            action_options = threat_summary.get("action_options", [])
+            detail_sources = threat_summary.get("detail_sources", [])
+            top_offender = str(threat_summary.get("top_offender", "Unknown"))
+            top_offender_type = str(threat_summary.get("top_offender_type", "Unknown"))
+            top_offender_cnt = int(threat_summary.get("top_offender_cnt", 0))
+            detected_destinations = int(threat_summary.get("detected_destinations", 0))
+            high_crit_count = int(threat_summary.get("high_crit_count", 0))
+            top_unauth = threat_summary.get("top_unauth", pd.DataFrame(columns=["Domain", "Hits"]))
+            risk_counts = threat_summary.get("risk_counts", pd.DataFrame(columns=["Risk", "Count"]))
 
             tm1, tm2, tm3 = st.columns(3)
-            tm1.metric("Detected Exfil Destinations", f"{int(threat_base['destination'].replace({'': None, 'Unknown': None}).dropna().nunique()):,}")
+            tm1.metric("Detected Exfil Destinations", f"{detected_destinations:,}")
             tm2.metric(
-                f"Top Offender ({'MAC' if offender_key == 'mac' else 'IP'})",
+                f"Top Offender ({top_offender_type})",
                 top_offender,
                 delta=f"{top_offender_cnt:,} events",
                 delta_color="inverse",
             )
             tm3.metric(
                 "Critical / High Risks",
-                f"{int(threat_base['Severity'].isin(['CRITICAL', 'HIGH']).sum()):,}",
+                f"{high_crit_count:,}",
                 delta="Requires attention",
                 delta_color="inverse",
             )
@@ -2086,7 +2455,6 @@ def render_shadow_sharing(parquet_root: Path):
                         key=f"sharing_exfil_risk_{selected_scope_key}",
                     )
                 with exf_top_2:
-                    action_options = sorted(threat_base["Action"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
                     exfil_action_filter = st.multiselect(
                         "Action",
                         action_options,
@@ -2128,21 +2496,27 @@ def render_shadow_sharing(parquet_root: Path):
                     exfil_points = exfil_points[exfil_points["Action"].isin(exfil_action_filter)]
                 if exfil_search:
                     q = exfil_search.lower()
-                    exfil_points = exfil_points[
-                        exfil_points["mac"].astype(str).str.lower().str.contains(q, na=False)
-                        | exfil_points["host_name"].astype(str).str.lower().str.contains(q, na=False)
-                        | exfil_points["id.orig_h"].astype(str).str.lower().str.contains(q, na=False)
-                        | exfil_points["destination"].astype(str).str.lower().str.contains(q, na=False)
-                        | exfil_points["Exfil_Detection_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                        | exfil_points["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                        | exfil_points["Action_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                    ]
+                    if "__search_blob" in exfil_points.columns:
+                        exfil_points = exfil_points[exfil_points["__search_blob"].str.contains(q, na=False, regex=False)]
+                    else:
+                        exfil_points = exfil_points[
+                            exfil_points["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                            | exfil_points["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                            | exfil_points["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                            | exfil_points["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                            | exfil_points["Exfil_Detection_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                            | exfil_points["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                            | exfil_points["Action_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                        ]
                 min_upload_bytes = int(exfil_min_mb * 1024 * 1024)
                 if min_upload_bytes > 0:
                     exfil_points = exfil_points[exfil_points["bytes"] >= min_upload_bytes]
                 else:
                     exfil_points = exfil_points[exfil_points["bytes"] > 0]
-                exfil_points = exfil_points.sort_values("bytes", ascending=False).head(5000)
+                if len(exfil_points) > 5000:
+                    exfil_points = exfil_points.nlargest(5000, "bytes")
+                else:
+                    exfil_points = exfil_points.sort_values("bytes", ascending=False)
 
                 st.markdown(
                     f"<div class='shadow-filter-hint'>Risk: <strong>{', '.join(exfil_risk_filter) if exfil_risk_filter else 'None'}</strong> | Action: <strong>{len(exfil_action_filter)} selected</strong> | Search: <strong>{'On' if exfil_search else 'Off'}</strong> | Min Transfer: <strong>{exfil_min_mb} MB</strong></div>",
@@ -2208,14 +2582,6 @@ def render_shadow_sharing(parquet_root: Path):
             u_chart1, u_chart2 = st.columns([2, 1])
             with u_chart1:
                 st.markdown("#### Top Exfiltration Destinations")
-                top_unauth = (
-                    threat_base.groupby("destination", dropna=False)
-                    .size()
-                    .reset_index(name="Hits")
-                    .sort_values("Hits", ascending=False)
-                    .head(10)
-                    .rename(columns={"destination": "Domain"})
-                )
                 if not top_unauth.empty:
                     fig_u1 = px.bar(
                         top_unauth,
@@ -2232,13 +2598,6 @@ def render_shadow_sharing(parquet_root: Path):
 
             with u_chart2:
                 st.markdown("#### Risk Distribution")
-                risk_counts = (
-                    threat_base.groupby("Severity", dropna=False)
-                    .size()
-                    .reset_index(name="Count")
-                    .rename(columns={"Severity": "Risk"})
-                    .sort_values("Count", ascending=False)
-                )
                 if not risk_counts.empty:
                     fig_u2 = px.pie(
                         risk_counts,
@@ -2269,7 +2628,6 @@ def render_shadow_sharing(parquet_root: Path):
                 )
 
             with af_top_2:
-                detail_sources = sorted(threat_base["log_source"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
                 detail_source_filter = st.multiselect(
                     "Filter by Log Source",
                     detail_sources,
@@ -2292,15 +2650,18 @@ def render_shadow_sharing(parquet_root: Path):
                 detail_df = detail_df[detail_df["log_source"].isin(detail_source_filter)]
             if detail_search:
                 q = detail_search.lower()
-                detail_df = detail_df[
-                    detail_df["mac"].astype(str).str.lower().str.contains(q, na=False)
-                    | detail_df["host_name"].astype(str).str.lower().str.contains(q, na=False)
-                    | detail_df["id.orig_h"].astype(str).str.lower().str.contains(q, na=False)
-                    | detail_df["destination"].astype(str).str.lower().str.contains(q, na=False)
-                    | detail_df["Exfil_Detection_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                    | detail_df["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                ]
-            detail_df = detail_df.sort_values("ts", ascending=False).head(MAX_ROWS_DISPLAY).copy()
+                if "__search_blob" in detail_df.columns:
+                    detail_df = detail_df[detail_df["__search_blob"].str.contains(q, na=False, regex=False)]
+                else:
+                    detail_df = detail_df[
+                        detail_df["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                        | detail_df["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                        | detail_df["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                        | detail_df["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                        | detail_df["Exfil_Detection_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                        | detail_df["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    ]
+            detail_df = detail_df.head(MAX_ROWS_DISPLAY).copy()
 
             detail_risk_summary = ", ".join(detail_risk) if detail_risk else "None"
             detail_source_summary = f"{len(detail_source_filter)} selected" if detail_source_filter else "None"

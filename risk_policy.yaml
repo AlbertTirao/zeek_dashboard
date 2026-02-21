@@ -1,21 +1,20 @@
 # risk_policy.yaml
-# Risk Policy Configuration
-# This policy is consumed by ui/pages/shadow_app.py.
+# Shadow Apps risk policy (consumed by ui/pages/shadow_apps.py)
 #
-# How risk is decided (in code order):
-# 1) Behavior tags from traffic volume/anomalies:
-#    - Potential Exfiltration  -> Critical
-#    - Protocol Anomaly        -> High
-#    - Heavy Download          -> Medium
-# 2) Policy rules below (ports / source logs)
-# 3) Low rules by app_status
+# Read order (first match wins per event):
+# 1) Behavior rules from traffic patterns:
+#    - bytes_sent > 10,000,000 bytes      -> Critical (Potential Exfiltration)
+#    - source_log == WEIRD                -> High (Protocol Anomaly)
+#    - bytes_received > 100,000,000 bytes -> Medium (Heavy Download)
+# 2) Rules below (critical/high/medium: source_logs and ports)
+# 3) low.app_status
 # 4) default
 
 critical:
   # Logs that usually indicate a security-relevant detection or protocol abuse
   source_logs:
     - "NOTICE"
-    - "WEIRD"
+  # NOTE: WEIRD is already mapped by behavior rule to High before policy checks.
   # Optional: add ports you consider "critical" in your environment
   ports:
     - 4444 # common C2/backdoor port (example)

@@ -18,8 +18,8 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # PERFORMANCE STRATEGY (FAST LOAD)
 # =============================================================================
 
-# Bump version so old cached parquet (without hostname) gets rebuilt automatically
-CACHE_VERSION = "shadow-cache-v2-hostname"
+# Bump version so old cached parquet (without app_software / readable risk basis) gets rebuilt automatically
+CACHE_VERSION = "shadow-cache-v4-app-software"
 
 # -----------------------------
 # Config
@@ -40,7 +40,14 @@ RISK_COLORS = {
 STATUS_COLORS = {"Authorized": "#22c55e", "Unauthorized": "#ef4444"}
 RISK_OPTIONS = ["Critical", "High", "Medium", "Low", "Safe"]
 
+# Behavior-driven thresholds (applied before policy-based matching).
+EXFIL_BYTES_SENT_THRESHOLD = 10_000_000
+HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD = 100_000_000
+PROTOCOL_ANOMALY_SOURCE_LOG = "WEIRD"
+
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_APP_SOFTWARE_NULLS = {"", "-", "unknown", "nan", "none", "null", "n/a", "unidentified_activity"}
 
 
 def normalize_mac(x) -> str:
@@ -66,6 +73,140 @@ def risk_score(val: str) -> int:
 
 def score_to_risk(score: int) -> str:
     return SCORE_TO_RISK.get(int(score), "Safe")
+
+
+def _fmt_mb_threshold(num_bytes: int) -> str:
+    mb = float(num_bytes) / 1_000_000.0
+    if mb.is_integer():
+        return f"{int(mb)} MB"
+    return f"{mb:.1f} MB"
+
+
+def _policy_section(policy: dict, level: str) -> dict:
+    if not isinstance(policy, dict):
+        return {}
+    section = policy.get(level, {})
+    return section if isinstance(section, dict) else {}
+
+
+def _policy_logs(policy: dict, level: str) -> set[str]:
+    section = _policy_section(policy, level)
+    out = set()
+    for x in (section.get("source_logs", []) or []):
+        s = str(x).strip()
+        if s:
+            out.add(s.upper())
+    return out
+
+
+def _policy_ports(policy: dict, level: str) -> set[int]:
+    section = _policy_section(policy, level)
+    out = set()
+    for p in (section.get("ports", []) or []):
+        try:
+            out.add(int(p))
+        except Exception:
+            pass
+    return out
+
+
+def _policy_statuses(policy: dict, level: str) -> set[str]:
+    section = _policy_section(policy, level)
+    out = set()
+    for x in (section.get("app_status", []) or []):
+        s = str(x).strip()
+        if s:
+            out.add(s)
+    return out
+
+
+def build_risk_policy_reference(policy: dict) -> pd.DataFrame:
+    rows = [
+        {
+            "Order": 1,
+            "Risk Level": "Critical",
+            "Rule Source": "Behavior",
+            "Trigger": (
+                "Potential Exfiltration: bytes_sent > "
+                f"{EXFIL_BYTES_SENT_THRESHOLD:,} ({_fmt_mb_threshold(EXFIL_BYTES_SENT_THRESHOLD)})"
+            ),
+        },
+        {
+            "Order": 2,
+            "Risk Level": "High",
+            "Rule Source": "Behavior",
+            "Trigger": f"Protocol Anomaly: source_log = {PROTOCOL_ANOMALY_SOURCE_LOG}",
+        },
+        {
+            "Order": 3,
+            "Risk Level": "Medium",
+            "Rule Source": "Behavior",
+            "Trigger": (
+                "Heavy Download: bytes_received > "
+                f"{HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD:,} ({_fmt_mb_threshold(HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD)})"
+            ),
+        },
+    ]
+
+    order = 4
+    for lvl_key, lvl_name in (("critical", "Critical"), ("high", "High"), ("medium", "Medium")):
+        logs = sorted(_policy_logs(policy, lvl_key))
+        ports = sorted(_policy_ports(policy, lvl_key))
+        if logs:
+            rows.append(
+                {
+                    "Order": order,
+                    "Risk Level": lvl_name,
+                    "Rule Source": "risk_policy.yaml",
+                    "Trigger": f"{lvl_key}.source_logs contains source_log ({', '.join(logs)})",
+                }
+            )
+            order += 1
+        if ports:
+            rows.append(
+                {
+                    "Order": order,
+                    "Risk Level": lvl_name,
+                    "Rule Source": "risk_policy.yaml",
+                    "Trigger": f"{lvl_key}.ports contains destination port ({', '.join(str(p) for p in ports)})",
+                }
+            )
+            order += 1
+
+    low_statuses = sorted(_policy_statuses(policy, "low"))
+    if low_statuses:
+        rows.append(
+            {
+                "Order": order,
+                "Risk Level": "Low",
+                "Rule Source": "risk_policy.yaml",
+                "Trigger": f"low.app_status contains App Status ({', '.join(low_statuses)})",
+            }
+        )
+        order += 1
+
+    default_raw = str(policy.get("default", "Safe")) if isinstance(policy, dict) and policy else "Safe"
+    default_risk = score_to_risk(risk_score(default_raw))
+    if policy:
+        rows.append(
+            {
+                "Order": order,
+                "Risk Level": default_risk,
+                "Rule Source": "risk_policy.yaml",
+                "Trigger": f"default = '{default_raw}' (used when no rule above matches)",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "Order": order,
+                "Risk Level": "Safe",
+                "Rule Source": "Fallback",
+                "Trigger": "No risk_policy.yaml loaded; fallback to Safe",
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def _mark_dialog_origin():
@@ -509,6 +650,54 @@ def extract_domain(url: str):
     return url.split(":")[0].rstrip(".")
 
 
+def normalize_app_software(app_value: str, source_log: str) -> str:
+    s = "" if app_value is None else str(app_value).strip()
+    if not s:
+        return ""
+    low = s.lower().strip()
+    if low in _APP_SOFTWARE_NULLS:
+        return ""
+
+    # Remove obvious URL framing and query fragments.
+    s = s.strip().strip("'").strip('"').split("?", 1)[0].strip()
+    if "://" in s:
+        try:
+            parsed = urlparse(s)
+            s = (parsed.path or parsed.hostname or "").strip()
+        except Exception:
+            pass
+    if not s:
+        return ""
+
+    # If this is a filesystem path, keep only the filename segment.
+    s = s.replace("\\", "/")
+    if "/" in s:
+        s = s.rsplit("/", 1)[-1].strip()
+    if not s:
+        return ""
+
+    low = s.lower()
+    if low in _APP_SOFTWARE_NULLS:
+        return ""
+    if _IPV4_RE.match(low):
+        return ""
+
+    # Drop pure domains/hosts from the software column.
+    host_like = low.split(":", 1)[0].rstrip(".")
+    if host_like.startswith("www."):
+        host_like = host_like[4:]
+    if "." in host_like and host_like == extract_domain(host_like):
+        return ""
+
+    # Non-software logs usually provide identifiers/domains, not software names.
+    if str(source_log).upper() in {"DNS", "HTTP", "SSL"} and "." in low and " " not in low:
+        return ""
+
+    if not re.search(r"[a-zA-Z]", s):
+        return ""
+    return re.sub(r"\s+", " ", s).strip()[:120]
+
+
 def load_allowlist():
     if not WHITELIST_FILE.exists():
         return []
@@ -790,6 +979,10 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             ["host", "server_name", "query", "filename", "service", "unparsed_version", "name", "note"],
             "'-'",
         )
+        sql_app_software_raw = get_coalesce(
+            ["name", "service", "unparsed_version", "filename"],
+            "''",
+        )
 
         info_parts = []
         if "method" in existing_cols and "uri" in existing_cols:
@@ -814,6 +1007,7 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             {sql_sent} as bytes_sent,
             {sql_recv} as bytes_received,
             {sql_app} as app_identifier,
+            {sql_app_software_raw} as app_software_raw,
             {sql_info} as Info,
             upper(regexp_extract(source_file_path, '([a-z]+)\\.parquet', 1)) as source_log
         FROM raw_logs r
@@ -848,7 +1042,11 @@ def vectorized_behavior(df: pd.DataFrame) -> pd.Series:
     sent = pd.to_numeric(df["bytes_sent"], errors="coerce").fillna(0).astype("int64")
     recv = pd.to_numeric(df["bytes_received"], errors="coerce").fillna(0).astype("int64")
     slog = df["source_log"].astype(str).str.upper()
-    conds = [sent > 10_000_000, recv > 100_000_000, slog.eq("WEIRD")]
+    conds = [
+        sent > EXFIL_BYTES_SENT_THRESHOLD,
+        recv > HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD,
+        slog.eq(PROTOCOL_ANOMALY_SOURCE_LOG),
+    ]
     choices = ["Potential Exfiltration", "Heavy Download", "Protocol Anomaly"]
     return pd.Series(np.select(conds, choices, default="Standard Traffic"), index=df.index)
 
@@ -864,70 +1062,77 @@ def vectorized_risk(df: pd.DataFrame, policy: dict):
 
     m = behavior.eq("Potential Exfiltration") & score.eq(-1)
     score[m] = 4
-    basis[m] = "Behavior: Potential Exfiltration (bytes_sent threshold)"
+    basis[m] = (
+        "Critical: Potential Exfiltration because bytes_sent exceeded "
+        f"{EXFIL_BYTES_SENT_THRESHOLD:,} ({_fmt_mb_threshold(EXFIL_BYTES_SENT_THRESHOLD)})."
+    )
 
     m = behavior.eq("Protocol Anomaly") & score.eq(-1)
     score[m] = 3
-    basis[m] = "Behavior: Protocol Anomaly (WEIRD log)"
+    basis[m] = f"High: Protocol Anomaly detected from source_log={PROTOCOL_ANOMALY_SOURCE_LOG}."
 
     m = behavior.eq("Heavy Download") & score.eq(-1)
     score[m] = 2
-    basis[m] = "Behavior: Heavy Download (bytes_received threshold)"
+    basis[m] = (
+        "Medium: Heavy Download because bytes_received exceeded "
+        f"{HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD:,} ({_fmt_mb_threshold(HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD)})."
+    )
 
-    def _logs(level: str):
-        return set(str(x).upper() for x in (policy.get(level, {}).get("source_logs", []) or []))
-
-    def _ports(level: str):
-        out = set()
-        for p in (policy.get(level, {}).get("ports", []) or []):
-            try:
-                out.add(int(p))
-            except Exception:
-                pass
-        return out
-
-    crit_logs, crit_ports = _logs("critical"), _ports("critical")
-    high_logs, high_ports = _logs("high"), _ports("high")
-    med_logs, med_ports = _logs("medium"), _ports("medium")
+    crit_logs, crit_ports = _policy_logs(policy, "critical"), _policy_ports(policy, "critical")
+    high_logs, high_ports = _policy_logs(policy, "high"), _policy_ports(policy, "high")
+    med_logs, med_ports = _policy_logs(policy, "medium"), _policy_ports(policy, "medium")
 
     if crit_logs:
         m = slog.isin(crit_logs) & score.eq(-1)
         score[m] = 4
-        basis.loc[m] = "Policy: critical.source_logs matched (" + slog.loc[m].astype(str) + ")"
+        basis.loc[m] = (
+            "Critical: source_log matched risk_policy.critical.source_logs ("
+            + slog.loc[m].astype(str)
+            + ")."
+        )
     if crit_ports:
         m = port.isin(crit_ports) & score.eq(-1)
         score[m] = 4
-        basis.loc[m] = "Policy: critical.ports matched (" + port.loc[m].astype(str) + ")"
+        basis.loc[m] = (
+            "Critical: destination port matched risk_policy.critical.ports ("
+            + port.loc[m].astype(str)
+            + ")."
+        )
 
     if high_logs:
         m = slog.isin(high_logs) & score.eq(-1)
         score[m] = 3
-        basis[m] = "Policy: high.source_logs matched (" + slog[m] + ")"
+        basis[m] = "High: source_log matched risk_policy.high.source_logs (" + slog[m] + ")."
     if high_ports:
         m = port.isin(high_ports) & score.eq(-1)
         score[m] = 3
-        basis[m] = "Policy: high.ports matched (" + port[m].astype(str) + ")"
+        basis[m] = "High: destination port matched risk_policy.high.ports (" + port[m].astype(str) + ")."
 
     if med_logs:
         m = slog.isin(med_logs) & score.eq(-1)
         score[m] = 2
-        basis[m] = "Policy: medium.source_logs matched (" + slog[m] + ")"
+        basis[m] = "Medium: source_log matched risk_policy.medium.source_logs (" + slog[m] + ")."
     if med_ports:
         m = port.isin(med_ports) & score.eq(-1)
         score[m] = 2
-        basis[m] = "Policy: medium.ports matched (" + port[m].astype(str) + ")"
+        basis[m] = "Medium: destination port matched risk_policy.medium.ports (" + port[m].astype(str) + ")."
 
-    low_statuses = set(policy.get("low", {}).get("app_status", []) or [])
+    low_statuses = _policy_statuses(policy, "low")
     if low_statuses:
         m = status.isin(low_statuses) & score.eq(-1)
         score[m] = 1
-        basis[m] = "Policy: low.app_status matched (" + status[m].astype(str) + ")"
+        basis[m] = "Low: App Status matched risk_policy.low.app_status (" + status[m].astype(str) + ")."
 
-    default_str = str(policy.get("default", "Safe")) if policy else "Safe"
+    default_str = str(policy.get("default", "Safe")) if isinstance(policy, dict) and policy else "Safe"
     default_score = int(RISK_SCORE.get(default_str, 0))
+    default_risk = score_to_risk(default_score)
     m = score.eq(-1)
     score[m] = default_score
-    basis[m] = f"Default policy applied ({default_str})" if policy else "No policy loaded (fallback Safe)"
+    basis[m] = (
+        f"{default_risk}: No higher-priority rule matched; fallback to risk_policy.default ('{default_str}')."
+        if policy
+        else "Safe: No risk_policy.yaml loaded; fallback default applied."
+    )
 
     risk_level = score.map(lambda s: SCORE_TO_RISK.get(int(s), "Safe")).astype(str)
     return risk_level, basis, score.astype("int16")
@@ -975,6 +1180,15 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     mask_empty = df["domain_clean"].eq("") | df["domain_clean"].isna()
     df.loc[mask_empty, "domain_clean"] = df.loc[mask_empty, "app_identifier"].astype(str)
     df["domain_clean"] = df["domain_clean"].fillna("unidentified_activity")
+    soft_raw_series = df.get("app_software_raw", pd.Series("", index=df.index))
+    df["app_software"] = [
+        normalize_app_software(soft_raw, src) or normalize_app_software(app_val, src)
+        for soft_raw, app_val, src in zip(
+            soft_raw_series.tolist(),
+            df["app_identifier"].tolist(),
+            df["source_log"].tolist(),
+        )
+    ]
 
     if allow_re is not None:
         allowed_mask = df["domain_clean"].astype(str).str.contains(allow_re, na=False)
@@ -997,6 +1211,7 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
         "hostname",  # ✅ persist
         "domain_clean",
         "app_identifier",
+        "app_software",
         "source_log",
         "dst_port",
         "bytes_sent",
@@ -1130,7 +1345,7 @@ def show_inventory_allow_dialog():
         f"Confirm allowlisting for MAC `{target_mac or 'unknown'}`."
     )
     st.markdown(f"- Destination: `{destination_raw or '-'}`")
-    st.markdown(f"- Application / Identifier: `{app_or_id or '-'}`")
+    st.markdown(f"- Application / Software: `{app_or_id or '-'}`")
     st.caption(
         "This will update whitelist_domains.yaml and refresh statuses to Authorized after cache rebuild."
     )
@@ -1183,13 +1398,13 @@ def show_inventory_app_dialog(conn):
         st.caption(f"Application usage scope: {sel_app or '-'}")
 
     if not target_mac or not sel_dest or not sel_app:
-        st.warning("Missing application context. Please select an Application / Identifier row again.")
+        st.warning("Missing application context. Please select an Application / Software row again.")
         return
 
     app_where = [
         "lower(mac) = lower(?)",
         "domain_clean = ?",
-        "COALESCE(NULLIF(app_identifier,''), domain_clean) = ?",
+        "app_software = ?",
     ]
     app_params = [target_mac, sel_dest, sel_app]
 
@@ -1203,7 +1418,7 @@ def show_inventory_app_dialog(conn):
 
     if forensic_search:
         q = f"%{forensic_search}%"
-        app_where.append("(domain_clean ILIKE ? OR app_identifier ILIKE ? OR ip ILIKE ? OR hostname ILIKE ? OR Info ILIKE ?)")
+        app_where.append("(domain_clean ILIKE ? OR app_software ILIKE ? OR ip ILIKE ? OR hostname ILIKE ? OR Info ILIKE ?)")
         app_params.extend([q, q, q, q, q])
 
     app_where_sql = " AND ".join(app_where)
@@ -1294,23 +1509,23 @@ def show_inventory_app_dialog(conn):
     st.markdown("#### Why This Risk Level")
     reason_df = (
         app_df.assign(
-            risk_basis=app_df["Risk Basis"].fillna("").astype(str).str.strip().replace("", "No explicit basis captured"),
+            risk_reason=app_df["Risk Basis"].fillna("").astype(str).str.strip().replace("", "No explicit reason captured"),
             risk_level=app_df["Risk Level"].fillna("Safe").astype(str),
         )
-        .groupby(["risk_level", "risk_basis"], as_index=False)
+        .groupby(["risk_level", "risk_reason"], as_index=False)
         .size()
-        .rename(columns={"size": "Events", "risk_level": "Risk Level", "risk_basis": "Risk Basis"})
+        .rename(columns={"size": "Events", "risk_level": "Risk Level", "risk_reason": "Risk Reason"})
         .sort_values("Events", ascending=False)
         .head(12)
     )
     if not reason_df.empty:
         top_reason = reason_df.iloc[0]
         st.caption(
-            f"Top observed cause: {top_reason['Risk Level']} - {top_reason['Risk Basis']} ({int(top_reason['Events']):,} events)."
+            f"Top observed cause: {top_reason['Risk Level']} - {top_reason['Risk Reason']} ({int(top_reason['Events']):,} events)."
         )
         st.dataframe(reason_df, use_container_width=True, hide_index=True)
     else:
-        st.info("No risk basis details available for this application.")
+        st.info("No risk reason details available for this application.")
 
 
 @st.dialog("Shadow App Forensics Details", width="large", dismissible=False)
@@ -1550,7 +1765,7 @@ def show_forensics_dialog(conn):
 
     if forensic_search:
         q_inv = f"%{forensic_search}%"
-        inv_where.append("(domain_clean ILIKE ? OR app_identifier ILIKE ?)")
+        inv_where.append("(domain_clean ILIKE ? OR app_software ILIKE ?)")
         inv_params.extend([q_inv, q_inv])
 
     inv_where_sql = " AND ".join(inv_where)
@@ -1561,7 +1776,7 @@ def show_forensics_dialog(conn):
         WITH base AS (
             SELECT
                 domain_clean,
-                app_identifier,
+                app_software,
                 source_log,
                 "App Status" AS app_status,
                 _risk_score,
@@ -1570,11 +1785,13 @@ def show_forensics_dialog(conn):
             WHERE {inv_where_sql}
               AND domain_clean IS NOT NULL
               AND domain_clean <> ''
+              AND app_software IS NOT NULL
+              AND trim(app_software) <> ''
         ),
         agg AS (
             SELECT
                 domain_clean,
-                COALESCE(NULLIF(app_identifier,''), domain_clean) AS app_identifier,
+                app_software,
                 STRING_AGG(DISTINCT source_log, ', ' ORDER BY source_log) AS sources,
                 MIN(datetime) AS first_seen,
                 MAX(datetime) AS last_seen,
@@ -1587,7 +1804,7 @@ def show_forensics_dialog(conn):
         )
         SELECT
             domain_clean AS destination,
-            app_identifier AS application_or_identifier,
+            app_software AS application_or_identifier,
             sources,
             status,
             first_seen,
@@ -1610,7 +1827,7 @@ def show_forensics_dialog(conn):
     )
 
     if inventory_df.empty:
-        st.info("No application inventory could be derived for this MAC (with current filters).")
+        st.info("No application/software names were detected for this MAC with the current filters.")
     else:
         inv_grid = inventory_df.copy()
         inv_grid.insert(0, "#", range(1, len(inv_grid) + 1))
@@ -1671,6 +1888,17 @@ def show_forensics_dialog(conn):
             }
             """
         )
+        inv_app_only_click_js = JsCode(
+            """
+            function(params) {
+                if (!params || !params.column || !params.node) return;
+                const colId = params.column.getColId ? params.column.getColId() : '';
+                if (colId === 'application_or_identifier') {
+                    params.node.setSelected(true, true);
+                }
+            }
+            """
+        )
 
         gb_inv = GridOptionsBuilder.from_dataframe(inv_grid)
         gb_inv.configure_default_column(
@@ -1691,7 +1919,7 @@ def show_forensics_dialog(conn):
         )
         gb_inv.configure_column(
             "application_or_identifier",
-            header_name="Application / Identifier",
+            header_name="Application / Software",
             minWidth=185,
             flex=1.35,
             wrapText=True,
@@ -1733,6 +1961,8 @@ def show_forensics_dialog(conn):
         inv_grid_options["domLayout"] = "normal"
         inv_grid_options["alwaysShowVerticalScroll"] = True
         inv_grid_options["tooltipShowDelay"] = 0
+        inv_grid_options["suppressRowClickSelection"] = True
+        inv_grid_options["onCellClicked"] = inv_app_only_click_js
 
         inv_grid_response = AgGrid(
             inv_grid,
@@ -1748,12 +1978,9 @@ def show_forensics_dialog(conn):
             reload_data=False,
             key=f"dlg_inventory_grid_{target_mac}_{int(st.session_state.get('shadow_inv_grid_nonce', 0))}",
         )
-        st.caption(
-            f"{len(inv_grid):,} inventory rows shown. Rows are grouped by Destination + Application / Identifier "
-            "from the current MAC and filter scope, with Source Logs merged, First Seen/Last Seen and Hits aggregated, "
-            "status derived from any unauthorized activity, and Max Risk from the highest observed risk score; "
-            "rows are sorted by Max Risk, Hits, then Last Seen."
-        )
+        st.caption("Click only Application / Software to open a popup dialog with app usage and risk-cause details.")
+        st.caption("Check Allowed for an unauthorized row to open allowlist confirmation.")
+        st.caption(f"{len(inv_grid):,} rows shown in application inventory.")
 
         edited_inv = inv_grid_response.get("data", None)
         if isinstance(edited_inv, pd.DataFrame):
@@ -1917,6 +2144,20 @@ def render_shadow_apps(parquet_root: Path):
     col3.metric("Unauthorized Events", f"{unauthorized_count:,}", f"{unauth_pct:.1f}% of total", delta_color="inverse")
     col4.metric("Critical / High Risk", f"{crit_high_count:,}", f"{crit_high_pct:.1f}% of total", delta_color="inverse")
 
+    with st.expander("How Risk Is Calculated", expanded=False):
+        st.markdown(
+            "<div class='shadow-callout'>Rules are evaluated top-to-bottom per event. The first match sets the Risk Level.</div>",
+            unsafe_allow_html=True,
+        )
+        ref_df = build_risk_policy_reference(risk_policy)
+        st.dataframe(ref_df, use_container_width=True, hide_index=True)
+        if risk_policy:
+            st.caption(
+                f"Policy source: `{RISK_POLICY_FILE.name}`. Update that file to tune ports/log sources/status defaults."
+            )
+        else:
+            st.caption("No risk_policy.yaml found. Only behavior rules and Safe fallback are active.")
+
     st.divider()
 
     # Charts
@@ -1979,10 +2220,16 @@ def render_shadow_apps(parquet_root: Path):
     tab_main = st.container()
 
     # =============================================================================
-    # TAB 1: AgGrid (CLICK ROW -> OPEN DIALOG)
+    # TAB 1: AgGrid (CLICK MAC CELL -> OPEN DIALOG)
     # =============================================================================
     with tab_main:
         st.markdown("### Application Audit Log")
+        st.markdown(
+            "<div class='shadow-callout'>Click only the MAC Address column to open the per-device forensics dialog.</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         search_query_audit = st.text_input(
             "Search (MAC, Hostname, IP, Domain)",
             placeholder="e.g., 192.168.1.14 or github.com",
@@ -2005,6 +2252,7 @@ def render_shadow_apps(parquet_root: Path):
                 default=audit_sources,   # default = all
                 key="audit_source_filter",
             )
+        st.markdown("</div>", unsafe_allow_html=True)
 
         where = []
         params = []
@@ -2067,7 +2315,7 @@ def render_shadow_apps(parquet_root: Path):
                 hostname,
                 ip,
                 source_log,
-                risk_basis AS Max_Risk_Basis,
+                risk_basis AS Max_Risk_Reason,
                 ROW_NUMBER() OVER (
                     PARTITION BY domain_clean, mac, hostname, ip, source_log
                     ORDER BY _risk_score DESC, datetime DESC
@@ -2090,7 +2338,7 @@ def render_shadow_apps(parquet_root: Path):
                 WHEN 1 THEN 'Low'
                 ELSE 'Safe'
             END AS Max_Risk,
-            b.Max_Risk_Basis
+            b.Max_Risk_Reason
         FROM agg a
         LEFT JOIN (SELECT * FROM pick_basis WHERE rn = 1) b
             ON a.domain_clean=b.domain_clean
@@ -2147,11 +2395,31 @@ def render_shadow_apps(parquet_root: Path):
                 }
                 """
             )
+            mac_only_click_js = JsCode(
+                """
+                function(params) {
+                    if (!params || !params.column || !params.node) return;
+                    const colId = params.column.getColId ? params.column.getColId() : '';
+                    if (colId === 'mac') {
+                        params.node.setSelected(true, true);
+                    }
+                }
+                """
+            )
 
             # Column formatting (match)
             gb.configure_column("#", header_name="#", width=70, pinned="left", suppressMovable=True, resizable=False)
             gb.configure_column("mac", header_name="MAC Address (Click)", cellStyle=mac_cellstyle)
             gb.configure_column("Max_Risk", header_name="Risk Level", cellStyle=risk_cellstyle)
+            gb.configure_column(
+                "Max_Risk_Reason",
+                header_name="Risk Reason",
+                minWidth=260,
+                flex=1.4,
+                wrapText=True,
+                autoHeight=True,
+                tooltipField="Max_Risk_Reason",
+            )
 
             # Optional: tighten these widths (feel more like a fixed enterprise table)
             gb.configure_column("domain_clean", header_name="Domain", minWidth=220)
@@ -2164,12 +2432,13 @@ def render_shadow_apps(parquet_root: Path):
 
             grid_options = _apply_shadow_grid_filter_sort(gb.build())
             grid_options["rowSelection"] = "single"
-            grid_options["suppressRowClickSelection"] = False
+            grid_options["suppressRowClickSelection"] = True
             grid_options["rowMultiSelectWithClick"] = False
             grid_options["domLayout"] = "normal"
             grid_options["alwaysShowVerticalScroll"] = True
             grid_options["suppressHorizontalScroll"] = False
             grid_options["alwaysShowHorizontalScroll"] = True
+            grid_options["onCellClicked"] = mac_only_click_js
 
             ag_theme, ag_css = get_aggrid_theme_and_css()
             audit_ag_css = dict(ag_css)
