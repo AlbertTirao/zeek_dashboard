@@ -2057,19 +2057,12 @@ def show_forensics_dialog(conn):
             key=f"dlg_inventory_grid_{target_mac}_{int(st.session_state.get('shadow_inv_grid_nonce', 0))}",
         )
         st.caption(
-            f"{len(inv_grid):,} rows shown. Each row is one Destination + Application / Identifier pair for this MAC under current filters."
+            f"{len(inv_grid):,} rows shown. Each row is a Destination + Application/Identifier for this MAC with current filters."
         )
         st.caption(
-            "Only validated software names or valid domains are included. Non-app labels, notes, and anomaly tags are excluded."
-        )
-        st.caption(
-            "Sources are merged unique log types; First Seen / Last Seen / Hits are aggregated across matching events."
-        )
-        st.caption(
-            "Status becomes Unauthorized if any matched event is unauthorized, and Max Risk shows the highest observed risk for that row."
-        )
-        st.caption(
-            "Click Application / Identifier for detailed event view. Toggle Allowed on unauthorized rows to open allowlist confirmation."
+            "Only valid apps/domains are shown. Sources are merged, First Seen/Last Seen/Hits are aggregated, "
+            "Unauthorized and Max Risk show the highest severity seen. Click Application/Identifier for details "
+            "or toggle Allowed on unauthorized rows to start allowlisting."
         )
 
         edited_inv = inv_grid_response.get("data", None)
