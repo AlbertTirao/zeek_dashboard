@@ -2,7 +2,6 @@
 from datetime import datetime
 
 import streamlit as st
-import pandas as pd
 from pathlib import Path
 from .shadow_apps import render_shadow_apps
 from .shadow_sharings import render_shadow_uploads
@@ -19,6 +18,7 @@ def inject_traffic_header_css():
             --panel-shadow: 0 14px 38px rgba(0,0,0,0.25);
             --accent-cyan: #00F7FF;
             --accent-red: #F63049;
+            --tm-topbar-height: 2.35rem;
         }
 
         .stApp {
@@ -31,11 +31,24 @@ def inject_traffic_header_css():
         .block-container,
         .main .block-container,
         [data-testid="stMainBlockContainer"] {
-            padding-top: 0 !important;
+            padding-top: calc(var(--tm-topbar-height) + 0.35rem) !important;
             padding-bottom: 1.05rem !important;
             padding-left: 30px !important;
             padding-right: 30px !important;
             max-width: 100% !important;
+        }
+
+        header[data-testid="stHeader"] {
+            height: var(--tm-topbar-height) !important;
+            min-height: var(--tm-topbar-height) !important;
+            background: #000 !important;
+        }
+
+        header[data-testid="stHeader"] > div {
+            height: var(--tm-topbar-height) !important;
+            min-height: var(--tm-topbar-height) !important;
+            padding-top: 0 !important;
+            padding-bottom: 0 !important;
         }
 
         [data-testid="stAppViewContainer"] > .main,
@@ -103,49 +116,6 @@ def inject_traffic_header_css():
     )
 
 # ---------------------------------------------------------
-# Helper: Reconstruct 'filtered' device list from Parquet
-# ---------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_device_data(parquet_root: Path):
-    """
-    Loads known_hosts and dhcp from Parquet to create the device list
-    needed by Shadow Uploads/AI tabs.
-    """
-    if not parquet_root.exists():
-        return pd.DataFrame()
-
-    # Load all known_hosts and dhcp files
-    kh_dfs = []
-    dhcp_dfs = []
-    
-    for date_dir in parquet_root.iterdir():
-        if not date_dir.is_dir(): continue
-        
-        kh = date_dir / "known_hosts.parquet"
-        dh = date_dir / "dhcp.parquet"
-        
-        if kh.exists(): kh_dfs.append(pd.read_parquet(kh))
-        if dh.exists(): dhcp_dfs.append(pd.read_parquet(dh))
-
-    # Merge logic (simplified)
-    known_hosts = pd.concat(kh_dfs, ignore_index=True) if kh_dfs else pd.DataFrame()
-    dhcp = pd.concat(dhcp_dfs, ignore_index=True) if dhcp_dfs else pd.DataFrame()
-    
-    if known_hosts.empty:
-        return pd.DataFrame()
-
-    # If we have DHCP, merge it in to get hostnames
-    if not dhcp.empty and "client_addr" in dhcp.columns:
-        # Deduplicate DHCP to latest hostname per IP
-        dhcp_clean = dhcp.drop_duplicates(subset=["client_addr"], keep="last")
-        # Ensure join keys match type
-        if "host" in known_hosts.columns:
-             merged = pd.merge(known_hosts, dhcp_clean, left_on="host", right_on="client_addr", how="left")
-             return merged
-    
-    return known_hosts
-
-# ---------------------------------------------------------
 # Main Render
 # ---------------------------------------------------------
 def render(parquet_root: Path):
@@ -165,24 +135,15 @@ def render(parquet_root: Path):
         unsafe_allow_html=True,
     )
 
-    if st.button("Refresh Analytics"):
-        st.rerun()
+    section = st.radio(
+        "Select Section",
+        ["Shadow Apps", "Shadow Sharings", "Shadow AI"],
+        horizontal=True,
+    )
 
-    # 1. Load Device Data (Optional usage)
-    filtered = load_device_data(parquet_root)
-
-    # 2. Tabs
-    tab = st.radio("Select Section", ["Shadow Apps", "Shadow Sharings", "Shadow AI"], horizontal=True)
-
-    if tab == "Shadow Apps":
-        # Correct: Passes Path
+    if section == "Shadow Apps":
         render_shadow_apps(parquet_root)
-        
-    elif tab == "Shadow Sharings":
-        # --- FIXED HERE ---
-        # Was passing 'filtered' (DataFrame), now passing 'parquet_root' (Path)
+    elif section == "Shadow Sharings":
         render_shadow_uploads(parquet_root)
-            
-    elif tab == "Shadow AI":
-        # Correct: Passes Path
+    else:
         render_shadow_ai(parquet_root)

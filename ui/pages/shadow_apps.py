@@ -28,14 +28,6 @@ WHITELIST_FILE = Path(__file__).resolve().parents[2] / "whitelist_domains.yaml"
 RISK_POLICY_FILE = Path(__file__).resolve().parents[2] / "risk_policy.yaml"
 CACHE_DIRNAME = "_shadow_cache_apps"
 
-LICENSE_REGISTRY = {
-    "office.com": None,
-    "microsoft.com": None,
-    "github.com": None,
-    "zoom.us": None,
-    "slack.com": None,
-}
-
 RISK_SCORE = {"Safe": 0, "Low": 1, "Medium": 2, "High": 3, "Critical": 4}
 SCORE_TO_RISK = {v: k for k, v in RISK_SCORE.items()}
 RISK_COLORS = {
@@ -46,6 +38,7 @@ RISK_COLORS = {
     "Safe": "#22c55e",
 }
 STATUS_COLORS = {"Authorized": "#22c55e", "Unauthorized": "#ef4444"}
+RISK_OPTIONS = ["Critical", "High", "Medium", "Low", "Safe"]
 
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 
@@ -84,11 +77,21 @@ def risk_multiselect(label: str, key: str, default=None, on_change=None):
         default = ["Critical", "High", "Medium", "Low"]
     return st.multiselect(
         label,
-        ["Critical", "High", "Medium", "Low", "Safe"],
+        RISK_OPTIONS,
         default=default,
         key=key,
         on_change=on_change,
     )
+
+
+def summarize_multiselect(selected, all_options, *, all_label="All", none_label="None") -> str:
+    selected_list = [str(v).strip() for v in (selected or []) if str(v).strip()]
+    all_list = [str(v).strip() for v in (all_options or []) if str(v).strip()]
+    if not selected_list:
+        return none_label
+    if all_list and set(selected_list) == set(all_list):
+        return all_label
+    return ", ".join(selected_list)
 
 
 def _close_shadow_dialog(reset_grid: bool = True):
@@ -191,6 +194,11 @@ def get_aggrid_theme_and_css():
             "border": "1px solid #2D456C !important",
         },
         ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-root-wrapper ::-webkit-scrollbar-button": {
+            "display": "none !important",
+            "width": "0 !important",
+            "height": "0 !important",
+        },
     }
     return theme, custom_css
 
@@ -295,90 +303,6 @@ def inject_shadow_apps_css():
                 #040B18;
         }
 
-        .shadow-day-chip {
-            border: 1px solid rgba(255,255,255,0.18);
-            background: rgba(255,255,255,0.05);
-            border-radius: 999px;
-            padding: 7px 12px;
-            margin-top: 1.72rem;
-            font-size: 12px;
-            font-weight: 700;
-            line-height: 1.2;
-            display: inline-flex;
-            align-items: center;
-        }
-
-        .shadow-callout {
-            border: 1px solid var(--panel-border);
-            background: var(--panel-bg);
-            border-radius: 10px;
-            padding: 0.5rem 0.72rem;
-            font-size: 0.84rem;
-            margin-bottom: 0.45rem;
-        }
-
-        .shadow-filter-shell {
-            border: 1px solid rgba(148, 163, 184, 0.28);
-            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
-            border-radius: 12px;
-            padding: 0.72rem 0.85rem 0.55rem 0.85rem;
-            margin-bottom: 0.72rem;
-        }
-
-        .shadow-filter-hint {
-            font-size: 0.76rem;
-            color: #9fb1c8;
-            margin-top: 0.2rem;
-            margin-bottom: 0.2rem;
-        }
-
-        .shadow-filter-shell [data-testid="stWidgetLabel"] p {
-            font-size: 0.76rem;
-            letter-spacing: 0.05em;
-            text-transform: uppercase;
-            color: #bfd1ea;
-            font-weight: 700;
-        }
-
-        .shadow-filter-shell [data-testid="stTextInput"] input,
-        .shadow-filter-shell [data-testid="stTextArea"] textarea {
-            background: rgba(8, 20, 40, 0.8) !important;
-            border: 1px solid #35517d !important;
-            color: #e5eefc !important;
-        }
-
-        .shadow-filter-shell [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
-        .shadow-filter-shell [data-testid="stMultiSelect"] div[data-baseweb="select"] > div {
-            background: rgba(8, 20, 40, 0.8) !important;
-            border: 1px solid #35517d !important;
-            color: #e5eefc !important;
-            min-height: 2.42rem;
-        }
-
-        .shadow-filter-shell div[role="radiogroup"] label {
-            background: rgba(8, 20, 40, 0.75) !important;
-            border: 1px solid #35517d !important;
-            border-radius: 8px !important;
-            padding: 0.3rem 0.5rem !important;
-        }
-
-        .shadow-table-shell {
-            border: 1px solid rgba(148, 163, 184, 0.24);
-            background: linear-gradient(180deg, rgba(2,6,23,0.5), rgba(2,6,23,0.35));
-            border-radius: 12px;
-            padding: 0.56rem 0.62rem 0.46rem 0.62rem;
-            margin-bottom: 0.75rem;
-        }
-
-        .shadow-dialog-banner {
-            border: 1px solid rgba(56, 189, 248, 0.42);
-            background: linear-gradient(120deg, rgba(14,116,144,0.25), rgba(15,23,42,0.62));
-            border-radius: 10px;
-            padding: 0.5rem 0.74rem;
-            font-size: 0.84rem;
-            margin-bottom: 0.45rem;
-        }
-
         [data-testid="stMetric"] {
             background: var(--panel-bg);
             border: 1px solid var(--panel-border);
@@ -420,6 +344,12 @@ def inject_shadow_apps_css():
             background: rgba(255,255,255,0.08);
             border-color: rgba(255,255,255,0.2);
             font-weight: 700;
+        }
+
+        [data-testid="stDataFrame"] ::-webkit-scrollbar-button {
+            display: none !important;
+            width: 0 !important;
+            height: 0 !important;
         }
         </style>
         """,
@@ -1250,10 +1180,7 @@ def show_inventory_app_dialog(conn):
             _close_inventory_app_dialog()
             st.rerun()
     with top[1]:
-        st.markdown(
-            f"<div class='shadow-dialog-banner'>Application usage scope: <strong>{sel_app or '-'}</strong></div>",
-            unsafe_allow_html=True,
-        )
+        st.caption(f"Application usage scope: {sel_app or '-'}")
 
     if not target_mac or not sel_dest or not sel_app:
         st.warning("Missing application context. Please select an Application / Identifier row again.")
@@ -1418,10 +1345,9 @@ def show_forensics_dialog(conn):
             st.rerun()
 
     with top[1]:
-        st.markdown(
-            f"<div class='shadow-dialog-banner'>Forensic analysis scope: <strong>{target_mac}</strong></div>",
-            unsafe_allow_html=True,
-        )
+        forensic_scope_line = st.empty()
+        forensic_summary_line = st.empty()
+        forensic_note_line = st.empty()
 
     if not target_mac:
         st.info("No MAC selected.")
@@ -1432,43 +1358,42 @@ def show_forensics_dialog(conn):
         st.warning("No data found for this specific MAC address.")
         return
 
-    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
     src_df = _sql_fetch_df(
         conn,
         "SELECT DISTINCT source_log FROM shadow_events WHERE lower(mac) = lower(?) ORDER BY 1",
         [target_mac],
     )
     f_raw_sources = src_df["source_log"].dropna().tolist() if not src_df.empty else []
-    selected_f_source = st.selectbox(
-        "Filter Source",
-        ["All"] + f_raw_sources,
-        key=f"dlg_src_{target_mac}",
+    forensic_search = st.text_input(
+        "Quick Search",
+        placeholder="IP, domain, context...",
+        key=f"dlg_search_{target_mac}",
         on_change=_mark_dialog_origin,
-    )
-    f_bottom_left, f_bottom_right = st.columns([1.4, 2.6])
+    ).strip()
+    f_bottom_left, f_bottom_right = st.columns([2.6, 1.4])
     with f_bottom_left:
         forensic_risk = risk_multiselect(
             "Filter Risk",
             key=f"dlg_risk_{target_mac}",
-            default=["Critical", "High", "Medium", "Low", "Safe"],
+            default=RISK_OPTIONS,
             on_change=_mark_dialog_origin,
         )
     with f_bottom_right:
-        forensic_search = st.text_input(
-            "Quick Search",
-            placeholder="IP, domain, context...",
-            key=f"dlg_search_{target_mac}",
+        selected_f_source = st.selectbox(
+            "Filter Source",
+            ["All"] + f_raw_sources,
+            key=f"dlg_src_{target_mac}",
             on_change=_mark_dialog_origin,
-        ).strip()
-    st.markdown("</div>", unsafe_allow_html=True)
+        )
 
-    risk_summary = ", ".join(forensic_risk) if forensic_risk else "None"
-    source_summary = selected_f_source if selected_f_source != "All" else "All Sources"
-    st.markdown(
-        f"<div class='shadow-filter-hint'>Source: <strong>{source_summary}</strong> | Risk: <strong>{risk_summary}</strong> | Search: <strong>{'On' if forensic_search else 'Off'}</strong></div>",
-        unsafe_allow_html=True,
+    is_all_risk_selected = bool(forensic_risk) and set(forensic_risk) == set(RISK_OPTIONS)
+    risk_summary = summarize_multiselect(forensic_risk, RISK_OPTIONS, all_label="All")
+    source_summary = "All" if selected_f_source == "All" else selected_f_source
+    forensic_scope_line.caption(f"Forensic analysis scope: {target_mac}")
+    forensic_summary_line.caption(
+        f"Source: {source_summary} | Risk: {risk_summary} | Search: {'On' if forensic_search else 'Off'}"
     )
-    st.caption("Graphs below are computed from the current MAC + Source/Risk/Search filters.")
+    forensic_note_line.caption("Graphs below are computed from the current MAC + Source/Risk/Search filters.")
 
     where = ["lower(mac) = lower(?)"]
     params = [target_mac]
@@ -1477,7 +1402,7 @@ def show_forensics_dialog(conn):
         where.append("upper(source_log) = upper(?)")
         params.append(selected_f_source)
 
-    if forensic_risk:
+    if forensic_risk and not is_all_risk_selected:
         in_clause = _build_in_clause(forensic_risk, params)
         where.append(f""""Risk Level" IN {in_clause}""")
 
@@ -1527,25 +1452,16 @@ def show_forensics_dialog(conn):
     # Dialog analytics: Timeline + Top Destinations
     # =============================================================================
     st.markdown("#### Activity Timeline")
-    tl_cfg_1, tl_cfg_2 = st.columns([1.2, 1.8])
-    with tl_cfg_1:
-        timeline_grain = st.selectbox(
-            "Time Bucket",
-            ["5 min", "10 min", "30 min", "1 hour"],
-            index=1,
-            key=f"dlg_time_bucket_{target_mac}",
-            on_change=_mark_dialog_origin,
-        )
-    with tl_cfg_2:
-        timeline_mode = st.radio(
-            "Timeline View",
-            ["Total Events", "Status Split"],
-            horizontal=True,
-            key=f"dlg_timeline_mode_{target_mac}",
-            on_change=_mark_dialog_origin,
-        )
+    timeline_mode = st.radio(
+        "Timeline View",
+        ["Total Events", "Status Split"],
+        horizontal=True,
+        key=f"dlg_timeline_mode_{target_mac}",
+        on_change=_mark_dialog_origin,
+    )
 
-    bucket_rule = {"5 min": "5min", "10 min": "10min", "30 min": "30min", "1 hour": "1H"}[timeline_grain]
+    bucket_rule = "10min"
+    timeline_label = "10 min"
     timeline = forensic_df.dropna(subset=["datetime"]).copy()
 
     if not timeline.empty:
@@ -1563,7 +1479,7 @@ def show_forensics_dialog(conn):
                 y="hits",
                 color="App Status",
                 color_discrete_map=STATUS_COLORS,
-                title=f"Activity ({timeline_grain})",
+                title=f"Activity ({timeline_label})",
             )
             style_plotly_figure(fig_f, height=320)
         else:
@@ -1572,7 +1488,7 @@ def show_forensics_dialog(conn):
                 f_line,
                 x="datetime",
                 y="hits",
-                title=f"Activity ({timeline_grain})",
+                title=f"Activity ({timeline_label})",
                 color_discrete_sequence=["#60a5fa"],
             )
             style_plotly_figure(fig_f, height=320, show_legend=False)
@@ -1628,7 +1544,7 @@ def show_forensics_dialog(conn):
         inv_where.append("upper(source_log) = upper(?)")
         inv_params.append(selected_f_source)
 
-    if forensic_risk:
+    if forensic_risk and not is_all_risk_selected:
         inv_in = _build_in_clause(forensic_risk, inv_params)
         inv_where.append(f""""Risk Level" IN {inv_in}""")
 
@@ -1764,7 +1680,6 @@ def show_forensics_dialog(conn):
             minWidth=88,
             suppressMenu=False,
         )
-        gb_inv.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
         gb_inv.configure_selection(selection_mode="single", use_checkbox=False)
         gb_inv.configure_column("#", header_name="#", width=52, pinned="left", suppressMovable=True)
         gb_inv.configure_column(
@@ -1819,7 +1734,6 @@ def show_forensics_dialog(conn):
         inv_grid_options["alwaysShowVerticalScroll"] = True
         inv_grid_options["tooltipShowDelay"] = 0
 
-        st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
         inv_grid_response = AgGrid(
             inv_grid,
             gridOptions=inv_grid_options,
@@ -1834,10 +1748,12 @@ def show_forensics_dialog(conn):
             reload_data=False,
             key=f"dlg_inventory_grid_{target_mac}_{int(st.session_state.get('shadow_inv_grid_nonce', 0))}",
         )
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.caption("Click Application / Identifier to open a popup dialog with app usage and risk-cause details.")
-        st.caption("Check Allowed for an unauthorized row to open allowlist confirmation.")
-        st.caption(f"{len(inv_grid):,} rows shown in application inventory.")
+        st.caption(
+            f"{len(inv_grid):,} inventory rows shown. Rows are grouped by Destination + Application / Identifier "
+            "from the current MAC and filter scope, with Source Logs merged, First Seen/Last Seen and Hits aggregated, "
+            "status derived from any unauthorized activity, and Max Risk from the highest observed risk score; "
+            "rows are sorted by Max Risk, Hits, then Last Seen."
+        )
 
         edited_inv = inv_grid_response.get("data", None)
         if isinstance(edited_inv, pd.DataFrame):
@@ -1921,40 +1837,6 @@ def hide_dialog_x_button():
         unsafe_allow_html=True,
     )
 
-def inject_license_white_text_css():
-    st.markdown(
-        """
-        <style>
-        /* Make text white inside License section and streamlit widgets */
-        .license-section, .license-section * {
-            color: #EAEAEA !important;
-        }
-
-        /* Fix Streamlit dataframe/table text in dark background */
-        .license-section [data-testid="stDataFrame"] * {
-            color: #EAEAEA !important;
-        }
-        .license-section table * {
-            color: #EAEAEA !important;
-        }
-
-        /* Inputs / selects inside license area */
-        .license-section input, 
-        .license-section textarea, 
-        .license-section select {
-            color: #EAEAEA !important;
-            background: #000 !important;
-        }
-
-        /* Streamlit expander header text */
-        .license-section [data-testid="stExpander"] summary * {
-            color: #EAEAEA !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
 # =============================================================================
 # Main Render
 # =============================================================================
@@ -1983,25 +1865,7 @@ def render_shadow_apps(parquet_root: Path):
         st.warning("No log directories found.")
         return
 
-    def _on_day_change():
-        _close_shadow_dialog(reset_grid=True)
-        _close_inventory_allow_dialog()
-        _close_inventory_app_dialog()
-
-    day_col, day_hint_col = st.columns([1.2, 2])
-    with day_col:
-        selected_day = st.selectbox(
-            "Dataset Day",
-            available_dates,
-            index=0,
-            key="shadow_day_select",
-            on_change=_on_day_change,
-        )
-    with day_hint_col:
-        st.markdown(
-            f"<div class='shadow-day-chip'>Active date: &nbsp; <strong>{selected_day}</strong></div>",
-            unsafe_allow_html=True,
-        )
+    selected_day = available_dates[0]
     target_dates = [selected_day]
 
     approved = load_allowlist()
@@ -2112,19 +1976,13 @@ def render_shadow_apps(parquet_root: Path):
         else:
             st.info("No data for source chart.")
 
-    tab_main = st.tabs(["Application Audit & License"])[0]
+    tab_main = st.container()
 
     # =============================================================================
     # TAB 1: AgGrid (CLICK ROW -> OPEN DIALOG)
     # =============================================================================
     with tab_main:
         st.markdown("### Application Audit Log")
-        st.markdown(
-            "<div class='shadow-callout'>Click a row to open the per-device forensics dialog for that MAC address.</div>",
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         search_query_audit = st.text_input(
             "Search (MAC, Hostname, IP, Domain)",
             placeholder="e.g., 192.168.1.14 or github.com",
@@ -2135,7 +1993,7 @@ def render_shadow_apps(parquet_root: Path):
             audit_risk_filter = risk_multiselect(
                 "Filter Risk",
                 key="audit_risk_filter",
-                default=["Critical", "High", "Medium", "Low", "Safe"],
+                default=RISK_OPTIONS,
             )
         with bottom_filter_col2:
             # Pull available sources from the data (for the selected day already loaded into shadow_events)
@@ -2147,12 +2005,14 @@ def render_shadow_apps(parquet_root: Path):
                 default=audit_sources,   # default = all
                 key="audit_source_filter",
             )
-        st.markdown("</div>", unsafe_allow_html=True)
 
         where = []
         params = []
 
-        if audit_risk_filter:
+        is_all_risk_selected = bool(audit_risk_filter) and set(audit_risk_filter) == set(RISK_OPTIONS)
+        is_all_sources_selected = bool(audit_sources) and set(audit_source_filter) == set(audit_sources)
+
+        if audit_risk_filter and not is_all_risk_selected:
             in_clause = _build_in_clause(audit_risk_filter, params)
             where.append(f""""Risk Level" IN {in_clause}""")
 
@@ -2161,17 +2021,14 @@ def render_shadow_apps(parquet_root: Path):
             where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
             params.extend([q, q, q, q])
 
-        if audit_source_filter:
+        if audit_source_filter and not is_all_sources_selected:
             in_clause = _build_in_clause(audit_source_filter, params)
             where.append(f"source_log IN {in_clause}")
 
-        risk_summary = ", ".join(audit_risk_filter) if audit_risk_filter else "None"
-        source_summary = f"{len(audit_source_filter)} selected" if audit_source_filter else "None"
+        risk_summary = summarize_multiselect(audit_risk_filter, RISK_OPTIONS, all_label="All")
+        source_summary = summarize_multiselect(audit_source_filter, audit_sources, all_label="All")
         search_summary = "On" if search_query_audit else "Off"
-        st.markdown(
-            f"<div class='shadow-filter-hint'>Risk: <strong>{risk_summary}</strong> | Sources: <strong>{source_summary}</strong> | Search: <strong>{search_summary}</strong></div>",
-            unsafe_allow_html=True,
-        )
+        st.caption(f"Risk: {risk_summary} | Sources: {source_summary} | Search: {search_summary}")
 
         where_sql = "WHERE " + " AND ".join(where) if where else ""
 
@@ -2250,17 +2107,14 @@ def render_shadow_apps(parquet_root: Path):
         if display_df.empty:
             st.info("No logs match your filter.")
         else:
-            # Add row index column like license grid (optional but makes it feel identical)
+            # Add row index column for easier navigation.
             df_grid = display_df.copy()
             df_grid.insert(0, "#", range(1, len(df_grid) + 1))
 
             gb = GridOptionsBuilder.from_dataframe(df_grid)
 
-            # Make it behave like the License Users grid (filter/sort/resize + footer pagination)
+            # Enable filter/sort/resize.
             gb.configure_default_column(filter=True, sortable=True, resizable=True)
-
-            # IMPORTANT: pagination gives you the bottom footer bar (what you called "bottom header")
-            gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
 
             # Keep single-row selection
             gb.configure_selection(selection_mode="single", use_checkbox=False)
@@ -2328,12 +2182,16 @@ def render_shadow_apps(parquet_root: Path):
                     ".ag-row-even": {"background-color": "#0A1C33"},
                     ".ag-row-hover": {"background-color": "#13305A"},
                     ".ag-row-selected": {"background-color": "#1B3F75"},
+                    ".ag-root-wrapper ::-webkit-scrollbar-button": {
+                        "display": "none !important",
+                        "width": "0 !important",
+                        "height": "0 !important",
+                    },
                 }
             )
 
             grid_key = f"shadow_audit_grid_{int(st.session_state.get('shadow_grid_nonce', 0))}"
 
-            st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
             grid_response = AgGrid(
                 df_grid,
                 gridOptions=grid_options,
@@ -2348,8 +2206,11 @@ def render_shadow_apps(parquet_root: Path):
                 reload_data=False,
                 key=grid_key,
             )
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.caption(f"{len(df_grid):,} grouped rows shown (limited to top 1,000).")
+            st.caption(
+                f"{len(df_grid):,} grouped rows shown. Rows are built by grouping filtered events on "
+                "Domain + MAC + Hostname + IP + Source, then computing First Seen, Last Seen, Hits, and "
+                "the max risk; groups are sorted by max risk score and hit count, and only the top 1,000 are displayed."
+            )
 
             # selection -> open dialog
             selected_rows = grid_response.get("selected_rows", None)
@@ -2374,156 +2235,4 @@ def render_shadow_apps(parquet_root: Path):
                     st.rerun()
             else:
                 st.session_state["shadow_last_selected_mac"] = None
-
-        # =============================================================================
-        # License Compliance (NO DROPDOWN - TABLE)
-        # =============================================================================
-        st.divider()
-        st.markdown("### License Compliance Audit")
-
-        # summary + details
-        usage_rows = []
-        details_all = []
-
-        # ensure hostname exists (fallback view already injects it)
-        shadow_cols = set(_describe_cols(conn, "shadow_events"))
-        has_hostname = "hostname" in shadow_cols
-
-        for software in LICENSE_REGISTRY.keys():
-            cnt = conn.execute(
-                """
-                SELECT COUNT(DISTINCT mac)
-                FROM shadow_events
-                WHERE domain_clean ILIKE ?
-                  AND mac IS NOT NULL AND mac <> '' AND lower(mac) <> 'unknown'
-                """,
-                [f"%{software}%"],
-            ).fetchone()
-            unique_users = int(cnt[0]) if cnt else 0
-            status = "Usage Detected" if unique_users > 0 else "No Usage"
-            usage_rows.append({"Software": software, "Active Devices Count": unique_users, "Status": status})
-
-            # details per software
-            if has_hostname:
-                df_sw = conn.execute(
-                    """
-                    SELECT
-                        ? AS Software,
-                        mac AS mac,
-                        arg_max(hostname, datetime) AS hostname,
-                        MAX(datetime) AS last_seen,
-                        COUNT(*) AS events
-                    FROM shadow_events
-                    WHERE domain_clean ILIKE ?
-                      AND mac IS NOT NULL AND mac <> '' AND lower(mac) <> 'unknown'
-                    GROUP BY mac
-                    ORDER BY last_seen DESC NULLS LAST
-                    """,
-                    [software, f"%{software}%"],
-                ).df()
-            else:
-                df_sw = conn.execute(
-                    """
-                    SELECT
-                        ? AS Software,
-                        mac AS mac,
-                        'Unknown' AS hostname,
-                        MAX(datetime) AS last_seen,
-                        COUNT(*) AS events
-                    FROM shadow_events
-                    WHERE domain_clean ILIKE ?
-                      AND mac IS NOT NULL AND mac <> '' AND lower(mac) <> 'unknown'
-                    GROUP BY mac
-                    ORDER BY last_seen DESC NULLS LAST
-                    """,
-                    [software, f"%{software}%"],
-                ).df()
-
-            if not df_sw.empty:
-                df_sw["mac"] = df_sw["mac"].apply(normalize_mac)
-                df_sw["hostname"] = df_sw["hostname"].fillna("Unknown").astype(str).replace({"": "Unknown"})
-                df_sw["last_seen"] = pd.to_datetime(df_sw["last_seen"], errors="coerce")
-                details_all.append(df_sw)
-
-        usage_df = pd.DataFrame(usage_rows)
-        in_use_count = int((usage_df["Status"] == "Usage Detected").sum())
-        tracked_software = int(len(usage_df))
-        active_licensed_devices = int(usage_df["Active Devices Count"].sum())
-
-        l1, l2, l3 = st.columns(3)
-        l1.metric("Software Tracked", f"{tracked_software:,}")
-        l2.metric("Software In Use", f"{in_use_count:,}")
-        l3.metric("Total Active Devices", f"{active_licensed_devices:,}")
-
-        table_col, chart_col = st.columns([1.7, 1])
-
-        with table_col:
-            st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-            st.dataframe(
-                usage_df.style.map(
-                    lambda x: "color: #FF4B4B; font-weight: 600;"
-                    if x == "Usage Detected"
-                    else "color: #00CC96; font-weight: 600;",
-                    subset=["Status"],
-                ),
-                use_container_width=True,
-                hide_index=True,
-                height=_table_height_for_rows(len(usage_df), row_px=36, header_px=44, min_px=190, max_px=360),
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        with chart_col:
-            usage_chart_df = usage_df.sort_values("Active Devices Count", ascending=False)
-            fig = px.bar(
-                usage_chart_df,
-                x="Software",
-                y="Active Devices Count",
-                text_auto=True,
-                color="Status",
-                color_discrete_map={"Usage Detected": "#f97316", "No Usage": "#22c55e"},
-            )
-            style_plotly_figure(fig, height=420)
-            fig.update_layout(xaxis_title=None, yaxis_title="Active Devices", legend_title=None)
-            st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("#### License Users")
-        if details_all:
-            license_df = pd.concat(details_all, ignore_index=True)
-
-            gb2 = GridOptionsBuilder.from_dataframe(license_df)
-            gb2.configure_default_column(filter=True, sortable=True, resizable=True)
-            gb2.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
-            license_grid_options = _apply_shadow_grid_filter_sort(gb2.build())
-            license_grid_options["domLayout"] = "normal"
-            license_grid_options["alwaysShowVerticalScroll"] = True
-            license_grid_options["suppressHorizontalScroll"] = False
-            license_grid_options["alwaysShowHorizontalScroll"] = True
-
-            ag_theme, ag_css = get_aggrid_theme_and_css()
-
-            st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-            AgGrid(
-                license_df,
-                gridOptions=license_grid_options,
-                update_mode=GridUpdateMode.NO_UPDATE,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                height=_table_height_for_rows(len(license_df), min_px=240, max_px=520),
-                theme=ag_theme,
-                custom_css=ag_css,
-                allow_unsafe_jscode=True,
-                enable_enterprise_modules=True,
-                fit_columns_on_grid_load=True,
-                reload_data=False,
-                key="license_devices_grid",
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.download_button(
-                "Download License Users CSV",
-                data=license_df.to_csv(index=False).encode("utf-8"),
-                file_name="license_users.csv",
-                mime="text/csv",
-            )
-        else:
-            st.info("No license usage detected for the selected day.")
 
