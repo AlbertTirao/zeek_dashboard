@@ -18,8 +18,8 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # PERFORMANCE STRATEGY (FAST LOAD)
 # =============================================================================
 
-# Bump version so old cached parquet (without app_software / readable risk basis) gets rebuilt automatically
-CACHE_VERSION = "shadow-cache-v4-app-software"
+# Bump version so old cached parquet (without software_type+name identity) gets rebuilt automatically
+CACHE_VERSION = "shadow-cache-v6-software-type-name"
 
 # -----------------------------
 # Config
@@ -47,7 +47,10 @@ PROTOCOL_ANOMALY_SOURCE_LOG = "WEIRD"
 
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$")
 _APP_SOFTWARE_NULLS = {"", "-", "unknown", "nan", "none", "null", "n/a", "unidentified_activity"}
+_SOFTWARE_LOG_SOURCES = {"SOFTWARE", "FILES"}
+_DOMAIN_LOG_SOURCES = {"HTTP", "SSL", "DNS"}
 
 
 def normalize_mac(x) -> str:
@@ -650,9 +653,32 @@ def extract_domain(url: str):
     return url.split(":")[0].rstrip(".")
 
 
-def normalize_app_software(app_value: str, source_log: str) -> str:
+def extract_domain_strict(url: str) -> str:
+    domain = extract_domain(url)
+    if not domain:
+        return ""
+    d = domain.strip().lower()
+    if d in _APP_SOFTWARE_NULLS:
+        return ""
+    if _IPV4_RE.match(d):
+        return ""
+    if ".." in d:
+        return ""
+    return d if _DOMAIN_RE.match(d) else ""
+
+
+def normalize_app_software(
+    app_value: str,
+    source_log: str,
+    *,
+    software_type: str = "",
+    software_name: str = "",
+) -> str:
     s = "" if app_value is None else str(app_value).strip()
     if not s:
+        return ""
+    src = str(source_log).upper().strip()
+    if src not in _SOFTWARE_LOG_SOURCES:
         return ""
     low = s.lower().strip()
     if low in _APP_SOFTWARE_NULLS:
@@ -669,6 +695,14 @@ def normalize_app_software(app_value: str, source_log: str) -> str:
     if not s:
         return ""
 
+    # SOFTWARE often emits "Name/Version"; keep name when available.
+    if src == "SOFTWARE" and "/" in s:
+        left, right = s.split("/", 1)
+        left = left.strip()
+        right = right.strip()
+        if left and re.search(r"[a-zA-Z]", left) and re.fullmatch(r"[0-9a-zA-Z._-]+", right or ""):
+            s = left
+
     # If this is a filesystem path, keep only the filename segment.
     s = s.replace("\\", "/")
     if "/" in s:
@@ -682,15 +716,38 @@ def normalize_app_software(app_value: str, source_log: str) -> str:
     if _IPV4_RE.match(low):
         return ""
 
+    sw_type = "" if software_type is None else str(software_type).strip()
+    sw_name = "" if software_name is None else str(software_name).strip()
+    sw_type_low = sw_type.lower()
+    sw_name_low = sw_name.lower()
+    if sw_type_low in _APP_SOFTWARE_NULLS:
+        sw_type = ""
+    if sw_name_low in _APP_SOFTWARE_NULLS:
+        sw_name = ""
+
+    if src == "SOFTWARE":
+        name_part = sw_name or s
+        if name_part and "/" in name_part:
+            left, right = name_part.split("/", 1)
+            left = left.strip()
+            right = right.strip()
+            if left and re.search(r"[a-zA-Z]", left) and re.fullmatch(r"[0-9a-zA-Z._-]+", right or ""):
+                name_part = left
+        name_part = re.sub(r"\s+", " ", str(name_part)).strip()
+        if sw_type and name_part:
+            combined = f"{sw_type} - {name_part}"
+            if re.search(r"[a-zA-Z]", combined):
+                return combined[:120]
+        if name_part and re.search(r"[a-zA-Z]", name_part):
+            return name_part[:120]
+        if sw_type and re.search(r"[a-zA-Z]", sw_type):
+            return sw_type[:120]
+
     # Drop pure domains/hosts from the software column.
     host_like = low.split(":", 1)[0].rstrip(".")
     if host_like.startswith("www."):
         host_like = host_like[4:]
     if "." in host_like and host_like == extract_domain(host_like):
-        return ""
-
-    # Non-software logs usually provide identifiers/domains, not software names.
-    if str(source_log).upper() in {"DNS", "HTTP", "SSL"} and "." in low and " " not in low:
         return ""
 
     if not re.search(r"[a-zA-Z]", s):
@@ -983,6 +1040,14 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             ["name", "service", "unparsed_version", "filename"],
             "''",
         )
+        sql_software_type_raw = get_coalesce(
+            ["software_type"],
+            "''",
+        )
+        sql_software_name_raw = get_coalesce(
+            ["name"],
+            "''",
+        )
 
         info_parts = []
         if "method" in existing_cols and "uri" in existing_cols:
@@ -1008,6 +1073,8 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             {sql_recv} as bytes_received,
             {sql_app} as app_identifier,
             {sql_app_software_raw} as app_software_raw,
+            {sql_software_type_raw} as software_type_raw,
+            {sql_software_name_raw} as software_name_raw,
             {sql_info} as Info,
             upper(regexp_extract(source_file_path, '([a-z]+)\\.parquet', 1)) as source_log
         FROM raw_logs r
@@ -1176,19 +1243,29 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     df["hostname"] = df["hostname"].replace({"": "Unknown"})
     df.loc[df["hostname"].str.lower().isin(["nan", "none"]), "hostname"] = "Unknown"
 
-    df["domain_clean"] = df["app_identifier"].apply(extract_domain)
-    mask_empty = df["domain_clean"].eq("") | df["domain_clean"].isna()
-    df.loc[mask_empty, "domain_clean"] = df.loc[mask_empty, "app_identifier"].astype(str)
-    df["domain_clean"] = df["domain_clean"].fillna("unidentified_activity")
+    df["domain_clean"] = [
+        extract_domain_strict(v) if str(src).upper().strip() in _DOMAIN_LOG_SOURCES else ""
+        for v, src in zip(df["app_identifier"].tolist(), df["source_log"].tolist())
+    ]
+    df["domain_clean"] = df["domain_clean"].fillna("")
+    df.loc[df["domain_clean"].eq(""), "domain_clean"] = "unidentified_activity"
     soft_raw_series = df.get("app_software_raw", pd.Series("", index=df.index))
+    soft_type_series = df.get("software_type_raw", pd.Series("", index=df.index))
+    soft_name_series = df.get("software_name_raw", pd.Series("", index=df.index))
     df["app_software"] = [
-        normalize_app_software(soft_raw, src) or normalize_app_software(app_val, src)
-        for soft_raw, app_val, src in zip(
+        normalize_app_software(soft_raw, src, software_type=soft_t, software_name=soft_n)
+        or normalize_app_software(app_val, src, software_type=soft_t, software_name=soft_n)
+        for soft_raw, app_val, src, soft_t, soft_n in zip(
             soft_raw_series.tolist(),
             df["app_identifier"].tolist(),
             df["source_log"].tolist(),
+            soft_type_series.tolist(),
+            soft_name_series.tolist(),
         )
     ]
+    df["app_identity"] = df["app_software"].fillna("").astype(str).str.strip()
+    m_domain_identity = df["app_identity"].eq("") & df["domain_clean"].ne("unidentified_activity")
+    df.loc[m_domain_identity, "app_identity"] = df.loc[m_domain_identity, "domain_clean"].astype(str)
 
     if allow_re is not None:
         allowed_mask = df["domain_clean"].astype(str).str.contains(allow_re, na=False)
@@ -1212,6 +1289,7 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
         "domain_clean",
         "app_identifier",
         "app_software",
+        "app_identity",
         "source_log",
         "dst_port",
         "bytes_sent",
@@ -1332,7 +1410,7 @@ def _sql_fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
 # =============================================================================
 # Dialog
 # =============================================================================
-@st.dialog("Allow Application / Software", width="small", dismissible=False)
+@st.dialog("Allow Application / Identifier", width="small", dismissible=False)
 def show_inventory_allow_dialog():
     candidate = st.session_state.get("shadow_allow_candidate") or {}
     target_mac = str(candidate.get("mac") or "").strip().lower()
@@ -1345,7 +1423,7 @@ def show_inventory_allow_dialog():
         f"Confirm allowlisting for MAC `{target_mac or 'unknown'}`."
     )
     st.markdown(f"- Destination: `{destination_raw or '-'}`")
-    st.markdown(f"- Application / Software: `{app_or_id or '-'}`")
+    st.markdown(f"- Application / Identifier: `{app_or_id or '-'}`")
     st.caption(
         "This will update whitelist_domains.yaml and refresh statuses to Authorized after cache rebuild."
     )
@@ -1356,7 +1434,7 @@ def show_inventory_allow_dialog():
     c1, c2 = st.columns(2)
     with c1:
         if st.button(
-            "Allow This App/Software",
+            "Allow This App/Domain",
             type="primary",
             use_container_width=True,
             disabled=invalid_target,
@@ -1398,13 +1476,13 @@ def show_inventory_app_dialog(conn):
         st.caption(f"Application usage scope: {sel_app or '-'}")
 
     if not target_mac or not sel_dest or not sel_app:
-        st.warning("Missing application context. Please select an Application / Software row again.")
+        st.warning("Missing application context. Please select an Application / Identifier row again.")
         return
 
     app_where = [
         "lower(mac) = lower(?)",
         "domain_clean = ?",
-        "app_software = ?",
+        "app_identity = ?",
     ]
     app_params = [target_mac, sel_dest, sel_app]
 
@@ -1418,7 +1496,7 @@ def show_inventory_app_dialog(conn):
 
     if forensic_search:
         q = f"%{forensic_search}%"
-        app_where.append("(domain_clean ILIKE ? OR app_software ILIKE ? OR ip ILIKE ? OR hostname ILIKE ? OR Info ILIKE ?)")
+        app_where.append("(domain_clean ILIKE ? OR app_identity ILIKE ? OR ip ILIKE ? OR hostname ILIKE ? OR Info ILIKE ?)")
         app_params.extend([q, q, q, q, q])
 
     app_where_sql = " AND ".join(app_where)
@@ -1749,7 +1827,7 @@ def show_forensics_dialog(conn):
     # MOVED: Applications / Software inventory table (BOTTOM)
     # =============================================================================
     st.divider()
-    st.markdown("#### Applications / Software Observed (This MAC)")
+    st.markdown("#### Applications / Identifiers Observed (This MAC)")
 
     inv_where = ["lower(mac) = lower(?)"]
     inv_params = [target_mac]
@@ -1765,7 +1843,7 @@ def show_forensics_dialog(conn):
 
     if forensic_search:
         q_inv = f"%{forensic_search}%"
-        inv_where.append("(domain_clean ILIKE ? OR app_software ILIKE ?)")
+        inv_where.append("(domain_clean ILIKE ? OR app_identity ILIKE ?)")
         inv_params.extend([q_inv, q_inv])
 
     inv_where_sql = " AND ".join(inv_where)
@@ -1776,7 +1854,7 @@ def show_forensics_dialog(conn):
         WITH base AS (
             SELECT
                 domain_clean,
-                app_software,
+                app_identity,
                 source_log,
                 "App Status" AS app_status,
                 _risk_score,
@@ -1785,13 +1863,13 @@ def show_forensics_dialog(conn):
             WHERE {inv_where_sql}
               AND domain_clean IS NOT NULL
               AND domain_clean <> ''
-              AND app_software IS NOT NULL
-              AND trim(app_software) <> ''
+              AND app_identity IS NOT NULL
+              AND trim(app_identity) <> ''
         ),
         agg AS (
             SELECT
                 domain_clean,
-                app_software,
+                app_identity,
                 STRING_AGG(DISTINCT source_log, ', ' ORDER BY source_log) AS sources,
                 MIN(datetime) AS first_seen,
                 MAX(datetime) AS last_seen,
@@ -1804,7 +1882,7 @@ def show_forensics_dialog(conn):
         )
         SELECT
             domain_clean AS destination,
-            app_software AS application_or_identifier,
+            app_identity AS application_or_identifier,
             sources,
             status,
             first_seen,
@@ -1827,7 +1905,7 @@ def show_forensics_dialog(conn):
     )
 
     if inventory_df.empty:
-        st.info("No application/software names were detected for this MAC with the current filters.")
+        st.info("No valid application/software/domain identifiers were detected for this MAC with the current filters.")
     else:
         inv_grid = inventory_df.copy()
         inv_grid.insert(0, "#", range(1, len(inv_grid) + 1))
@@ -1919,7 +1997,7 @@ def show_forensics_dialog(conn):
         )
         gb_inv.configure_column(
             "application_or_identifier",
-            header_name="Application / Software",
+            header_name="Application / Identifier",
             minWidth=185,
             flex=1.35,
             wrapText=True,
@@ -1978,9 +2056,21 @@ def show_forensics_dialog(conn):
             reload_data=False,
             key=f"dlg_inventory_grid_{target_mac}_{int(st.session_state.get('shadow_inv_grid_nonce', 0))}",
         )
-        st.caption("Click only Application / Software to open a popup dialog with app usage and risk-cause details.")
-        st.caption("Check Allowed for an unauthorized row to open allowlist confirmation.")
-        st.caption(f"{len(inv_grid):,} rows shown in application inventory.")
+        st.caption(
+            f"{len(inv_grid):,} rows shown. Each row is one Destination + Application / Identifier pair for this MAC under current filters."
+        )
+        st.caption(
+            "Only validated software names or valid domains are included. Non-app labels, notes, and anomaly tags are excluded."
+        )
+        st.caption(
+            "Sources are merged unique log types; First Seen / Last Seen / Hits are aggregated across matching events."
+        )
+        st.caption(
+            "Status becomes Unauthorized if any matched event is unauthorized, and Max Risk shows the highest observed risk for that row."
+        )
+        st.caption(
+            "Click Application / Identifier for detailed event view. Toggle Allowed on unauthorized rows to open allowlist confirmation."
+        )
 
         edited_inv = inv_grid_response.get("data", None)
         if isinstance(edited_inv, pd.DataFrame):
