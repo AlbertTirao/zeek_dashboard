@@ -165,6 +165,76 @@ def load_whitelist() -> Tuple[List[str], int]:
 
 WHITELIST_DOMAINS, WHITELIST_MTIME_NS = load_whitelist()
 
+
+def _is_admin_user() -> bool:
+    """
+    Best-effort admin detection. Works if your auth layer sets either:
+      - st.session_state["is_admin"] = True
+      - st.session_state["user_role"] = "admin"
+    Otherwise defaults to False.
+    """
+    try:
+        if bool(st.session_state.get("is_admin", False)):
+            return True
+        if str(st.session_state.get("user_role", "")).lower() == "admin":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _add_domain_to_whitelist(domain: str) -> Tuple[bool, str]:
+    """
+    Add a domain/host to whitelist_domains.yaml.
+
+    Returns (ok, message).
+    """
+    host = _normalize_host(domain)
+    if not host:
+        return False, "Empty destination"
+    if _is_ip_literal(host):
+        return False, "Refusing to whitelist a raw IP (use a domain)"
+
+    y = _safe_yaml_load(WHITELIST_FILE)
+    if not isinstance(y, dict):
+        y = {}
+
+    # pick a list key to use / preserve
+    key = None
+    for k in ["trusted_domains", "whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]:
+        if isinstance(y.get(k), list):
+            key = k
+            break
+    if key is None:
+        # If dict form exists, extend it; else default to trusted_domains list
+        for k in ["trusted_domains", "whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]:
+            if isinstance(y.get(k), dict):
+                y[k][host] = True
+                try:
+                    WHITELIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+                        yaml.safe_dump(y, f, sort_keys=True)
+                    return True, f"Added {host} to {k}"
+                except Exception as e:
+                    return False, f"Failed to write whitelist: {e}"
+        key = "trusted_domains"
+        y[key] = []
+
+    lst = [str(x).strip().lower() for x in (y.get(key) or []) if str(x).strip()]
+    if host in lst:
+        return True, f"{host} already present in {key}"
+    lst.append(host)
+    lst = sorted(set(lst))
+    y[key] = lst
+
+    try:
+        WHITELIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+            yaml.safe_dump(y, f, sort_keys=True)
+        return True, f"Added {host} to {key}"
+    except Exception as e:
+        return False, f"Failed to write whitelist: {e}"
+
 # -----------------------------------------------------------------------------
 # Normalization helpers
 # -----------------------------------------------------------------------------
@@ -518,20 +588,445 @@ CATEGORY_RULES: List[Tuple[str, List[str]]] = [
     ("Remote Access", ["teamviewer.com", "anydesk.com", "ngrok.io", "ngrok.com", "tailscale.com", "zerotier.com"]),
 ]
 
+
+# -----------------------------------------------------------------------------
+# Correlation / destination normalization helpers
+# -----------------------------------------------------------------------------
+
+# NOTE: We do not have a Public Suffix List in this project, so registrable-domain
+# extraction is best-effort. It is used for grouping; allowlist checks are done
+# against the *full* normalized host via boundary-safe suffix matching.
+_MULTI_LEVEL_SUFFIXES = {
+    # common
+    "co.uk", "org.uk", "ac.uk",
+    "com.au", "net.au", "org.au",
+    "co.jp", "ne.jp", "or.jp",
+    "com.br", "com.mx",
+    "co.in", "com.ph",
+}
+
+
+def _strip_scheme_path(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    # remove scheme
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    # remove path/query
+    s = s.split("/", 1)[0]
+    s = s.split("?", 1)[0]
+    s = s.split("#", 1)[0]
+    return s.strip()
+
+
+def _split_host_port(hostport: str) -> Tuple[str, Optional[int]]:
+    s = str(hostport or "").strip()
+    if not s:
+        return "", None
+    # IPv6 in brackets: [2001:db8::1]:443
+    if s.startswith("["):
+        if "]" in s:
+            host = s[1:s.index("]")]
+            rest = s[s.index("]") + 1:]
+            if rest.startswith(":"):
+                try:
+                    return host, int(rest[1:])
+                except Exception:
+                    return host, None
+            return host, None
+        return s, None
+    # plain host:port (avoid treating IPv6 as host:port)
+    if s.count(":") == 1:
+        h, p = s.rsplit(":", 1)
+        if p.isdigit():
+            try:
+                return h, int(p)
+            except Exception:
+                return h, None
+    return s, None
+
+
+def _normalize_host(value: str) -> str:
+    """
+    Normalize any of:
+      - 'https://sub.example.com/path'
+      - 'sub.example.com:443'
+      - '[2001:db8::1]:443'
+      - '1.2.3.4:443'
+    into a lowercase host/IP without port/path.
+    """
+    s = _strip_scheme_path(value)
+    host, _ = _split_host_port(s)
+    host = str(host or "").strip().strip(".").lower()
+    if host in {"", "unknown", "nan", "none", "-"}:
+        return ""
+    return host
+
+
+def _registrable_domain_best_effort(host: str) -> str:
+    h = _normalize_host(host)
+    if not h:
+        return ""
+    if _is_ip_literal(h):
+        return h
+    parts = [p for p in h.split(".") if p]
+    if len(parts) <= 2:
+        return h
+    suffix2 = ".".join(parts[-2:])
+    suffix3 = ".".join(parts[-3:])
+    # if last two labels are a known multi-level suffix, keep last 3 labels
+    if suffix2 in _MULTI_LEVEL_SUFFIXES and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    if suffix3 in _MULTI_LEVEL_SUFFIXES and len(parts) >= 4:
+        return ".".join(parts[-4:])
+    return ".".join(parts[-2:])
+
+
+def _is_internal_ip(value: str) -> bool:
+    s = str(value or "").strip()
+    if not s:
+        return False
+    try:
+        ip = ipaddress.ip_address(s)
+        # Private, ULA, link-local, loopback are treated as internal
+        return bool(ip.is_private or ip.is_link_local or ip.is_loopback)
+    except Exception:
+        return False
+
+
+def _parse_zeek_list(v: object) -> List[str]:
+    """
+    Zeek parquet fields can be:
+      - list/tuple
+      - string like 'a,b,c' or 'a b c'
+      - '(empty)' or '-'
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return [str(x).strip() for x in v if str(x).strip() and str(x).strip() not in {"-", "(empty)"}]
+    s = str(v).strip()
+    if not s or s in {"-", "(empty)", "nan", "None"}:
+        return []
+    # split on commas or whitespace
+    if "," in s:
+        parts = [p.strip() for p in s.split(",")]
+    else:
+        parts = [p.strip() for p in re.split(r"\s+", s)]
+    return [p for p in parts if p and p not in {"-", "(empty)"}]
+
+
+def _build_dns_ip_map(dns_df: pd.DataFrame) -> Dict[str, str]:
+    """Best-effort mapping from answer IP -> query domain for the date."""
+    if dns_df is None or dns_df.empty:
+        return {}
+    if "answers" not in dns_df.columns or "query" not in dns_df.columns:
+        return {}
+    out: Dict[str, str] = {}
+    tmp = dns_df[["query", "answers"]].copy()
+    tmp["query"] = tmp["query"].astype(str)
+    for _, r in tmp.iterrows():
+        q = _normalize_host(r.get("query", ""))
+        if not q:
+            continue
+        dom = _registrable_domain_best_effort(q) or q
+        for a in _parse_zeek_list(r.get("answers")):
+            a = str(a).strip()
+            if _is_ip_literal(a):
+                out[a] = dom
+    return out
+
+
+def _first_nonempty(series: pd.Series) -> str:
+    for x in series.tolist():
+        s = str(x or "").strip()
+        if s and s.lower() not in {"nan", "none", "(empty)", "-"}:
+            return s
+    return ""
+
+
+def _build_ssl_by_uid(ssl_df: pd.DataFrame) -> pd.DataFrame:
+    if ssl_df is None or ssl_df.empty or "uid" not in ssl_df.columns:
+        return pd.DataFrame(columns=["uid", "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"])
+    keep = [c for c in ["uid", "ts", "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"] if c in ssl_df.columns]
+    sdf = ssl_df[keep].copy()
+    sdf = _ensure_ts_datetime(sdf)
+    sdf = sdf.sort_values("ts", ascending=True)
+    g = sdf.groupby("uid", dropna=False)
+    out = pd.DataFrame({
+        "uid": g.size().index.astype(str),
+        "server_name": g["server_name"].apply(_first_nonempty) if "server_name" in sdf.columns else "",
+        "ja3": g["ja3"].apply(_first_nonempty) if "ja3" in sdf.columns else "",
+        "ja3s": g["ja3s"].apply(_first_nonempty) if "ja3s" in sdf.columns else "",
+        "version": g["version"].apply(_first_nonempty) if "version" in sdf.columns else "",
+        "cipher": g["cipher"].apply(_first_nonempty) if "cipher" in sdf.columns else "",
+        "curve": g["curve"].apply(_first_nonempty) if "curve" in sdf.columns else "",
+        "next_protocol": g["next_protocol"].apply(_first_nonempty) if "next_protocol" in sdf.columns else "",
+    }).reset_index(drop=True)
+    out["uid"] = out["uid"].astype(str)
+    return out
+
+
+def _http_content_type_row(df: pd.DataFrame) -> pd.Series:
+    if "content_type" in df.columns:
+        return df["content_type"].astype(str)
+    if "orig_mime_types" in df.columns:
+        return df["orig_mime_types"].apply(lambda v: _parse_zeek_list(v)[0] if _parse_zeek_list(v) else "")
+    return pd.Series([""] * len(df))
+
+
+def _build_http_by_uid(http_df: pd.DataFrame) -> pd.DataFrame:
+    if http_df is None or http_df.empty or "uid" not in http_df.columns:
+        return pd.DataFrame(columns=[
+            "uid", "host", "method", "uri", "user_agent", "content_type",
+            "status_code", "request_body_len", "response_body_len",
+            "http_any_upload", "http_any_share"
+        ])
+    keep = [c for c in ["uid", "ts", "host", "method", "uri", "user_agent", "status_code", "request_body_len", "response_body_len", "orig_mime_types", "content_type"] if c in http_df.columns]
+    hdf = http_df[keep].copy()
+    hdf = _ensure_ts_datetime(hdf)
+    hdf = hdf.sort_values("ts", ascending=True)
+
+    # normalize content type
+    hdf["content_type_norm"] = _http_content_type_row(hdf).astype(str)
+
+    # flags
+    hdf["method_norm"] = hdf.get("method", "").astype(str).str.upper()
+    hdf["uri_norm"] = hdf.get("uri", "").astype(str)
+    hdf["host_norm"] = hdf.get("host", "").astype(str)
+
+    hdf["http_is_upload"] = hdf["method_norm"].isin(["POST", "PUT", "PATCH"]) & (
+        hdf["uri_norm"].str.contains(UPLOAD_URI_RE) | hdf["content_type_norm"].str.contains(API_UPLOAD_RE)
+    )
+    hdf["http_is_share"] = (
+        hdf["uri_norm"].str.contains(PASTE_URI_RE)
+        | hdf["uri_norm"].str.contains(re.compile(r"(share|shared|sharing|create_shared|create_shared_link|/s/)", re.IGNORECASE))
+    )
+
+    # numeric body lens
+    if "request_body_len" in hdf.columns:
+        hdf["request_body_len_num"] = pd.to_numeric(hdf["request_body_len"], errors="coerce").fillna(0)
+    else:
+        hdf["request_body_len_num"] = 0.0
+    if "response_body_len" in hdf.columns:
+        hdf["response_body_len_num"] = pd.to_numeric(hdf["response_body_len"], errors="coerce").fillna(0)
+    else:
+        hdf["response_body_len_num"] = 0.0
+
+    g = hdf.groupby("uid", dropna=False)
+    out = pd.DataFrame({
+        "uid": g.size().index.astype(str),
+        "host": g["host_norm"].apply(_first_nonempty),
+        "method": g["method_norm"].apply(_first_nonempty),
+        "uri": g["uri_norm"].apply(_first_nonempty),
+        "user_agent": g["user_agent"].apply(_first_nonempty) if "user_agent" in hdf.columns else "",
+        "content_type": g["content_type_norm"].apply(_first_nonempty),
+        "status_code": g["status_code"].apply(_first_nonempty) if "status_code" in hdf.columns else "",
+        "request_body_len": g["request_body_len_num"].sum(),
+        "response_body_len": g["response_body_len_num"].sum(),
+        "http_any_upload": g["http_is_upload"].max().astype(bool),
+        "http_any_share": g["http_is_share"].max().astype(bool),
+    }).reset_index(drop=True)
+    out["uid"] = out["uid"].astype(str)
+    return out
+
+
+def _build_files_by_uid(files_df: pd.DataFrame) -> pd.DataFrame:
+    """Join files.log to conn via uid or conn_uids (Zeek often uses conn_uids list)."""
+    if files_df is None or files_df.empty:
+        return pd.DataFrame(columns=["uid", "file_total_bytes", "file_seen_bytes", "file_mime_types", "file_names", "file_sources"])
+    f = files_df.copy()
+    f = _ensure_ts_datetime(f)
+    if "uid" in f.columns:
+        f["_uid"] = f["uid"].astype(str)
+    elif "conn_uids" in f.columns:
+        f["_uid_list"] = f["conn_uids"].apply(_parse_zeek_list)
+        f = f.explode("_uid_list")
+        f["_uid"] = f["_uid_list"].astype(str)
+    else:
+        return pd.DataFrame(columns=["uid", "file_total_bytes", "file_seen_bytes", "file_mime_types", "file_names", "file_sources"])
+
+    f["file_total_bytes"] = pd.to_numeric(f.get("total_bytes", 0), errors="coerce").fillna(0)
+    f["file_seen_bytes"] = pd.to_numeric(f.get("seen_bytes", 0), errors="coerce").fillna(0)
+    f["file_mime"] = f.get("mime_type", "").astype(str)
+    f["file_name"] = f.get("filename", "").astype(str)
+    f["file_source"] = f.get("source", "").astype(str)
+
+    g = f.groupby("_uid", dropna=False)
+    out = pd.DataFrame({
+        "uid": g.size().index.astype(str),
+        "file_total_bytes": g["file_total_bytes"].sum(),
+        "file_seen_bytes": g["file_seen_bytes"].sum(),
+        "file_mime_types": g["file_mime"].apply(lambda s: ", ".join([x for x in sorted(set([str(v).strip() for v in s.tolist() if str(v).strip()]))][:6])),
+        "file_names": g["file_name"].apply(lambda s: ", ".join([x for x in sorted(set([str(v).strip() for v in s.tolist() if str(v).strip()]))][:6])),
+        "file_sources": g["file_source"].apply(lambda s: ", ".join([x for x in sorted(set([str(v).strip() for v in s.tolist() if str(v).strip()]))][:6])),
+    }).reset_index(drop=True)
+    out["uid"] = out["uid"].astype(str)
+    return out
+
+
+def _detect_action_flow(row: pd.Series) -> Tuple[str, str]:
+    """Higher-confidence action inference after correlation."""
+    if bool(row.get("http_any_share", False)):
+        return ("Share Link", "http uri indicates share/link creation")
+    if bool(row.get("http_any_upload", False)):
+        return ("Upload", "http method/uri/content-type indicates upload")
+    file_bytes = float(row.get("file_total_bytes", 0) or 0)
+    if file_bytes >= 1 * 1024 * 1024:
+        bout = float(row.get("bytes_out", 0) or 0)
+        bin_ = float(row.get("bytes_in", 0) or 0)
+        if bout >= bin_:
+            return ("File Transfer (Upload)", "files.log total_bytes + conn direction")
+        return ("File Transfer (Download)", "files.log total_bytes + conn direction")
+    bout = float(row.get("bytes_out", 0) or 0)
+    bin_ = float(row.get("bytes_in", 0) or 0)
+    ratio = float(row.get("out_in_ratio", 0) or 0)
+    if bout >= 10 * 1024 * 1024 and ratio >= 5:
+        return ("Upload (TLS)", "conn orig_bytes high and outbound ratio high")
+    if bin_ >= 25 * 1024 * 1024 and (bin_ >= 3 * max(bout, 1)):
+        return ("Download", "conn resp_bytes high and inbound ratio high")
+    return ("Access", "baseline access")
+
+
+def _build_correlated_flows(
+    conn_df: pd.DataFrame,
+    ssl_by_uid: pd.DataFrame,
+    http_by_uid: pd.DataFrame,
+    files_by_uid: pd.DataFrame,
+    dns_ip_map: Dict[str, str],
+) -> pd.DataFrame:
+    if conn_df is None or conn_df.empty:
+        return pd.DataFrame()
+
+    c = conn_df.copy()
+    c = _ensure_ts_datetime(c)
+    c = c.dropna(subset=["ts"])
+
+    for col in ["uid", "id.orig_h", "id.resp_h", "id.resp_p", "proto", "service", "duration", "orig_bytes", "resp_bytes", "orig_ip_bytes", "resp_ip_bytes", "orig_l2_addr"]:
+        if col not in c.columns:
+            c[col] = None
+
+    c["uid"] = c["uid"].astype(str)
+    c["id.orig_h"] = c["id.orig_h"].astype(str).str.strip()
+    c["id.resp_h"] = c["id.resp_h"].astype(str).str.strip()
+    c["id.resp_p"] = pd.to_numeric(c["id.resp_p"], errors="coerce").fillna(0).astype(int)
+
+    ob = pd.to_numeric(c["orig_bytes"], errors="coerce")
+    rb = pd.to_numeric(c["resp_bytes"], errors="coerce")
+    if ob.isna().all():
+        ob = pd.to_numeric(c["orig_ip_bytes"], errors="coerce")
+    if rb.isna().all():
+        rb = pd.to_numeric(c["resp_ip_bytes"], errors="coerce")
+    c["bytes_out"] = ob.fillna(0)
+    c["bytes_in"] = rb.fillna(0)
+    c["out_in_ratio"] = c["bytes_out"] / (c["bytes_in"].clip(lower=1))
+
+    # Focus on internal -> external. If orig_h isn't parseable, keep it.
+    try:
+        c = c[(~c["id.orig_h"].apply(_is_ip_literal)) | (c["id.orig_h"].apply(_is_internal_ip))]
+    except Exception:
+        pass
+    try:
+        c = c[~c["id.resp_h"].apply(_is_internal_ip)]
+    except Exception:
+        pass
+
+    if not ssl_by_uid.empty:
+        c = c.merge(ssl_by_uid, on="uid", how="left", suffixes=("", "_ssl"))
+    else:
+        c["server_name"] = ""
+
+    if not http_by_uid.empty:
+        c = c.merge(http_by_uid, on="uid", how="left", suffixes=("", "_http"))
+    else:
+        for col in ["host", "method", "uri", "user_agent", "content_type", "status_code"]:
+            c[col] = ""
+        c["request_body_len"] = 0.0
+        c["response_body_len"] = 0.0
+        c["http_any_upload"] = False
+        c["http_any_share"] = False
+
+    if not files_by_uid.empty:
+        c = c.merge(files_by_uid, on="uid", how="left", suffixes=("", "_files"))
+    else:
+        c["file_total_bytes"] = 0.0
+        c["file_seen_bytes"] = 0.0
+        c["file_mime_types"] = ""
+        c["file_names"] = ""
+        c["file_sources"] = ""
+
+    c["dest_host_http"] = c.get("host", "").astype(str).apply(_normalize_host)
+    c["dest_host_sni"] = c.get("server_name", "").astype(str).apply(_normalize_host)
+    c["dest_host_dns"] = c.get("id.resp_h", "").astype(str).map(lambda ip: dns_ip_map.get(str(ip).strip(), ""))
+    c["dest_host_dns"] = c["dest_host_dns"].astype(str).apply(_normalize_host)
+
+    def _pick_dest(row):
+        if row.get("dest_host_http"):
+            return row["dest_host_http"], "http.host"
+        if row.get("dest_host_sni"):
+            return row["dest_host_sni"], "ssl.server_name"
+        if row.get("dest_host_dns"):
+            return row["dest_host_dns"], "dns.answers->query"
+        return str(row.get("id.resp_h") or "").strip(), "conn.id.resp_h"
+
+    picked = c.apply(_pick_dest, axis=1, result_type="expand")
+    c["destination"] = picked[0].replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
+    c["Destination_Basis"] = picked[1].fillna("")
+
+    c["dest_domain"] = c["destination"].apply(_registrable_domain_best_effort)
+    c.loc[c["dest_domain"].eq(""), "dest_domain"] = c["destination"]
+
+    # Primary byte measure for dashboard = outbound bytes
+    c["bytes"] = c["bytes_out"]
+
+    # action inference
+    act = c.apply(_detect_action_flow, axis=1)
+    c["Action"] = [a for a, _ in act]
+    c["Action_Basis"] = [b for _, b in act]
+
+    c["log_source"] = "flow"
+
+    keep_cols = [
+        "ts", "uid", "log_source",
+        "id.orig_h", "orig_l2_addr",
+        "id.resp_h", "id.resp_p", "proto", "service", "duration",
+        "destination", "dest_domain", "Destination_Basis",
+        "bytes", "bytes_out", "bytes_in", "out_in_ratio",
+        "method", "uri", "user_agent", "content_type",
+        "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol",
+        "host", "status_code", "request_body_len", "response_body_len", "http_any_upload", "http_any_share",
+        "file_total_bytes", "file_seen_bytes", "file_mime_types", "file_names", "file_sources",
+        "Action", "Action_Basis",
+    ]
+    keep_cols = [c0 for c0 in keep_cols if c0 in c.columns]
+    return c[keep_cols].copy()
 def _domain_in_allowlist(dest: str, allowlist: List[str]) -> Tuple[bool, str]:
     """
     Returns (allowed, basis)
-    basis is the matched allowlist domain, or ""
+
+    Boundary-safe suffix match:
+      - allow 'example.com' matches 'example.com' and 'a.b.example.com'
+      - does NOT match 'example.com.evil.tld'
     """
-    d = str(dest or "").lower().strip()
-    if not d or d in ("unknown", "nan", "none", "-"):
+    host = _normalize_host(dest)
+    if not host:
         return (False, "")
-    for a in allowlist:
-        if a and a in d:
-            return (True, a)
+
+    for a in (allowlist or []):
+        a0 = str(a or "").strip().lower()
+        if not a0:
+            continue
+        # support wildcard forms like "*.example.com"
+        if a0.startswith("*."):
+            a0 = a0[2:]
+        a0 = _normalize_host(a0) or a0.strip(".")
+        if not a0:
+            continue
+        if host == a0 or host.endswith("." + a0):
+            return (True, a0)
+
     return (False, "")
-
-
 def _tag_category(dest: str) -> str:
     d = str(dest or "").lower().strip()
     if not d:
@@ -663,61 +1158,77 @@ def _severity_label(score: int) -> str:
 def _risk_score_row(row: pd.Series) -> Tuple[int, str]:
     """
     Returns (Risk_Score, Risk_Basis)
+
+    Scoring philosophy:
+      - Shadow sharing is fundamentally "unapproved egress to sharing-capable services"
+      - Strongest evidence comes from correlated HTTP methods/URIs and files.log
+      - For TLS-only, we can only infer from volume + directionality (orig_bytes vs resp_bytes)
     """
     score = 10
     basis: List[str] = []
 
-    # Allowlist / unapproved
-    if not bool(row.get("Allowed", False)):
+    allowed = bool(row.get("Allowed", False))
+    if not allowed:
         score += 15
         basis.append("destination not in whitelist")
 
-    # Category
     cat = str(row.get("Category", "Unknown"))
     if cat in ("Cloud Storage", "Paste", "Remote Access"):
         score += 10
         basis.append(f"category={cat}")
 
-    # Action
-    action = str(row.get("Action", ""))
-    if action == "Upload":
+    action = str(row.get("Action", "") or "")
+    if action in {"Upload", "Upload (TLS)", "File Transfer (Upload)"}:
         score += 20
-        basis.append("upload action")
+        basis.append(f"action={action}")
+    elif action in {"Share Link", "Paste/Share"}:
+        score += 12
+        basis.append(f"action={action}")
     elif action == "Post Data":
         score += 10
         basis.append("http post")
-    elif action == "Paste/Share":
-        score += 12
-        basis.append("paste/share action")
-    elif action == "Automated Access":
-        score += 10
-        basis.append("automation access")
 
-    # Client type
     if str(row.get("Client_Type", "")) == "Automation / SDK":
         score += 10
         basis.append("automation user-agent")
 
-    # Bytes
-    b = float(row.get("bytes", 0) or 0)
-    if b >= 500 * 1024 * 1024:
-        score += 35
-        basis.append(">=500MB")
-    elif b >= 100 * 1024 * 1024:
-        score += 25
-        basis.append(">=100MB")
-    elif b >= 10 * 1024 * 1024:
-        score += 12
-        basis.append(">=10MB")
+    # Prefer outbound bytes for flows
+    bytes_out = float(row.get("bytes_out", row.get("bytes", 0)) or 0)
+    bytes_in = float(row.get("bytes_in", 0) or 0)
+    ratio = float(row.get("out_in_ratio", 0) or 0)
 
-    # DNS exfil
+    if bytes_out >= 500 * 1024 * 1024:
+        score += 35
+        basis.append(">=500MB outbound")
+    elif bytes_out >= 100 * 1024 * 1024:
+        score += 25
+        basis.append(">=100MB outbound")
+    elif bytes_out >= 10 * 1024 * 1024:
+        score += 12
+        basis.append(">=10MB outbound")
+
+    if bytes_out >= 10 * 1024 * 1024 and ratio >= 5 and not allowed:
+        score += 10
+        basis.append("high outbound ratio")
+
+    file_bytes = float(row.get("file_total_bytes", 0) or 0)
+    if file_bytes >= 10 * 1024 * 1024:
+        score += 10
+        basis.append("files.log >=10MB")
+
+    # If HTTP request body is large, treat as stronger upload evidence.
+    req_body = float(row.get("request_body_len", 0) or 0)
+    if req_body >= 10 * 1024 * 1024:
+        score += 10
+        basis.append("http request_body_len >=10MB")
+
+    # DNS exfil heuristics (dns rows)
     dns_add = int(row.get("DNS_Exfil_Add", 0) or 0)
     if dns_add > 0:
         score += dns_add
         r = str(row.get("DNS_Exfil_Reason", "") or "")
         basis.append(f"dns exfil: {r}" if r else "dns exfil heuristic")
 
-    # cap
     score = int(min(100, score))
     if not basis:
         basis = ["baseline"]
@@ -726,7 +1237,7 @@ def _risk_score_row(row: pd.Series) -> Tuple[int, str]:
 
 def _detect_exfil_signal_row(row: pd.Series) -> Tuple[bool, str]:
     """
-    Returns (is_exfil_signal, detection_basis) using explicit exfil indicators.
+    Returns (is_exfil_signal, detection_basis) using explicit/strong indicators.
     """
     reasons: List[str] = []
 
@@ -735,26 +1246,34 @@ def _detect_exfil_signal_row(row: pd.Series) -> Tuple[bool, str]:
     severity = str(row.get("Severity", "") or "").upper()
     dns_reason = str(row.get("DNS_Exfil_Reason", "") or "").strip()
     allowed = bool(row.get("Allowed", False))
-    bytes_v = float(row.get("bytes", 0) or 0)
 
-    if action in {"Upload", "Post Data", "Paste/Share", "File Transfer"}:
+    bytes_out = float(row.get("bytes_out", row.get("bytes", 0)) or 0)
+    ratio = float(row.get("out_in_ratio", 0) or 0)
+    file_bytes = float(row.get("file_total_bytes", 0) or 0)
+
+    if action in {"Upload", "Upload (TLS)", "File Transfer (Upload)", "Share Link", "Paste/Share", "Post Data"}:
         reasons.append(f"action={action}")
 
     if dns_reason:
         reasons.append("dns exfil heuristic")
 
-    if not allowed and action in {"Remote Access", "Automated Access"} and bytes_v >= 10 * 1024 * 1024:
-        reasons.append(f"{action.lower()} with >=10MB")
+    if not allowed and bytes_out >= 10 * 1024 * 1024 and ratio >= 5:
+        reasons.append(">=10MB outbound with high ratio")
 
-    if not allowed and log_source == "conn" and bytes_v >= 100 * 1024 * 1024:
-        reasons.append("large raw connection >=100MB")
+    if not allowed and file_bytes >= 10 * 1024 * 1024:
+        reasons.append("files.log >=10MB on unapproved dest")
 
-    if not allowed and severity in {"CRITICAL", "HIGH"} and bytes_v >= 50 * 1024 * 1024:
-        reasons.append("high-risk large transfer")
+    if not allowed and severity in {"CRITICAL", "HIGH"} and bytes_out >= 50 * 1024 * 1024:
+        reasons.append("high-risk large outbound transfer")
+
+    # TLS-only, still suspicious: large raw flow to unapproved destination
+    if not allowed and log_source == "flow" and bytes_out >= 100 * 1024 * 1024:
+        reasons.append("unapproved flow >=100MB outbound")
 
     if not reasons:
         return False, ""
     return True, "; ".join(reasons)
+
 
 # -----------------------------------------------------------------------------
 # Builders
@@ -838,6 +1357,15 @@ def _bytes_from_df(df: pd.DataFrame, log_source: str) -> pd.Series:
 
 
 def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) -> pd.DataFrame:
+    """
+    Build one day's shadow-sharing dataset.
+
+    New approach:
+      - Use conn.log as the primary table (one row per uid / flow)
+      - Correlate ssl/http/files onto conn via uid (and files.conn_uids)
+      - Use dns.answers->query as a fallback naming source when http.host / ssl.server_name are missing
+      - Keep dns.log rows separately for DNS exfil heuristics (tunneling / b64-like labels)
+    """
     date_dir = Path(parquet_root) / date_str
     buckets = _collect_date_files(date_dir)
 
@@ -869,50 +1397,60 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     # identity maps
     ip_map, mac_map = _build_identity_maps(buckets["dhcp"], buckets["conn"], known_files)
 
-    frames: List[pd.DataFrame] = []
-    for src in ["http", "ssl", "dns", "conn", "files"]:
-        paths = buckets.get(src, [])
-        if not paths:
-            continue
+    # read logs
+    df_conn = _duck_read_parquet_union(buckets.get("conn") or [])
+    df_ssl = _duck_read_parquet_union(buckets.get("ssl") or [])
+    df_http = _duck_read_parquet_union(buckets.get("http") or [])
+    df_files = _duck_read_parquet_union(buckets.get("files") or [])
+    df_dns = _duck_read_parquet_union(buckets.get("dns") or [])
 
-        df = _duck_read_parquet_union(paths)
-        if df.empty:
-            continue
+    # correlated flows
+    dns_ip_map = _build_dns_ip_map(df_dns) if not df_dns.empty else {}
+    ssl_by_uid = _build_ssl_by_uid(df_ssl) if not df_ssl.empty else pd.DataFrame()
+    http_by_uid = _build_http_by_uid(df_http) if not df_http.empty else pd.DataFrame()
+    files_by_uid = _build_files_by_uid(df_files) if not df_files.empty else pd.DataFrame()
+    df_flow = _build_correlated_flows(df_conn, ssl_by_uid, http_by_uid, files_by_uid, dns_ip_map)
 
-        df["log_source"] = src
-        df = _ensure_ts_datetime(df)
-        df = df.dropna(subset=["ts"])
-
-        # ensure fields
-        if "id.orig_h" not in df.columns:
-            df["id.orig_h"] = ""
+    # dns rows (kept for tunneling heuristics / supporting evidence)
+    df_dns_events = pd.DataFrame()
+    if not df_dns.empty:
+        d = df_dns.copy()
+        d = _ensure_ts_datetime(d)
+        d = d.dropna(subset=["ts"])
+        if "id.orig_h" not in d.columns:
+            d["id.orig_h"] = ""
         else:
-            df["id.orig_h"] = df["id.orig_h"].astype(str).str.strip()
+            d["id.orig_h"] = d["id.orig_h"].astype(str).str.strip()
+        if "orig_l2_addr" not in d.columns:
+            d["orig_l2_addr"] = None
 
-        if "orig_l2_addr" not in df.columns:
-            df["orig_l2_addr"] = None
-        if "user_agent" not in df.columns:
-            df["user_agent"] = ""
-        if "method" not in df.columns:
-            df["method"] = ""
-        if "uri" not in df.columns:
-            df["uri"] = ""
-        # optional content-type (if Zeek HTTP header logging is present)
-        if "content_type" not in df.columns:
-            df["content_type"] = ""
-
-        df["destination"] = _destination_from_df(df, src).replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
-        df["bytes"] = _bytes_from_df(df, src)
-
+        # destination = query
+        if "query" not in d.columns:
+            d["query"] = ""
+        d["destination"] = d["query"].astype(str).fillna("").replace({"(empty)": "", "-": ""})
+        d.loc[d["destination"].eq(""), "destination"] = "Unknown"
+        d["bytes"] = 0
+        d["log_source"] = "dns"
+        d["method"] = ""
+        d["uri"] = ""
+        d["user_agent"] = ""
+        d["content_type"] = ""
+        d["Action"] = "DNS Lookup"
+        d["Action_Basis"] = "dns query"
         keep = [
             "ts", "log_source", "id.orig_h", "destination", "bytes",
             "method", "uri", "user_agent", "content_type",
-            "orig_l2_addr",
-            "host", "server_name", "query",
-            "filename", "mime_type", "source", "fuid", "tx_hosts", "rx_hosts", "seen_bytes", "total_bytes",
+            "orig_l2_addr", "query", "answers", "rcode_name", "qtype_name",
+            "Action", "Action_Basis",
         ]
-        keep = [c for c in keep if c in df.columns]
-        frames.append(df[keep].copy())
+        keep = [c for c in keep if c in d.columns]
+        df_dns_events = d[keep].copy()
+
+    frames: List[pd.DataFrame] = []
+    if df_flow is not None and not df_flow.empty:
+        frames.append(df_flow)
+    if df_dns_events is not None and not df_dns_events.empty:
+        frames.append(df_dns_events)
 
     if not frames:
         return pd.DataFrame()
@@ -924,7 +1462,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     out = _enrich_identity(out, ip_map, mac_map)
     out["Identity_Confidence"] = out.apply(_identity_confidence, axis=1)
 
-    # allowlist basis
+    # allowlist basis (destination host/domain)
     allowed_basis = out["destination"].apply(lambda d: _domain_in_allowlist(d, WHITELIST_DOMAINS))
     out["Allowed"] = allowed_basis.apply(lambda x: bool(x[0]))
     out["Allow_Basis"] = allowed_basis.apply(lambda x: str(x[1] or ""))
@@ -933,26 +1471,36 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     out["Category"] = out["destination"].apply(_tag_category)
 
     # client type
+    if "user_agent" not in out.columns:
+        out["user_agent"] = ""
     out["Client_Type"] = out["user_agent"].apply(fingerprint_client)
 
-    # action detection
-    out["Action"], out["Action_Basis"] = zip(*out.apply(
-        lambda r: _detect_action(
-            str(r.get("log_source", "")),
-            str(r.get("method", "")),
-            str(r.get("uri", "")),
-            str(r.get("user_agent", "")),
-            str(r.get("destination", "")),
-            str(r.get("content_type", "")),
-        ),
-        axis=1
-    ))
+    # Fill missing Action (mostly defensive)
+    if "Action" not in out.columns:
+        out["Action"] = ""
+    if "Action_Basis" not in out.columns:
+        out["Action_Basis"] = ""
+    missing_action = out["Action"].astype(str).str.strip().eq("")
+    if missing_action.any():
+        tmp = out.loc[missing_action].apply(
+            lambda r: _detect_action(
+                str(r.get("log_source", "")),
+                str(r.get("method", "")),
+                str(r.get("uri", "")),
+                str(r.get("user_agent", "")),
+                str(r.get("destination", "")),
+                str(r.get("content_type", "")),
+            ),
+            axis=1,
+        )
+        out.loc[missing_action, "Action"] = tmp.apply(lambda x: x[0])
+        out.loc[missing_action, "Action_Basis"] = tmp.apply(lambda x: x[1])
 
     # DNS exfil heuristics (only on dns rows)
     out["DNS_Exfil_Add"] = 0
     out["DNS_Exfil_Reason"] = ""
     dns_mask = out["log_source"].astype(str).str.lower().eq("dns")
-    if dns_mask.any() and "query" in out.columns:
+    if dns_mask.any():
         q_series = out.loc[dns_mask, "destination"].astype(str).fillna("")
         scores_reasons = q_series.apply(_dns_exfil_score)
         out.loc[dns_mask, "DNS_Exfil_Add"] = scores_reasons.apply(lambda x: int(x[0]))
@@ -969,8 +1517,10 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     out["Exfil_Indicator"] = ex.apply(lambda x: bool(x[0]))
     out["Exfil_Detection_Basis"] = ex.apply(lambda x: str(x[1]))
 
-    # VirusTotal link for domain/SNI/query
-    out["vt_link"] = "https://www.virustotal.com/gui/domain/" + out["destination"].astype(str)
+    # VirusTotal link for domain-like destinations; best-effort.
+    vt_target = out["destination"].astype(str).apply(_registrable_domain_best_effort)
+    vt_target = vt_target.where(vt_target.astype(str).str.len() > 0, out["destination"].astype(str))
+    out["vt_link"] = "https://www.virustotal.com/gui/domain/" + vt_target.astype(str)
 
     # write cache
     try:
@@ -1701,6 +2251,36 @@ def show_shadow_sharing_device_dialog(
             height=430,
             update_mode=GridUpdateMode.NO_UPDATE,
         )
+
+        st.markdown("#### Authorize Destination (allowlist)")
+
+        # Only offer domains/hosts (not IPs) that are currently unapproved in this scope.
+        cand = dest.copy()
+        cand["Allow_Basis"] = cand["Allow_Basis"].astype(str).fillna("")
+        cand = cand[cand["Allow_Basis"].eq("")]
+        cand = cand[~cand["destination"].astype(str).apply(lambda x: _is_ip_literal(_normalize_host(x)))]
+        cand = cand[~cand["destination"].astype(str).str.lower().isin(["unknown", "nan", "none", ""])]
+
+        candidates = cand["destination"].astype(str).dropna().unique().tolist()
+        candidates = sorted(candidates)[:200]
+
+        if not candidates:
+            st.caption("No unapproved domain-like destinations detected for this device in the selected scope.")
+        else:
+            sel_domain = st.selectbox("Select a destination to add to the whitelist", candidates, key=f"shadow_sharing_auth_select_{selected_scope_key}_{mac_key}")
+            is_admin = _is_admin_user()
+
+            if not is_admin:
+                st.caption("Admin-only action: set st.session_state['is_admin']=True or st.session_state['user_role']='admin' in your auth layer.")
+            if st.button("Authorize selected destination", key=f"shadow_sharing_auth_btn_{selected_scope_key}_{mac_key}", disabled=not is_admin):
+                ok, msg = _add_domain_to_whitelist(sel_domain)
+                if ok:
+                    st.success(msg)
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(msg)
+
 
     with tab_bursts:
         st.markdown("#### Burst Detection (5-minute windows)")
