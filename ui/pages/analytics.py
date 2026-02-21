@@ -136,7 +136,7 @@ def render(parquet_root: Path):
     )
 
     section = st.radio(
-        "Select Section",
+        "",
         ["Shadow Apps", "Shadow Sharings", "Shadow AI"],
         horizontal=True,
     )
