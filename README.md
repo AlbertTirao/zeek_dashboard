@@ -84,8 +84,13 @@ Authentication is implemented directly in Python (no Node auth service).
 [auth]
 mongodb_uri = "mongodb+srv://<db_user>:<db_password>@<cluster-host>/?appName=Cluster0"
 mongodb_db = "zeek_auth"
-bootstrap_admin_username = "admin"
+bootstrap_admin_username = "admin@gmail.com"
 bootstrap_admin_password = "AdminPass123!"
+allowed_google_emails = ["admin@gmail.com"]
+google_oauth_enabled = false
+google_client_id = "your-google-oauth-client-id.apps.googleusercontent.com"
+google_client_secret = "your-google-oauth-client-secret"
+google_redirect_uri = "http://localhost:8501"
 session_secret = "replace-with-a-long-random-secret"
 session_ttl_seconds = 604800
 ```
@@ -95,6 +100,8 @@ Notes:
 1. URL-encode special characters in password.
 2. `mongodb_db` is the database name used by the app.
 3. `session_secret` enables login persistence across browser reloads.
+4. `allowed_google_emails` (optional) restricts login only when Google OAuth is enabled.
+5. Set Google Cloud OAuth authorized redirect URI to `google_redirect_uri`.
 
 ### Option B: Local MongoDB With Docker
 
@@ -110,8 +117,13 @@ docker compose up -d auth-mongo
 [auth]
 mongodb_uri = "mongodb://zeek_root:zeek_root_dev@localhost:27017/?authSource=admin"
 mongodb_db = "zeek_auth"
-bootstrap_admin_username = "admin"
+bootstrap_admin_username = "admin@gmail.com"
 bootstrap_admin_password = "AdminPass123!"
+allowed_google_emails = ["admin@gmail.com"]
+google_oauth_enabled = false
+google_client_id = "your-google-oauth-client-id.apps.googleusercontent.com"
+google_client_secret = "your-google-oauth-client-secret"
+google_redirect_uri = "http://localhost:8501"
 session_secret = "replace-with-a-long-random-secret"
 session_ttl_seconds = 604800
 ```
@@ -132,7 +144,7 @@ docker compose down -v
 
 1. On first startup, if `app_users` is empty, the app creates the bootstrap admin from `.streamlit/secrets.toml`.
 2. Default bootstrap login from example config:
-   - Username: `admin`
+   - Username: `admin@gmail.com`
    - Password: `AdminPass123!`
 3. If users already exist, bootstrap is skipped.
 
@@ -156,8 +168,20 @@ Make sure your Google account is a collaborator on the Zeek logs Drive folder.
    - malformed URI
 3. `Invalid username or password` on first login:
    - `app_users` already contains users and bootstrap was skipped
+4. `Google sign-in is unavailable`:
+   - check `auth.google_client_id`, `auth.google_client_secret`, `auth.google_redirect_uri`
+   - ensure the same redirect URI is configured in Google Cloud
+5. `Google account verification failed for the entered e-mail`:
+   - sign in using the exact same email typed in the form
+6. `This e-mail is not approved for login`:
+   - this check applies when Google OAuth is enabled
+   - add the address to `auth.allowed_google_emails` in `.streamlit/secrets.toml`
 
 ## Security
 
 1. Do not commit `.streamlit/secrets.toml` or `.env`
 2. Rotate credentials if secrets were exposed
+3. User accounts must use `@gmail.com` addresses.
+4. Passwords must be at least 8 characters and include at least one special character.
+5. When `allowed_google_emails` is set, only listed Google emails can authenticate in OAuth mode.
+6. With Google OAuth enabled, login requires a verified Google account (`email_verified=true`).

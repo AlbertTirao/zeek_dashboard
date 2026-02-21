@@ -196,12 +196,13 @@ def _render_edit_user_dialog(
         return
 
     with st.form("um_edit_user_modal_form", clear_on_submit=False):
-        new_username = st.text_input("Username", value=target, placeholder="Username")
+        new_username = st.text_input("E-mail", value=target, placeholder="name@gmail.com")
         new_password = st.text_input(
             "New Password",
             type="password",
             placeholder="Leave blank to keep current password",
         )
+        st.caption("If set, password must be at least 8 characters and include a special character.")
         submit = st.form_submit_button("Save User Changes", use_container_width=True)
 
     if submit:
@@ -265,8 +266,13 @@ def render(current_username: str):
     )
 
     with st.form("create_user_form", clear_on_submit=True):
-        username = st.text_input("Username", placeholder="e.g. analyst1")
-        password = st.text_input("Password", type="password", placeholder="At least 8 characters")
+        username = st.text_input("E-mail", placeholder="name@gmail.com")
+        password = st.text_input(
+            "Password",
+            type="password",
+            placeholder="At least 8 characters and 1 special character",
+        )
+        st.caption("Only @gmail.com e-mail accounts are allowed.")
         role = st.selectbox("Role", options=["staff", "admin"], index=0)
         submit_create = st.form_submit_button("Create User", use_container_width=True)
 
@@ -311,14 +317,16 @@ def render(current_username: str):
         editor_df = _with_row_numbers(
             df[["Username", "Role", "Created By", "Created At", "Last Login", "Edit"]].copy()
         )
+        # Fit the table to actual rows so empty visual rows are not shown.
+        table_height = min(420, max(140, 40 * (len(editor_df) + 1)))
 
         st.markdown("<div class='um-table-shell'>", unsafe_allow_html=True)
         edited_df = st.data_editor(
             editor_df,
-            num_rows="dynamic",
+            num_rows="fixed",
             use_container_width=True,
             hide_index=True,
-            key="um_user_editor",
+            key="um_user_editor_v2",
             column_config={
                 "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
                 "Username": st.column_config.TextColumn("Username", disabled=True, width="medium"),
@@ -332,11 +340,11 @@ def render(current_username: str):
                     width="small",
                 ),
             },
-            height=420,
+            height=table_height,
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.caption("Tip: Tick Edit to open modal for username/password. To delete a user, remove the row then click Save Changes.")
+        st.caption("Tip: Tick Edit to open modal for username/password, then click Save Changes for role updates.")
 
         edit_candidates = []
         for row in edited_df.to_dict("records"):

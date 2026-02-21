@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets as py_secrets
 import time
 from pathlib import Path
 from typing import Optional
@@ -10,11 +11,32 @@ from typing import Optional
 import streamlit as st
 
 from services import auth_service
-from services.auth_service import authenticate_user
+from services.auth_service import (
+    authenticate_google_oauth_code,
+    authenticate_user_password_only,
+    authenticate_user,
+    build_google_oauth_authorization_url,
+    is_email_allowed_for_login,
+    is_google_oauth_configured,
+    is_valid_gmail_email,
+    password_has_special_character,
+)
 
 
 PERSISTENT_AUTH_QUERY_KEY = "auth"
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+GOOGLE_OAUTH_STATE_SESSION_KEY = "google_oauth_state"
+GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY = "google_oauth_expected_email"
+GOOGLE_OAUTH_STATE_TTL_SECONDS = 10 * 60
+GOOGLE_OAUTH_QUERY_KEYS = (
+    "code",
+    "state",
+    "scope",
+    "authuser",
+    "prompt",
+    "error",
+    "error_description",
+)
 
 
 def _get_secret(path: str, default=None):
@@ -96,6 +118,44 @@ def _issue_persistent_auth_token(username: str) -> Optional[str]:
     return f"{_b64url_encode(payload_bytes)}.{_b64url_encode(signature)}"
 
 
+def _issue_google_oauth_state(expected_email: str) -> Optional[str]:
+    clean_email = (expected_email or "").strip().lower()
+    secret = _session_secret()
+    if not clean_email or not secret:
+        return None
+    now = int(time.time())
+    payload = {
+        "e": clean_email,
+        "iat": now,
+        "exp": now + GOOGLE_OAUTH_STATE_TTL_SECONDS,
+        "n": py_secrets.token_urlsafe(16),
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    signature = hmac.new(secret, payload_bytes, hashlib.sha256).digest()
+    return f"{_b64url_encode(payload_bytes)}.{_b64url_encode(signature)}"
+
+
+def _verify_google_oauth_state(state: str) -> Optional[str]:
+    secret = _session_secret()
+    if not secret or not state:
+        return None
+    try:
+        payload_part, signature_part = state.split(".", 1)
+        payload_bytes = _b64url_decode(payload_part)
+        provided_signature = _b64url_decode(signature_part)
+        expected_signature = hmac.new(secret, payload_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(provided_signature, expected_signature):
+            return None
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        expected_email = str(payload.get("e", "")).strip().lower()
+        exp = int(payload.get("exp", 0))
+        if not expected_email or exp < int(time.time()):
+            return None
+        return expected_email
+    except Exception:
+        return None
+
+
 def _verify_persistent_auth_token(token: str) -> Optional[str]:
     secret = _session_secret()
     if not secret or not token:
@@ -117,12 +177,16 @@ def _verify_persistent_auth_token(token: str) -> Optional[str]:
         return None
 
 
-def _query_param_auth_token() -> Optional[str]:
-    token = st.query_params.get(PERSISTENT_AUTH_QUERY_KEY)
+def _query_param_value(key: str) -> Optional[str]:
+    token = st.query_params.get(key)
     if isinstance(token, list):
         token = token[0] if token else ""
     token = str(token or "").strip()
     return token or None
+
+
+def _query_param_auth_token() -> Optional[str]:
+    return _query_param_value(PERSISTENT_AUTH_QUERY_KEY)
 
 
 def persist_auth_session(username: str) -> None:
@@ -134,6 +198,69 @@ def persist_auth_session(username: str) -> None:
 def clear_persistent_auth_session() -> None:
     if PERSISTENT_AUTH_QUERY_KEY in st.query_params:
         del st.query_params[PERSISTENT_AUTH_QUERY_KEY]
+
+
+def _clear_google_oauth_query_params() -> None:
+    for key in GOOGLE_OAUTH_QUERY_KEYS:
+        if key in st.query_params:
+            del st.query_params[key]
+
+
+def _handle_google_oauth_callback() -> None:
+    if not is_google_oauth_configured():
+        return
+
+    oauth_error = _query_param_value("error")
+    if oauth_error:
+        detail = _query_param_value("error_description")
+        st.error("Google sign-in was cancelled or failed.")
+        if detail:
+            st.caption(detail)
+        _clear_google_oauth_query_params()
+        return
+
+    code = _query_param_value("code")
+    if not code:
+        return
+
+    returned_state = _query_param_value("state")
+    expected_email = _verify_google_oauth_state(str(returned_state or "").strip())
+    if not expected_email:
+        st.error("Google sign-in verification failed. Please try again.")
+        _clear_google_oauth_query_params()
+        st.session_state.pop(GOOGLE_OAUTH_STATE_SESSION_KEY, None)
+        st.session_state.pop(GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY, None)
+        return
+
+    try:
+        user = authenticate_google_oauth_code(code, expected_email=expected_email)
+    except Exception as e:
+        st.error("Google sign-in is unavailable.")
+        detail = str(e)
+        if "Token used too early" in detail or "Token expired" in detail:
+            st.caption("System clock mismatch detected. Turn on automatic date/time and retry login.")
+        else:
+            st.caption(detail)
+        _clear_google_oauth_query_params()
+        st.session_state.pop(GOOGLE_OAUTH_STATE_SESSION_KEY, None)
+        st.session_state.pop(GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY, None)
+        return
+
+    _clear_google_oauth_query_params()
+    st.session_state.pop(GOOGLE_OAUTH_STATE_SESSION_KEY, None)
+    st.session_state.pop(GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY, None)
+
+    if user is None:
+        st.error("Google account verification failed for the entered e-mail.")
+        return
+
+    st.session_state.auth_user = {
+        "username": user.username,
+        "role": user.role,
+        "is_active": user.is_active,
+    }
+    persist_auth_session(user.username)
+    st.rerun()
 
 
 def _restore_user_from_persistent_auth() -> None:
@@ -179,6 +306,11 @@ def require_authentication() -> None:
     _restore_user_from_persistent_auth()
     if is_authenticated():
         return
+    google_oauth_ready = is_google_oauth_configured()
+    if google_oauth_ready:
+        _handle_google_oauth_callback()
+        if is_authenticated():
+            return
 
     bg_image_path = Path(__file__).resolve().parent / "pages" / "Pic" / "bg.png"
     bg_image_data = ""
@@ -323,21 +455,82 @@ def require_authentication() -> None:
     )
 
     with st.container(key="login_shell"):
+        submitted = False
+        username = ""
+        password = ""
         col_form, col_image = st.columns([1, 1.18], gap="small")
         with col_form:
             with st.container(key="login_form_panel"):
-                st.markdown("<h1>Log In</h1><p>Sign in with your assigned account.</p>", unsafe_allow_html=True)
+                if google_oauth_ready:
+                    st.markdown("<h1>Log In</h1><p>Use your Gmail and password to continue.</p>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<h1>Log In</h1><p>Sign in with your assigned @gmail.com account.</p>", unsafe_allow_html=True)
                 with st.form("login_form", clear_on_submit=False):
-                    username = st.text_input("E-mail", placeholder="Enter your e-mail")
+                    username = st.text_input("E-mail", placeholder="name@gmail.com")
                     password = st.text_input("Password", type="password", placeholder="Password")
+                    if google_oauth_ready:
+                        st.caption(
+                            "After login, the system verifies that this is a real Google account."
+                        )
+                    else:
+                        st.caption("Use an approved @gmail.com address. Password must include at least one special character.")
                     submitted = st.form_submit_button("LOG IN", use_container_width=True)
         with col_image:
             with st.container(key="login_image_panel"):
                 st.markdown("&nbsp;", unsafe_allow_html=True)
 
     if submitted:
+        clean_username = (username or "").strip().lower()
+        if not is_valid_gmail_email(clean_username):
+            st.error("Use a valid @gmail.com e-mail address.")
+            st.stop()
+        if not is_email_allowed_for_login(clean_username):
+            st.error("This e-mail is not approved for login.")
+            st.stop()
+        if not password_has_special_character(password):
+            st.error("Password must include at least one special character.")
+            st.stop()
+
+        if google_oauth_ready:
+            try:
+                user = authenticate_user_password_only(username=clean_username, password=password)
+            except Exception as e:
+                st.error("Login service is unavailable.")
+                st.caption(
+                    "Check AUTH_MONGODB_URI / MONGODB_URI and MongoDB connectivity."
+                )
+                st.code(str(e))
+                st.stop()
+
+            if user is None:
+                st.error("Invalid e-mail or password.")
+                st.stop()
+
+            state = _issue_google_oauth_state(clean_username)
+            if not state:
+                st.error("Google sign-in is not configured correctly.")
+                st.stop()
+            st.session_state[GOOGLE_OAUTH_STATE_SESSION_KEY] = state
+            st.session_state[GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY] = clean_username
+            oauth_url = build_google_oauth_authorization_url(state)
+            if not oauth_url:
+                st.error("Google sign-in is not configured correctly.")
+                st.stop()
+
+            st.info("Redirecting to Google sign-in...")
+            st.markdown(
+                f"<meta http-equiv='refresh' content='0;url={oauth_url}'>",
+                unsafe_allow_html=True,
+            )
+            st.link_button(
+                "Continue to Google Sign-In",
+                oauth_url,
+                use_container_width=True,
+            )
+            st.stop()
+
         try:
-            user = authenticate_user(username=username, password=password)
+            user = authenticate_user(username=clean_username, password=password)
         except Exception as e:
             st.error("Login service is unavailable.")
             st.caption(
@@ -347,7 +540,7 @@ def require_authentication() -> None:
             st.stop()
 
         if user is None:
-            st.error("Invalid username or password.")
+            st.error("Invalid e-mail or password.")
             st.stop()
         st.session_state.auth_user = {
             "username": user.username,
