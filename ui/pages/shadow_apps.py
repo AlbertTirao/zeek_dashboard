@@ -2175,7 +2175,17 @@ def render_shadow_apps(parquet_root: Path):
         st.warning("No log directories found.")
         return
 
-    selected_day = available_dates[0]
+    def _on_day_change():
+        _close_shadow_dialog(reset_grid=True)
+
+    selected_day = st.selectbox(
+        "Dataset Scope",
+        available_dates,
+        index=0,
+        key="shadow_day_select",
+        on_change=_on_day_change,
+    )
+
     target_dates = [selected_day]
 
     approved = load_allowlist()
@@ -2226,20 +2236,6 @@ def render_shadow_apps(parquet_root: Path):
     col2.metric("Authorized Events", f"{authorized_count:,}", f"{auth_pct:.1f}% of total")
     col3.metric("Unauthorized Events", f"{unauthorized_count:,}", f"{unauth_pct:.1f}% of total", delta_color="inverse")
     col4.metric("Critical / High Risk", f"{crit_high_count:,}", f"{crit_high_pct:.1f}% of total", delta_color="inverse")
-
-    with st.expander("How Risk Is Calculated", expanded=False):
-        st.markdown(
-            "<div class='shadow-callout'>Rules are evaluated top-to-bottom per event. The first match sets the Risk Level.</div>",
-            unsafe_allow_html=True,
-        )
-        ref_df = build_risk_policy_reference(risk_policy)
-        st.dataframe(ref_df, use_container_width=True, hide_index=True)
-        if risk_policy:
-            st.caption(
-                f"Policy source: `{RISK_POLICY_FILE.name}`. Update that file to tune ports/log sources/status defaults."
-            )
-        else:
-            st.caption("No risk_policy.yaml found. Only behavior rules and Safe fallback are active.")
 
     st.divider()
 
@@ -2579,4 +2575,18 @@ def render_shadow_apps(parquet_root: Path):
                     st.rerun()
             else:
                 st.session_state["shadow_last_selected_mac"] = None
+
+        with st.expander("How Risk Is Calculated", expanded=False):
+            st.markdown(
+                "<div class='shadow-callout'>Rules are evaluated top-to-bottom per event. The first match sets the Risk Level.</div>",
+                unsafe_allow_html=True,
+            )
+            ref_df = build_risk_policy_reference(risk_policy)
+            st.dataframe(ref_df, use_container_width=True, hide_index=True)
+            if risk_policy:
+                st.caption(
+                    f"Policy source: `{RISK_POLICY_FILE.name}`. Update that file to tune ports/log sources/status defaults."
+                )
+            else:
+                st.caption("No risk_policy.yaml found. Only behavior rules and Safe fallback are active.")
 
