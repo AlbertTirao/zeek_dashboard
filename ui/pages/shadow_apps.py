@@ -2224,10 +2224,6 @@ def render_shadow_apps(parquet_root: Path):
     # =============================================================================
     with tab_main:
         st.markdown("### Application Audit Log")
-        st.markdown(
-            "<div class='shadow-callout'>Click only the MAC Address column to open the per-device forensics dialog.</div>",
-            unsafe_allow_html=True,
-        )
 
         st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         search_query_audit = st.text_input(
@@ -2272,11 +2268,6 @@ def render_shadow_apps(parquet_root: Path):
         if audit_source_filter and not is_all_sources_selected:
             in_clause = _build_in_clause(audit_source_filter, params)
             where.append(f"source_log IN {in_clause}")
-
-        risk_summary = summarize_multiselect(audit_risk_filter, RISK_OPTIONS, all_label="All")
-        source_summary = summarize_multiselect(audit_source_filter, audit_sources, all_label="All")
-        search_summary = "On" if search_query_audit else "Off"
-        st.caption(f"Risk: {risk_summary} | Sources: {source_summary} | Search: {search_summary}")
 
         where_sql = "WHERE " + " AND ".join(where) if where else ""
 
@@ -2461,6 +2452,7 @@ def render_shadow_apps(parquet_root: Path):
 
             grid_key = f"shadow_audit_grid_{int(st.session_state.get('shadow_grid_nonce', 0))}"
 
+            st.caption("Click on any MAC Address to show device forensics dialog.")
             grid_response = AgGrid(
                 df_grid,
                 gridOptions=grid_options,
