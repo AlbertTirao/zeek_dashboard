@@ -86,3 +86,5 @@ trusted_domains:
 - _spotify-connect._tcp.local
 - google.com
 - connectivity-check.ubuntu.com
+- v16-cla.tiktokcdn.com
+- bing.com

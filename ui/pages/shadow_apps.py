@@ -18,8 +18,8 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # PERFORMANCE STRATEGY (FAST LOAD)
 # =============================================================================
 
-# Bump version so old cached parquet (without software_type+name identity) gets rebuilt automatically
-CACHE_VERSION = "shadow-cache-v6-software-type-name"
+# Bump version so old cached parquet gets rebuilt automatically when ingestion logic changes.
+CACHE_VERSION = "shadow-cache-v11-risk-source-consistency"
 
 # -----------------------------
 # Config
@@ -49,8 +49,13 @@ _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$")
 _APP_SOFTWARE_NULLS = {"", "-", "unknown", "nan", "none", "null", "n/a", "unidentified_activity"}
+_HOSTNAME_NULLS = {"", "-", "unknown", "nan", "none", "null", "n/a"}
+_MAC_UNKNOWNS = {"", "unknown", "nan", "none", "null"}
 _SOFTWARE_LOG_SOURCES = {"SOFTWARE", "FILES"}
 _DOMAIN_LOG_SOURCES = {"HTTP", "SSL", "DNS"}
+_DOMAIN_INFER_EXCLUDED_SOURCES = {"NOTICE"}
+_DOMAIN_INFER_IP_UNKNOWN = {"", "unknown", "0.0.0.0", "nan", "none", "null"}
+_DOMAIN_INFER_TOLERANCE_SECONDS = 2
 
 
 def normalize_mac(x) -> str:
@@ -83,6 +88,11 @@ def _fmt_mb_threshold(num_bytes: int) -> str:
     if mb.is_integer():
         return f"{int(mb)} MB"
     return f"{mb:.1f} MB"
+
+
+def normalize_source_log_value(value) -> str:
+    s = "" if value is None else str(value).strip().upper()
+    return s if s else "UNKNOWN"
 
 
 def _policy_section(policy: dict, level: str) -> dict:
@@ -526,7 +536,7 @@ def get_db_connection():
     return conn
 
 
-LOG_TYPES = ["http", "ssl", "dns", "files", "conn", "software", "weird", "notice"]
+LOG_TYPES = ["http", "ssl", "dns", "files", "conn", "software", "weird"]
 
 
 @st.cache_data(show_spinner=False)
@@ -753,6 +763,243 @@ def normalize_app_software(
     if not re.search(r"[a-zA-Z]", s):
         return ""
     return re.sub(r"\s+", " ", s).strip()[:120]
+
+
+def _asof_grouped_match(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    by_cols: list[str],
+    right_value_cols: list[str],
+    tolerance_seconds: int,
+) -> pd.DataFrame:
+    out_cols = ["row_idx", *right_value_cols]
+    if left_df.empty or right_df.empty:
+        return pd.DataFrame(columns=out_cols)
+    tolerance = pd.Timedelta(seconds=int(tolerance_seconds))
+
+    if not by_cols:
+        left_sorted = left_df.sort_values(["datetime"]).copy()
+        right_sorted = right_df.sort_values(["datetime"]).copy()
+        joined = pd.merge_asof(
+            left_sorted,
+            right_sorted[["datetime", *right_value_cols]],
+            on="datetime",
+            direction="nearest",
+            tolerance=tolerance,
+        )
+        return joined[out_cols]
+
+    right_groups = right_df.groupby(by_cols, dropna=False, sort=False)
+    matched_parts: list[pd.DataFrame] = []
+    for key, left_part in left_df.groupby(by_cols, dropna=False, sort=False):
+        try:
+            right_part = right_groups.get_group(key)
+        except KeyError:
+            continue
+        if left_part.empty or right_part.empty:
+            continue
+        left_sorted = left_part.sort_values(["datetime"]).copy()
+        right_sorted = right_part.sort_values(["datetime"]).copy()
+        joined = pd.merge_asof(
+            left_sorted,
+            right_sorted[["datetime", *right_value_cols]],
+            on="datetime",
+            direction="nearest",
+            tolerance=tolerance,
+        )
+        matched_parts.append(joined[out_cols])
+
+    if not matched_parts:
+        return pd.DataFrame(columns=out_cols)
+    return pd.concat(matched_parts, ignore_index=True)
+
+
+def _asof_domain_match(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    by_cols: list[str],
+    tolerance_seconds: int,
+) -> pd.DataFrame:
+    matched = _asof_grouped_match(
+        left_df=left_df,
+        right_df=right_df,
+        by_cols=by_cols,
+        right_value_cols=["domain_clean"],
+        tolerance_seconds=tolerance_seconds,
+    )
+    if matched.empty:
+        return pd.DataFrame(columns=["row_idx", "matched_domain"])
+    matched["matched_domain"] = matched["domain_clean"].fillna("").astype(str).str.strip()
+    return matched[["row_idx", "matched_domain"]]
+
+
+def infer_missing_domains(df: pd.DataFrame) -> pd.Series:
+    """
+    Infer missing domains for CONN/SOFTWARE/FILES rows using nearest domain-bearing
+    logs (HTTP/SSL/DNS) on the same MAC/IP and close timestamp.
+    """
+    inferred = pd.Series("", index=df.index, dtype="object")
+    if df is None or df.empty:
+        return inferred
+
+    base = pd.DataFrame(index=df.index)
+    base["datetime"] = pd.to_datetime(df.get("datetime"), errors="coerce")
+    base["mac"] = df.get("mac", pd.Series("unknown", index=df.index)).fillna("unknown").astype(str).str.lower().str.strip()
+    base["ip"] = df.get("ip", pd.Series("Unknown", index=df.index)).fillna("Unknown").astype(str).str.strip()
+    base["source_log"] = (
+        df.get("source_log", pd.Series("", index=df.index)).fillna("").astype(str).str.upper().str.strip()
+    )
+    base["domain_clean"] = df.get("domain_clean", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
+    base["dst_port"] = pd.to_numeric(
+        df.get("dst_port", pd.Series(0, index=df.index)),
+        errors="coerce",
+    ).fillna(0).astype("int64")
+
+    anchor_mask = (
+        base["datetime"].notna()
+        & base["source_log"].isin(_DOMAIN_LOG_SOURCES)
+        & base["domain_clean"].ne("")
+        & ~base["domain_clean"].str.lower().eq("unidentified_activity")
+    )
+    anchors = base.loc[anchor_mask, ["datetime", "mac", "ip", "dst_port", "domain_clean"]].copy()
+    if anchors.empty:
+        return inferred
+
+    target_mask = (
+        base["datetime"].notna()
+        & base["domain_clean"].eq("")
+        & base["source_log"].ne("")
+        & ~base["source_log"].isin(_DOMAIN_INFER_EXCLUDED_SOURCES)
+    )
+    if not target_mask.any():
+        return inferred
+
+    targets = base.loc[target_mask, ["datetime", "mac", "ip", "source_log", "dst_port"]].copy()
+    targets["row_idx"] = targets.index
+    unknown_ip_mask = targets["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN)
+
+    def apply_matches(matches_df: pd.DataFrame):
+        if matches_df.empty:
+            return
+        matched = matches_df.copy()
+        matched["matched_domain"] = matched["matched_domain"].fillna("").astype(str).str.strip()
+        matched = matched[matched["matched_domain"].ne("")]
+        if matched.empty:
+            return
+        inferred.loc[matched["row_idx"].tolist()] = matched["matched_domain"].tolist()
+
+    # Stage 1: strictest match for CONN with known port and known IP.
+    stage1_left = targets.loc[
+        targets["source_log"].eq("CONN") & targets["dst_port"].gt(0) & ~unknown_ip_mask,
+        ["row_idx", "datetime", "mac", "ip", "dst_port"],
+    ].copy()
+    stage1_right = anchors.loc[anchors["dst_port"].gt(0), ["datetime", "mac", "ip", "dst_port", "domain_clean"]].copy()
+    apply_matches(
+        _asof_domain_match(
+            stage1_left,
+            stage1_right,
+            ["mac", "ip", "dst_port"],
+            _DOMAIN_INFER_TOLERANCE_SECONDS,
+        )
+    )
+
+    pending = targets.loc[inferred.loc[targets["row_idx"]].eq("").values].copy()
+    if pending.empty:
+        return inferred
+    pending_unknown_ip = pending["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN)
+
+    # Stage 2: same MAC + IP within tolerance.
+    stage2_left = pending.loc[
+        ~pending_unknown_ip,
+        ["row_idx", "datetime", "mac", "ip"],
+    ].copy()
+    stage2_right = anchors.loc[
+        ~anchors["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN),
+        ["datetime", "mac", "ip", "domain_clean"],
+    ].copy()
+    apply_matches(
+        _asof_domain_match(
+            stage2_left,
+            stage2_right,
+            ["mac", "ip"],
+            _DOMAIN_INFER_TOLERANCE_SECONDS,
+        )
+    )
+
+    pending = targets.loc[inferred.loc[targets["row_idx"]].eq("").values].copy()
+    if pending.empty:
+        return inferred
+    pending_unknown_ip = pending["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN)
+
+    # Stage 3: only for unknown-IP rows, fallback by MAC.
+    stage3_left = pending.loc[pending_unknown_ip, ["row_idx", "datetime", "mac"]].copy()
+    stage3_right = anchors.loc[:, ["datetime", "mac", "domain_clean"]].copy()
+    apply_matches(
+        _asof_domain_match(
+            stage3_left,
+            stage3_right,
+            ["mac"],
+            _DOMAIN_INFER_TOLERANCE_SECONDS,
+        )
+    )
+    return inferred
+
+
+def _normalize_hostname_value(value) -> str:
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return ""
+    if s.lower() in _HOSTNAME_NULLS:
+        return ""
+    return re.sub(r"\s+", " ", s)[:120]
+
+
+def backfill_unknown_hostnames(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype="object")
+
+    host = df.get("hostname", pd.Series("Unknown", index=df.index)).apply(_normalize_hostname_value)
+    ip = df.get("ip", pd.Series("Unknown", index=df.index)).fillna("Unknown").astype(str).str.strip()
+    mac = df.get("mac", pd.Series("unknown", index=df.index)).fillna("unknown").astype(str).str.lower().str.strip()
+    dt = pd.to_datetime(df.get("datetime"), errors="coerce")
+
+    out = host.copy()
+
+    def _preferred_map(key_series: pd.Series, valid_key_mask: pd.Series) -> pd.Series:
+        known = out.ne("")
+        src = pd.DataFrame(
+            {
+                "key": key_series.loc[known & valid_key_mask].astype(str),
+                "hostname": out.loc[known & valid_key_mask].astype(str),
+                "datetime": dt.loc[known & valid_key_mask],
+            }
+        )
+        if src.empty:
+            return pd.Series(dtype="object")
+        pref = (
+            src.groupby(["key", "hostname"], as_index=False)
+            .agg(hits=("hostname", "size"), last_seen=("datetime", "max"))
+            .sort_values(["key", "hits", "last_seen", "hostname"], ascending=[True, False, False, True])
+            .drop_duplicates(subset=["key"], keep="first")
+            .set_index("key")["hostname"]
+        )
+        return pref
+
+    ip_valid = ~ip.str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN)
+    ip_pref = _preferred_map(ip, ip_valid)
+    if not ip_pref.empty:
+        m_ip_fill = out.eq("") & ip_valid
+        out.loc[m_ip_fill] = ip.loc[m_ip_fill].map(ip_pref).fillna("")
+
+    mac_valid = ~mac.isin(_MAC_UNKNOWNS)
+    mac_pref = _preferred_map(mac, mac_valid)
+    if not mac_pref.empty:
+        m_mac_fill = out.eq("") & mac_valid
+        out.loc[m_mac_fill] = mac.loc[m_mac_fill].map(mac_pref).fillna("")
+
+    out = out.fillna("").astype(str).str.strip()
+    out.loc[out.eq("")] = "Unknown"
+    return out
 
 
 def load_allowlist():
@@ -1076,7 +1323,7 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             {sql_software_type_raw} as software_type_raw,
             {sql_software_name_raw} as software_name_raw,
             {sql_info} as Info,
-            upper(regexp_extract(source_file_path, '([a-z]+)\\.parquet', 1)) as source_log
+            COALESCE(NULLIF(upper(regexp_extract(source_file_path, '([a-z]+)\\.parquet', 1)), ''), 'UNKNOWN') as source_log
         FROM raw_logs r
         LEFT JOIN v_ip_map m ON {sql_ip} = m.ip_addr
         """
@@ -1239,15 +1486,20 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
 
     df["ip"] = df["ip"].fillna("Unknown").astype(str)
     df["mac"] = df["mac"].apply(normalize_mac)
+    df["source_log"] = df.get("source_log", pd.Series("", index=df.index)).apply(normalize_source_log_value)
     df["hostname"] = df.get("hostname", "Unknown").fillna("Unknown").astype(str)
     df["hostname"] = df["hostname"].replace({"": "Unknown"})
     df.loc[df["hostname"].str.lower().isin(["nan", "none"]), "hostname"] = "Unknown"
+    df["hostname"] = backfill_unknown_hostnames(df)
 
     df["domain_clean"] = [
         extract_domain_strict(v) if str(src).upper().strip() in _DOMAIN_LOG_SOURCES else ""
         for v, src in zip(df["app_identifier"].tolist(), df["source_log"].tolist())
     ]
     df["domain_clean"] = df["domain_clean"].fillna("")
+    inferred_domains = infer_missing_domains(df)
+    m_infer_domain = df["domain_clean"].eq("") & inferred_domains.reindex(df.index).fillna("").ne("")
+    df.loc[m_infer_domain, "domain_clean"] = inferred_domains.loc[m_infer_domain]
     df.loc[df["domain_clean"].eq(""), "domain_clean"] = "unidentified_activity"
     soft_raw_series = df.get("app_software_raw", pd.Series("", index=df.index))
     soft_type_series = df.get("software_type_raw", pd.Series("", index=df.index))
@@ -1267,6 +1519,15 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     m_domain_identity = df["app_identity"].eq("") & df["domain_clean"].ne("unidentified_activity")
     df.loc[m_domain_identity, "app_identity"] = df.loc[m_domain_identity, "domain_clean"].astype(str)
 
+    # CONN rows rarely carry app/software identity; derive a stable identifier so
+    # forensics inventory can show meaningful rows when source is filtered to CONN.
+    src_upper = df["source_log"].astype(str).str.upper()
+    conn_port = pd.to_numeric(df.get("dst_port", 0), errors="coerce").fillna(0).astype("int64")
+    m_conn_missing_identity = df["app_identity"].eq("") & src_upper.eq("CONN")
+    m_conn_with_port = m_conn_missing_identity & conn_port.gt(0)
+    df.loc[m_conn_with_port, "app_identity"] = "CONN Port " + conn_port.loc[m_conn_with_port].astype(str)
+    df.loc[m_conn_missing_identity & ~m_conn_with_port, "app_identity"] = "CONN Telemetry"
+
     if allow_re is not None:
         allowed_mask = df["domain_clean"].astype(str).str.contains(allow_re, na=False)
     else:
@@ -1275,9 +1536,25 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     df["App Status"] = np.where(allowed_mask, "Authorized", "Unauthorized")
     df["Behavior"] = vectorized_behavior(df)
     risk_level, risk_basis, risk_score_int = vectorized_risk(df, risk_policy)
-    df["Risk Level"] = risk_level
-    df["Risk Basis"] = risk_basis
-    df["_risk_score"] = risk_score_int
+    df["_risk_score"] = pd.to_numeric(risk_score_int, errors="coerce").fillna(0).astype("int16")
+    df["Risk Level"] = df["_risk_score"].map(lambda s: SCORE_TO_RISK.get(int(s), "Safe")).astype(str)
+    df["Risk Basis"] = risk_basis.fillna("").astype(str).str.strip()
+    m_missing_basis = df["Risk Basis"].eq("")
+    if m_missing_basis.any():
+        port_text = (
+            pd.to_numeric(df.loc[m_missing_basis, "dst_port"], errors="coerce")
+            .fillna(0)
+            .astype("int64")
+            .astype(str)
+        )
+        df.loc[m_missing_basis, "Risk Basis"] = (
+            df.loc[m_missing_basis, "Risk Level"].astype(str)
+            + ": Derived from source_log="
+            + df.loc[m_missing_basis, "source_log"].astype(str)
+            + ", dst_port="
+            + port_text
+            + "."
+        )
     df["date"] = str(date_str)
 
     keep_cols = [
@@ -1355,6 +1632,7 @@ def register_shadow_view(conn, cached_files: list[str]):
         f"""
         CREATE OR REPLACE VIEW shadow_events AS
         SELECT * FROM read_parquet({file_list_sql}, union_by_name=True)
+        WHERE upper(COALESCE(source_log, '')) <> 'NOTICE'
         """
     )
 
@@ -1366,6 +1644,7 @@ def register_shadow_view(conn, cached_files: list[str]):
             CREATE OR REPLACE VIEW shadow_events AS
             SELECT *, 'Unknown'::VARCHAR AS hostname
             FROM read_parquet({file_list_sql}, union_by_name=True)
+            WHERE upper(COALESCE(source_log, '')) <> 'NOTICE'
             """
         )
 
@@ -1459,6 +1738,7 @@ def show_inventory_app_dialog(conn):
     ctx = st.session_state.get("shadow_app_detail_context") or {}
     target_mac = str(ctx.get("mac") or "").strip().lower()
     sel_dest = str(ctx.get("destination") or "").strip()
+    sel_dest_lookup = str(ctx.get("destination_lookup") or sel_dest).strip()
     sel_app = str(ctx.get("application_or_identifier") or "").strip()
     selected_f_source = str(ctx.get("selected_f_source") or "All").strip() or "All"
     forensic_risk = ctx.get("forensic_risk") or []
@@ -1475,55 +1755,117 @@ def show_inventory_app_dialog(conn):
     with top[1]:
         st.caption(f"Application usage scope: {sel_app or '-'}")
 
-    if not target_mac or not sel_dest or not sel_app:
+    if not target_mac or not sel_dest_lookup or not sel_app:
         st.warning("Missing application context. Please select an Application / Identifier row again.")
         return
 
-    app_where = [
-        "lower(mac) = lower(?)",
-        "domain_clean = ?",
-        "app_identity = ?",
-    ]
-    app_params = [target_mac, sel_dest, sel_app]
+    def _fetch_app_events(destination_key: str) -> pd.DataFrame:
+        app_where = [
+            "lower(destination_lookup) = lower(?)",
+            "lower(app_identity_norm) = lower(?)",
+        ]
+        app_params = [target_mac, destination_key, sel_app]
 
-    if selected_f_source != "All":
-        app_where.append("upper(source_log) = upper(?)")
-        app_params.append(selected_f_source)
+        if selected_f_source != "All":
+            app_where.append("upper(source_log) = upper(?)")
+            app_params.append(selected_f_source)
 
-    if forensic_risk:
-        app_in = _build_in_clause(forensic_risk, app_params)
-        app_where.append(f""""Risk Level" IN {app_in}""")
+        if not forensic_risk:
+            app_where.append("1=0")
+        elif set(forensic_risk) != set(RISK_OPTIONS):
+            app_in = _build_in_clause(forensic_risk, app_params)
+            app_where.append(f""""Risk Level" IN {app_in}""")
 
-    if forensic_search:
-        q = f"%{forensic_search}%"
-        app_where.append("(domain_clean ILIKE ? OR app_identity ILIKE ? OR ip ILIKE ? OR hostname ILIKE ? OR Info ILIKE ?)")
-        app_params.extend([q, q, q, q, q])
+        if forensic_search:
+            q = f"%{forensic_search}%"
+            app_where.append(
+                "(destination_lookup ILIKE ? OR app_identity_raw ILIKE ? OR ip ILIKE ? OR Info ILIKE ? OR hostname ILIKE ?)"
+            )
+            app_params.extend([q, q, q, q, q])
 
-    app_where_sql = " AND ".join(app_where)
-    app_df = _sql_fetch_df(
-        conn,
-        f"""
-        SELECT
-            datetime,
-            source_log,
-            "Risk Level",
-            "Risk Basis",
-            "Behavior",
-            "App Status",
-            bytes_sent,
-            bytes_received,
-            dst_port,
-            Info
-        FROM shadow_events
-        WHERE {app_where_sql}
-        ORDER BY datetime DESC
-        """,
-        app_params,
-    )
+        app_where_sql = " AND ".join(app_where)
+        return _sql_fetch_df(
+            conn,
+            f"""
+            WITH app_base AS (
+                SELECT
+                    datetime,
+                    COALESCE(NULLIF(trim(source_log), ''), 'UNKNOWN') AS source_log,
+                    CASE COALESCE(try_cast(_risk_score AS INT), 0)
+                        WHEN 4 THEN 'Critical'
+                        WHEN 3 THEN 'High'
+                        WHEN 2 THEN 'Medium'
+                        WHEN 1 THEN 'Low'
+                        ELSE 'Safe'
+                    END AS "Risk Level",
+                    CASE
+                        WHEN "Risk Basis" IS NOT NULL AND trim("Risk Basis") <> '' THEN trim("Risk Basis")
+                        ELSE
+                            (
+                                CASE COALESCE(try_cast(_risk_score AS INT), 0)
+                                    WHEN 4 THEN 'Critical'
+                                    WHEN 3 THEN 'High'
+                                    WHEN 2 THEN 'Medium'
+                                    WHEN 1 THEN 'Low'
+                                    ELSE 'Safe'
+                                END
+                            )
+                            || ': Derived from source_log='
+                            || COALESCE(NULLIF(trim(source_log), ''), 'UNKNOWN')
+                            || ', dst_port='
+                            || CAST(COALESCE(try_cast(dst_port AS INT), 0) AS VARCHAR)
+                            || '.'
+                    END AS "Risk Basis",
+                    "Behavior",
+                    "App Status",
+                    bytes_sent,
+                    bytes_received,
+                    dst_port,
+                    COALESCE(NULLIF(trim(Info), ''), '-') AS Info,
+                    COALESCE(NULLIF(trim(domain_clean), ''), 'unidentified_activity') AS destination_lookup,
+                    COALESCE(NULLIF(trim(ip), ''), 'Unknown') AS ip,
+                    COALESCE(NULLIF(trim(hostname), ''), 'Unknown') AS hostname,
+                    COALESCE(NULLIF(trim(app_identity), ''), '') AS app_identity_raw,
+                    CASE
+                        WHEN app_identity IS NOT NULL AND trim(app_identity) <> '' THEN trim(app_identity)
+                        WHEN upper(source_log) = 'CONN' AND try_cast(dst_port AS INT) > 0
+                            THEN 'CONN Port ' || CAST(try_cast(dst_port AS INT) AS VARCHAR)
+                        WHEN upper(source_log) = 'CONN' THEN 'CONN Telemetry'
+                        ELSE ''
+                    END AS app_identity_norm
+                FROM shadow_events
+                WHERE lower(mac) = lower(?)
+            )
+            SELECT
+                datetime,
+                source_log,
+                "Risk Level",
+                "Risk Basis",
+                "Behavior",
+                "App Status",
+                bytes_sent,
+                bytes_received,
+                dst_port,
+                Info
+            FROM app_base
+            WHERE {app_where_sql}
+            ORDER BY datetime DESC
+            """,
+            app_params,
+        )
+
+    matched_destination_key = sel_dest_lookup
+    app_df = _fetch_app_events(matched_destination_key)
+    if app_df.empty and sel_dest and sel_dest_lookup.lower() != sel_dest.lower():
+        fallback_df = _fetch_app_events(sel_dest)
+        if not fallback_df.empty:
+            app_df = fallback_df
+            matched_destination_key = sel_dest
 
     if app_df.empty:
         st.info("No events found for this application with current filters.")
         return
+    st.caption(f"Matched destination: {matched_destination_key}")
 
     app_df["datetime"] = pd.to_datetime(app_df["datetime"], errors="coerce")
     invalid_ts = int(app_df["datetime"].isna().sum())
@@ -1534,7 +1876,7 @@ def show_inventory_app_dialog(conn):
     app_metrics[0].metric("Events", f"{len(app_df):,}")
     app_metrics[1].metric("Unauthorized", f"{int((app_df['App Status'] == 'Unauthorized').sum()):,}")
     app_metrics[2].metric("Critical / High", f"{int(app_df['Risk Level'].isin(['Critical', 'High']).sum()):,}")
-    app_metrics[3].metric("Distinct Sources", f"{int(app_df['source_log'].nunique(dropna=True)):,}")
+    app_metrics[3].metric("Distinct Source Logs", f"{int(app_df['source_log'].nunique(dropna=True)):,}")
 
     trend = app_df.dropna(subset=["datetime"]).copy()
     trend = trend.set_index("datetime").resample("1H").size().reset_index(name="events")
@@ -1653,10 +1995,29 @@ def show_forensics_dialog(conn):
 
     src_df = _sql_fetch_df(
         conn,
-        "SELECT DISTINCT source_log FROM shadow_events WHERE lower(mac) = lower(?) ORDER BY 1",
+        """
+        SELECT DISTINCT upper(trim(source_log)) AS source_log
+        FROM shadow_events
+        WHERE lower(mac) = lower(?)
+          AND source_log IS NOT NULL
+          AND trim(source_log) <> ''
+        ORDER BY 1
+        """,
         [target_mac],
     )
-    f_raw_sources = src_df["source_log"].dropna().tolist() if not src_df.empty else []
+    f_raw_sources = src_df["source_log"].dropna().astype(str).str.strip().tolist() if not src_df.empty else []
+    if "SOFTWARE" not in f_raw_sources:
+        has_software = conn.execute(
+            """
+            SELECT 1
+            FROM shadow_events
+            WHERE upper(trim(source_log)) = 'SOFTWARE'
+            LIMIT 1
+            """
+        ).fetchone()
+        if has_software:
+            f_raw_sources.append("SOFTWARE")
+    f_raw_sources = sorted({s for s in f_raw_sources if s})
     forensic_search = st.text_input(
         "Quick Search",
         placeholder="IP, domain, context...",
@@ -1695,14 +2056,16 @@ def show_forensics_dialog(conn):
         where.append("upper(source_log) = upper(?)")
         params.append(selected_f_source)
 
-    if forensic_risk and not is_all_risk_selected:
+    if not forensic_risk:
+        where.append("1=0")
+    elif not is_all_risk_selected:
         in_clause = _build_in_clause(forensic_risk, params)
         where.append(f""""Risk Level" IN {in_clause}""")
 
     if forensic_search:
         q = f"%{forensic_search}%"
-        where.append("(domain_clean ILIKE ? OR ip ILIKE ? OR Info ILIKE ? OR hostname ILIKE ?)")
-        params.extend([q, q, q, q])
+        where.append("(domain_clean ILIKE ? OR ip ILIKE ? OR Info ILIKE ? OR hostname ILIKE ? OR app_identity ILIKE ?)")
+        params.extend([q, q, q, q, q])
 
     where_sql = " AND ".join(where)
 
@@ -1710,7 +2073,7 @@ def show_forensics_dialog(conn):
         conn,
         f"""
         SELECT
-            datetime, mac, hostname, ip, domain_clean, source_log, Info, dst_port,
+            datetime, mac, hostname, ip, domain_clean, app_identity, source_log, Info, dst_port,
             bytes_sent, bytes_received, Behavior, "App Status", "Risk Level", "Risk Basis"
         FROM shadow_events
         WHERE {where_sql}
@@ -1745,6 +2108,22 @@ def show_forensics_dialog(conn):
     # Dialog analytics: Timeline + Top Destinations
     # =============================================================================
     st.markdown("#### Activity Timeline")
+    timeline_controls = st.columns([1.6, 1.2, 2.2])
+    with timeline_controls[0]:
+        timeline_status_filter = st.selectbox(
+            "Status Filter",
+            ["All", "Authorized", "Unauthorized", "Unknown"],
+            key=f"dlg_timeline_status_{target_mac}",
+            on_change=_mark_dialog_origin,
+        )
+    with timeline_controls[1]:
+        timeline_bucket_label = st.selectbox(
+            "Bucket",
+            ["5 min", "10 min", "30 min", "1 hour"],
+            index=1,
+            key=f"dlg_timeline_bucket_{target_mac}",
+            on_change=_mark_dialog_origin,
+        )
     timeline_mode = st.radio(
         "Timeline View",
         ["Total Events", "Status Split"],
@@ -1753,9 +2132,17 @@ def show_forensics_dialog(conn):
         on_change=_mark_dialog_origin,
     )
 
-    bucket_rule = "10min"
-    timeline_label = "10 min"
+    bucket_map = {
+        "5 min": ("5min", "5 min"),
+        "10 min": ("10min", "10 min"),
+        "30 min": ("30min", "30 min"),
+        "1 hour": ("1H", "1 hour"),
+    }
+    bucket_rule, timeline_label = bucket_map.get(timeline_bucket_label, ("10min", "10 min"))
     timeline = forensic_df.dropna(subset=["datetime"]).copy()
+    timeline["App Status"] = timeline["App Status"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
+    if timeline_status_filter != "All":
+        timeline = timeline[timeline["App Status"].eq(timeline_status_filter)]
 
     if not timeline.empty:
         if timeline_mode == "Status Split":
@@ -1790,7 +2177,7 @@ def show_forensics_dialog(conn):
         fig_f.update_yaxes(title="Events")
         st.plotly_chart(fig_f, use_container_width=True)
     else:
-        st.warning("No valid timestamps for timeline.")
+        st.warning("No timeline events match the selected status/bucket filters.")
 
     st.markdown("#### Top Destinations")
     top_dest = (
@@ -1837,14 +2224,16 @@ def show_forensics_dialog(conn):
         inv_where.append("upper(source_log) = upper(?)")
         inv_params.append(selected_f_source)
 
-    if forensic_risk and not is_all_risk_selected:
+    if not forensic_risk:
+        inv_where.append("1=0")
+    elif not is_all_risk_selected:
         inv_in = _build_in_clause(forensic_risk, inv_params)
         inv_where.append(f""""Risk Level" IN {inv_in}""")
 
     if forensic_search:
         q_inv = f"%{forensic_search}%"
-        inv_where.append("(domain_clean ILIKE ? OR app_identity ILIKE ?)")
-        inv_params.extend([q_inv, q_inv])
+        inv_where.append("(domain_clean ILIKE ? OR app_identity ILIKE ? OR ip ILIKE ? OR Info ILIKE ? OR hostname ILIKE ?)")
+        inv_params.extend([q_inv, q_inv, q_inv, q_inv, q_inv])
 
     inv_where_sql = " AND ".join(inv_where)
 
@@ -1854,7 +2243,13 @@ def show_forensics_dialog(conn):
         WITH base AS (
             SELECT
                 domain_clean,
-                app_identity,
+                CASE
+                    WHEN app_identity IS NOT NULL AND trim(app_identity) <> '' THEN trim(app_identity)
+                    WHEN upper(source_log) = 'CONN' AND try_cast(dst_port AS INT) > 0
+                        THEN 'CONN Port ' || CAST(try_cast(dst_port AS INT) AS VARCHAR)
+                    WHEN upper(source_log) = 'CONN' THEN 'CONN Telemetry'
+                    ELSE ''
+                END AS app_identity_norm,
                 source_log,
                 "App Status" AS app_status,
                 _risk_score,
@@ -1863,13 +2258,11 @@ def show_forensics_dialog(conn):
             WHERE {inv_where_sql}
               AND domain_clean IS NOT NULL
               AND domain_clean <> ''
-              AND app_identity IS NOT NULL
-              AND trim(app_identity) <> ''
         ),
         agg AS (
             SELECT
                 domain_clean,
-                app_identity,
+                app_identity_norm AS app_identity,
                 STRING_AGG(DISTINCT source_log, ', ' ORDER BY source_log) AS sources,
                 MIN(datetime) AS first_seen,
                 MAX(datetime) AS last_seen,
@@ -1878,6 +2271,7 @@ def show_forensics_dialog(conn):
                 CASE WHEN SUM(CASE WHEN app_status='Unauthorized' THEN 1 ELSE 0 END) > 0
                      THEN 'Unauthorized' ELSE 'Authorized' END AS status
             FROM base
+            WHERE app_identity_norm <> ''
             GROUP BY 1,2
         )
         SELECT
@@ -1903,6 +2297,545 @@ def show_forensics_dialog(conn):
         """,
         inv_params,
     )
+
+    if not inventory_df.empty:
+        inventory_df["lookup_destination"] = inventory_df["destination"].fillna("").astype(str).str.strip()
+        inv_dest = inventory_df["destination"].fillna("").astype(str).str.strip()
+        inv_app = inventory_df["application_or_identifier"].fillna("").astype(str).str.strip()
+        inv_sources = inventory_df["sources"].fillna("").astype(str).str.upper()
+
+        is_port = inv_app.str.startswith("CONN Port ") | inv_app.eq("CONN Telemetry")
+        is_software = inv_sources.str.contains("SOFTWARE", regex=False)
+        is_domain = (
+            (~is_port)
+            & (~is_software)
+            & inv_dest.str.lower().ne("unidentified_activity")
+            & inv_app.str.lower().eq(inv_dest.str.lower())
+        )
+        inventory_df["identity_type"] = np.select(
+            [is_port, is_software, is_domain],
+            ["Port", "Software", "Domain"],
+            default="Application",
+        )
+
+        # Build accurate port lists from the currently filtered forensic events.
+        port_df = forensic_df.copy()
+        port_df["domain_clean"] = port_df["domain_clean"].fillna("").astype(str).str.strip()
+        port_df["source_log"] = port_df["source_log"].fillna("").astype(str).str.upper().str.strip()
+        port_df["app_identity"] = port_df["app_identity"].fillna("").astype(str).str.strip()
+        port_df["dst_port"] = pd.to_numeric(port_df["dst_port"], errors="coerce").fillna(0).astype("int64")
+        port_df["app_identity_norm"] = port_df["app_identity"]
+        m_missing_identity = port_df["app_identity_norm"].eq("")
+        m_conn_missing = m_missing_identity & port_df["source_log"].eq("CONN")
+        m_conn_with_port = m_conn_missing & port_df["dst_port"].gt(0)
+        port_df.loc[m_conn_with_port, "app_identity_norm"] = (
+            "CONN Port " + port_df.loc[m_conn_with_port, "dst_port"].astype(str)
+        )
+        port_df.loc[m_conn_missing & ~m_conn_with_port, "app_identity_norm"] = "CONN Telemetry"
+        port_df = port_df[(port_df["domain_clean"] != "") & (port_df["app_identity_norm"] != "")]
+
+        if not port_df.empty:
+            port_map = (
+                port_df.groupby(["domain_clean", "app_identity_norm"], as_index=False)["dst_port"]
+                .agg(lambda s: ", ".join(str(v) for v in sorted({int(x) for x in s if int(x) > 0})))
+                .rename(
+                    columns={
+                        "domain_clean": "destination",
+                        "app_identity_norm": "application_or_identifier",
+                        "dst_port": "conn_ports",
+                    }
+                )
+            )
+            inventory_df = inventory_df.merge(
+                port_map,
+                on=["destination", "application_or_identifier"],
+                how="left",
+            )
+        else:
+            inventory_df["conn_ports"] = ""
+        if "conn_ports" in inventory_df.columns:
+            inventory_df["conn_ports"] = inventory_df["conn_ports"].fillna("")
+
+        # If a Software row has no native port or unresolved destination, infer
+        # from nearest non-software events for this MAC within a tight time window.
+        software_rows = inventory_df["identity_type"].eq("Software")
+        software_missing_port = software_rows & inventory_df["conn_ports"].astype(str).str.strip().eq("")
+        software_unknown_destination = software_rows & (
+            inventory_df["destination"].fillna("").astype(str).str.strip().str.lower().eq("unidentified_activity")
+        )
+        software_needs_inference = software_missing_port | software_unknown_destination
+        if software_needs_inference.any():
+            sw_where = list(inv_where)
+            sw_params = list(inv_params)
+            sw_where.append("upper(source_log) = 'SOFTWARE'")
+            sw_where.append("app_identity IS NOT NULL")
+            sw_where.append("trim(app_identity) <> ''")
+            sw_where_sql = " AND ".join(sw_where)
+
+            sw_anchor_df = _sql_fetch_df(
+                conn,
+                f"""
+                SELECT
+                    datetime,
+                    ip,
+                    trim(app_identity) AS app_identity
+                FROM shadow_events
+                WHERE {sw_where_sql}
+                ORDER BY datetime
+                """,
+                sw_params,
+            )
+            if not sw_anchor_df.empty:
+                sw_anchor_df["datetime"] = pd.to_datetime(sw_anchor_df["datetime"], errors="coerce")
+                sw_anchor_df["ip"] = sw_anchor_df["ip"].fillna("").astype(str).str.strip()
+                sw_anchor_df["app_identity"] = sw_anchor_df["app_identity"].fillna("").astype(str).str.strip()
+                sw_anchor_df = sw_anchor_df[
+                    sw_anchor_df["datetime"].notna()
+                    & sw_anchor_df["app_identity"].ne("")
+                ]
+
+                sw_keys = (
+                    inventory_df.loc[software_needs_inference, ["application_or_identifier"]]
+                    .copy()
+                    .rename(columns={"application_or_identifier": "app_identity"})
+                )
+                sw_keys["app_identity"] = sw_keys["app_identity"].fillna("").astype(str).str.strip()
+                sw_keys = sw_keys[sw_keys["app_identity"].ne("")].drop_duplicates()
+
+                sw_anchor_df = sw_anchor_df.merge(sw_keys, on="app_identity", how="inner")
+
+                if not sw_anchor_df.empty:
+                    min_ts = sw_anchor_df["datetime"].min() - pd.Timedelta(seconds=2)
+                    max_ts = sw_anchor_df["datetime"].max() + pd.Timedelta(seconds=2)
+                    sw_candidates = _sql_fetch_df(
+                        conn,
+                        """
+                        SELECT
+                            datetime,
+                            ip,
+                            domain_clean,
+                            try_cast(dst_port AS INT) AS dst_port
+                        FROM shadow_events
+                        WHERE lower(mac) = lower(?)
+                          AND upper(source_log) <> 'SOFTWARE'
+                          AND datetime >= ?
+                          AND datetime <= ?
+                          AND (
+                                try_cast(dst_port AS INT) > 0
+                                OR (
+                                    domain_clean IS NOT NULL
+                                    AND trim(domain_clean) <> ''
+                                    AND lower(trim(domain_clean)) <> 'unidentified_activity'
+                                )
+                          )
+                        ORDER BY datetime
+                        """,
+                        [target_mac, min_ts, max_ts],
+                    )
+
+                    if not sw_candidates.empty:
+                        sw_anchor_df = sw_anchor_df.sort_values("datetime")
+                        sw_candidates["datetime"] = pd.to_datetime(sw_candidates["datetime"], errors="coerce")
+                        sw_candidates["ip"] = sw_candidates["ip"].fillna("").astype(str).str.strip()
+                        sw_candidates["domain_clean"] = sw_candidates["domain_clean"].fillna("").astype(str).str.strip()
+                        sw_candidates["dst_port"] = pd.to_numeric(
+                            sw_candidates["dst_port"], errors="coerce"
+                        ).fillna(0).astype("int64")
+                        sw_candidates = sw_candidates[
+                            sw_candidates["datetime"].notna()
+                            & (
+                                sw_candidates["dst_port"].gt(0)
+                                | sw_candidates["domain_clean"].ne("")
+                            )
+                        ].copy()
+                        sw_candidates = sw_candidates[
+                            ~sw_candidates["domain_clean"].str.lower().eq("unidentified_activity")
+                        ].sort_values("datetime")
+
+                        if not sw_candidates.empty:
+                            anchors = sw_anchor_df[["datetime", "ip", "app_identity"]].copy().reset_index(drop=True)
+                            anchors["row_idx"] = anchors.index.astype("int64")
+                            candidates = sw_candidates.rename(
+                                columns={"domain_clean": "matched_domain", "dst_port": "matched_port"}
+                            )
+
+                            match_ip = pd.DataFrame()
+                            if anchors["ip"].ne("").any() and candidates["ip"].ne("").any():
+                                match_ip = _asof_grouped_match(
+                                    left_df=anchors.loc[anchors["ip"].ne(""), ["row_idx", "datetime", "ip"]].copy(),
+                                    right_df=candidates.loc[
+                                        candidates["ip"].ne(""),
+                                        ["ip", "datetime", "matched_domain", "matched_port"],
+                                    ].copy(),
+                                    by_cols=["ip"],
+                                    right_value_cols=["matched_domain", "matched_port"],
+                                    tolerance_seconds=2,
+                                )
+                            if match_ip.empty:
+                                match_ip = anchors.copy()
+                                match_ip["matched_domain"] = pd.NA
+                                match_ip["matched_port"] = pd.NA
+                            else:
+                                match_ip = anchors.merge(match_ip, on="row_idx", how="left")
+                            if "matched_domain" not in match_ip.columns:
+                                match_ip["matched_domain"] = pd.NA
+                            if "matched_port" not in match_ip.columns:
+                                match_ip["matched_port"] = pd.NA
+
+                            missing_match = match_ip["matched_domain"].isna() & match_ip["matched_port"].isna()
+                            if missing_match.any():
+                                fallback_left = match_ip.loc[missing_match, ["row_idx", "datetime"]].copy()
+                                fallback_match = _asof_grouped_match(
+                                    left_df=fallback_left,
+                                    right_df=candidates[["datetime", "matched_domain", "matched_port"]].copy(),
+                                    by_cols=[],
+                                    right_value_cols=["matched_domain", "matched_port"],
+                                    tolerance_seconds=2,
+                                )
+                                if not fallback_match.empty:
+                                    fallback_map = fallback_match.set_index("row_idx")
+                                    for col in ["matched_domain", "matched_port"]:
+                                        match_ip.loc[missing_match, col] = (
+                                            match_ip.loc[missing_match, "row_idx"].map(fallback_map[col]).values
+                                        )
+
+                            sw_nearest = match_ip.copy()
+                            sw_nearest["matched_domain"] = (
+                                sw_nearest["matched_domain"].fillna("").astype(str).str.strip()
+                            )
+                            sw_nearest["matched_port"] = pd.to_numeric(
+                                sw_nearest["matched_port"], errors="coerce"
+                            ).fillna(0).astype("int64")
+
+                            if not sw_nearest.empty:
+                                sw_domain_hits = (
+                                    sw_nearest[sw_nearest["matched_domain"].ne("")]
+                                    .groupby(["app_identity", "matched_domain"], as_index=False)
+                                    .size()
+                                    .rename(columns={"size": "hits"})
+                                    .sort_values(
+                                        ["app_identity", "hits", "matched_domain"],
+                                        ascending=[True, False, True],
+                                    )
+                                )
+                                if not sw_domain_hits.empty:
+                                    sw_domain_map = (
+                                        sw_domain_hits.groupby("app_identity", as_index=False)
+                                        .head(1)
+                                        .rename(
+                                            columns={
+                                                "app_identity": "application_or_identifier",
+                                                "matched_domain": "inferred_destination",
+                                            }
+                                        )[
+                                            ["application_or_identifier", "inferred_destination"]
+                                        ]
+                                    )
+                                    inventory_df = inventory_df.merge(
+                                        sw_domain_map,
+                                        on="application_or_identifier",
+                                        how="left",
+                                    )
+                                    inventory_df["inferred_destination"] = (
+                                        inventory_df["inferred_destination"].fillna("").astype(str).str.strip()
+                                    )
+                                    software_unknown_destination = software_rows & (
+                                        inventory_df["destination"]
+                                        .fillna("")
+                                        .astype(str)
+                                        .str.strip()
+                                        .str.lower()
+                                        .eq("unidentified_activity")
+                                    )
+                                    inventory_df["destination"] = np.where(
+                                        software_unknown_destination
+                                        & inventory_df["inferred_destination"].ne(""),
+                                        inventory_df["inferred_destination"],
+                                        inventory_df["destination"],
+                                    )
+
+                                sw_port_hits = (
+                                    sw_nearest[sw_nearest["matched_port"].gt(0)]
+                                    .groupby(["app_identity", "matched_port"], as_index=False)
+                                    .size()
+                                    .rename(columns={"size": "hits"})
+                                    .sort_values(
+                                        ["app_identity", "hits", "matched_port"],
+                                        ascending=[True, False, True],
+                                    )
+                                )
+                                if not sw_port_hits.empty:
+                                    sw_top_ports = (
+                                        sw_port_hits.groupby("app_identity", as_index=False)
+                                        .head(3)
+                                        .groupby("app_identity", as_index=False)["matched_port"]
+                                        .agg(lambda s: ", ".join(str(int(v)) for v in s))
+                                        .rename(
+                                            columns={
+                                                "app_identity": "application_or_identifier",
+                                                "matched_port": "inferred_ports",
+                                            }
+                                        )
+                                    )
+                                    inventory_df = inventory_df.merge(
+                                        sw_top_ports,
+                                        on="application_or_identifier",
+                                        how="left",
+                                    )
+                                    inventory_df["inferred_ports"] = (
+                                        inventory_df["inferred_ports"].fillna("").astype(str).str.strip()
+                                    )
+                                    software_missing_port = software_rows & (
+                                        inventory_df["conn_ports"].astype(str).str.strip().eq("")
+                                    )
+                                    inventory_df["conn_ports"] = np.where(
+                                        software_missing_port
+                                        & inventory_df["inferred_ports"].ne(""),
+                                        inventory_df["inferred_ports"] + " (inferred)",
+                                        inventory_df["conn_ports"],
+                                    )
+
+                                inventory_df = inventory_df.drop(
+                                    columns=["inferred_destination", "inferred_ports"],
+                                    errors="ignore",
+                                )
+
+        # For CONN rows with unresolved destination, infer destination from
+        # nearest non-CONN events for the same MAC (IP-priority, then fallback).
+        conn_unknown_destination = (
+            inventory_df["identity_type"].eq("Port")
+            & inventory_df["destination"].fillna("").astype(str).str.strip().str.lower().eq("unidentified_activity")
+        )
+        if conn_unknown_destination.any():
+            conn_anchor_df = forensic_df.copy()
+            conn_anchor_df["datetime"] = pd.to_datetime(conn_anchor_df["datetime"], errors="coerce")
+            conn_anchor_df["ip"] = conn_anchor_df["ip"].fillna("").astype(str).str.strip()
+            conn_anchor_df["source_log"] = conn_anchor_df["source_log"].fillna("").astype(str).str.upper().str.strip()
+            conn_anchor_df["app_identity"] = conn_anchor_df["app_identity"].fillna("").astype(str).str.strip()
+            conn_anchor_df["dst_port"] = pd.to_numeric(conn_anchor_df["dst_port"], errors="coerce").fillna(0).astype("int64")
+            conn_anchor_df = conn_anchor_df[
+                conn_anchor_df["datetime"].notna() & conn_anchor_df["source_log"].eq("CONN")
+            ]
+            conn_anchor_df["app_identity_norm"] = conn_anchor_df["app_identity"]
+            m_conn_missing_identity = conn_anchor_df["app_identity_norm"].eq("")
+            m_conn_with_port = m_conn_missing_identity & conn_anchor_df["dst_port"].gt(0)
+            conn_anchor_df.loc[m_conn_with_port, "app_identity_norm"] = (
+                "CONN Port " + conn_anchor_df.loc[m_conn_with_port, "dst_port"].astype(str)
+            )
+            conn_anchor_df.loc[m_conn_missing_identity & ~m_conn_with_port, "app_identity_norm"] = "CONN Telemetry"
+            conn_anchor_df = conn_anchor_df[conn_anchor_df["app_identity_norm"].ne("")]
+
+            conn_keys = (
+                inventory_df.loc[conn_unknown_destination, ["application_or_identifier"]]
+                .copy()
+                .rename(columns={"application_or_identifier": "app_identity_norm"})
+            )
+            conn_keys["app_identity_norm"] = conn_keys["app_identity_norm"].fillna("").astype(str).str.strip()
+            conn_keys = conn_keys[conn_keys["app_identity_norm"].ne("")].drop_duplicates()
+
+            conn_anchor_df = conn_anchor_df.merge(conn_keys, on="app_identity_norm", how="inner")
+            if not conn_anchor_df.empty:
+                min_ts = conn_anchor_df["datetime"].min() - pd.Timedelta(seconds=2)
+                max_ts = conn_anchor_df["datetime"].max() + pd.Timedelta(seconds=2)
+                conn_candidates = _sql_fetch_df(
+                    conn,
+                    """
+                    SELECT
+                        datetime,
+                        ip,
+                        domain_clean
+                    FROM shadow_events
+                    WHERE lower(mac) = lower(?)
+                      AND upper(source_log) <> 'CONN'
+                      AND datetime >= ?
+                      AND datetime <= ?
+                      AND domain_clean IS NOT NULL
+                      AND trim(domain_clean) <> ''
+                      AND lower(trim(domain_clean)) <> 'unidentified_activity'
+                    ORDER BY datetime
+                    """,
+                    [target_mac, min_ts, max_ts],
+                )
+                if not conn_candidates.empty:
+                    conn_candidates["datetime"] = pd.to_datetime(conn_candidates["datetime"], errors="coerce")
+                    conn_candidates["ip"] = conn_candidates["ip"].fillna("").astype(str).str.strip()
+                    conn_candidates["domain_clean"] = conn_candidates["domain_clean"].fillna("").astype(str).str.strip()
+                    conn_candidates = conn_candidates[
+                        conn_candidates["datetime"].notna() & conn_candidates["domain_clean"].ne("")
+                    ].sort_values("datetime")
+
+                    if not conn_candidates.empty:
+                        conn_anchors = conn_anchor_df[["datetime", "ip", "app_identity_norm"]].copy().reset_index(drop=True)
+                        conn_anchors["row_idx"] = conn_anchors.index.astype("int64")
+
+                        conn_match_ip = pd.DataFrame()
+                        if conn_anchors["ip"].ne("").any() and conn_candidates["ip"].ne("").any():
+                            conn_match_ip = _asof_grouped_match(
+                                left_df=conn_anchors.loc[
+                                    conn_anchors["ip"].ne(""),
+                                    ["row_idx", "datetime", "ip"],
+                                ].copy(),
+                                right_df=conn_candidates.loc[
+                                    conn_candidates["ip"].ne(""),
+                                    ["ip", "datetime", "domain_clean"],
+                                ].copy(),
+                                by_cols=["ip"],
+                                right_value_cols=["domain_clean"],
+                                tolerance_seconds=2,
+                            )
+                        if conn_match_ip.empty:
+                            conn_match_ip = conn_anchors.copy()
+                            conn_match_ip["domain_clean"] = pd.NA
+                        else:
+                            conn_match_ip = conn_anchors.merge(conn_match_ip, on="row_idx", how="left")
+                        if "domain_clean" not in conn_match_ip.columns:
+                            conn_match_ip["domain_clean"] = pd.NA
+
+                        conn_match_ip["domain_clean"] = (
+                            conn_match_ip["domain_clean"].fillna("").astype(str).str.strip()
+                        )
+                        conn_domain_hits = (
+                            conn_match_ip[conn_match_ip["domain_clean"].ne("")]
+                            .groupby(["app_identity_norm", "domain_clean"], as_index=False)
+                            .size()
+                            .rename(columns={"size": "hits"})
+                            .sort_values(
+                                ["app_identity_norm", "hits", "domain_clean"],
+                                ascending=[True, False, True],
+                            )
+                        )
+                        if not conn_domain_hits.empty:
+                            conn_domain_map = (
+                                conn_domain_hits.groupby("app_identity_norm", as_index=False)
+                                .head(1)
+                                .rename(
+                                    columns={
+                                        "app_identity_norm": "application_or_identifier",
+                                        "domain_clean": "conn_inferred_destination",
+                                    }
+                                )[["application_or_identifier", "conn_inferred_destination"]]
+                            )
+                            inventory_df = inventory_df.merge(
+                                conn_domain_map,
+                                on="application_or_identifier",
+                                how="left",
+                            )
+                            inventory_df["conn_inferred_destination"] = (
+                                inventory_df["conn_inferred_destination"].fillna("").astype(str).str.strip()
+                            )
+                            conn_unknown_destination = (
+                                inventory_df["identity_type"].eq("Port")
+                                & inventory_df["destination"]
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
+                                .str.lower()
+                                .eq("unidentified_activity")
+                            )
+                            inventory_df["destination"] = np.where(
+                                conn_unknown_destination
+                                & inventory_df["conn_inferred_destination"].ne(""),
+                                inventory_df["conn_inferred_destination"],
+                                inventory_df["destination"],
+                            )
+                            inventory_df = inventory_df.drop(
+                                columns=["conn_inferred_destination"],
+                                errors="ignore",
+                            )
+
+        # Add an explicit unmapped bucket so table Hits reconcile with Events.
+        unmapped_base = forensic_df.copy()
+        unmapped_base["domain_clean"] = unmapped_base["domain_clean"].fillna("").astype(str).str.strip()
+        unmapped_base["source_log"] = unmapped_base["source_log"].fillna("").astype(str).str.upper().str.strip()
+        unmapped_base["app_identity"] = unmapped_base["app_identity"].fillna("").astype(str).str.strip()
+        unmapped_base["dst_port"] = pd.to_numeric(unmapped_base["dst_port"], errors="coerce").fillna(0).astype("int64")
+        unmapped_base["app_identity_norm"] = unmapped_base["app_identity"]
+        m_u_missing_identity = unmapped_base["app_identity_norm"].eq("")
+        m_u_conn_missing = m_u_missing_identity & unmapped_base["source_log"].eq("CONN")
+        m_u_conn_with_port = m_u_conn_missing & unmapped_base["dst_port"].gt(0)
+        unmapped_base.loc[m_u_conn_with_port, "app_identity_norm"] = (
+            "CONN Port " + unmapped_base.loc[m_u_conn_with_port, "dst_port"].astype(str)
+        )
+        unmapped_base.loc[m_u_conn_missing & ~m_u_conn_with_port, "app_identity_norm"] = "CONN Telemetry"
+        mapped_mask = unmapped_base["domain_clean"].ne("") & unmapped_base["app_identity_norm"].ne("")
+        unmapped_events = unmapped_base[~mapped_mask].copy()
+        if not unmapped_events.empty:
+            src_values = sorted({str(v).strip() for v in unmapped_events["source_log"].tolist() if str(v).strip()})
+            source_text = ", ".join(src_values)
+            t_series = pd.to_datetime(unmapped_events["datetime"], errors="coerce")
+            first_seen = t_series.min()
+            last_seen = t_series.max()
+            status_vals = unmapped_events["App Status"].fillna("").astype(str).str.strip()
+            status_label = "Unauthorized" if status_vals.eq("Unauthorized").any() else "Authorized"
+            risk_rank = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Safe": 0}
+            risk_vals = unmapped_events["Risk Level"].fillna("Safe").astype(str).str.strip()
+            risk_scores = risk_vals.map(risk_rank).fillna(0).astype(int)
+            max_score = int(risk_scores.max()) if not risk_scores.empty else 0
+            score_to_risk = {4: "Critical", 3: "High", 2: "Medium", 1: "Low", 0: "Safe"}
+            unmapped_row = pd.DataFrame(
+                [
+                    {
+                        "destination": "Unmapped Events",
+                        "lookup_destination": "Unmapped Events",
+                        "application_or_identifier": "Unmapped",
+                        "sources": source_text,
+                        "status": status_label,
+                        "first_seen": first_seen,
+                        "last_seen": last_seen,
+                        "hits": int(len(unmapped_events)),
+                        "max_risk": score_to_risk.get(max_score, "Safe"),
+                        "identity_type": "Unmapped",
+                        "conn_ports": "",
+                    }
+                ]
+            )
+            inventory_df = pd.concat([inventory_df, unmapped_row], ignore_index=True, sort=False)
+    if inventory_df.empty:
+        unmapped_base = forensic_df.copy()
+        unmapped_base["domain_clean"] = unmapped_base["domain_clean"].fillna("").astype(str).str.strip()
+        unmapped_base["source_log"] = unmapped_base["source_log"].fillna("").astype(str).str.upper().str.strip()
+        unmapped_base["app_identity"] = unmapped_base["app_identity"].fillna("").astype(str).str.strip()
+        unmapped_base["dst_port"] = pd.to_numeric(unmapped_base["dst_port"], errors="coerce").fillna(0).astype("int64")
+        unmapped_base["app_identity_norm"] = unmapped_base["app_identity"]
+        m_u_missing_identity = unmapped_base["app_identity_norm"].eq("")
+        m_u_conn_missing = m_u_missing_identity & unmapped_base["source_log"].eq("CONN")
+        m_u_conn_with_port = m_u_conn_missing & unmapped_base["dst_port"].gt(0)
+        unmapped_base.loc[m_u_conn_with_port, "app_identity_norm"] = (
+            "CONN Port " + unmapped_base.loc[m_u_conn_with_port, "dst_port"].astype(str)
+        )
+        unmapped_base.loc[m_u_conn_missing & ~m_u_conn_with_port, "app_identity_norm"] = "CONN Telemetry"
+        mapped_mask = unmapped_base["domain_clean"].ne("") & unmapped_base["app_identity_norm"].ne("")
+        unmapped_events = unmapped_base[~mapped_mask].copy()
+        if not unmapped_events.empty:
+            src_values = sorted({str(v).strip() for v in unmapped_events["source_log"].tolist() if str(v).strip()})
+            source_text = ", ".join(src_values)
+            t_series = pd.to_datetime(unmapped_events["datetime"], errors="coerce")
+            first_seen = t_series.min()
+            last_seen = t_series.max()
+            status_vals = unmapped_events["App Status"].fillna("").astype(str).str.strip()
+            status_label = "Unauthorized" if status_vals.eq("Unauthorized").any() else "Authorized"
+            risk_rank = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Safe": 0}
+            risk_vals = unmapped_events["Risk Level"].fillna("Safe").astype(str).str.strip()
+            risk_scores = risk_vals.map(risk_rank).fillna(0).astype(int)
+            max_score = int(risk_scores.max()) if not risk_scores.empty else 0
+            score_to_risk = {4: "Critical", 3: "High", 2: "Medium", 1: "Low", 0: "Safe"}
+            inventory_df = pd.DataFrame(
+                [
+                    {
+                        "destination": "Unmapped Events",
+                        "lookup_destination": "Unmapped Events",
+                        "application_or_identifier": "Unmapped",
+                        "sources": source_text,
+                        "status": status_label,
+                        "first_seen": first_seen,
+                        "last_seen": last_seen,
+                        "hits": int(len(unmapped_events)),
+                        "max_risk": score_to_risk.get(max_score, "Safe"),
+                        "identity_type": "Unmapped",
+                        "conn_ports": "",
+                    }
+                ]
+            )
 
     if inventory_df.empty:
         st.info("No valid application/software/domain identifiers were detected for this MAC with the current filters.")
@@ -1949,6 +2882,8 @@ def show_forensics_dialog(conn):
         inv_allow_editable = JsCode(
             """
             function(params) {
+                const app = (params.data && params.data.application_or_identifier ? params.data.application_or_identifier : '').toString().toLowerCase();
+                if (app === 'unmapped') return false;
                 const status = (params.data && params.data.status ? params.data.status : '').toString().toLowerCase();
                 return status !== 'authorized';
             }
@@ -2014,6 +2949,8 @@ def show_forensics_dialog(conn):
             autoHeight=True,
             tooltipField="sources",
         )
+        gb_inv.configure_column("identity_type", header_name="Identifier Type", width=128)
+        gb_inv.configure_column("conn_ports", header_name="Port(s)", width=108)
         gb_inv.configure_column(
             "Allowed",
             header_name="Allowed",
@@ -2030,6 +2967,7 @@ def show_forensics_dialog(conn):
         gb_inv.configure_column("last_seen", header_name="Last Seen", width=152)
         gb_inv.configure_column("hits", header_name="Hits", width=72)
         gb_inv.configure_column("max_risk", header_name="Max Risk", width=94, cellStyle=inv_risk_style)
+        gb_inv.configure_column("lookup_destination", hide=True)
         gb_inv.configure_column("_allow_key", hide=True)
 
         ag_theme, ag_css = get_aggrid_theme_and_css()
@@ -2060,9 +2998,14 @@ def show_forensics_dialog(conn):
             f"{len(inv_grid):,} rows shown. Each row is a Destination + Application/Identifier for this MAC with current filters."
         )
         st.caption(
-            "Only valid apps/domains are shown. Sources are merged, First Seen/Last Seen/Hits are aggregated, "
-            "Unauthorized and Max Risk show the highest severity seen. Click Application/Identifier for details "
-            "or toggle Allowed on unauthorized rows to start allowlisting."
+            "Rows are grouped by Destination + Application/Identifier. Sources are merged, First Seen/Last Seen/Hits "
+            "are aggregated, and Unauthorized/Max Risk show highest severity seen. An 'Unmapped' row may appear so "
+            "table Hits reconcile to Events. Click Application/Identifier for details or toggle Allowed on unauthorized "
+            "rows to start allowlisting."
+        )
+        st.caption(
+            "Software/CONN rows may use inferred Destination from nearest non-software events for this MAC (\u00b12s). "
+            "Port(s) inferred are labeled '(inferred)'."
         )
 
         edited_inv = inv_grid_response.get("data", None)
@@ -2110,12 +3053,14 @@ def show_forensics_dialog(conn):
             and not st.session_state.get("shadow_app_detail_dialog_open")
         ):
             sel_dest = str(selected_inv.get("destination", "") or "").strip()
+            sel_dest_lookup = str(selected_inv.get("lookup_destination", sel_dest) or "").strip()
             sel_app = str(selected_inv.get("application_or_identifier", "") or "").strip()
-            if sel_dest and sel_app:
+            if sel_dest and sel_app and sel_app.lower() != "unmapped":
                 _open_inventory_app_dialog(
                     {
                         "mac": target_mac,
                         "destination": sel_dest,
+                        "destination_lookup": sel_dest_lookup,
                         "application_or_identifier": sel_app,
                         "selected_f_source": selected_f_source,
                         "forensic_risk": list(forensic_risk),
@@ -2335,23 +3280,27 @@ def render_shadow_apps(parquet_root: Path):
         is_all_risk_selected = bool(audit_risk_filter) and set(audit_risk_filter) == set(RISK_OPTIONS)
         is_all_sources_selected = bool(audit_sources) and set(audit_source_filter) == set(audit_sources)
 
-        if audit_risk_filter and not is_all_risk_selected:
+        if not audit_risk_filter:
+            where.append("1=0")
+        elif not is_all_risk_selected:
             in_clause = _build_in_clause(audit_risk_filter, params)
             where.append(f""""Risk Level" IN {in_clause}""")
 
         if search_query_audit:
             q = f"%{search_query_audit}%"
-            where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ?)")
-            params.extend([q, q, q, q])
+            where.append("(mac ILIKE ? OR hostname ILIKE ? OR ip ILIKE ? OR domain_clean ILIKE ? OR app_identity ILIKE ?)")
+            params.extend([q, q, q, q, q])
 
-        if audit_source_filter and not is_all_sources_selected:
+        if audit_sources and not audit_source_filter:
+            where.append("1=0")
+        elif audit_source_filter and not is_all_sources_selected:
             in_clause = _build_in_clause(audit_source_filter, params)
             where.append(f"source_log IN {in_clause}")
 
         where_sql = "WHERE " + " AND ".join(where) if where else ""
 
         audit_sql = f"""
-        WITH base AS (
+        WITH raw AS (
             SELECT
                 domain_clean,
                 mac,
@@ -2360,9 +3309,121 @@ def render_shadow_apps(parquet_root: Path):
                 source_log,
                 datetime,
                 _risk_score,
-                "Risk Basis" AS risk_basis
+                "Risk Basis" AS risk_basis,
+                app_identity,
+                dst_port
             FROM shadow_events
             {where_sql}
+        ),
+        host_counts AS (
+            SELECT
+                lower(trim(mac)) AS mac_key,
+                trim(hostname) AS pref_hostname,
+                COUNT(*) AS hits,
+                MAX(datetime) AS last_seen
+            FROM shadow_events
+            WHERE mac IS NOT NULL
+              AND trim(mac) <> ''
+              AND lower(trim(mac)) NOT IN ('unknown', 'nan', 'none', 'null')
+              AND hostname IS NOT NULL
+              AND trim(hostname) <> ''
+              AND lower(trim(hostname)) NOT IN ('unknown', 'nan', 'none', 'null', 'n/a', '-')
+            GROUP BY 1,2
+        ),
+        host_pref AS (
+            SELECT mac_key, pref_hostname
+            FROM (
+                SELECT
+                    mac_key,
+                    pref_hostname,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY mac_key
+                        ORDER BY hits DESC, last_seen DESC, pref_hostname ASC
+                    ) AS rn
+                FROM host_counts
+            ) t
+            WHERE rn = 1
+        ),
+        domain_counts AS (
+            SELECT
+                lower(trim(mac)) AS mac_key,
+                lower(trim(ip)) AS ip_key,
+                trim(domain_clean) AS pref_domain,
+                COUNT(*) AS hits,
+                MAX(datetime) AS last_seen
+            FROM shadow_events
+            WHERE mac IS NOT NULL
+              AND trim(mac) <> ''
+              AND lower(trim(mac)) NOT IN ('unknown', 'nan', 'none', 'null')
+              AND ip IS NOT NULL
+              AND trim(ip) <> ''
+              AND lower(trim(ip)) NOT IN ('unknown', '0.0.0.0', 'nan', 'none', 'null')
+              AND domain_clean IS NOT NULL
+              AND trim(domain_clean) <> ''
+              AND lower(trim(domain_clean)) <> 'unidentified_activity'
+            GROUP BY 1,2,3
+        ),
+        domain_pref AS (
+            SELECT mac_key, ip_key, pref_domain
+            FROM (
+                SELECT
+                    mac_key,
+                    ip_key,
+                    pref_domain,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY mac_key, ip_key
+                        ORDER BY hits DESC, last_seen DESC, pref_domain ASC
+                    ) AS rn
+                FROM domain_counts
+            ) t
+            WHERE rn = 1
+        ),
+        base AS (
+            SELECT
+                CASE
+                    WHEN r.domain_clean IS NOT NULL
+                     AND trim(r.domain_clean) <> ''
+                     AND lower(trim(r.domain_clean)) <> 'unidentified_activity'
+                        THEN trim(r.domain_clean)
+                    WHEN dp.pref_domain IS NOT NULL AND trim(dp.pref_domain) <> ''
+                        THEN trim(dp.pref_domain)
+                    WHEN r.app_identity IS NOT NULL
+                     AND trim(r.app_identity) <> ''
+                     AND lower(trim(r.app_identity)) NOT IN ('unknown', 'nan', 'none', 'null', 'n/a', '-', 'unidentified_activity')
+                     AND lower(trim(r.app_identity)) <> 'conn telemetry'
+                     AND lower(trim(r.app_identity)) NOT LIKE 'conn port %'
+                        THEN trim(r.app_identity)
+                    WHEN try_cast(r.dst_port AS INT) > 0
+                        THEN 'port/' || CAST(try_cast(r.dst_port AS INT) AS VARCHAR)
+                    WHEN r.ip IS NOT NULL
+                     AND trim(r.ip) <> ''
+                     AND lower(trim(r.ip)) NOT IN ('unknown', '0.0.0.0', 'nan', 'none', 'null')
+                        THEN trim(r.ip)
+                    WHEN hp.pref_hostname IS NOT NULL AND trim(hp.pref_hostname) <> ''
+                        THEN trim(hp.pref_hostname)
+                    ELSE 'unresolved_destination'
+                END AS domain_clean,
+                COALESCE(NULLIF(trim(r.mac), ''), 'unknown') AS mac,
+                CASE
+                    WHEN r.hostname IS NOT NULL
+                     AND trim(r.hostname) <> ''
+                     AND lower(trim(r.hostname)) NOT IN ('unknown', 'nan', 'none', 'null', 'n/a', '-')
+                        THEN trim(r.hostname)
+                    WHEN hp.pref_hostname IS NOT NULL AND trim(hp.pref_hostname) <> ''
+                        THEN trim(hp.pref_hostname)
+                    ELSE 'Unknown'
+                END AS hostname,
+                COALESCE(NULLIF(trim(r.ip), ''), 'Unknown') AS ip,
+                COALESCE(NULLIF(trim(r.source_log), ''), 'UNKNOWN') AS source_log,
+                r.datetime,
+                r._risk_score,
+                r.risk_basis
+            FROM raw r
+            LEFT JOIN host_pref hp
+              ON lower(trim(r.mac)) = hp.mac_key
+            LEFT JOIN domain_pref dp
+              ON lower(trim(r.mac)) = dp.mac_key
+             AND lower(trim(r.ip)) = dp.ip_key
         ),
         agg AS (
             SELECT
@@ -2385,7 +3446,7 @@ def render_shadow_apps(parquet_root: Path):
                 hostname,
                 ip,
                 source_log,
-                risk_basis AS Max_Risk_Reason,
+                COALESCE(NULLIF(trim(risk_basis), ''), 'No explicit reason captured') AS Max_Risk_Reason,
                 ROW_NUMBER() OVER (
                     PARTITION BY domain_clean, mac, hostname, ip, source_log
                     ORDER BY _risk_score DESC, datetime DESC
@@ -2411,20 +3472,18 @@ def render_shadow_apps(parquet_root: Path):
             b.Max_Risk_Reason
         FROM agg a
         LEFT JOIN (SELECT * FROM pick_basis WHERE rn = 1) b
-            ON a.domain_clean=b.domain_clean
-           AND a.mac=b.mac
-           AND a.hostname=b.hostname
-           AND a.ip=b.ip
-           AND a.source_log=b.source_log
+            ON a.domain_clean IS NOT DISTINCT FROM b.domain_clean
+           AND a.mac IS NOT DISTINCT FROM b.mac
+           AND a.hostname IS NOT DISTINCT FROM b.hostname
+           AND a.ip IS NOT DISTINCT FROM b.ip
+           AND a.source_log IS NOT DISTINCT FROM b.source_log
         ORDER BY a.Max_Risk_Score DESC, a.Hits DESC
         LIMIT 1000
         """
 
         display_df = _sql_fetch_df(conn, audit_sql, params)
 
-        if display_df.empty:
-            st.info("No logs match your filter.")
-        else:
+        if not display_df.empty:
             # Add row index column for easier navigation.
             df_grid = display_df.copy()
             df_grid.insert(0, "#", range(1, len(df_grid) + 1))
