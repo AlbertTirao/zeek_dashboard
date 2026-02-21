@@ -1854,11 +1854,6 @@ def show_shadow_sharing_device_dialog(
 
 def render_shadow_sharing(parquet_root: Path):
     inject_shadow_sharing_css()
-    st.markdown("### Data Exfiltration Monitoring")
-    st.markdown(
-        "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN/FILES telemetry to surface potential shadow sharing and exfiltration paths.</div>",
-        unsafe_allow_html=True,
-    )
 
     parquet_root = Path(parquet_root)
     if not parquet_root.exists():
@@ -1870,14 +1865,16 @@ def render_shadow_sharing(parquet_root: Path):
         st.warning("No logs found.")
         return
 
-    top1, top2, top3 = st.columns([1.5, 2.3, 0.8])
-    with top1:
-        selected_date = st.selectbox(
-            "Dataset Scope",
-            available_dates,
-            index=0,
-            key="shadow_sharing_date",
-        )
+    def _on_scope_change():
+        _close_shadow_sharing_dialog()
+
+    selected_date = st.selectbox(
+        "Dataset Scope",
+        available_dates,
+        index=0,
+        key="shadow_sharing_date",
+        on_change=_on_scope_change,
+    )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
     st.session_state.setdefault("shadow_sharing_dialog_open", False)
     st.session_state.setdefault("shadow_sharing_dialog_mac", None)
@@ -1888,69 +1885,32 @@ def render_shadow_sharing(parquet_root: Path):
     st.session_state.setdefault("shadow_sharing_threat_base_df", None)
     st.session_state.setdefault("shadow_sharing_threat_cache_key", None)
     st.session_state.setdefault("shadow_sharing_threat_summary", None)
-    with top2:
-        scope_label = selected_date
-        st.markdown(
-            f"<div class='shadow-day-chip'>Active scope: &nbsp; <strong>{scope_label}</strong></div>",
-            unsafe_allow_html=True,
-        )
-    with top3:
-        st.write("")
-        st.write("")
-        if st.button("Refresh", key="shadow_sharing_refresh"):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.session_state.pop("shadow_sharing_threat_base_df", None)
-            st.session_state.pop("shadow_sharing_threat_cache_key", None)
-            st.session_state.pop("shadow_sharing_threat_summary", None)
-            st.rerun()
 
-    with st.expander("Detection basis (what this page detects)", expanded=False):
-        st.write(
-            "This page correlates Zeek telemetry (HTTP/SSL/DNS/CONN/FILES) and flags potential Shadow Sharing / Exfiltration.\n"
-            "- Allowed/Unapproved is based on whitelist_domains.yaml (Allow_Basis shows which entry matched).\n"
-            "- Action is inferred from HTTP method/URI patterns, client type, and files telemetry.\n"
-            "- DNS exfil heuristics flag tunneling-like query patterns.\n"
-            "- Risk_Score/Risk Level is computed with an explainable Risk_Basis string."
-        )
+    search_q = st.text_input("Search (MAC, Host, IP, Destination, Basis)", placeholder="e.g., 192.168.1.14",)
 
-    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns([2.0, 1.35, 1.55, 1.2])
+    c1, c2, c3 = st.columns([1.8, 1.4, 1.2])
     with c1:
-        selected_sources = st.multiselect("Protocols", ["http", "ssl", "dns", "conn", "files"], default=["http", "ssl", "dns", "files"])
-    with c2:
-        show_only_unapproved = st.checkbox("Only Unapproved", value=False)
-    with c3:
-        selected_risk_levels = st.multiselect("Risk Level", ["CRITICAL", "HIGH", "MEDIUM", "LOW"], default=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
-    with c4:
-        min_bytes_mb = st.number_input("Min Bytes (MB)", min_value=0, value=0, step=10)
-
-    c5, c6, c7 = st.columns([1.8, 1.4, 2.6])
-    with c5:
         action_filter = st.multiselect(
             "Action",
             ["Upload", "Post Data", "Paste/Share", "File Transfer", "Remote Access", "Automated Access", "Browse", "Encrypted Access", "Raw Connection", "DNS Lookup"],
             default=[],
             placeholder="All actions",
         )
-    with c6:
+    with c2:
         category_filter = st.multiselect(
             "Category",
             ["Cloud Storage", "Paste", "Messaging", "Code Repo", "Remote Access", "Unknown"],
             default=[],
             placeholder="All categories",
         )
-    with c7:
-        search_q = st.text_input("Search (MAC, Host, IP, Destination, Basis)", placeholder="Enter keywords...")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with c3:
+        min_bytes_mb = st.number_input("Min Bytes (MB)", min_value=0, value=0, step=10)
 
-    source_summary = ", ".join(selected_sources) if selected_sources else "None"
-    risk_level_summary = ", ".join(selected_risk_levels) if selected_risk_levels else "None"
-    search_summary = "On" if (search_q or "").strip() else "Off"
-    st.markdown(
-        f"<div class='shadow-filter-hint'>Protocols: <strong>{source_summary}</strong> | Risk Level: <strong>{risk_level_summary}</strong> | Only Unapproved: <strong>{'Yes' if show_only_unapproved else 'No'}</strong> | Search: <strong>{search_summary}</strong></div>",
-        unsafe_allow_html=True,
-    )
+    c4, c5 = st.columns([1.55, 2.0])
+    with c4:
+        selected_risk_levels = st.multiselect("Risk Level", ["CRITICAL", "HIGH", "MEDIUM", "LOW"], default=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
+    with c5:
+        selected_sources = st.multiselect("Source Logs", ["http", "ssl", "dns", "conn", "files"], default=["http", "ssl", "dns", "files"])
 
     # Date scope
     target_dates = [selected_date] if selected_date else []
@@ -1966,9 +1926,6 @@ def render_shadow_sharing(parquet_root: Path):
 
     if selected_sources:
         filtered = filtered[filtered["log_source"].isin(selected_sources)]
-
-    if show_only_unapproved:
-        filtered = filtered[filtered["Allowed"] == False]  # noqa: E712
 
     if selected_risk_levels:
         filtered = filtered[filtered["Severity"].isin(selected_risk_levels)]
@@ -2002,7 +1959,6 @@ def render_shadow_sharing(parquet_root: Path):
     main_filter_cache_key = (
         selected_scope_key,
         _normalized_token_tuple(selected_sources),
-        bool(show_only_unapproved),
         _normalized_token_tuple(selected_risk_levels, upper=True),
         int(min_bytes_mb),
         _normalized_token_tuple(action_filter),
@@ -2579,38 +2535,20 @@ def render_shadow_sharing(parquet_root: Path):
 
             st.divider()
 
-            u_chart1, u_chart2 = st.columns([2, 1])
-            with u_chart1:
-                st.markdown("#### Top Exfiltration Destinations")
-                if not top_unauth.empty:
-                    fig_u1 = px.bar(
-                        top_unauth,
-                        x="Hits",
-                        y="Domain",
-                        orientation="h",
-                        color_discrete_sequence=["#f97316"],
-                    )
-                    style_plotly_figure(fig_u1, height=360, show_legend=False)
-                    fig_u1.update_layout(yaxis={"categoryorder": "total ascending"})
-                    st.plotly_chart(fig_u1, use_container_width=True)
-                else:
-                    st.info("No exfiltration destinations found.")
-
-            with u_chart2:
-                st.markdown("#### Risk Distribution")
-                if not risk_counts.empty:
-                    fig_u2 = px.pie(
-                        risk_counts,
-                        values="Count",
-                        names="Risk",
-                        color="Risk",
-                        color_discrete_map=SEVERITY_COLORS,
-                        hole=0.6,
-                    )
-                    style_plotly_figure(fig_u2, height=360)
-                    st.plotly_chart(fig_u2, use_container_width=True)
-                else:
-                    st.info("No risk distribution data.")
+            st.markdown("#### Risk Distribution")
+            if not risk_counts.empty:
+                fig_u2 = px.pie(
+                    risk_counts,
+                    values="Count",
+                    names="Risk",
+                    color="Risk",
+                    color_discrete_map=SEVERITY_COLORS,
+                    hole=0.6,
+                )
+                style_plotly_figure(fig_u2, height=360)
+                st.plotly_chart(fig_u2, use_container_width=True)
+            else:
+                st.info("No risk distribution data.")
 
             st.divider()
 
@@ -2734,6 +2672,15 @@ def render_shadow_sharing(parquet_root: Path):
                     update_mode=GridUpdateMode.NO_UPDATE,
                 )
                 st.caption(f"{len(detail_grid):,} detected exfil events shown (limited to {MAX_ROWS_DISPLAY:,}).")
+
+    with st.expander("Detection basis (what this page detects)", expanded=False):
+        st.write(
+            "This page correlates Zeek telemetry (HTTP/SSL/DNS/CONN/FILES) and flags potential Shadow Sharing / Exfiltration.\n"
+            "- Allowed/Unapproved is based on whitelist_domains.yaml (Allow_Basis shows which entry matched).\n"
+            "- Action is inferred from HTTP method/URI patterns, client type, and files telemetry.\n"
+            "- DNS exfil heuristics flag tunneling-like query patterns.\n"
+            "- Risk_Score/Risk Level is computed with an explainable Risk_Basis string."
+        )
 
     if st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac"):
         show_shadow_sharing_device_dialog(filtered, selected_scope_key=selected_scope_key)

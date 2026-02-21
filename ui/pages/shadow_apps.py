@@ -1666,14 +1666,14 @@ def show_forensics_dialog(conn):
     f_bottom_left, f_bottom_right = st.columns([2.6, 1.4])
     with f_bottom_left:
         forensic_risk = risk_multiselect(
-            "Filter Risk",
+            "Risk Level",
             key=f"dlg_risk_{target_mac}",
             default=RISK_OPTIONS,
             on_change=_mark_dialog_origin,
         )
     with f_bottom_right:
         selected_f_source = st.selectbox(
-            "Filter Source",
+            "Source Logs",
             ["All"] + f_raw_sources,
             key=f"dlg_src_{target_mac}",
             on_change=_mark_dialog_origin,
@@ -2307,13 +2307,13 @@ def render_shadow_apps(parquet_root: Path):
         st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         search_query_audit = st.text_input(
             "Search (MAC, Hostname, IP, Domain)",
-            placeholder="e.g., 192.168.1.14 or github.com",
+            placeholder="e.g., 192.168.1.14",
             key="audit_search",
         ).strip()
         bottom_filter_col1, bottom_filter_col2 = st.columns([2.2, 2.2])
         with bottom_filter_col1:
             audit_risk_filter = risk_multiselect(
-                "Filter Risk",
+                "Risk Level",
                 key="audit_risk_filter",
                 default=RISK_OPTIONS,
             )
@@ -2322,7 +2322,7 @@ def render_shadow_apps(parquet_root: Path):
             src_df_audit = _sql_fetch_df(conn, "SELECT DISTINCT source_log FROM shadow_events ORDER BY 1")
             audit_sources = src_df_audit["source_log"].dropna().tolist() if not src_df_audit.empty else []
             audit_source_filter = st.multiselect(
-                "Filter Source",
+                "Source Logs",
                 audit_sources,
                 default=audit_sources,   # default = all
                 key="audit_source_filter",
