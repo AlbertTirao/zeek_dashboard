@@ -24,11 +24,6 @@ DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WHITELIST_FILE = PROJECT_ROOT / "whitelist_domains.yaml"
 
-try:
-    from .constants import MAX_ROWS_DISPLAY
-except ImportError:
-    MAX_ROWS_DISPLAY = 1000
-
 SEVERITY_COLORS = {
     "CRITICAL": "#ef4444",
     "HIGH": "#f97316",
@@ -1652,20 +1647,6 @@ def style_plotly_figure(fig, *, height: int = 360, show_legend: bool = True):
     return fig
 
 
-def _risk_score_cellstyle() -> JsCode:
-    return JsCode(
-        """
-        function(params) {
-            const v = Number(params.value || 0);
-            if (v >= 80) return { 'color': '#ef4444', 'fontWeight': '900' };
-            if (v >= 60) return { 'color': '#f97316', 'fontWeight': '900' };
-            if (v >= 30) return { 'color': '#f59e0b', 'fontWeight': '800' };
-            return { 'color': '#22c55e', 'fontWeight': '700' };
-        }
-        """
-    )
-
-
 def _severity_cellstyle() -> JsCode:
     return JsCode(
         """
@@ -2068,22 +2049,6 @@ def show_shadow_sharing_device_dialog(
             color: #c7d6eb;
             line-height: 1.1;
         }
-        div[data-testid="stDialog"] .stTabs [data-baseweb="tab-list"] {
-            gap: 0.42rem;
-            margin-bottom: 0.4rem;
-        }
-        div[data-testid="stDialog"] .stTabs [data-baseweb="tab"] {
-            border: 1px solid rgba(148, 163, 184, 0.3);
-            background: rgba(255,255,255,0.03);
-            border-radius: 999px;
-            padding: 0.32rem 0.8rem;
-            font-size: 0.82rem;
-        }
-        div[data-testid="stDialog"] .stTabs [data-baseweb="tab"][aria-selected="true"] {
-            background: rgba(255,255,255,0.08);
-            border-color: rgba(186, 207, 234, 0.42);
-            font-weight: 700;
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2128,24 +2093,11 @@ def show_shadow_sharing_device_dialog(
             unsafe_allow_html=True,
         )
 
-    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    dlg_f1, dlg_f2 = st.columns([2.5, 1.0])
-    with dlg_f1:
-        dialog_search = st.text_input(
-            "Search In Device Scope",
-            placeholder="destination, IP, host, action, URI, risk basis...",
-            key=f"shadow_sharing_dlg_search_{selected_scope_key}_{mac_key}",
-        ).strip()
-    with dlg_f2:
-        row_options = [5000, 10000, 25000, 50000, 100000]
-        default_rows = 10000 if len(scoped) > 10000 else next((n for n in row_options if len(scoped) <= n), row_options[-1])
-        dialog_row_limit = st.selectbox(
-            "Rows To Analyze",
-            options=row_options,
-            index=row_options.index(default_rows),
-            key=f"shadow_sharing_dlg_rows_{selected_scope_key}_{mac_key}",
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
+    dialog_search = st.text_input(
+        "Search (destination, IP, host, action, URI, risk basis)",
+        placeholder="e.g., 192.168.1.14",
+        key=f"shadow_sharing_dlg_search_{selected_scope_key}_{mac_key}",
+    ).strip()
 
     scoped_all = scoped.copy()
     if dialog_search:
@@ -2180,15 +2132,13 @@ def show_shadow_sharing_device_dialog(
     total_mb = float(scoped_all["bytes"].sum()) / 1024 / 1024
     unapproved = int((scoped_all["Allowed"] == False).sum())  # noqa: E712
     unique_dest = int(scoped_all["destination"].replace({"": None, "Unknown": None}).dropna().nunique())
-    high_crit = int(scoped_all["Severity"].isin(["CRITICAL", "HIGH"]).sum())
 
     scoped = scoped_all.sort_values("ts", ascending=False).copy()
     matched_events = int(len(scoped))
-    if len(scoped) > int(dialog_row_limit):
-        scoped = scoped.head(int(dialog_row_limit)).copy()
-        st.caption(f"Performance mode: loaded latest {len(scoped):,} of {matched_events:,} matched events.")
-    else:
-        st.caption(f"Loaded {len(scoped):,} matched events.")
+    st.markdown(
+        f"<div class='shadow-filter-hint shadow-scope-hint'>Loaded <strong>{matched_events:,}</strong> matched events.</div>",
+        unsafe_allow_html=True,
+    )
 
     first_seen_txt = first_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(first_seen) else "-"
     last_seen_txt = last_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(last_seen) else "-"
@@ -2203,15 +2153,12 @@ def show_shadow_sharing_device_dialog(
         unsafe_allow_html=True,
     )
 
-    dm1, dm2, dm3, dm4 = st.columns(4)
+    dm1, dm2, dm3 = st.columns(3)
     dm1.metric("Scoped Events", f"{len(scoped):,}")
     dm2.metric("Unapproved", unapproved, delta="Investigate" if unapproved > 0 else "Clear", delta_color="inverse")
-    dm3.metric("Critical / High", f"{high_crit:,}", delta="High Risk" if high_crit > 0 else "None", delta_color="inverse")
-    dm4.metric("Total Volume", f"{total_mb:.2f} MB")
+    dm3.metric("Total Volume", f"{total_mb:.2f} MB")
 
-    tab_dest, tab_bursts, tab_log = st.tabs(["By Destination", "Bursts", "Event Log"])
-
-    with tab_dest:
+    with st.container():
         st.markdown("#### Destination Forensics")
 
         dest = scoped.groupby("destination", dropna=False).agg(
@@ -2235,7 +2182,6 @@ def show_shadow_sharing_device_dialog(
 
         gb_dest = GridOptionsBuilder.from_dataframe(dest_grid)
         gb_dest.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
-        gb_dest.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
         gb_dest.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
         gb_dest.configure_column("destination", header_name="Destination", minWidth=200)
         gb_dest.configure_column("Category", width=130)
@@ -2253,185 +2199,9 @@ def show_shadow_sharing_device_dialog(
             key=f"shadow_sharing_dest_grid_{selected_scope_key}_{mac_key}",
             height=430,
             update_mode=GridUpdateMode.NO_UPDATE,
-        )
-
-        st.markdown("#### Authorize Destination (allowlist)")
-
-        # Only offer domains/hosts (not IPs) that are currently unapproved in this scope.
-        cand = dest.copy()
-        cand["Allow_Basis"] = cand["Allow_Basis"].astype(str).fillna("")
-        cand = cand[cand["Allow_Basis"].eq("")]
-        cand = cand[~cand["destination"].astype(str).apply(lambda x: _is_ip_literal(_normalize_host(x)))]
-        cand = cand[~cand["destination"].astype(str).str.lower().isin(["unknown", "nan", "none", ""])]
-
-        candidates = cand["destination"].astype(str).dropna().unique().tolist()
-        candidates = sorted(candidates)[:200]
-
-        if not candidates:
-            st.caption("No unapproved domain-like destinations detected for this device in the selected scope.")
-        else:
-            sel_domain = st.selectbox("Select a destination to add to the whitelist", candidates, key=f"shadow_sharing_auth_select_{selected_scope_key}_{mac_key}")
-            is_admin = _is_admin_user()
-
-            if not is_admin:
-                st.caption("Admin-only action: set st.session_state['is_admin']=True or st.session_state['user_role']='admin' in your auth layer.")
-            if st.button("Authorize selected destination", key=f"shadow_sharing_auth_btn_{selected_scope_key}_{mac_key}", disabled=not is_admin):
-                ok, msg = _add_domain_to_whitelist(sel_domain)
-                if ok:
-                    st.success(msg)
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-
-    with tab_bursts:
-        st.markdown("#### Burst Detection (5-minute windows)")
-        b = scoped.copy()
-        b["bucket"] = b["ts"].dt.floor("5min")
-        b["mac"] = target_mac
-        b["bytes"] = pd.to_numeric(b["bytes"], errors="coerce").fillna(0)
-        if "destination" not in b.columns:
-            b["destination"] = "Unknown"
-        b["destination"] = b["destination"].astype(str).replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
-
-        top_app = (
-            b.groupby(["bucket", "mac", "destination"], dropna=False)["bytes"]
-            .sum()
-            .reset_index(name="top_app_bytes")
-            .sort_values(["bucket", "mac", "top_app_bytes", "destination"], ascending=[True, True, False, True])
-            .drop_duplicates(["bucket", "mac"], keep="first")
-            .rename(columns={"destination": "top_application"})
-        )
-
-        bursts = b.groupby(["bucket", "mac"], dropna=False).agg(
-            bytes=("bytes", "sum"),
-            events=("ts", "count"),
-            max_risk=("Risk_Score", "max"),
-            host=("host_name", lambda x: next((v for v in x.astype(str) if v), "")),
-        ).reset_index()
-        bursts = bursts.merge(top_app, on=["bucket", "mac"], how="left")
-        bursts["top_application"] = bursts["top_application"].fillna("Unknown").astype(str)
-        bursts["top_app_bytes"] = pd.to_numeric(bursts["top_app_bytes"], errors="coerce").fillna(0).astype(int)
-
-        top_bursts = bursts.sort_values(["max_risk", "bytes", "events"], ascending=False).head(200)
-
-        if top_bursts.empty:
-            st.info("No burst windows for this MAC.")
-        else:
-            fig = px.scatter(
-                top_bursts,
-                x="bucket",
-                y="mac",
-                size="bytes",
-                color="max_risk",
-                hover_data=["host", "events", "top_application", "top_app_bytes"],
-                template=get_plotly_template(),
-                render_mode="webgl" if len(top_bursts) > 2000 else "auto",
-                title="Top bursts (size=bytes, color=max risk)",
-            )
-            style_plotly_figure(fig, height=395, show_legend=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-            burst_grid = top_bursts.copy()
-            burst_grid.insert(0, "#", range(1, len(burst_grid) + 1))
-            burst_grid["bucket"] = pd.to_datetime(burst_grid["bucket"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
-            burst_grid["bytes"] = pd.to_numeric(burst_grid["bytes"], errors="coerce").fillna(0).astype(int)
-            burst_grid["max_risk"] = pd.to_numeric(burst_grid["max_risk"], errors="coerce").fillna(0).astype(int)
-            burst_grid["top_app_bytes"] = pd.to_numeric(burst_grid["top_app_bytes"], errors="coerce").fillna(0).astype(int)
-            burst_grid["max_risk_level"] = burst_grid["max_risk"].apply(_severity_label)
-            burst_grid = burst_grid.drop(columns=["max_risk"])
-
-            gb_burst = GridOptionsBuilder.from_dataframe(burst_grid)
-            gb_burst.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
-            gb_burst.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-            gb_burst.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
-            gb_burst.configure_column("bucket", header_name="Window", width=150)
-            gb_burst.configure_column("mac", header_name="MAC", minWidth=150)
-            gb_burst.configure_column("host", header_name="Host", minWidth=160)
-            gb_burst.configure_column("top_application", header_name="Top Application / Software", minWidth=220)
-            gb_burst.configure_column("top_app_bytes", header_name="Top App Bytes", width=140)
-            gb_burst.configure_column("events", header_name="Events", width=90)
-            gb_burst.configure_column("bytes", header_name="Bytes", width=130)
-            gb_burst.configure_column("max_risk_level", header_name="Max Risk Level", width=130, cellStyle=_severity_cellstyle())
-
-            render_shadow_aggrid(
-                burst_grid,
-                gb_burst,
-                key=f"shadow_sharing_burst_grid_{selected_scope_key}_{mac_key}",
-                height=430,
-                update_mode=GridUpdateMode.NO_UPDATE,
-            )
-
-    with tab_log:
-        head, btn = st.columns([4, 1])
-        with head:
-            st.markdown("#### Detailed Event Log (export-ready)")
-        with btn:
-            csv_data = scoped.to_csv(index=False).encode("utf-8")
-            st.download_button("Export CSV", csv_data, f"shadow_sharing_log_{mac_key}.csv", "text/csv")
-
-        st.markdown(
-            f"<div class='shadow-filter-hint'>Showing up to <strong>{MAX_ROWS_DISPLAY:,}</strong> rows from <strong>{len(scoped):,}</strong> loaded events (<strong>{matched_events:,}</strong> matched) for <strong>{target_mac}</strong>.</div>",
-            unsafe_allow_html=True,
-        )
-
-        cols = [
-            "ts", "host_name", "mac", "Identity_Confidence", "id.orig_h",
-            "destination", "vt_link",
-            "Allow_Basis",
-            "Category", "Action", "Action_Basis",
-            "bytes",
-            "Client_Type",
-            "Risk_Score", "Severity", "Risk_Basis",
-            "log_source",
-            "method", "uri",
-            "DNS_Exfil_Add", "DNS_Exfil_Reason",
-        ]
-
-        log_src = scoped.copy()
-        for c in cols:
-            if c not in log_src.columns:
-                log_src[c] = ""
-
-        view = log_src[cols].copy()
-        log_grid = view.head(MAX_ROWS_DISPLAY).copy()
-        log_grid.insert(0, "#", range(1, len(log_grid) + 1))
-        log_grid["ts"] = pd.to_datetime(log_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-        log_grid["bytes"] = pd.to_numeric(log_grid["bytes"], errors="coerce").fillna(0).astype(int)
-        log_grid["Risk_Score"] = pd.to_numeric(log_grid["Risk_Score"], errors="coerce").fillna(0).astype(int)
-
-        gb_log = GridOptionsBuilder.from_dataframe(log_grid)
-        gb_log.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
-        gb_log.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-        gb_log.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
-        gb_log.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
-        gb_log.configure_column("host_name", header_name="Host", minWidth=140, flex=1.2)
-        gb_log.configure_column("mac", header_name="MAC", minWidth=145, flex=1.15)
-        gb_log.configure_column("Identity_Confidence", header_name="Identity", minWidth=120, flex=1.0)
-        gb_log.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
-        gb_log.configure_column("destination", header_name="Destination", minWidth=180, flex=1.6)
-        gb_log.configure_column("vt_link", header_name="VirusTotal", minWidth=105, flex=0.9, cellRenderer=_link_cell_renderer())
-        gb_log.configure_column("Allow_Basis", header_name="Allow Basis", minWidth=200, flex=1.8)
-        gb_log.configure_column("Category", minWidth=120, flex=1.0)
-        gb_log.configure_column("Action", minWidth=130, flex=1.1)
-        gb_log.configure_column("bytes", header_name="Bytes", minWidth=110, flex=1.0)
-        gb_log.configure_column("Client_Type", header_name="Client", minWidth=120, flex=1.0)
-        gb_log.configure_column("Risk_Score", header_name="Risk Score", minWidth=95, flex=0.85, cellStyle=_risk_score_cellstyle())
-        gb_log.configure_column("Severity", header_name="Risk Level", minWidth=105, flex=0.95, cellStyle=_severity_cellstyle())
-        gb_log.configure_column("log_source", header_name="Source", minWidth=95, flex=0.9)
-        gb_log.configure_column("method", header_name="Method", minWidth=90, flex=0.9)
-        gb_log.configure_column("uri", header_name="URI", minWidth=220, flex=2.0)
-        gb_log.configure_column("Risk_Basis", header_name="Risk Basis", minWidth=220, flex=2.0)
-        gb_log.configure_column("Action_Basis", header_name="Action Basis", minWidth=210, flex=1.9)
-        gb_log.configure_column("DNS_Exfil_Reason", header_name="DNS Exfil Reason", minWidth=220, flex=2.0)
-
-        render_shadow_aggrid(
-            log_grid,
-            gb_log,
-            key=f"shadow_sharing_log_grid_{selected_scope_key}_{mac_key}",
-            height=520,
-            update_mode=GridUpdateMode.NO_UPDATE,
+            wrap_shell=False,
+            force_scrollbars=True,
+            hide_scrollbar_buttons=True,
         )
 
 
