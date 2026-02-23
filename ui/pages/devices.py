@@ -326,7 +326,15 @@ def load_visual_metrics_from_parquet(parquet_root: Path):
 # =====================================================
 # 1b) Alerts-aligned latest inventory (conn/dhcp/arp)
 # =====================================================
-@st.cache_data(show_spinner=False, ttl=120)
+@st.cache_data(show_spinner=False, ttl=180)
+def _list_alert_event_cache_files(parquet_root: Path) -> tuple[str, ...]:
+    cache_root = parquet_root / "_cache_alerts"
+    if not cache_root.exists():
+        return tuple()
+    return tuple(str(p) for p in sorted(cache_root.rglob("alerts_events.parquet")))
+
+
+@st.cache_data(show_spinner=False, ttl=600)
 def load_alerts_latest_inventory_rows(parquet_root: Path) -> pd.DataFrame:
     """
     Pull the same latest-per-MAC inventory basis used by Alerts page so
@@ -336,63 +344,64 @@ def load_alerts_latest_inventory_rows(parquet_root: Path) -> pd.DataFrame:
 
     latest = None
 
-    try:
-        from ui.pages import alerts as alerts_page
+    # Fast path: read normalized alert cache files directly.
+    # This avoids importing/rebuilding Alerts pipelines on Device page load.
+    cache_files = list(_list_alert_event_cache_files(parquet_root))
+    if cache_files:
+        try:
+            import duckdb
 
-        by_date_str = alerts_page._discover_date_dirs(str(parquet_root))
-        selected_date_dirs_key = tuple(
-            (date_str, str(Path(day_dir)))
-            for date_str in sorted(by_date_str.keys(), reverse=True)
-            for day_dir in by_date_str.get(date_str, [])
-        )
-        if selected_date_dirs_key:
-            raw_events, known_hosts_norm = alerts_page._load_cached_for_date_dirs_cached(
-                str(parquet_root), selected_date_dirs_key
-            )
-            if raw_events is not None and not raw_events.empty:
-                mac_to_ip, _ = alerts_page.build_known_maps(known_hosts_norm)
-                latest = alerts_page.build_device_table(raw_events, mac_to_ip)
-    except Exception:
-        latest = None
+            con = duckdb.connect(database=":memory:")
+            fallback = con.execute(
+                """
+                WITH ev AS (
+                  SELECT
+                    try_cast(ts_dt AS timestamp) AS ts_dt,
+                    cast(mac_norm AS varchar) AS mac_norm,
+                    NULLIF(NULLIF(cast(ip AS varchar), ''), 'nan') AS ip,
+                    NULLIF(NULLIF(cast(host AS varchar), ''), 'nan') AS host
+                  FROM read_parquet(?, union_by_name=true)
+                  WHERE mac_norm IS NOT NULL
+                )
+                SELECT
+                  mac_norm AS mac,
+                  ip,
+                  host,
+                  ts_dt AS ts
+                FROM ev
+                WHERE ts_dt IS NOT NULL
+                QUALIFY row_number() OVER (PARTITION BY mac_norm ORDER BY ts_dt DESC) = 1
+                """,
+                [cache_files],
+            ).df()
+            con.close()
 
-    # Fallback: read normalized alert cache files directly when the primary
-    # import/load path is unavailable, so Device Inspection still reconciles.
+            if fallback is not None and not fallback.empty:
+                latest = fallback[["mac", "ip", "host", "ts"]].copy()
+        except Exception:
+            latest = None
+
+    # Slow fallback: run Alerts loading path only when cache files are missing
+    # or unreadable, so reconciliation remains available.
     if latest is None or latest.empty:
-        cache_root = parquet_root / "_cache_alerts"
-        cache_files = sorted(cache_root.rglob("alerts_events.parquet")) if cache_root.exists() else []
-        if cache_files:
-            try:
-                import duckdb
+        try:
+            from ui.pages import alerts as alerts_page
 
-                con = duckdb.connect(database=":memory:")
-                fallback = con.execute(
-                    """
-                    WITH ev AS (
-                      SELECT
-                        try_cast(ts_dt AS timestamp) AS ts_dt,
-                        cast(mac_norm AS varchar) AS mac_norm,
-                        NULLIF(NULLIF(cast(ip AS varchar), ''), 'nan') AS ip,
-                        NULLIF(NULLIF(cast(host AS varchar), ''), 'nan') AS host
-                      FROM read_parquet(?, union_by_name=true)
-                      WHERE mac_norm IS NOT NULL
-                    )
-                    SELECT
-                      mac_norm AS mac,
-                      ip,
-                      host,
-                      ts_dt AS ts
-                    FROM ev
-                    WHERE ts_dt IS NOT NULL
-                    QUALIFY row_number() OVER (PARTITION BY mac_norm ORDER BY ts_dt DESC) = 1
-                    """,
-                    [[str(p) for p in cache_files]],
-                ).df()
-                con.close()
-
-                if fallback is not None and not fallback.empty:
-                    latest = fallback[["mac", "ip", "host", "ts"]].copy()
-            except Exception:
-                latest = None
+            by_date_str = alerts_page._discover_date_dirs(str(parquet_root))
+            selected_date_dirs_key = tuple(
+                (date_str, str(Path(day_dir)))
+                for date_str in sorted(by_date_str.keys(), reverse=True)
+                for day_dir in by_date_str.get(date_str, [])
+            )
+            if selected_date_dirs_key:
+                raw_events, known_hosts_norm = alerts_page._load_cached_for_date_dirs_cached(
+                    str(parquet_root), selected_date_dirs_key
+                )
+                if raw_events is not None and not raw_events.empty:
+                    mac_to_ip, _ = alerts_page.build_known_maps(known_hosts_norm)
+                    latest = alerts_page.build_device_table(raw_events, mac_to_ip)
+        except Exception:
+            latest = None
 
     if latest is None or latest.empty:
         return pd.DataFrame(columns=base_cols)
