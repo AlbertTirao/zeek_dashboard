@@ -2000,35 +2000,6 @@ def _extract_selected_mac(selected_rows) -> Optional[str]:
     return selected_mac
 
 
-def _normalized_token_tuple(values, *, upper: bool = False) -> Tuple[str, ...]:
-    items = values if isinstance(values, list) else []
-    out: List[str] = []
-    seen = set()
-    for raw in items:
-        s = str(raw).strip()
-        if not s:
-            continue
-        s = s.upper() if upper else s.lower()
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    out.sort()
-    return tuple(out)
-
-
-def _build_text_search_blob(df: pd.DataFrame, columns: List[str]) -> pd.Series:
-    if df.empty:
-        return pd.Series([], index=df.index, dtype="object")
-    cols = [c for c in columns if c in df.columns]
-    if not cols:
-        return pd.Series([""] * len(df), index=df.index, dtype="object")
-    blob = df[cols[0]].astype(str).str.lower()
-    for c in cols[1:]:
-        blob = blob + " | " + df[c].astype(str).str.lower()
-    return blob.fillna("")
-
-
 @st.dialog("Device Forensics Details", width="large")
 def show_shadow_sharing_device_dialog(
     filtered: pd.DataFrame,
