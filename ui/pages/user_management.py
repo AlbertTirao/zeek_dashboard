@@ -1,7 +1,9 @@
 import pandas as pd
 import streamlit as st
+from datetime import datetime
 
 from services import auth_service
+from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 
 def _inject_user_management_css() -> None:
@@ -229,23 +231,19 @@ def _render_edit_user_dialog(
 
 def render(current_username: str):
     _inject_user_management_css()
+    inject_traffic_style_header_css()
 
     users = auth_service.list_users()
     total_users = len(users)
     admin_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
     staff_count = sum(1 for u in users if str(u.get("role", "")).lower() == "staff")
 
-    st.markdown(
-        """
-        <div class="um-page-header">
-          <div>
-            <div class="um-title">User Management</div>
-            <div class="um-sub">Admin-only controls for account provisioning and access governance.</div>
-          </div>
-          <div class="um-chip"><span class="um-chip-dot"></span>Identity Access</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    render_traffic_style_header(
+        title="User Management",
+        subtitle="Admin-only controls for account provisioning and access governance",
+        chip_label="Identity Access",
+        updated_txt=updated_txt,
     )
 
     m1, m2, m3 = st.columns(3, gap="large")

@@ -3,6 +3,7 @@
 
 import re
 import warnings
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -17,7 +18,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v8"
+CACHE_VERSION = "shadow-ai-cache-v10"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -97,21 +98,66 @@ def _harden_pattern(p: str) -> str:
     return rf"(?:^|[^a-z0-9_-])(?:{p})(?:$|[^a-z0-9_-])"
 
 
+DEFAULT_GENERIC_NAME_PATTERNS = [
+    r"\bgpt\b",
+    r"\bcopilot\b",
+    r"\bagent\b",
+    r"\bllm\b",
+    r"\bgenai\b",
+    r"\bai\b",
+]
+DEFAULT_FILE_UPLOAD_EXTENSIONS = ["csv", "xlsx", "xls", "pdf", "zip", "json"]
+DEFAULT_DETECTION_SETTINGS = {
+    "baseline_days": 30,
+    "large_https_post_threshold_mb": 5.0,
+    "medium_https_post_threshold_mb": 1.0,
+    "high_frequency_calls_per_hour": 50,
+    "json_post_calls_per_hour": 20,
+    "small_request_max_kb": 64,
+    "smb_window_minutes": 5,
+}
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def load_ai_signatures() -> Tuple[List[str], Dict[str, List[str]], Dict[str, List[str]], Dict[int, str], int]:
+def load_ai_signatures() -> Tuple[
+    List[str],
+    Dict[str, List[str]],
+    Dict[str, List[str]],
+    Dict[int, str],
+    List[str],
+    List[str],
+    Dict[str, float],
+    List[str],
+    int,
+]:
     """
     Reads ai_signatures.yaml:
       - ai_signatures: provider -> [regex fragments]
       - local_ai_ports: port -> label
       - authorized_providers: [provider names]
+      - generic_name_patterns: [regex fragments]
+      - saas_allowlist_domains: [domain suffixes]
+      - detection_settings: threshold and baseline tuning
+      - file_upload_extensions: [ext without dot]
     """
     y = _safe_yaml_load(AI_SIGNATURES_FILE)
 
     authorized = y.get("authorized_providers", []) or []
     ai_sigs = y.get("ai_signatures", {}) or {}
     local_ports = y.get("local_ai_ports", {}) or {}
+    generic_name_patterns = y.get("generic_name_patterns", []) or DEFAULT_GENERIC_NAME_PATTERNS
+    saas_allowlist_domains = y.get("saas_allowlist_domains", []) or []
+    file_upload_extensions = y.get("file_upload_extensions", []) or DEFAULT_FILE_UPLOAD_EXTENSIONS
+    det_raw = y.get("detection_settings", {}) or {}
 
     authorized = [str(x).strip() for x in authorized if str(x).strip()]
+    generic_name_patterns = [str(x).strip() for x in generic_name_patterns if str(x).strip()]
+    saas_allowlist_domains = [
+        str(x).strip().lower().lstrip("*.").strip(".")
+        for x in saas_allowlist_domains
+        if str(x).strip()
+    ]
+    file_upload_extensions = [str(x).strip().lower().lstrip(".") for x in file_upload_extensions if str(x).strip()]
 
     raw_ai: Dict[str, List[str]] = {}
     hardened_ai: Dict[str, List[str]] = {}
@@ -139,12 +185,88 @@ def load_ai_signatures() -> Tuple[List[str], Dict[str, List[str]], Dict[str, Lis
         except Exception:
             continue
 
+    def _to_int(v, default: int) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    def _to_float(v, default: float) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    detection_settings: Dict[str, float] = dict(DEFAULT_DETECTION_SETTINGS)
+    detection_settings["baseline_days"] = _to_int(det_raw.get("baseline_days"), int(DEFAULT_DETECTION_SETTINGS["baseline_days"]))
+    detection_settings["large_https_post_threshold_mb"] = _to_float(
+        det_raw.get("large_https_post_threshold_mb"),
+        float(DEFAULT_DETECTION_SETTINGS["large_https_post_threshold_mb"]),
+    )
+    detection_settings["medium_https_post_threshold_mb"] = _to_float(
+        det_raw.get("medium_https_post_threshold_mb"),
+        float(DEFAULT_DETECTION_SETTINGS["medium_https_post_threshold_mb"]),
+    )
+    detection_settings["high_frequency_calls_per_hour"] = _to_int(
+        det_raw.get("high_frequency_calls_per_hour"),
+        int(DEFAULT_DETECTION_SETTINGS["high_frequency_calls_per_hour"]),
+    )
+    detection_settings["json_post_calls_per_hour"] = _to_int(
+        det_raw.get("json_post_calls_per_hour"),
+        int(DEFAULT_DETECTION_SETTINGS["json_post_calls_per_hour"]),
+    )
+    detection_settings["small_request_max_kb"] = _to_int(
+        det_raw.get("small_request_max_kb"),
+        int(DEFAULT_DETECTION_SETTINGS["small_request_max_kb"]),
+    )
+    detection_settings["smb_window_minutes"] = _to_int(
+        det_raw.get("smb_window_minutes"),
+        int(DEFAULT_DETECTION_SETTINGS["smb_window_minutes"]),
+    )
+
+    # clamp invalid values
+    detection_settings["baseline_days"] = max(1, int(detection_settings["baseline_days"]))
+    detection_settings["large_https_post_threshold_mb"] = max(0.1, float(detection_settings["large_https_post_threshold_mb"]))
+    detection_settings["medium_https_post_threshold_mb"] = max(0.05, float(detection_settings["medium_https_post_threshold_mb"]))
+    detection_settings["high_frequency_calls_per_hour"] = max(1, int(detection_settings["high_frequency_calls_per_hour"]))
+    detection_settings["json_post_calls_per_hour"] = max(1, int(detection_settings["json_post_calls_per_hour"]))
+    detection_settings["small_request_max_kb"] = max(1, int(detection_settings["small_request_max_kb"]))
+    detection_settings["smb_window_minutes"] = max(1, int(detection_settings["smb_window_minutes"]))
+
     mtime_ns = int(AI_SIGNATURES_FILE.stat().st_mtime_ns) if AI_SIGNATURES_FILE.exists() else 0
-    return authorized, raw_ai, hardened_ai, fixed_ports, mtime_ns
+    return (
+        authorized,
+        raw_ai,
+        hardened_ai,
+        fixed_ports,
+        generic_name_patterns,
+        saas_allowlist_domains,
+        detection_settings,
+        file_upload_extensions,
+        mtime_ns,
+    )
 
 
-AUTHORIZED_PROVIDERS, RAW_AI_SIGNATURES, AI_SIGNATURES, LOCAL_AI_PORTS, SIG_MTIME_NS = load_ai_signatures()
+(
+    AUTHORIZED_PROVIDERS,
+    RAW_AI_SIGNATURES,
+    AI_SIGNATURES,
+    LOCAL_AI_PORTS,
+    GENERIC_NAME_PATTERNS,
+    SAAS_ALLOWLIST_DOMAINS,
+    DETECTION_SETTINGS,
+    FILE_UPLOAD_EXTENSIONS,
+    SIG_MTIME_NS,
+) = load_ai_signatures()
 AUTHORIZED_SET = {x.lower() for x in AUTHORIZED_PROVIDERS}
+
+BASELINE_DAYS = int(DETECTION_SETTINGS.get("baseline_days", 30))
+LARGE_UPLOAD_THRESHOLD_BYTES = int(float(DETECTION_SETTINGS.get("large_https_post_threshold_mb", 5.0)) * 1024 * 1024)
+MEDIUM_UPLOAD_THRESHOLD_BYTES = int(float(DETECTION_SETTINGS.get("medium_https_post_threshold_mb", 1.0)) * 1024 * 1024)
+HIGH_FREQUENCY_CALLS_PER_HOUR = int(DETECTION_SETTINGS.get("high_frequency_calls_per_hour", 50))
+JSON_POST_CALLS_PER_HOUR = int(DETECTION_SETTINGS.get("json_post_calls_per_hour", 20))
+SMALL_REQUEST_MAX_BYTES = int(DETECTION_SETTINGS.get("small_request_max_kb", 64) * 1024)
+SMB_WINDOW_MINUTES = int(DETECTION_SETTINGS.get("smb_window_minutes", 5))
 
 
 def _build_master_pattern(hardened_ai: Dict[str, List[str]]) -> str:
@@ -157,6 +279,26 @@ def _build_master_pattern(hardened_ai: Dict[str, List[str]]) -> str:
 
 
 MASTER_PATTERN = _build_master_pattern(AI_SIGNATURES)
+
+
+def _build_provider_hint_pattern(patterns: List[str]) -> re.Pattern:
+    compiled_parts: List[str] = []
+    for raw in patterns or []:
+        p = str(raw).strip()
+        if not p:
+            continue
+        try:
+            re.compile(p, re.IGNORECASE)
+            compiled_parts.append(f"(?:{p})")
+        except Exception:
+            compiled_parts.append(re.escape(p))
+
+    if not compiled_parts:
+        return re.compile(r"$^")
+    return re.compile("|".join(compiled_parts), re.IGNORECASE)
+
+
+GENERIC_PROVIDER_HINT_PATTERN = _build_provider_hint_pattern(GENERIC_NAME_PATTERNS)
 
 FUZZY_MIN_SCORE = 88
 FUZZY_TOKEN_STOPWORDS = {
@@ -277,6 +419,23 @@ def _build_fuzzy_alias_lookup(provider_aliases: Dict[str, List[str]]) -> Dict[st
 FUZZY_PROVIDER_ALIASES = _build_fuzzy_provider_aliases(RAW_AI_SIGNATURES)
 FUZZY_ALIAS_TO_PROVIDER = _build_fuzzy_alias_lookup(FUZZY_PROVIDER_ALIASES)
 FUZZY_ALIAS_CHOICES = sorted(FUZZY_ALIAS_TO_PROVIDER.keys())
+
+
+def _build_fuzzy_hint_pattern(alias_choices: List[str]) -> re.Pattern:
+    # Build a lightweight keyword gate to avoid expensive fuzzy checks on clearly unrelated text.
+    toks = set()
+    for alias in alias_choices or []:
+        for tok in str(alias).split():
+            tok = tok.strip().lower()
+            if len(tok) >= 4 and tok not in FUZZY_TOKEN_STOPWORDS:
+                toks.add(tok)
+    if not toks:
+        return re.compile(r"$^")
+    parts = [re.escape(t) for t in sorted(toks, key=len, reverse=True)]
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
+FUZZY_HINT_PATTERN = _build_fuzzy_hint_pattern(FUZZY_ALIAS_CHOICES)
 
 
 def _fuzzy_candidates_from_text(raw_text: str) -> List[str]:
@@ -415,7 +574,7 @@ def _ensure_ts_datetime(df: pd.DataFrame) -> pd.DataFrame:
 
     # mostly ISO-like
     non_na = s_str.dropna()
-    if len(non_na) > 0 and (non_na.apply(lambda x: bool(_ISO_LIKE.match(x))).mean() >= 0.80):
+    if len(non_na) > 0 and non_na.str.match(_ISO_LIKE).mean() >= 0.80:
         df["ts"] = pd.to_datetime(s_str, format="ISO8601", errors="coerce")
         return df
 
@@ -488,12 +647,36 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
                 remaining = provider.isna()
 
     if remaining.any():
-        rem_pos = remaining.to_numpy().nonzero()[0]
-        for pos in rem_pos:
-            prov, fuzzy_sig = _fuzzy_provider_match(text_series.iloc[pos], min_score=FUZZY_MIN_SCORE)
-            if prov != "Unknown":
-                provider.iloc[pos] = prov
-                sig.iloc[pos] = fuzzy_sig
+        rem = text_series[remaining]
+        if not rem.empty:
+            # Gate fuzzy work to AI-like tokens only, then run once per unique text.
+            rem_hint = rem[rem.str.contains(FUZZY_HINT_PATTERN, na=False, regex=True)]
+            if not rem_hint.empty:
+                fuzzy_map: Dict[str, Tuple[str, str]] = {}
+                for raw_text in rem_hint.drop_duplicates().tolist():
+                    prov, fuzzy_sig = _fuzzy_provider_match(raw_text, min_score=FUZZY_MIN_SCORE)
+                    if prov != "Unknown":
+                        fuzzy_map[raw_text] = (prov, fuzzy_sig)
+
+                if fuzzy_map:
+                    for raw_text, (prov, fuzzy_sig) in fuzzy_map.items():
+                        m = remaining & text_series.eq(raw_text)
+                        if m.any():
+                            provider[m] = prov
+                            sig[m] = fuzzy_sig
+                            remaining = provider.isna()
+
+    if remaining.any():
+        # Final heuristic fallback for new/unknown brands that still look AI-related.
+        rem = text_series[remaining]
+        try:
+            m_generic = rem.str.contains(GENERIC_PROVIDER_HINT_PATTERN, na=False, regex=True)
+        except Exception:
+            m_generic = pd.Series(False, index=rem.index)
+        if m_generic.any():
+            idx = rem.index[m_generic]
+            provider.loc[idx] = "Unidentified AI-like SaaS"
+            sig.loc[idx] = "generic-ai-pattern"
 
     return provider.fillna("Unknown"), sig.fillna("-")
 
@@ -753,6 +936,402 @@ def _to_domain_from_destination(dest: str) -> str:
     return s.lower()
 
 
+def _domain_series_from_destination(dest_series: pd.Series) -> pd.Series:
+    s = dest_series.astype(str).str.strip()
+    s = s.replace({"nan": "", "None": "", "-": ""})
+    s = s.str.replace("SNI:", "", regex=False).str.strip()
+    tail = s.str.rsplit(":", n=1).str[1]
+    base = s.str.rsplit(":", n=1).str[0]
+    has_numeric_tail = tail.str.fullmatch(r"\d+").fillna(False)
+    s = s.where(~has_numeric_tail, base)
+    return s.str.lower()
+
+
+def _is_public_domain_series(domain_series: pd.Series) -> pd.Series:
+    d = domain_series.astype(str).str.strip().str.lower()
+    has_dot = d.str.contains(r"\.", regex=True, na=False)
+    not_local = ~d.str.endswith((".local", ".lan", ".home", ".internal"), na=False)
+    not_localhost = ~d.str.startswith("localhost", na=False)
+    not_ip = ~d.str.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", na=False)
+    not_empty = d.ne("")
+    return has_dot & not_local & not_localhost & not_ip & not_empty
+
+
+def _domain_in_allowlist_series(domain_series: pd.Series, allowlist: List[str]) -> pd.Series:
+    d = domain_series.astype(str).str.strip().str.lower()
+    if not allowlist:
+        return pd.Series(False, index=d.index)
+    out = pd.Series(False, index=d.index)
+    for raw in allowlist:
+        suffix = str(raw).strip().lower().lstrip("*.").strip(".")
+        if not suffix:
+            continue
+        out = out | d.eq(suffix) | d.str.endswith("." + suffix, na=False)
+    return out
+
+
+def _resolve_lookback_dates(all_dates: List[str], target_dates: List[str], baseline_days: int) -> Tuple[str, ...]:
+    parsed_targets: List[date] = []
+    target_set = {str(x) for x in (target_dates or [])}
+    for d in target_set:
+        try:
+            parsed_targets.append(datetime.strptime(d, "%Y-%m-%d").date())
+        except Exception:
+            continue
+    if not parsed_targets:
+        return tuple()
+
+    first_target = min(parsed_targets)
+    start = first_target - timedelta(days=max(1, int(baseline_days)))
+
+    out: List[str] = []
+    for d in all_dates or []:
+        if d in target_set:
+            continue
+        try:
+            dt = datetime.strptime(str(d), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if start <= dt < first_target:
+            out.append(str(d))
+    return tuple(sorted(set(out)))
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_historical_host_domain_pairs_from_cache(parquet_root: Path, lookback_dates: Tuple[str, ...]) -> List[str]:
+    root = Path(parquet_root)
+    out: set[str] = set()
+    for d in lookback_dates or ():
+        cpath = cache_ai_events_path(root, str(d))
+        if not cpath.exists():
+            continue
+        df = None
+        for cols in (
+            ["id.orig_h", "Domain", "Destination"],
+            ["id.orig_h", "Domain"],
+            ["id.orig_h", "Destination"],
+            None,
+        ):
+            try:
+                if cols is None:
+                    df = pd.read_parquet(cpath)
+                else:
+                    df = pd.read_parquet(cpath, columns=cols)
+                break
+            except Exception:
+                continue
+        if df is None:
+            continue
+        if df.empty:
+            continue
+        if "id.orig_h" not in df.columns:
+            continue
+
+        host = _clean_ip_series(df["id.orig_h"]).fillna("")
+        if "Domain" in df.columns:
+            domain = df["Domain"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
+        else:
+            domain = _domain_series_from_destination(df.get("Destination", pd.Series("", index=df.index)))
+        valid = host.ne("") & domain.ne("")
+        if not valid.any():
+            continue
+        pairs = (host[valid] + "|" + domain[valid]).tolist()
+        out.update([p for p in pairs if p])
+    return sorted(out)
+
+
+def _append_reason(base: pd.Series, mask: pd.Series, label: str) -> pd.Series:
+    out = base.astype(str).replace({"nan": "", "None": ""}).copy()
+    m = mask.fillna(False)
+    if not m.any():
+        return out
+    left = m & out.ne("")
+    right = m & out.eq("")
+    out.loc[left] = out.loc[left] + " | " + label
+    out.loc[right] = label
+    return out
+
+
+def _smb_precursor_mask(events: pd.DataFrame, smb_events: pd.DataFrame) -> pd.Series:
+    mask_out = pd.Series(False, index=events.index)
+    if events.empty or smb_events is None or smb_events.empty:
+        return mask_out
+    if "id.orig_h" not in events.columns or "ts" not in events.columns:
+        return mask_out
+    if "id.orig_h" not in smb_events.columns or "ts" not in smb_events.columns:
+        return mask_out
+
+    src = events.get("Detection_Source", pd.Series("", index=events.index)).astype(str).str.upper()
+    method = events.get("method", pd.Series("", index=events.index)).astype(str).str.upper()
+    bytes_out = pd.to_numeric(events.get("Upload_Bytes", 0), errors="coerce").fillna(0)
+    is_candidate = src.eq("HTTP") & method.eq("POST") & bytes_out.ge(LARGE_UPLOAD_THRESHOLD_BYTES)
+    if not is_candidate.any():
+        return mask_out
+
+    lhs = events.loc[is_candidate, ["id.orig_h", "ts"]].copy()
+    lhs["id.orig_h"] = _clean_ip_series(lhs["id.orig_h"])
+    lhs["ts"] = pd.to_datetime(lhs["ts"], errors="coerce")
+    lhs = lhs.dropna(subset=["id.orig_h", "ts"])
+    if lhs.empty:
+        return mask_out
+    lhs["_row_index"] = lhs.index
+
+    rhs = smb_events[["id.orig_h", "ts"]].copy()
+    rhs["id.orig_h"] = _clean_ip_series(rhs["id.orig_h"])
+    rhs["ts"] = pd.to_datetime(rhs["ts"], errors="coerce")
+    rhs = rhs.dropna(subset=["id.orig_h", "ts"])
+    if rhs.empty:
+        return mask_out
+    rhs = rhs.rename(columns={"ts": "smb_ts"})
+
+    try:
+        lhs = lhs.sort_values(["id.orig_h", "ts"])
+        rhs = rhs.sort_values(["id.orig_h", "smb_ts"])
+        merged = pd.merge_asof(
+            lhs,
+            rhs,
+            by="id.orig_h",
+            left_on="ts",
+            right_on="smb_ts",
+            direction="backward",
+            tolerance=pd.Timedelta(minutes=SMB_WINDOW_MINUTES),
+        )
+        flagged = merged.loc[merged["smb_ts"].notna(), "_row_index"].tolist()
+        if flagged:
+            mask_out.loc[flagged] = True
+    except Exception:
+        return mask_out
+
+    return mask_out
+
+
+def _apply_behavioral_signals(
+    events: pd.DataFrame,
+    *,
+    historical_pairs: Optional[set[str]] = None,
+    smb_events: Optional[pd.DataFrame] = None,
+    baseline_days: int = 30,
+) -> pd.DataFrame:
+    if events is None or events.empty:
+        return events
+
+    out = events.copy()
+    out["ts"] = pd.to_datetime(out.get("ts", pd.Series(pd.NaT, index=out.index)), errors="coerce")
+    out["Upload_Bytes"] = pd.to_numeric(out.get("Upload_Bytes", 0), errors="coerce").fillna(0)
+
+    if "Domain" not in out.columns:
+        out["Domain"] = _domain_series_from_destination(out.get("Destination", pd.Series("", index=out.index)))
+    else:
+        out["Domain"] = out["Domain"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
+
+    host = _clean_ip_series(out.get("id.orig_h", pd.Series("", index=out.index))).fillna("")
+    source = out.get("Detection_Source", pd.Series("", index=out.index)).astype(str).str.upper()
+    method = out.get("method", pd.Series("", index=out.index)).astype(str).str.upper()
+    content_type = out.get("content_type", pd.Series("", index=out.index)).astype(str).str.lower()
+    uri = out.get("uri", pd.Series("", index=out.index)).astype(str).str.lower()
+    detail = out.get("Detail", pd.Series("", index=out.index)).astype(str).str.lower()
+    uri_or_detail = uri.where(uri.str.strip().ne(""), detail)
+
+    is_http_post = source.eq("HTTP") & method.eq("POST")
+    out["Large_HTTPS_Upload"] = is_http_post & out["Upload_Bytes"].ge(LARGE_UPLOAD_THRESHOLD_BYTES)
+    out["Medium_HTTPS_Upload"] = is_http_post & out["Upload_Bytes"].ge(MEDIUM_UPLOAD_THRESHOLD_BYTES)
+
+    ext_pat = ""
+    if FILE_UPLOAD_EXTENSIONS:
+        ext_pat = r"\.(?:" + "|".join([re.escape(x) for x in FILE_UPLOAD_EXTENSIONS]) + r")(?:$|[?&#])"
+    file_like_uri = uri_or_detail.str.contains(ext_pat, regex=True, na=False) if ext_pat else pd.Series(False, index=out.index)
+    file_like_mime = content_type.str.contains(
+        r"(csv|excel|spreadsheet|pdf|zip|json|application\/octet-stream)",
+        regex=True,
+        na=False,
+    )
+    out["File_Upload_Indicator"] = is_http_post & out["Medium_HTTPS_Upload"] & (file_like_uri | file_like_mime)
+
+    domain = out["Domain"].astype(str).str.strip().str.lower()
+    public_domain = _is_public_domain_series(domain)
+    allowlisted = _domain_in_allowlist_series(domain, SAAS_ALLOWLIST_DOMAINS)
+
+    pair = (host + "|" + domain).where(host.ne("") & domain.ne(""), "")
+    first_seen_ts = out.groupby(pair, dropna=False)["ts"].transform("min")
+    first_in_scope = out["ts"].eq(first_seen_ts) & pair.ne("")
+    historical_pairs = historical_pairs or set()
+    seen_before = pair.isin(historical_pairs) if historical_pairs else pd.Series(False, index=out.index)
+    out["First_Seen_SaaS"] = first_in_scope & public_domain & ~allowlisted & ~seen_before
+
+    actor = host.where(host.ne(""), out.get("mac", pd.Series("", index=out.index)).astype(str).str.lower())
+    hour = out["ts"].dt.floor("h")
+    group_frame = pd.DataFrame(
+        {
+            "actor": actor.fillna(""),
+            "provider": out.get("AI_Provider", pd.Series("", index=out.index)).astype(str),
+            "hour": hour,
+        },
+        index=out.index,
+    )
+    valid_group = group_frame["actor"].ne("") & group_frame["hour"].notna()
+    multi_key = pd.MultiIndex.from_arrays([group_frame["actor"], group_frame["provider"], group_frame["hour"]])
+
+    out["High_Freq_API"] = False
+    if valid_group.any():
+        grp = out.loc[valid_group].groupby(
+            [group_frame.loc[valid_group, "actor"], group_frame.loc[valid_group, "provider"], group_frame.loc[valid_group, "hour"]],
+            dropna=False,
+        ).agg(calls=("ts", "count"), avg_upload=("Upload_Bytes", "mean"))
+        high_idx = grp[(grp["calls"] >= HIGH_FREQUENCY_CALLS_PER_HOUR) & (grp["avg_upload"] <= SMALL_REQUEST_MAX_BYTES)].index
+        out["High_Freq_API"] = pd.Series(multi_key.isin(high_idx), index=out.index) & valid_group
+
+    json_post = is_http_post & content_type.str.contains(r"application\/json", regex=True, na=False)
+    out["JSON_Heavy_API"] = False
+    if (valid_group & json_post).any():
+        grp_json = out.loc[valid_group & json_post].groupby(
+            [group_frame.loc[valid_group & json_post, "actor"], group_frame.loc[valid_group & json_post, "provider"], group_frame.loc[valid_group & json_post, "hour"]],
+            dropna=False,
+        ).size()
+        json_idx = grp_json[grp_json >= JSON_POST_CALLS_PER_HOUR].index
+        out["JSON_Heavy_API"] = pd.Series(multi_key.isin(json_idx), index=out.index) & valid_group & json_post
+
+    existing_strong = out.get("Strong_Signal_Pattern", pd.Series(False, index=out.index)).astype(bool)
+    if smb_events is not None:
+        out["Strong_Signal_Pattern"] = existing_strong | _smb_precursor_mask(out, smb_events)
+    else:
+        out["Strong_Signal_Pattern"] = existing_strong
+    out["Governance_Alert"] = out["Large_HTTPS_Upload"] & (
+        out["First_Seen_SaaS"] | out["File_Upload_Indicator"] | out["High_Freq_API"] | out["JSON_Heavy_API"] | out["Strong_Signal_Pattern"]
+    )
+
+    indicators = pd.Series("", index=out.index, dtype="object")
+    indicators = _append_reason(indicators, out["First_Seen_SaaS"], f"First-seen SaaS ({int(baseline_days)}d baseline)")
+    indicators = _append_reason(indicators, out["Large_HTTPS_Upload"], f"Large HTTPS POST >= {int(round(LARGE_UPLOAD_THRESHOLD_BYTES / (1024 * 1024)))}MB")
+    indicators = _append_reason(indicators, out["File_Upload_Indicator"], "File-like upload correlation")
+    indicators = _append_reason(indicators, out["JSON_Heavy_API"], "JSON-heavy API traffic")
+    indicators = _append_reason(indicators, out["High_Freq_API"], f"High-frequency API ({HIGH_FREQUENCY_CALLS_PER_HOUR}/hour)")
+    indicators = _append_reason(indicators, out["Strong_Signal_Pattern"], f"SMB-to-upload precursor <= {SMB_WINDOW_MINUTES}min")
+    out["Behavior_Indicators"] = indicators.where(indicators.ne(""), "-")
+
+    basis = out.get("Detection_Basis", pd.Series("", index=out.index)).astype(str).replace({"nan": "", "None": ""})
+    basis = _append_reason(basis, out["First_Seen_SaaS"], "First-seen SaaS critical signal")
+    basis = _append_reason(basis, out["Governance_Alert"], "Governance alert pattern")
+    out["Detection_Basis"] = basis
+
+    return out
+
+
+def _compute_evidence_type(df: pd.DataFrame) -> pd.Series:
+    src = df.get("Detection_Source", pd.Series("", index=df.index)).astype(str).str.upper()
+    method = df.get("method", pd.Series("", index=df.index)).astype(str).str.upper()
+
+    out = src.copy()
+    out = out.replace({"": "Unknown", "NAN": "Unknown", "NONE": "Unknown"})
+
+    ssl_mask = src.eq("SSL")
+    dns_mask = src.str.startswith("DNS", na=False)
+    conn_mask = src.str.startswith("CONN", na=False)
+    http_mask = src.eq("HTTP")
+
+    out[ssl_mask] = "TLS SNI"
+    out[dns_mask] = "DNS query"
+    out[conn_mask] = "Local Port"
+    if http_mask.any():
+        http_ev = ("HTTP+" + method.where(method != "", "")).str.rstrip("+")
+        out[http_mask] = http_ev[http_mask]
+    return out
+
+
+def _compute_risk_score(df: pd.DataFrame) -> pd.Series:
+    source = df.get("Detection_Source", pd.Series("", index=df.index)).astype(str).str.upper()
+    method = df.get("method", pd.Series("", index=df.index)).astype(str).str.upper()
+    detail = df.get("Detail", pd.Series("", index=df.index)).astype(str).str.lower()
+    bytes_out = pd.to_numeric(df.get("Upload_Bytes", 0), errors="coerce").fillna(0.0)
+    client_type = df.get("Client_Type", pd.Series("", index=df.index)).astype(str)
+    first_seen = df.get("First_Seen_SaaS", pd.Series(False, index=df.index)).astype(bool)
+    governance_alert = df.get("Governance_Alert", pd.Series(False, index=df.index)).astype(bool)
+    json_heavy = df.get("JSON_Heavy_API", pd.Series(False, index=df.index)).astype(bool)
+    high_freq = df.get("High_Freq_API", pd.Series(False, index=df.index)).astype(bool)
+    file_upload = df.get("File_Upload_Indicator", pd.Series(False, index=df.index)).astype(bool)
+    strong_signal = df.get("Strong_Signal_Pattern", pd.Series(False, index=df.index)).astype(bool)
+
+    score = pd.Series(10, index=df.index, dtype="int64")
+    http = source.eq("HTTP")
+
+    score += http.astype(int) * 20
+    score += (http & method.eq("POST")).astype(int) * 20
+
+    gt_5mb = bytes_out >= LARGE_UPLOAD_THRESHOLD_BYTES
+    gt_1mb = bytes_out >= MEDIUM_UPLOAD_THRESHOLD_BYTES
+    gt_10kb = bytes_out > (10 * 1024)
+    score += (http & gt_5mb).astype(int) * 40
+    score += (http & (~gt_5mb) & gt_1mb).astype(int) * 20
+    score += (http & (~gt_1mb) & gt_10kb).astype(int) * 10
+
+    uri_hit = detail.str.contains(
+        r"/upload|/files|/embeddings|/fine-tune|v1/files|v1/embeddings|v1/chat/completions",
+        regex=True,
+        na=False,
+    )
+    score += (http & uri_hit).astype(int) * 15
+
+    score += source.eq("SSL").astype(int) * 15
+    score += source.str.startswith("DNS", na=False).astype(int) * 8
+    score += source.str.startswith("CONN", na=False).astype(int) * 12
+    score += client_type.eq("Automation / SDK").astype(int) * 15
+    score += first_seen.astype(int) * 25
+    score += governance_alert.astype(int) * 25
+    score += json_heavy.astype(int) * 10
+    score += high_freq.astype(int) * 10
+    score += file_upload.astype(int) * 8
+    score += strong_signal.astype(int) * 18
+
+    return score.clip(upper=100).astype(int)
+
+
+def _severity_from_scores(scores: pd.Series) -> pd.Series:
+    sev = pd.Series("LOW", index=scores.index, dtype="object")
+    sev[scores >= 30] = "MEDIUM"
+    sev[scores >= 60] = "HIGH"
+    sev[scores >= 80] = "CRITICAL"
+    return sev
+
+
+def _apply_critical_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df
+    risk = pd.to_numeric(out.get("Risk_Score", 0), errors="coerce").fillna(0).astype(int)
+    verdict = out.get("Policy_Verdict", pd.Series("", index=out.index)).astype(str)
+    first_seen = out.get("First_Seen_SaaS", pd.Series(False, index=out.index)).astype(bool)
+    gov_alert = out.get("Governance_Alert", pd.Series(False, index=out.index)).astype(bool)
+
+    critical_mask = first_seen & verdict.eq("Shadow AI")
+    high_mask = gov_alert & ~critical_mask
+
+    if critical_mask.any():
+        risk.loc[critical_mask] = risk.loc[critical_mask].clip(lower=85)
+        out.loc[critical_mask, "Severity"] = "CRITICAL"
+    if high_mask.any():
+        risk.loc[high_mask] = risk.loc[high_mask].clip(lower=65)
+        cur_sev = out.get("Severity", pd.Series("", index=out.index)).astype(str)
+        out.loc[high_mask & cur_sev.isin(["LOW", "MEDIUM"]), "Severity"] = "HIGH"
+
+    out["Risk_Score"] = risk
+    return out
+
+
+def _policy_columns(provider: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    p = provider.astype(str).str.lower()
+    allowed_mask = p.isin(AUTHORIZED_SET)
+
+    verdict = pd.Series("Shadow AI", index=provider.index, dtype="object")
+    verdict[allowed_mask] = "Allowed"
+
+    if AUTHORIZED_PROVIDERS:
+        basis = pd.Series("Provider is not on allowlist", index=provider.index, dtype="object")
+        basis[allowed_mask] = "Provider is on allowlist"
+    else:
+        basis = pd.Series("authorized_providers is empty (default deny)", index=provider.index, dtype="object")
+
+    return verdict, basis
+
+
 # =============================================================================
 # FILE DISCOVERY
 # =============================================================================
@@ -780,15 +1359,40 @@ def _collect_known_files(parquet_root: Path) -> List[Path]:
     if not parquet_root.exists():
         return known
     try:
-        for f in parquet_root.rglob("*.parquet"):
-            name = f.name.lower()
-            if ("known_hosts" in name) or ("knownhost" in name) or ("known_devices" in name) or ("knowndevices" in name):
-                known.append(f)
+        for p in parquet_root.iterdir():
+            if not p.is_dir() or not DATE_DIR_RE.match(p.name):
+                continue
+            for f in p.rglob("*.parquet"):
+                name = f.name.lower()
+                if ("known_hosts" in name) or ("knownhost" in name) or ("known_devices" in name) or ("knowndevices" in name):
+                    known.append(f)
     except Exception:
         pass
     return sorted(set(known))
 
 
+@st.cache_data(show_spinner=False)
+def _collect_known_files_by_date(parquet_root: Path) -> Dict[str, List[str]]:
+    parquet_root = Path(parquet_root)
+    out: Dict[str, List[str]] = {}
+    if not parquet_root.exists():
+        return out
+    try:
+        for p in parquet_root.iterdir():
+            if not p.is_dir() or not DATE_DIR_RE.match(p.name):
+                continue
+            files: List[str] = []
+            for f in p.rglob("*.parquet"):
+                name = f.name.lower()
+                if ("known_hosts" in name) or ("knownhost" in name) or ("known_devices" in name) or ("knowndevices" in name):
+                    files.append(str(f))
+            out[p.name] = sorted(set(files))
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(show_spinner=False)
 def _collect_date_logs(date_dir: Path) -> Dict[str, List[Path]]:
     buckets = {"http": [], "ssl": [], "dns": [], "conn": [], "dhcp": []}
     if not date_dir.exists():
@@ -871,11 +1475,12 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     ip_map, mac_map = _build_identity_maps(buckets["dhcp"], known_files)
 
     events: List[pd.DataFrame] = []
+    smb_events_frames: List[pd.DataFrame] = []
 
     # --- HTTP ---
     http_cols = [
         "ts", "id.orig_h", "id.resp_h", "id.resp_p",
-        "host", "uri", "user_agent", "method", "request_body_len",
+        "host", "uri", "user_agent", "method", "request_body_len", "content_type",
         "orig_l2_addr", "l2_addr", "src_mac",
     ]
     for f in buckets["http"]:
@@ -1009,37 +1614,47 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     # --- CONN (local AI ports) ---
     conn_cols = ["ts", "id.orig_h", "id.resp_h", "id.resp_p", "orig_ip_bytes", "orig_l2_addr", "l2_addr", "src_mac"]
     ports = sorted(LOCAL_AI_PORTS.keys())
-    if ports:
-        for f in buckets["conn"]:
-            df = _read_parquet_columns(f, conn_cols)
-            if df.empty or "id.resp_p" not in df.columns:
-                continue
-            df = _ensure_ts_datetime(df)
+    for f in buckets["conn"]:
+        df = _read_parquet_columns(f, conn_cols)
+        if df.empty or "id.resp_p" not in df.columns:
+            continue
+        df = _ensure_ts_datetime(df)
 
-            rp = pd.to_numeric(df["id.resp_p"], errors="coerce")
-            mask = rp.isin(ports)
-            if not mask.any():
-                continue
+        rp = pd.to_numeric(df["id.resp_p"], errors="coerce")
+        if "id.orig_h" in df.columns:
+            smb_mask = rp.eq(445)
+            if smb_mask.any():
+                smb = df.loc[smb_mask, ["id.orig_h", "ts"]].copy()
+                smb = smb.dropna(subset=["id.orig_h", "ts"])
+                if not smb.empty:
+                    smb_events_frames.append(smb)
 
-            hit = df.loc[mask].copy()
-            hit = _ensure_ts_datetime(hit)
+        if not ports:
+            continue
 
-            hit["id.resp_p"] = pd.to_numeric(hit["id.resp_p"], errors="coerce").fillna(-1).astype(int)
-            hit["AI_Provider"] = hit["id.resp_p"].map(LOCAL_AI_PORTS).fillna("Local/Custom AI")
-            hit["Signature_Match"] = hit["id.resp_p"].apply(lambda p: f"port {p}")
-            hit["Detection_Source"] = "CONN (Port)"
-            hit["Match_Field"] = "conn id.resp_p"
-            hit["Client_Type"] = "Local Tool"
-            hit["Upload_Bytes"] = pd.to_numeric(hit.get("orig_ip_bytes", 0), errors="coerce").fillna(0)
+        mask = rp.isin(ports)
+        if not mask.any():
+            continue
 
-            resp_h = hit.get("id.resp_h", "").astype(str).fillna("")
-            hit["Detail"] = "Port " + hit["id.resp_p"].astype(str) + " traffic"
-            hit["Destination"] = resp_h + ":" + hit["id.resp_p"].astype(str)
-            hit["user_agent"] = "-"
-            hit["Matched_Value"] = hit["Destination"].astype(str)
+        hit = df.loc[mask].copy()
+        hit = _ensure_ts_datetime(hit)
 
-            hit["Detection_Basis"] = "Local port match (" + hit["Signature_Match"].astype(str) + ")"
-            events.append(hit)
+        hit["id.resp_p"] = pd.to_numeric(hit["id.resp_p"], errors="coerce").fillna(-1).astype(int)
+        hit["AI_Provider"] = hit["id.resp_p"].map(LOCAL_AI_PORTS).fillna("Local/Custom AI")
+        hit["Signature_Match"] = hit["id.resp_p"].apply(lambda p: f"port {p}")
+        hit["Detection_Source"] = "CONN (Port)"
+        hit["Match_Field"] = "conn id.resp_p"
+        hit["Client_Type"] = "Local Tool"
+        hit["Upload_Bytes"] = pd.to_numeric(hit.get("orig_ip_bytes", 0), errors="coerce").fillna(0)
+
+        resp_h = hit.get("id.resp_h", "").astype(str).fillna("")
+        hit["Detail"] = "Port " + hit["id.resp_p"].astype(str) + " traffic"
+        hit["Destination"] = resp_h + ":" + hit["id.resp_p"].astype(str)
+        hit["user_agent"] = "-"
+        hit["Matched_Value"] = hit["Destination"].astype(str)
+
+        hit["Detection_Basis"] = "Local port match (" + hit["Signature_Match"].astype(str) + ")"
+        events.append(hit)
 
     if not events:
         return pd.DataFrame()
@@ -1054,6 +1669,10 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         "Matched_Value", "Detection_Basis", "Policy_Basis",
         "Upload_Bytes", "Risk_Score", "Severity", "Confidence",
         "Detail", "Destination", "user_agent",
+        "method", "uri", "content_type", "Domain", "Evidence_Type",
+        "Behavior_Indicators", "First_Seen_SaaS", "Governance_Alert",
+        "Large_HTTPS_Upload", "Medium_HTTPS_Upload", "File_Upload_Indicator",
+        "High_Freq_API", "JSON_Heavy_API", "Strong_Signal_Pattern",
     ]
     for c in required:
         if c not in final_df.columns:
@@ -1065,17 +1684,37 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     # normalize sizes
     final_df["Upload_Bytes"] = pd.to_numeric(final_df.get("Upload_Bytes", 0), errors="coerce").fillna(0)
 
-    # evidence + policy + scoring
-    final_df["Evidence_Type"] = final_df.apply(_evidence_type, axis=1)
-
-    final_df["Risk_Score"] = final_df.apply(calculate_severity, axis=1)
-    final_df["Severity"] = final_df["Risk_Score"].apply(normalize_severity_label)
-    final_df["Policy_Verdict"] = final_df["AI_Provider"].apply(_policy_verdict)
-    final_df["Policy_Basis"] = final_df["AI_Provider"].apply(_policy_basis)
-    final_df["Confidence"] = final_df["Detection_Source"].apply(_confidence)
-
     # derived domain
-    final_df["Domain"] = final_df["Destination"].apply(_to_domain_from_destination)
+    final_df["Domain"] = _domain_series_from_destination(final_df.get("Destination", pd.Series("", index=final_df.index)))
+
+    # policy
+    verdict, basis = _policy_columns(final_df["AI_Provider"])
+    final_df["Policy_Verdict"] = verdict
+    final_df["Policy_Basis"] = basis
+
+    # confidence
+    source = final_df.get("Detection_Source", pd.Series("", index=final_df.index)).astype(str).str.upper()
+    final_df["Confidence"] = pd.Series("Medium", index=final_df.index)
+    final_df.loc[source.isin(["HTTP", "SSL"]), "Confidence"] = "High"
+
+    # evidence and behavior heuristics
+    final_df["Evidence_Type"] = _compute_evidence_type(final_df)
+    smb_df = (
+        pd.concat(smb_events_frames, ignore_index=True)
+        if smb_events_frames
+        else pd.DataFrame(columns=["id.orig_h", "ts"])
+    )
+    final_df = _apply_behavioral_signals(
+        final_df,
+        historical_pairs=None,
+        smb_events=smb_df,
+        baseline_days=BASELINE_DAYS,
+    )
+
+    # risk scoring
+    final_df["Risk_Score"] = _compute_risk_score(final_df)
+    final_df["Severity"] = _severity_from_scores(final_df["Risk_Score"])
+    final_df = _apply_critical_overrides(final_df)
 
     final_df = final_df.sort_values("ts", ascending=False)
 
@@ -1090,6 +1729,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     return final_df
 
 
+@st.cache_data(show_spinner=False, ttl=180)
 def load_shadow_ai_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
     """
     Multi-date loader that reuses per-day caches (fast).
@@ -1098,13 +1738,17 @@ def load_shadow_ai_data(parquet_root: Path, target_dates: List[str]) -> pd.DataF
     if not parquet_root.exists():
         return pd.DataFrame()
 
-    known_files = _collect_known_files(parquet_root)
+    known_files_all = _collect_known_files(parquet_root)
+    known_files_by_date = _collect_known_files_by_date(parquet_root)
 
     frames: List[pd.DataFrame] = []
     for d in (target_dates or []):
         if not d or not DATE_DIR_RE.match(str(d)):
             continue
-        df_d = _build_one_date(parquet_root, str(d), known_files)
+        known_for_date = [Path(p) for p in known_files_by_date.get(str(d), [])]
+        if not known_for_date:
+            known_for_date = known_files_all
+        df_d = _build_one_date(parquet_root, str(d), known_for_date)
         if not df_d.empty:
             frames.append(df_d)
 
@@ -1113,6 +1757,18 @@ def load_shadow_ai_data(parquet_root: Path, target_dates: List[str]) -> pd.DataF
 
     out = pd.concat(frames, ignore_index=True)
     out = _ensure_ts_datetime(out)
+    all_dates = get_available_dates(parquet_root)
+    lookback_dates = _resolve_lookback_dates(all_dates, target_dates, BASELINE_DAYS)
+    historical_pairs = set(_load_historical_host_domain_pairs_from_cache(parquet_root, lookback_dates)) if lookback_dates else set()
+    out = _apply_behavioral_signals(
+        out,
+        historical_pairs=historical_pairs,
+        smb_events=None,
+        baseline_days=BASELINE_DAYS,
+    )
+    out["Risk_Score"] = _compute_risk_score(out)
+    out["Severity"] = _severity_from_scores(out["Risk_Score"])
+    out = _apply_critical_overrides(out)
     return out.sort_values("ts", ascending=False)
 
 
@@ -1149,11 +1805,142 @@ def _safe_value_counts_top(s: pd.Series) -> str:
     return str(vc.index[0]) if len(vc) else ""
 
 
+def _shadow_ai_data_stamp(df: pd.DataFrame) -> Tuple[int, str, str]:
+    if df is None or df.empty:
+        return (0, "", "")
+    ts_raw = df.get("ts", pd.Series([], dtype="datetime64[ns]"))
+    if pd.api.types.is_datetime64_any_dtype(ts_raw):
+        ts = ts_raw
+    else:
+        ts = pd.to_datetime(ts_raw, errors="coerce")
+    tmax = ts.max()
+    tmin = ts.min()
+    return (
+        int(len(df)),
+        str(tmax) if pd.notna(tmax) else "",
+        str(tmin) if pd.notna(tmin) else "",
+    )
+
+
+def _shadow_ai_mac_tab_cache_key(
+    selected_scope_key: str,
+    selected_verdict: List[str],
+    selected_severity: List[str],
+    provider_filter: List[str],
+    basis_field: List[str],
+    basis_sig: List[str],
+    evidence_filter: List[str],
+    min_upload_kb: float,
+    only_resolved_mac: bool,
+    ignore_dns_only: bool,
+    search_q: str,
+    data_stamp: Tuple[int, str, str],
+) -> Tuple[object, ...]:
+    return (
+        str(selected_scope_key),
+        tuple(sorted([str(x) for x in (selected_verdict or [])])),
+        tuple(sorted([str(x) for x in (selected_severity or [])])),
+        tuple(sorted([str(x) for x in (provider_filter or [])])),
+        tuple(sorted([str(x) for x in (basis_field or [])])),
+        tuple(sorted([str(x) for x in (basis_sig or [])])),
+        tuple(sorted([str(x) for x in (evidence_filter or [])])),
+        float(min_upload_kb or 0),
+        bool(only_resolved_mac),
+        bool(ignore_dns_only),
+        str(search_q or "").strip().lower(),
+        data_stamp,
+    )
+
+
+def _build_shadow_ai_mac_tab_frames(filtered: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    mac_view = filtered[filtered["Policy_Verdict"] == "Shadow AI"].copy()
+    if mac_view.empty:
+        return mac_view, pd.DataFrame()
+
+    mac_view["mac"] = mac_view["mac"].astype(str).str.strip().str.lower()
+    mac_view = mac_view[mac_view["mac"].str.contains(":", na=False)]
+    if mac_view.empty:
+        return mac_view, pd.DataFrame()
+
+    mac_summary = mac_view.groupby("mac").agg(
+        Host=("host_name", _safe_value_counts_top),
+        Last_Seen=("ts", "max"),
+        First_Seen=("ts", "min"),
+        Events=("ts", "count"),
+        Unique_Providers=("AI_Provider", lambda x: x.nunique()),
+        Total_Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
+        Top_Provider=("AI_Provider", _safe_value_counts_top),
+        Top_Domain=("Domain", _safe_value_counts_top),
+        Source_IP=("id.orig_h", _safe_value_counts_top),
+        Top_Evidence=("Evidence_Type", _safe_value_counts_top),
+        Max_Severity=("Severity", lambda x: "CRITICAL" if (x == "CRITICAL").any()
+                     else ("HIGH" if (x == "HIGH").any()
+                           else ("MEDIUM" if (x == "MEDIUM").any() else "LOW"))),
+    ).reset_index().sort_values(["Events", "Total_Upload_MB"], ascending=False)
+
+    return mac_view, mac_summary
+
+
+def _apply_shadow_ai_filters(
+    df: pd.DataFrame,
+    *,
+    selected_verdict: List[str],
+    selected_severity: List[str],
+    provider_filter: List[str],
+    basis_field: List[str],
+    basis_sig: List[str],
+    evidence_filter: List[str],
+    min_upload_kb: float,
+    only_resolved_mac: bool,
+    ignore_dns_only: bool,
+    search_q: str,
+) -> pd.DataFrame:
+    filtered = df.copy()
+
+    if selected_verdict:
+        filtered = filtered[filtered["Policy_Verdict"].isin(selected_verdict)]
+    if selected_severity:
+        filtered = filtered[filtered["Severity"].isin(selected_severity)]
+    if provider_filter:
+        filtered = filtered[filtered["AI_Provider"].isin(provider_filter)]
+    if basis_field:
+        filtered = filtered[filtered["Match_Field"].isin(basis_field)]
+    if basis_sig:
+        filtered = filtered[filtered["Signature_Match"].isin(basis_sig)]
+    if evidence_filter:
+        filtered = filtered[filtered["Evidence_Type"].isin(evidence_filter)]
+    if min_upload_kb > 0:
+        filtered = filtered[filtered["Upload_Bytes"] >= (float(min_upload_kb) * 1024)]
+    if only_resolved_mac:
+        filtered = filtered[filtered["mac"].astype(str).str.contains(":", na=False)]
+    if ignore_dns_only:
+        filtered = filtered[filtered["Detection_Source"].isin(["HTTP", "SSL", "CONN (Port)"])]
+
+    q = str(search_q or "").strip().lower()
+    if q:
+        filtered = filtered[
+            filtered["mac"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["AI_Provider"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["Detail"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["Destination"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["Domain"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["Detection_Basis"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["Policy_Basis"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["Matched_Value"].astype(str).str.lower().str.contains(q, na=False)
+        ]
+
+    return filtered
+
+
 # =============================================================================
 # UI HELPERS
 # =============================================================================
 
 MAX_ROWS_DISPLAY = 10000
+DIALOG_MAX_ROWS = 3000
+DIALOG_TIMELINE_MAX_POINTS = 3000
 SEVERITY_COLORS = {
     "CRITICAL": "#ef4444",
     "HIGH": "#f97316",
@@ -1309,21 +2096,71 @@ def render_shadow_aggrid(
     height: int = 430,
     update_mode=GridUpdateMode.NO_UPDATE,
     grid_options_overrides: Optional[Dict[str, object]] = None,
+    auto_fit_columns: bool = True,
 ):
     grid_options = gb.build()
-    autofit_js = JsCode(
-        """
-        function(params) {
-            setTimeout(function() {
-                if (params && params.api) {
-                    params.api.sizeColumnsToFit();
-                }
-            }, 0);
-        }
-        """
-    )
-    grid_options["onFirstDataRendered"] = autofit_js
-    grid_options["onGridSizeChanged"] = autofit_js
+
+    # Match Shadow Apps / Shadow Sharings filtering behavior.
+    default_col_def = dict(grid_options.get("defaultColDef") or {})
+    default_col_def["sortable"] = True
+    default_col_def["filter"] = "agSetColumnFilter"
+    default_col_def["floatingFilter"] = False
+    default_col_def.setdefault("minWidth", 96)
+    default_col_def["menuTabs"] = ["filterMenuTab", "generalMenuTab"]
+    default_col_def["suppressMenu"] = False
+
+    filter_params = dict(default_col_def.get("filterParams") or {})
+    filter_params.setdefault("excelMode", "windows")
+    filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
+    filter_params.setdefault("closeOnApply", True)
+    filter_params.setdefault("suppressMiniFilter", False)
+    default_col_def["filterParams"] = filter_params
+
+    grid_options["defaultColDef"] = default_col_def
+    grid_options["suppressMenuHide"] = False
+    grid_options["enableCellTextSelection"] = True
+    grid_options["ensureDomOrder"] = True
+    grid_options["enableRtl"] = False
+    grid_options["suppressColumnVirtualisation"] = True
+
+    # Enforce per-column menu/filter so every table column has the same 3-dot menu behavior.
+    col_defs = list(grid_options.get("columnDefs") or [])
+    if col_defs:
+        for col_def in col_defs:
+            if not isinstance(col_def, dict):
+                continue
+            col_def.setdefault("sortable", True)
+            col_def.setdefault("filter", "agSetColumnFilter")
+            col_def.setdefault("floatingFilter", False)
+            col_def.setdefault("menuTabs", ["filterMenuTab", "generalMenuTab"])
+            col_def.setdefault("suppressMenu", False)
+            cfp = dict(col_def.get("filterParams") or {})
+            cfp.setdefault("excelMode", "windows")
+            cfp.setdefault("buttons", ["apply", "clear", "cancel"])
+            cfp.setdefault("closeOnApply", True)
+            cfp.setdefault("suppressMiniFilter", False)
+            col_def["filterParams"] = cfp
+        grid_options["columnDefs"] = col_defs
+
+    if auto_fit_columns:
+        autofit_js = JsCode(
+            """
+            function(params) {
+                setTimeout(function() {
+                    if (!params) return;
+                    if (params.columnApi) {
+                        const cols = params.columnApi.getAllColumns ? params.columnApi.getAllColumns() : [];
+                        const colIds = cols.map(function(c) { return c.getColId ? c.getColId() : c.colId; }).filter(Boolean);
+                        if (colIds.length) {
+                            try { params.columnApi.autoSizeColumns(colIds, false); } catch (e) {}
+                        }
+                    }
+                }, 0);
+            }
+            """
+        )
+        grid_options["onFirstDataRendered"] = autofit_js
+        grid_options["onGridSizeChanged"] = autofit_js
     if grid_options_overrides:
         grid_options.update(grid_options_overrides)
 
@@ -1334,6 +2171,13 @@ def render_shadow_aggrid(
             ".ag-root-wrapper": {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"},
             ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E"},
             ".ag-header-cell, .ag-header-group-cell": {"background-color": "#10213E", "color": "#EAF2FF", "border-right": "1px solid #2A466E"},
+            ".ag-header-cell-menu-button": {
+                "opacity": "1 !important",
+                "display": "flex !important",
+                "align-items": "center",
+                "color": "#BFD7FF !important",
+            },
+            ".ag-header-cell-menu-button:hover": {"color": "#FFFFFF !important"},
             ".ag-row-odd": {"background-color": "#07162A"},
             ".ag-row-even": {"background-color": "#0A1C33"},
             ".ag-row-hover": {"background-color": "#13305A"},
@@ -1351,7 +2195,8 @@ def render_shadow_aggrid(
         theme=ag_theme,
         custom_css=table_css,
         allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=True,
+        enable_enterprise_modules=True,
+        fit_columns_on_grid_load=auto_fit_columns,
         reload_data=False,
         key=key,
     )
@@ -1368,10 +2213,14 @@ def _new_grid_builder(df_grid: pd.DataFrame, page_size: int = 15) -> GridOptions
     return gb
 
 
-def _close_shadow_ai_mac_dialog() -> None:
+def _close_shadow_ai_mac_dialog(*, preserve_last_selected: bool = True) -> None:
+    active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     st.session_state["shadow_ai_mac_dialog_open"] = False
     st.session_state["shadow_ai_mac_dialog_mac"] = None
-    st.session_state["shadow_ai_mac_dialog_last_selected"] = None
+    if preserve_last_selected and active_mac:
+        st.session_state["shadow_ai_mac_dialog_last_selected"] = active_mac
+    else:
+        st.session_state["shadow_ai_mac_dialog_last_selected"] = None
 
 
 def _render_shadow_ai_mac_drilldown(
@@ -1408,10 +2257,15 @@ def _render_shadow_ai_mac_drilldown(
     d3.metric("Domains", mac_events["Domain"].astype(str).replace({"": None}).dropna().nunique())
     d4.metric("Upload (MB)", f"{float(mac_events['Upload_Bytes'].sum())/1024/1024:.2f}")
 
+    chart_events = mac_events
+    if len(chart_events) > DIALOG_TIMELINE_MAX_POINTS:
+        chart_events = chart_events.head(DIALOG_TIMELINE_MAX_POINTS).copy()
+        st.caption(f"Timeline limited to latest {DIALOG_TIMELINE_MAX_POINTS:,} events for faster rendering.")
+
     cA, cB = st.columns([2, 1])
     with cA:
         figm = px.scatter(
-            mac_events,
+            chart_events,
             x="ts",
             y="AI_Provider",
             size="Risk_Score",
@@ -1478,6 +2332,7 @@ def _render_shadow_ai_mac_drilldown(
             gb_usage,
             key=f"shadow_ai_mac_usage_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
             height=330,
+            auto_fit_columns=False,
         )
 
     mac_event_cols = [
@@ -1486,10 +2341,12 @@ def _render_shadow_ai_mac_drilldown(
         "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
         "id.orig_h", "host_name", "user_agent",
     ]
-    mac_event_grid = mac_events[mac_event_cols].head(MAX_ROWS_DISPLAY).copy()
+    mac_event_grid = mac_events[mac_event_cols].head(DIALOG_MAX_ROWS).copy()
     mac_event_grid.insert(0, "#", range(1, len(mac_event_grid) + 1))
     mac_event_grid["ts"] = pd.to_datetime(mac_event_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
     mac_event_grid["Upload_Bytes"] = pd.to_numeric(mac_event_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+    if len(mac_events) > DIALOG_MAX_ROWS:
+        st.caption(f"Showing latest {DIALOG_MAX_ROWS:,} rows in event table.")
 
     gb_events = _new_grid_builder(mac_event_grid, page_size=20)
     gb_events.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
@@ -1513,28 +2370,27 @@ def _render_shadow_ai_mac_drilldown(
         gb_events,
         key=f"shadow_ai_mac_events_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
         height=540,
+        auto_fit_columns=False,
     )
 
 
 @st.dialog("MAC Drilldown - Shadow AI", width="large")
-def show_shadow_ai_mac_dialog(mac_view: pd.DataFrame, *, selected_scope_key: str) -> None:
+def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: str) -> None:
     active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     if not active_mac:
         st.info("No MAC selected.")
         return
 
-    c_left, c_right = st.columns([3.5, 1.0])
+    c_left, c_right = st.columns([1.0, 3.5])
     with c_left:
-        st.caption(f"Scope locked to MAC `{active_mac}`")
-    with c_right:
         if st.button("Close", use_container_width=True, type="primary", key=f"shadow_ai_mac_dlg_close_{selected_scope_key}"):
             _close_shadow_ai_mac_dialog()
             st.rerun()
+    with c_right:
+        st.caption(f"Scope locked to MAC `{active_mac}`")
 
-    mac_norm = mac_view["mac"].astype(str).str.strip().str.lower()
-    scoped = mac_view.loc[mac_norm == active_mac].copy()
     _render_shadow_ai_mac_drilldown(
-        scoped,
+        mac_scoped,
         selected_scope_key=selected_scope_key,
         active_mac=active_mac,
         key_prefix=f"dlg_{selected_scope_key}",
@@ -1648,6 +2504,10 @@ def inject_shadow_ai_css():
             border-color: rgba(255,255,255,0.2);
             font-weight: 700;
         }
+        div[data-testid="stDialog"] [data-testid="stDialogCloseButton"],
+        div[data-testid="stDialog"] button[aria-label="Close"] {
+            display: none !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1708,20 +2568,25 @@ def render_shadow_ai(parquet_root: Path):
         st.write(
             "Events are generated when Zeek telemetry matches `ai_signatures.yaml` (HTTP host/uri, TLS SNI, DNS query) "
             "or a configured local AI port (`conn id.resp_p`). Regex misses get a fuzzy alias fallback "
-            "(fuzzywuzzy) to catch close variants like ChatGPT/Llama/Ollama naming drift. "
-            "Policy verdict is based on `authorized_providers`."
+            "(fuzzywuzzy), then generic AI naming heuristics (`gpt`, `copilot`, `agent`, `llm`, `ai`) for unknown SaaS."
         )
         st.write(
-            "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, "
-            "Policy_Basis, Evidence_Type, and Confidence."
+            f"Behavior scoring includes first-seen SaaS detection over a {BASELINE_DAYS}-day baseline, "
+            f"large HTTPS POST uploads (>= {int(round(LARGE_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB), "
+            "file-like upload correlation, JSON-heavy API usage, high-frequency API bursts, and SMB->upload precursor checks."
+        )
+        st.write(
+            "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, Policy_Basis, "
+            "Evidence_Type, Behavior_Indicators, First_Seen_SaaS, Governance_Alert, and Confidence."
         )
 
     provider_values = sorted(
         set((RAW_AI_SIGNATURES or {}).keys())
         | set(FUZZY_PROVIDER_ALIASES.keys())
         | set(LOCAL_AI_PORTS.values())
+        | {"Unidentified AI-like SaaS"}
     )
-    signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])})
+    signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])} | {"generic-ai-pattern"})
     match_field_values = ["HTTP host/uri", "TLS SNI", "DNS query", "conn id.resp_p"]
     evidence_values = ["HTTP+POST", "HTTP+GET", "TLS SNI", "DNS query", "Local Port", "HTTP"]
 
@@ -1807,48 +2672,62 @@ def render_shadow_ai(parquet_root: Path):
         st.info("No AI signatures detected in the selected range.")
         return
 
-    filtered = df.copy()
-
-    # apply filters
-    if selected_verdict:
-        filtered = filtered[filtered["Policy_Verdict"].isin(selected_verdict)]
-    if selected_severity:
-        filtered = filtered[filtered["Severity"].isin(selected_severity)]
-    if provider_filter:
-        filtered = filtered[filtered["AI_Provider"].isin(provider_filter)]
-    if basis_field:
-        filtered = filtered[filtered["Match_Field"].isin(basis_field)]
-    if basis_sig:
-        filtered = filtered[filtered["Signature_Match"].isin(basis_sig)]
-    if evidence_filter:
-        filtered = filtered[filtered["Evidence_Type"].isin(evidence_filter)]
-    if min_upload_kb > 0:
-        filtered = filtered[filtered["Upload_Bytes"] >= (float(min_upload_kb) * 1024)]
-    if only_resolved_mac:
-        filtered = filtered[filtered["mac"].astype(str).str.contains(":", na=False)]
-    if ignore_dns_only:
-        filtered = filtered[filtered["Detection_Source"].isin(["HTTP", "SSL", "CONN (Port)"])]
-
-    # search
-    if search_q:
-        q = search_q.lower().strip()
-        if q:
-            filtered = filtered[
-                filtered["mac"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["AI_Provider"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Detail"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Destination"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Domain"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Detection_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Policy_Basis"].astype(str).str.lower().str.contains(q, na=False)
-                | filtered["Matched_Value"].astype(str).str.lower().str.contains(q, na=False)
-            ]
+    source_data_stamp = _shadow_ai_data_stamp(df)
+    filter_cache_key = _shadow_ai_mac_tab_cache_key(
+        selected_scope_key=selected_scope_key,
+        selected_verdict=selected_verdict,
+        selected_severity=selected_severity,
+        provider_filter=provider_filter,
+        basis_field=basis_field,
+        basis_sig=basis_sig,
+        evidence_filter=evidence_filter,
+        min_upload_kb=float(min_upload_kb or 0),
+        only_resolved_mac=only_resolved_mac,
+        ignore_dns_only=ignore_dns_only,
+        search_q=search_q,
+        data_stamp=source_data_stamp,
+    )
+    filter_cache_state = st.session_state.get("_shadow_ai_filtered_cache_v1", {})
+    if isinstance(filter_cache_state, dict) and filter_cache_state.get("key") == filter_cache_key:
+        filtered = filter_cache_state.get("df", pd.DataFrame())
+    else:
+        filtered = _apply_shadow_ai_filters(
+            df,
+            selected_verdict=selected_verdict,
+            selected_severity=selected_severity,
+            provider_filter=provider_filter,
+            basis_field=basis_field,
+            basis_sig=basis_sig,
+            evidence_filter=evidence_filter,
+            min_upload_kb=float(min_upload_kb or 0),
+            only_resolved_mac=only_resolved_mac,
+            ignore_dns_only=ignore_dns_only,
+            search_q=search_q,
+        )
+        st.session_state["_shadow_ai_filtered_cache_v1"] = {"key": filter_cache_key, "df": filtered}
 
     if filtered.empty:
         st.warning("No data matches your filters.")
         return
+
+    dialog_mac_pending = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
+    if st.session_state.get("shadow_ai_mac_dialog_open") and dialog_mac_pending:
+        mac_cache_state = st.session_state.get("_shadow_ai_mac_tab_cache_v1", {})
+        if isinstance(mac_cache_state, dict) and mac_cache_state.get("key") == filter_cache_key:
+            mac_view_for_dialog = mac_cache_state.get("mac_view", pd.DataFrame())
+            mac_summary_for_dialog = mac_cache_state.get("mac_summary", pd.DataFrame())
+        else:
+            mac_view_for_dialog, mac_summary_for_dialog = _build_shadow_ai_mac_tab_frames(filtered)
+            st.session_state["_shadow_ai_mac_tab_cache_v1"] = {
+                "key": filter_cache_key,
+                "mac_view": mac_view_for_dialog,
+                "mac_summary": mac_summary_for_dialog,
+            }
+
+        scoped_dialog = mac_view_for_dialog.loc[mac_view_for_dialog["mac"].eq(dialog_mac_pending)].copy() if not mac_view_for_dialog.empty else pd.DataFrame()
+        st.session_state["shadow_ai_mac_dialog_open"] = False
+        show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
+        st.stop()
 
     st.divider()
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -2092,30 +2971,36 @@ def render_shadow_ai(parquet_root: Path):
     with tabs[3]:
         st.markdown("### Device exposure (Shadow AI by MAC)")
 
-        mac_view = filtered[filtered["Policy_Verdict"] == "Shadow AI"].copy()
-        mac_view["mac"] = mac_view["mac"].astype(str).fillna("")
-        mac_view = mac_view[mac_view["mac"].str.contains(":", na=False)]
+        mac_cache_key = _shadow_ai_mac_tab_cache_key(
+            selected_scope_key=selected_scope_key,
+            selected_verdict=selected_verdict,
+            selected_severity=selected_severity,
+            provider_filter=provider_filter,
+            basis_field=basis_field,
+            basis_sig=basis_sig,
+            evidence_filter=evidence_filter,
+            min_upload_kb=float(min_upload_kb or 0),
+            only_resolved_mac=only_resolved_mac,
+            ignore_dns_only=ignore_dns_only,
+            search_q=search_q,
+            data_stamp=source_data_stamp,
+        )
+        mac_cache_state = st.session_state.get("_shadow_ai_mac_tab_cache_v1", {})
+        if isinstance(mac_cache_state, dict) and mac_cache_state.get("key") == mac_cache_key:
+            mac_view = mac_cache_state.get("mac_view", pd.DataFrame())
+            mac_summary = mac_cache_state.get("mac_summary", pd.DataFrame())
+        else:
+            mac_view, mac_summary = _build_shadow_ai_mac_tab_frames(filtered)
+            st.session_state["_shadow_ai_mac_tab_cache_v1"] = {
+                "key": mac_cache_key,
+                "mac_view": mac_view,
+                "mac_summary": mac_summary,
+            }
 
-        if mac_view.empty:
-            _close_shadow_ai_mac_dialog()
+        if mac_view.empty or mac_summary.empty:
+            _close_shadow_ai_mac_dialog(preserve_last_selected=False)
             st.info("No Shadow AI events with resolved MAC in the current view.")
         else:
-            mac_view["transfer_bucket"] = mac_view["Upload_Bytes"].apply(lambda b: _bucket_transfer(float(b or 0)))
-            mac_summary = mac_view.groupby("mac").agg(
-                Host=("host_name", _safe_value_counts_top),
-                Last_Seen=("ts", "max"),
-                First_Seen=("ts", "min"),
-                Events=("ts", "count"),
-                Unique_Providers=("AI_Provider", lambda x: x.nunique()),
-                Total_Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
-                Top_Provider=("AI_Provider", _safe_value_counts_top),
-                Top_Domain=("Domain", _safe_value_counts_top),
-                Source_IP=("id.orig_h", _safe_value_counts_top),
-                Top_Evidence=("Evidence_Type", _safe_value_counts_top),
-                Max_Severity=("Severity", lambda x: "CRITICAL" if (x == "CRITICAL").any()
-                             else ("HIGH" if (x == "HIGH").any()
-                                   else ("MEDIUM" if (x == "MEDIUM").any() else "LOW"))),
-            ).reset_index().sort_values(["Events", "Total_Upload_MB"], ascending=False)
             mac_grid = mac_summary.copy()
             mac_grid.insert(0, "#", range(1, len(mac_grid) + 1))
             mac_grid["Last_Seen"] = pd.to_datetime(mac_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
@@ -2173,6 +3058,7 @@ def render_shadow_ai(parquet_root: Path):
                     "rowMultiSelectWithClick": False,
                     "onCellClicked": mac_only_click_js,
                 },
+                auto_fit_columns=False,
             )
 
             selected_mac = _extract_selected_mac(mac_response.get("selected_rows", None))
@@ -2195,9 +3081,11 @@ def render_shadow_ai(parquet_root: Path):
 
             st.caption(f"Click a MAC row to open drilldown dialog. Current MAC: `{active_mac}`")
 
-            if st.session_state.get("shadow_ai_mac_dialog_open") and st.session_state.get("shadow_ai_mac_dialog_mac"):
+            dialog_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
+            if st.session_state.get("shadow_ai_mac_dialog_open") and dialog_mac:
                 st.session_state["shadow_ai_mac_dialog_open"] = False
-                show_shadow_ai_mac_dialog(mac_view, selected_scope_key=selected_scope_key)
+                scoped_dialog = mac_view.loc[mac_view["mac"].eq(dialog_mac)].copy()
+                show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
 
     # =============================================================================
     # TAB: BIG TRANSFERS
@@ -2235,7 +3123,8 @@ def render_shadow_ai(parquet_root: Path):
                 "ts", "Severity", "mac", "host_name", "id.orig_h",
                 "AI_Provider", "Domain", "Evidence_Type",
                 "Upload_Bytes", "Detail", "Destination",
-                "Matched_Value", "Detection_Basis",
+                "Matched_Value", "Detection_Basis", "Behavior_Indicators",
+                "First_Seen_SaaS", "Governance_Alert",
             ]
             for c in alert_cols:
                 if c not in alert_df.columns:
@@ -2280,7 +3169,8 @@ def render_shadow_ai(parquet_root: Path):
                     "AI_Provider", "Domain", "Evidence_Type",
                     "Upload_Bytes", "Detail", "Destination",
                     "Match_Field", "Signature_Match", "Matched_Value",
-                    "Detection_Basis", "Policy_Basis", "Confidence",
+                    "Detection_Basis", "Policy_Basis", "Behavior_Indicators",
+                    "First_Seen_SaaS", "Governance_Alert", "Confidence",
                 ]
                 for c in hi_cols:
                     if c not in hi.columns:
@@ -2320,7 +3210,11 @@ def render_shadow_ai(parquet_root: Path):
                 "Client_Type", "Detection_Source",
                 "Domain", "Destination", "Detail",
                 "Match_Field", "Signature_Match", "Matched_Value",
-                "Detection_Basis", "user_agent",
+                "Detection_Basis", "Behavior_Indicators",
+                "First_Seen_SaaS", "Governance_Alert",
+                "Large_HTTPS_Upload", "High_Freq_API", "JSON_Heavy_API",
+                "File_Upload_Indicator", "Strong_Signal_Pattern",
+                "user_agent",
             ]
             for c in cols:
                 if c not in filtered.columns:
@@ -2399,6 +3293,22 @@ def render_shadow_ai(parquet_root: Path):
             st.code("\n".join(AUTHORIZED_PROVIDERS))
         else:
             st.info("authorized_providers is empty (default deny).")
+
+        st.markdown("#### Detection settings")
+        st.code(yaml.safe_dump(
+            {
+                "baseline_days": BASELINE_DAYS,
+                "large_https_post_threshold_mb": round(LARGE_UPLOAD_THRESHOLD_BYTES / (1024 * 1024), 2),
+                "medium_https_post_threshold_mb": round(MEDIUM_UPLOAD_THRESHOLD_BYTES / (1024 * 1024), 2),
+                "high_frequency_calls_per_hour": HIGH_FREQUENCY_CALLS_PER_HOUR,
+                "json_post_calls_per_hour": JSON_POST_CALLS_PER_HOUR,
+                "small_request_max_kb": int(SMALL_REQUEST_MAX_BYTES / 1024),
+                "smb_window_minutes": SMB_WINDOW_MINUTES,
+                "file_upload_extensions": FILE_UPLOAD_EXTENSIONS,
+                "saas_allowlist_domains": SAAS_ALLOWLIST_DOMAINS,
+            },
+            sort_keys=False,
+        ))
 
         # show detection sources distribution
         st.markdown("#### Detection sources distribution")

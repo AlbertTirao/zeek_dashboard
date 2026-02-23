@@ -12,6 +12,7 @@ import duckdb
 import pandas as pd
 import streamlit as st
 import yaml
+from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 # --- Optional vendor lookup (fallback) ---
 try:
@@ -1232,21 +1233,16 @@ def render(parquet_root: str, authorized_macs_file: str):
         st.session_state["alerts_time_mode"] = "Last 7 Days"
 
     inject_alerts_page_css()
-    inject_alert_metric_card_css()
+    inject_traffic_style_header_css()
 
     updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.markdown(
-        f"""
-        <div class="alerts-page-header">
-          <div>
-            <div class="alerts-page-title">Alerts Overview</div>
-            <div class="alerts-page-sub">Device trust posture and activity anomalies | Updated: <b>{updated_txt}</b></div>
-          </div>
-          <div class="alerts-chip"><span class="alerts-dot"></span>Live monitoring</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_traffic_style_header(
+        title="Alerts Overview",
+        subtitle="Device trust posture and activity anomalies",
+        chip_label="Live monitoring",
+        updated_txt=updated_txt,
     )
+    inject_alert_metric_card_css()
 
     st.markdown("<div class='alerts-toolbar'>", unsafe_allow_html=True)
     st.markdown(

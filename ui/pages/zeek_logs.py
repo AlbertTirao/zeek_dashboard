@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import duckdb
 import pandas as pd
+from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 
 # -------------------------
@@ -363,19 +364,14 @@ def query_parquet_log(
 # -------------------------
 def render(parquet_root: Path):
     inject_zeek_logs_css()
+    inject_traffic_style_header_css()
 
     updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.markdown(
-        f"""
-        <div class="page-header">
-          <div>
-            <div class="page-title">Raw Log Explorer</div>
-            <div class="page-sub">Inspect raw Zeek parquet logs with full-column search and datetime-aware filtering | Updated: <b>{updated_txt}</b></div>
-          </div>
-          <div class="header-chip"><span class="header-dot"></span>Live monitoring</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_traffic_style_header(
+        title="Raw Log Explorer",
+        subtitle="Inspect raw Zeek parquet logs with full-column search and datetime-aware filtering",
+        chip_label="Live monitoring",
+        updated_txt=updated_txt,
     )
 
     available_dates = get_available_dates(parquet_root)

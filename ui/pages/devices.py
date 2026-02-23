@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yaml
+from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 # =============================================================================
 # Shared MAC normalization (same canonical MAC format as Alerts/Authorization)
@@ -1778,7 +1779,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         st.session_state.prev_dialog = None
 
     inject_page_css()
-    inject_metric_card_css()
+    inject_traffic_style_header_css()
 
     PARQUET_ROOT = Path(logs_root)
     known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
@@ -1905,18 +1906,13 @@ def render(logs_root: Path, authorized_mac_file: Path):
     # =====================================================
     updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     risk_state = "Healthy" if risk <= 20 else ("Warning" if risk <= 50 else "High Risk")
-    st.markdown(
-        f"""
-        <div class="page-header">
-          <div>
-            <div class="page-title">Device Overview</div>
-            <div class="page-sub">Network inventory and activity | Updated: <b>{updated_txt}</b></div>
-          </div>
-          <div class="header-chip"><span class="header-dot"></span>Risk posture: {risk_state}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_traffic_style_header(
+        title="Device Overview",
+        subtitle="Network inventory and activity",
+        chip_label=f"Risk posture: {risk_state}",
+        updated_txt=updated_txt,
     )
+    inject_metric_card_css()
 
     m1, m2, m3, m4, m5 = st.columns(5)
 

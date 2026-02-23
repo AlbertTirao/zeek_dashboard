@@ -8,6 +8,7 @@ import requests
 import time
 import inspect
 from uuid import uuid4
+from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 # -----------------------------
 # Configuration & Constants
@@ -1493,6 +1494,7 @@ def render_banning_list(ban_file: Path):
 # -----------------------------
 def render(mac_file: Path):
     inject_custom_css()
+    inject_traffic_style_header_css()
 
     if mac_file.suffix != ".yaml":
         mac_file = mac_file.with_suffix(".yaml")
@@ -1508,17 +1510,11 @@ def render(mac_file: Path):
     saved_bans = load_ban_list(ban_file)
 
     updated_txt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.markdown(
-        f"""
-        <div class="alerts-page-header">
-          <div>
-            <div class="alerts-page-title">Authorization Overview</div>
-            <div class="alerts-page-sub">Device, domain, and AI policy controls | Updated: <b>{updated_txt}</b></div>
-          </div>
-          <div class="alerts-chip"><span class="alerts-dot"></span>Live monitoring</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_traffic_style_header(
+        title="Authorization Overview",
+        subtitle="Device, domain, and AI policy controls",
+        chip_label="Live monitoring",
+        updated_txt=updated_txt,
     )
 
     m1, m2, m3, m4 = st.columns(4)

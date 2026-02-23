@@ -352,9 +352,33 @@ def render_current_page():
         user_management.render(current_username=auth_user["username"])
 
 
+# Keep header vertical position consistent across pages.
+def inject_global_header_alignment_css():
+    st.markdown(
+        """
+        <style>
+        html body [data-testid="stAppViewContainer"] .block-container,
+        html body [data-testid="stAppViewContainer"] .main .block-container,
+        html body [data-testid="stAppViewContainer"] [data-testid="stMainBlockContainer"] {
+            padding-top: 0.05rem !important;
+        }
+
+        html body .tm-page-header,
+        html body .alerts-page-header,
+        html body .page-header,
+        html body .um-page-header {
+            margin-top: 0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # =====================================================
 # MAIN EXECUTION
 # =====================================================
 
 render_current_page()
+inject_global_header_alignment_css()
 

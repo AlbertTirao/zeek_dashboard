@@ -6,6 +6,7 @@ from pathlib import Path
 from .shadow_apps import render_shadow_apps
 from .shadow_sharings import render_shadow_uploads
 from .shadow_ai import render_shadow_ai
+from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 
 def inject_traffic_header_css():
@@ -31,7 +32,7 @@ def inject_traffic_header_css():
         .block-container,
         .main .block-container,
         [data-testid="stMainBlockContainer"] {
-            padding-top: calc(var(--tm-topbar-height) + 0.35rem) !important;
+            padding-top: 0.05rem !important;
             padding-bottom: 1.05rem !important;
             padding-left: 30px !important;
             padding-right: 30px !important;
@@ -66,7 +67,7 @@ def inject_traffic_header_css():
             align-items:flex-end;
             justify-content:space-between;
             gap: 20px;
-            margin-top: 15px;
+            margin-top: 0 !important;
             margin-bottom: 16px;
             padding: 18px 20px;
             border-radius: 18px;
@@ -121,18 +122,13 @@ def inject_traffic_header_css():
 def render(parquet_root: Path):
     # REMOVED st.set_page_config() - This must be at the very top of app.py, not here
     inject_traffic_header_css()
+    inject_traffic_style_header_css()
     updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.markdown(
-        f"""
-        <div class="tm-page-header">
-          <div>
-            <div class="tm-page-title">Traffic Monitoring</div>
-            <div class="tm-page-sub">Shadow Apps, Shadow Sharings, and Shadow AI telemetry | Updated: <b>{updated_txt}</b></div>
-          </div>
-          <div class="tm-header-chip"><span class="tm-header-dot"></span>Network Monitoring</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_traffic_style_header(
+        title="Traffic Monitoring",
+        subtitle="Shadow Apps, Shadow Sharings, and Shadow AI telemetry",
+        chip_label="Network Monitoring",
+        updated_txt=updated_txt,
     )
 
     section = st.radio(
