@@ -19,7 +19,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # =============================================================================
 
 # Bump version so old cached parquet gets rebuilt automatically when ingestion logic changes.
-CACHE_VERSION = "shadow-cache-v11-risk-source-consistency"
+CACHE_VERSION = "shadow-cache-v13-unidentified-identity-normalization"
 
 # -----------------------------
 # Config
@@ -537,6 +537,7 @@ def get_db_connection():
 
 
 LOG_TYPES = ["http", "ssl", "dns", "files", "conn", "software", "weird"]
+POLICY_ALLOWED_SOURCE_LOGS = {str(x).strip().upper() for x in LOG_TYPES if str(x).strip()}
 
 
 @st.cache_data(show_spinner=False)
@@ -675,6 +676,35 @@ def extract_domain_strict(url: str) -> str:
     if ".." in d:
         return ""
     return d if _DOMAIN_RE.match(d) else ""
+
+
+def normalize_identifier_hint(value) -> str:
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if low in _APP_SOFTWARE_NULLS or low in {"(empty)", "[]"}:
+        return ""
+    return re.sub(r"\s+", " ", s)[:120]
+
+
+def extract_destination_hint(value) -> str:
+    """
+    Best-effort destination fallback when strict domain parsing fails.
+    Accepts domain, IP, mDNS/service-like hostnames, and other host tokens.
+    """
+    normalized = normalize_identifier_hint(value)
+    if not normalized:
+        return ""
+
+    host = extract_domain(normalized)
+    host_low = host.lower().strip()
+    if host and host_low not in _APP_SOFTWARE_NULLS and host_low not in {"*", "(empty)", "[]"}:
+        return host[:253]
+
+    if normalized.strip() == "*":
+        return ""
+    return normalized
 
 
 def normalize_app_software(
@@ -1101,12 +1131,83 @@ def compile_allow_regex(approved: list[str]):
         return None
 
 
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _dedupe_keep_order(items):
+    out = []
+    seen = set()
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _sanitize_risk_policy(policy: dict) -> dict:
+    if not isinstance(policy, dict):
+        return {}
+
+    clean = dict(policy)
+
+    for level in ("critical", "high", "medium"):
+        section = policy.get(level, {})
+        if not isinstance(section, dict):
+            section = {}
+
+        raw_logs = _as_list(section.get("source_logs", []))
+        logs = []
+        for raw in raw_logs:
+            norm = normalize_source_log_value(raw)
+            if norm in POLICY_ALLOWED_SOURCE_LOGS:
+                logs.append(norm)
+
+        raw_ports = _as_list(section.get("ports", []))
+        ports = []
+        for raw in raw_ports:
+            try:
+                p = int(raw)
+                if 1 <= p <= 65535:
+                    ports.append(p)
+            except Exception:
+                pass
+
+        updated = dict(section)
+        updated["source_logs"] = _dedupe_keep_order(logs)
+        updated["ports"] = _dedupe_keep_order(ports)
+        clean[level] = updated
+
+    low_section = policy.get("low", {})
+    if not isinstance(low_section, dict):
+        low_section = {}
+    low_statuses = []
+    for raw in _as_list(low_section.get("app_status", [])):
+        s = str(raw).strip()
+        if s:
+            low_statuses.append(s)
+    low_updated = dict(low_section)
+    low_updated["app_status"] = _dedupe_keep_order(low_statuses)
+    clean["low"] = low_updated
+
+    default_raw = str(policy.get("default", "Safe")).strip()
+    default_norm = default_raw.title()
+    clean["default"] = default_norm if default_norm in RISK_SCORE else "Safe"
+
+    return clean
+
+
 def load_risk_policy():
     if not RISK_POLICY_FILE.exists():
         return {}
     try:
         with open(RISK_POLICY_FILE, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            return _sanitize_risk_policy(yaml.safe_load(f) or {})
     except Exception:
         return {}
 
@@ -1492,11 +1593,27 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     df.loc[df["hostname"].str.lower().isin(["nan", "none"]), "hostname"] = "Unknown"
     df["hostname"] = backfill_unknown_hostnames(df)
 
-    df["domain_clean"] = [
-        extract_domain_strict(v) if str(src).upper().strip() in _DOMAIN_LOG_SOURCES else ""
-        for v, src in zip(df["app_identifier"].tolist(), df["source_log"].tolist())
-    ]
-    df["domain_clean"] = df["domain_clean"].fillna("")
+    domain_strict = pd.Series(
+        [
+            extract_domain_strict(v) if str(src).upper().strip() in _DOMAIN_LOG_SOURCES else ""
+            for v, src in zip(df["app_identifier"].tolist(), df["source_log"].tolist())
+        ],
+        index=df.index,
+        dtype="object",
+    )
+    domain_hint = pd.Series(
+        [
+            extract_destination_hint(v) if str(src).upper().strip() in _DOMAIN_LOG_SOURCES else ""
+            for v, src in zip(df["app_identifier"].tolist(), df["source_log"].tolist())
+        ],
+        index=df.index,
+        dtype="object",
+    )
+    df["domain_clean"] = domain_strict.fillna("").astype(str).str.strip()
+    m_domain_hint = df["domain_clean"].eq("") & domain_hint.fillna("").astype(str).str.strip().ne("")
+    if m_domain_hint.any():
+        df.loc[m_domain_hint, "domain_clean"] = domain_hint.loc[m_domain_hint].fillna("").astype(str).str.strip()
+
     inferred_domains = infer_missing_domains(df)
     m_infer_domain = df["domain_clean"].eq("") & inferred_domains.reindex(df.index).fillna("").ne("")
     df.loc[m_infer_domain, "domain_clean"] = inferred_domains.loc[m_infer_domain]
@@ -1516,17 +1633,15 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
         )
     ]
     df["app_identity"] = df["app_software"].fillna("").astype(str).str.strip()
+    app_identifier_hint = df["app_identifier"].apply(normalize_identifier_hint)
+    m_identifier_identity = df["app_identity"].eq("") & app_identifier_hint.ne("")
+    if m_identifier_identity.any():
+        df.loc[m_identifier_identity, "app_identity"] = app_identifier_hint.loc[m_identifier_identity].astype(str)
     m_domain_identity = df["app_identity"].eq("") & df["domain_clean"].ne("unidentified_activity")
     df.loc[m_domain_identity, "app_identity"] = df.loc[m_domain_identity, "domain_clean"].astype(str)
 
-    # CONN rows rarely carry app/software identity; derive a stable identifier so
-    # forensics inventory can show meaningful rows when source is filtered to CONN.
-    src_upper = df["source_log"].astype(str).str.upper()
-    conn_port = pd.to_numeric(df.get("dst_port", 0), errors="coerce").fillna(0).astype("int64")
-    m_conn_missing_identity = df["app_identity"].eq("") & src_upper.eq("CONN")
-    m_conn_with_port = m_conn_missing_identity & conn_port.gt(0)
-    df.loc[m_conn_with_port, "app_identity"] = "CONN Port " + conn_port.loc[m_conn_with_port].astype(str)
-    df.loc[m_conn_missing_identity & ~m_conn_with_port, "app_identity"] = "CONN Telemetry"
+    # Keep unresolved CONN identities empty here; UI/query layers will render
+    # unresolved entries as 'unidentified_activity' instead of synthetic labels.
 
     if allow_re is not None:
         allowed_mask = df["domain_clean"].astype(str).str.contains(allow_re, na=False)
@@ -1827,11 +1942,12 @@ def show_inventory_app_dialog(conn):
                     COALESCE(NULLIF(trim(hostname), ''), 'Unknown') AS hostname,
                     COALESCE(NULLIF(trim(app_identity), ''), '') AS app_identity_raw,
                     CASE
-                        WHEN app_identity IS NOT NULL AND trim(app_identity) <> '' THEN trim(app_identity)
-                        WHEN upper(source_log) = 'CONN' AND try_cast(dst_port AS INT) > 0
-                            THEN 'CONN Port ' || CAST(try_cast(dst_port AS INT) AS VARCHAR)
-                        WHEN upper(source_log) = 'CONN' THEN 'CONN Telemetry'
-                        ELSE ''
+                        WHEN app_identity IS NOT NULL
+                         AND trim(app_identity) <> ''
+                         AND lower(trim(app_identity)) <> 'conn telemetry'
+                         AND lower(trim(app_identity)) NOT LIKE 'conn port %'
+                            THEN trim(app_identity)
+                        ELSE 'unidentified_activity'
                     END AS app_identity_norm
                 FROM shadow_events
                 WHERE lower(mac) = lower(?)
@@ -2244,11 +2360,12 @@ def show_forensics_dialog(conn):
             SELECT
                 domain_clean,
                 CASE
-                    WHEN app_identity IS NOT NULL AND trim(app_identity) <> '' THEN trim(app_identity)
+                    WHEN app_identity IS NOT NULL AND trim(app_identity) <> ''
+                        THEN trim(app_identity)
                     WHEN upper(source_log) = 'CONN' AND try_cast(dst_port AS INT) > 0
                         THEN 'CONN Port ' || CAST(try_cast(dst_port AS INT) AS VARCHAR)
                     WHEN upper(source_log) = 'CONN' THEN 'CONN Telemetry'
-                    ELSE ''
+                    ELSE 'unidentified_activity'
                 END AS app_identity_norm,
                 source_log,
                 "App Status" AS app_status,
@@ -2271,7 +2388,6 @@ def show_forensics_dialog(conn):
                 CASE WHEN SUM(CASE WHEN app_status='Unauthorized' THEN 1 ELSE 0 END) > 0
                      THEN 'Unauthorized' ELSE 'Authorized' END AS status
             FROM base
-            WHERE app_identity_norm <> ''
             GROUP BY 1,2
         )
         SELECT
@@ -2300,11 +2416,21 @@ def show_forensics_dialog(conn):
 
     if not inventory_df.empty:
         inventory_df["lookup_destination"] = inventory_df["destination"].fillna("").astype(str).str.strip()
+        inventory_df["application_or_identifier"] = (
+            inventory_df["application_or_identifier"].fillna("").astype(str).str.strip()
+        )
+
         inv_dest = inventory_df["destination"].fillna("").astype(str).str.strip()
-        inv_app = inventory_df["application_or_identifier"].fillna("").astype(str).str.strip()
+        inv_app_raw = inventory_df["application_or_identifier"].fillna("").astype(str).str.strip()
+        inv_app = inv_app_raw.mask(
+            inv_app_raw.str.match(r"(?i)^conn port\s+\d+$", na=False)
+            | inv_app_raw.str.lower().eq("conn telemetry")
+            | inv_app_raw.eq(""),
+            "unidentified_activity",
+        )
         inv_sources = inventory_df["sources"].fillna("").astype(str).str.upper()
 
-        is_port = inv_app.str.startswith("CONN Port ") | inv_app.eq("CONN Telemetry")
+        is_port = inv_sources.str.contains("CONN", regex=False) & inv_app.str.lower().eq("unidentified_activity")
         is_software = inv_sources.str.contains("SOFTWARE", regex=False)
         is_domain = (
             (~is_port)
@@ -2332,6 +2458,7 @@ def show_forensics_dialog(conn):
             "CONN Port " + port_df.loc[m_conn_with_port, "dst_port"].astype(str)
         )
         port_df.loc[m_conn_missing & ~m_conn_with_port, "app_identity_norm"] = "CONN Telemetry"
+        port_df.loc[m_missing_identity & ~m_conn_missing, "app_identity_norm"] = "unidentified_activity"
         port_df = port_df[(port_df["domain_clean"] != "") & (port_df["app_identity_norm"] != "")]
 
         if not port_df.empty:
@@ -2743,6 +2870,37 @@ def show_forensics_dialog(conn):
                                 errors="ignore",
                             )
 
+        # Finalize display destination while preserving raw lookup key for drill-down queries.
+        inventory_df["destination"] = inventory_df["destination"].fillna("").astype(str).str.strip()
+        inventory_df["application_or_identifier"] = (
+            inventory_df["application_or_identifier"].fillna("").astype(str).str.strip()
+        )
+        inventory_df["lookup_destination"] = inventory_df["destination"]
+        m_conn_placeholder_display = (
+            inventory_df["application_or_identifier"].str.match(r"(?i)^conn port\s+\d+$", na=False)
+            | inventory_df["application_or_identifier"].str.lower().eq("conn telemetry")
+        )
+        if m_conn_placeholder_display.any():
+            inventory_df.loc[m_conn_placeholder_display, "application_or_identifier"] = "unidentified_activity"
+
+        unknown_tokens = {"", "unidentified_activity", "unknown", "-"}
+        m_unknown_dest = inventory_df["destination"].str.lower().isin(unknown_tokens)
+        m_unknown_app = inventory_df["application_or_identifier"].str.lower().isin(unknown_tokens)
+
+        # If a real identifier exists but destination is unresolved, display that identifier as destination.
+        m_display_fallback = m_unknown_dest & ~m_unknown_app
+        if m_display_fallback.any():
+            inventory_df.loc[m_display_fallback, "destination"] = (
+                inventory_df.loc[m_display_fallback, "application_or_identifier"]
+            )
+
+        m_unknown_dest = inventory_df["destination"].str.lower().isin(unknown_tokens)
+        m_unknown_app = inventory_df["application_or_identifier"].str.lower().isin(unknown_tokens)
+        if m_unknown_dest.any():
+            inventory_df.loc[m_unknown_dest, "destination"] = "unidentified_activity"
+        if m_unknown_app.any():
+            inventory_df.loc[m_unknown_app, "application_or_identifier"] = "unidentified_activity"
+
         # Add an explicit unmapped bucket so table Hits reconcile with Events.
         unmapped_base = forensic_df.copy()
         unmapped_base["domain_clean"] = unmapped_base["domain_clean"].fillna("").astype(str).str.strip()
@@ -2775,16 +2933,16 @@ def show_forensics_dialog(conn):
             unmapped_row = pd.DataFrame(
                 [
                     {
-                        "destination": "Unmapped Events",
-                        "lookup_destination": "Unmapped Events",
-                        "application_or_identifier": "Unmapped",
+                        "destination": "unidentified_activity",
+                        "lookup_destination": "unidentified_activity",
+                        "application_or_identifier": "unidentified_activity",
                         "sources": source_text,
                         "status": status_label,
                         "first_seen": first_seen,
                         "last_seen": last_seen,
                         "hits": int(len(unmapped_events)),
                         "max_risk": score_to_risk.get(max_score, "Safe"),
-                        "identity_type": "Unmapped",
+                        "identity_type": "Unknown",
                         "conn_ports": "",
                     }
                 ]
@@ -2822,16 +2980,16 @@ def show_forensics_dialog(conn):
             inventory_df = pd.DataFrame(
                 [
                     {
-                        "destination": "Unmapped Events",
-                        "lookup_destination": "Unmapped Events",
-                        "application_or_identifier": "Unmapped",
+                        "destination": "unidentified_activity",
+                        "lookup_destination": "unidentified_activity",
+                        "application_or_identifier": "unidentified_activity",
                         "sources": source_text,
                         "status": status_label,
                         "first_seen": first_seen,
                         "last_seen": last_seen,
                         "hits": int(len(unmapped_events)),
                         "max_risk": score_to_risk.get(max_score, "Safe"),
-                        "identity_type": "Unmapped",
+                        "identity_type": "Unknown",
                         "conn_ports": "",
                     }
                 ]
@@ -2883,7 +3041,7 @@ def show_forensics_dialog(conn):
             """
             function(params) {
                 const app = (params.data && params.data.application_or_identifier ? params.data.application_or_identifier : '').toString().toLowerCase();
-                if (app === 'unmapped') return false;
+                if (app === 'unmapped' || app === 'unidentified_activity') return false;
                 const status = (params.data && params.data.status ? params.data.status : '').toString().toLowerCase();
                 return status !== 'authorized';
             }
@@ -2999,7 +3157,7 @@ def show_forensics_dialog(conn):
         )
         st.caption(
             "Rows are grouped by Destination + Application/Identifier. Sources are merged, First Seen/Last Seen/Hits "
-            "are aggregated, and Unauthorized/Max Risk show highest severity seen. An 'Unmapped' row may appear so "
+            "are aggregated, and Unauthorized/Max Risk show highest severity seen. A 'unidentified_activity' row may appear so "
             "table Hits reconcile to Events. Click Application/Identifier for details or toggle Allowed on unauthorized "
             "rows to start allowlisting."
         )
@@ -3055,7 +3213,7 @@ def show_forensics_dialog(conn):
             sel_dest = str(selected_inv.get("destination", "") or "").strip()
             sel_dest_lookup = str(selected_inv.get("lookup_destination", sel_dest) or "").strip()
             sel_app = str(selected_inv.get("application_or_identifier", "") or "").strip()
-            if sel_dest and sel_app and sel_app.lower() != "unmapped":
+            if sel_dest and sel_app and sel_app.lower() not in {"unmapped", "unidentified_activity"}:
                 _open_inventory_app_dialog(
                     {
                         "mac": target_mac,

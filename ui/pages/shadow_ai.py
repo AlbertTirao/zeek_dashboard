@@ -3,6 +3,7 @@
 
 import re
 import warnings
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -16,12 +17,21 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v7"
+CACHE_VERSION = "shadow-ai-cache-v8"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AI_SIGNATURES_FILE = PROJECT_ROOT / "ai_signatures.yaml"
+
+try:
+    from fuzzywuzzy import fuzz, process
+
+    HAS_FUZZYWUZZY = True
+except Exception:
+    fuzz = None
+    process = None
+    HAS_FUZZYWUZZY = False
 
 
 # =============================================================================
@@ -148,6 +158,200 @@ def _build_master_pattern(hardened_ai: Dict[str, List[str]]) -> str:
 
 MASTER_PATTERN = _build_master_pattern(AI_SIGNATURES)
 
+FUZZY_MIN_SCORE = 88
+FUZZY_TOKEN_STOPWORDS = {
+    "com",
+    "net",
+    "org",
+    "www",
+    "http",
+    "https",
+    "api",
+    "app",
+    "cloud",
+    "service",
+    "services",
+    "localhost",
+    "local",
+    "ai",
+    "v1",
+    "completion",
+    "completions",
+    "embedding",
+    "embeddings",
+    "upload",
+    "uploads",
+    "file",
+    "files",
+}
+FUZZY_PROVIDER_SEEDS: Dict[str, List[str]] = {
+    "OpenAI / ChatGPT": ["chat gpt", "chat-gpt", "open ai"],
+    "Ollama (Local/Cloud)": ["ollama ai", "ollama local"],
+    "Meta Llama": ["llama", "llama 2", "llama2", "llama 3", "llama3", "llama cpp", "meta llama"],
+}
+
+
+def _normalize_fuzzy_text(value: str) -> str:
+    s = str(value or "").lower().strip()
+    if not s or s in {"nan", "none", "-"}:
+        return ""
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _regex_fragment_to_fuzzy_text(fragment: str) -> str:
+    s = str(fragment or "").lower()
+    if not s:
+        return ""
+    s = s.replace(r"\.", ".").replace(r"\/", "/").replace(r"\-", "-")
+    s = re.sub(r"\\[dDsSwWbBAZ]", " ", s)
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\([^\)]*\)", " ", s)
+    s = re.sub(r"[{}^$*+?|]", " ", s)
+    s = s.replace("\\", " ")
+    return _normalize_fuzzy_text(s)
+
+
+def _expand_alias_variants(raw_alias: str) -> List[str]:
+    norm = _normalize_fuzzy_text(raw_alias)
+    if not norm:
+        return []
+
+    out = {norm}
+    tokens = [t for t in norm.split() if t and t not in FUZZY_TOKEN_STOPWORDS]
+    for t in tokens:
+        if len(t) >= 5:
+            out.add(t)
+
+    if tokens:
+        compact = "".join(tokens)
+        if len(compact) >= 6:
+            out.add(compact)
+
+    if "chatgpt" in out:
+        out.update({"chat gpt", "chat-gpt"})
+    if "openai" in out:
+        out.update({"open ai"})
+    if any(t == "llama" or t.startswith("llama") for t in tokens):
+        out.update({"llama", "llama 2", "llama2", "llama 3", "llama3", "llama cpp"})
+
+    return sorted({x for x in out if len(x) >= 4})
+
+
+def _build_fuzzy_provider_aliases(raw_ai: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    provider_aliases: Dict[str, List[str]] = {}
+
+    for provider, fragments in (raw_ai or {}).items():
+        bucket = set()
+        for alias in _expand_alias_variants(provider):
+            bucket.add(alias)
+        for frag in (fragments or []):
+            cleaned = _regex_fragment_to_fuzzy_text(frag)
+            for alias in _expand_alias_variants(cleaned):
+                bucket.add(alias)
+        if bucket:
+            provider_aliases[provider] = sorted(bucket)
+
+    for provider, aliases in FUZZY_PROVIDER_SEEDS.items():
+        bucket = set(provider_aliases.get(provider, []))
+        for alias in _expand_alias_variants(provider):
+            bucket.add(alias)
+        for alias in aliases:
+            for variant in _expand_alias_variants(alias):
+                bucket.add(variant)
+        if bucket:
+            provider_aliases[provider] = sorted(bucket)
+
+    return provider_aliases
+
+
+def _build_fuzzy_alias_lookup(provider_aliases: Dict[str, List[str]]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for provider, aliases in provider_aliases.items():
+        for alias in aliases:
+            if alias and alias not in lookup:
+                lookup[alias] = provider
+    return lookup
+
+
+FUZZY_PROVIDER_ALIASES = _build_fuzzy_provider_aliases(RAW_AI_SIGNATURES)
+FUZZY_ALIAS_TO_PROVIDER = _build_fuzzy_alias_lookup(FUZZY_PROVIDER_ALIASES)
+FUZZY_ALIAS_CHOICES = sorted(FUZZY_ALIAS_TO_PROVIDER.keys())
+
+
+def _fuzzy_candidates_from_text(raw_text: str) -> List[str]:
+    norm = _normalize_fuzzy_text(raw_text)
+    if not norm:
+        return []
+
+    tokens = [t for t in norm.split() if t not in FUZZY_TOKEN_STOPWORDS]
+    candidates: List[str] = [norm]
+    candidates.extend([t for t in tokens if len(t) >= 4])
+
+    if len(tokens) >= 2:
+        for i in range(len(tokens) - 1):
+            pair = f"{tokens[i]} {tokens[i + 1]}".strip()
+            if len(pair) >= 6:
+                candidates.append(pair)
+
+    compact = "".join(tokens)
+    if len(compact) >= 6:
+        candidates.append(compact)
+
+    dedup: List[str] = []
+    seen = set()
+    for item in sorted(candidates, key=len, reverse=True):
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        dedup.append(item)
+        if len(dedup) >= 12:
+            break
+    return dedup
+
+
+def _extract_best_fuzzy_alias(candidate: str) -> Tuple[str, int]:
+    if not candidate or not FUZZY_ALIAS_CHOICES:
+        return "", 0
+
+    if HAS_FUZZYWUZZY and process is not None and fuzz is not None:
+        try:
+            match = process.extractOne(candidate, FUZZY_ALIAS_CHOICES, scorer=fuzz.token_set_ratio)
+        except Exception:
+            match = None
+        if not match:
+            return "", 0
+        return str(match[0]), int(match[1])
+
+    best_alias = ""
+    best_score = 0
+    for alias in FUZZY_ALIAS_CHOICES:
+        score = int(100 * SequenceMatcher(None, candidate, alias).ratio())
+        if score > best_score:
+            best_alias = alias
+            best_score = score
+    return best_alias, best_score
+
+
+def _fuzzy_provider_match(raw_text: str, *, min_score: int = FUZZY_MIN_SCORE) -> Tuple[str, str]:
+    best_provider = "Unknown"
+    best_alias = ""
+    best_score = 0
+
+    for candidate in _fuzzy_candidates_from_text(raw_text):
+        alias, score = _extract_best_fuzzy_alias(candidate)
+        if score > best_score:
+            best_alias = alias
+            best_score = score
+            best_provider = FUZZY_ALIAS_TO_PROVIDER.get(alias, "Unknown")
+            if best_score >= 100:
+                break
+
+    if best_provider != "Unknown" and best_score >= int(min_score):
+        return best_provider, f"fuzzy:{best_alias} ({best_score})"
+
+    return "Unknown", "-"
+
 
 # =============================================================================
 # NORMALIZATION + IDENTITY HELPERS
@@ -261,8 +465,10 @@ def _read_parquet_columns(path: Path, desired_cols: List[str]) -> pd.DataFrame:
 
 def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     """
-    First matching provider wins; Signature_Match stores the raw fragment.
+    First matching provider wins via regex; remaining rows get fuzzy fallback.
+    Signature_Match stores raw fragment or fuzzy alias marker.
     """
+    text_series = text_series.astype(str).replace({"nan": "", "None": ""}).fillna("")
     provider = pd.Series(index=text_series.index, dtype="object")
     sig = pd.Series(index=text_series.index, dtype="object")
     remaining = provider.isna()
@@ -280,6 +486,14 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
                 provider[m] = prov
                 sig[m] = raw_frag
                 remaining = provider.isna()
+
+    if remaining.any():
+        rem_pos = remaining.to_numpy().nonzero()[0]
+        for pos in rem_pos:
+            prov, fuzzy_sig = _fuzzy_provider_match(text_series.iloc[pos], min_score=FUZZY_MIN_SCORE)
+            if prov != "Unknown":
+                provider.iloc[pos] = prov
+                sig.iloc[pos] = fuzzy_sig
 
     return provider.fillna("Unknown"), sig.fillna("-")
 
@@ -678,7 +892,8 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         uri_s = df["uri"].astype(str).fillna("") if "uri" in df.columns else ""
         combined = (host_s + " " + uri_s).astype(str)
 
-        mask = combined.str.contains(MASTER_PATTERN, case=False, na=False, regex=True)
+        prov_all, sig_all = _assign_provider_and_signature(combined)
+        mask = prov_all != "Unknown"
         if not mask.any():
             continue
 
@@ -687,12 +902,8 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
 
         host_s_hit = hit[host_col].astype(str).fillna("")
         uri_s_hit = hit["uri"].astype(str).fillna("") if "uri" in hit.columns else ""
-        combined_hit = (host_s_hit + " " + uri_s_hit)
-
-        prov, sig = _assign_provider_and_signature(combined_hit)
-
-        hit["AI_Provider"] = prov
-        hit["Signature_Match"] = sig
+        hit["AI_Provider"] = prov_all.loc[mask].values
+        hit["Signature_Match"] = sig_all.loc[mask].values
         hit["Detection_Source"] = "HTTP"
         hit["Match_Field"] = "HTTP host/uri"
 
@@ -732,7 +943,8 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
             continue
 
         sni = df["server_name"].astype(str).fillna("")
-        mask = sni.str.contains(MASTER_PATTERN, case=False, na=False, regex=True)
+        prov_all, sig_all = _assign_provider_and_signature(sni)
+        mask = prov_all != "Unknown"
         if not mask.any():
             continue
 
@@ -740,10 +952,9 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         hit = _ensure_ts_datetime(hit)
 
         sni_hit = hit["server_name"].astype(str).fillna("")
-        prov, sig = _assign_provider_and_signature(sni_hit)
 
-        hit["AI_Provider"] = prov
-        hit["Signature_Match"] = sig
+        hit["AI_Provider"] = prov_all.loc[mask].values
+        hit["Signature_Match"] = sig_all.loc[mask].values
         hit["Detection_Source"] = "SSL"
         hit["Match_Field"] = "TLS SNI"
         hit["Client_Type"] = "Encrypted (TLS)"
@@ -768,7 +979,8 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
             continue
 
         q = df["query"].astype(str).fillna("")
-        mask = q.str.contains(MASTER_PATTERN, case=False, na=False, regex=True)
+        prov_all, sig_all = _assign_provider_and_signature(q)
+        mask = prov_all != "Unknown"
         if not mask.any():
             continue
 
@@ -776,10 +988,9 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         hit = _ensure_ts_datetime(hit)
 
         q_hit = hit["query"].astype(str).fillna("")
-        prov, sig = _assign_provider_and_signature(q_hit)
 
-        hit["AI_Provider"] = prov
-        hit["Signature_Match"] = sig
+        hit["AI_Provider"] = prov_all.loc[mask].values
+        hit["Signature_Match"] = sig_all.loc[mask].values
         hit["Detection_Source"] = "DNS"
         hit["Match_Field"] = "DNS query"
         hit["Client_Type"] = "DNS Resolver"
@@ -1072,6 +1283,24 @@ def _policy_cellstyle() -> JsCode:
     )
 
 
+def _extract_selected_mac(selected_rows) -> Optional[str]:
+    selected_mac = None
+    if isinstance(selected_rows, pd.DataFrame):
+        if not selected_rows.empty and "mac" in selected_rows.columns:
+            selected_mac = selected_rows.iloc[0]["mac"]
+    elif isinstance(selected_rows, list):
+        if len(selected_rows) > 0 and isinstance(selected_rows[0], dict):
+            selected_mac = selected_rows[0].get("mac")
+
+    if selected_mac is None:
+        return None
+
+    selected_mac = str(selected_mac).strip().lower()
+    if not selected_mac:
+        return None
+    return selected_mac
+
+
 def render_shadow_aggrid(
     df: pd.DataFrame,
     gb: GridOptionsBuilder,
@@ -1079,6 +1308,7 @@ def render_shadow_aggrid(
     key: str,
     height: int = 430,
     update_mode=GridUpdateMode.NO_UPDATE,
+    grid_options_overrides: Optional[Dict[str, object]] = None,
 ):
     grid_options = gb.build()
     autofit_js = JsCode(
@@ -1094,6 +1324,8 @@ def render_shadow_aggrid(
     )
     grid_options["onFirstDataRendered"] = autofit_js
     grid_options["onGridSizeChanged"] = autofit_js
+    if grid_options_overrides:
+        grid_options.update(grid_options_overrides)
 
     ag_theme, ag_css = get_aggrid_theme_and_css()
     table_css = dict(ag_css)
@@ -1134,6 +1366,179 @@ def _new_grid_builder(df_grid: pd.DataFrame, page_size: int = 15) -> GridOptions
     if "#" in df_grid.columns:
         gb.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False, flex=0)
     return gb
+
+
+def _close_shadow_ai_mac_dialog() -> None:
+    st.session_state["shadow_ai_mac_dialog_open"] = False
+    st.session_state["shadow_ai_mac_dialog_mac"] = None
+    st.session_state["shadow_ai_mac_dialog_last_selected"] = None
+
+
+def _render_shadow_ai_mac_drilldown(
+    mac_events: pd.DataFrame,
+    *,
+    selected_scope_key: str,
+    active_mac: str,
+    key_prefix: str,
+) -> None:
+    mac_events = mac_events.copy()
+    required = [
+        "ts", "Severity", "AI_Provider", "Domain", "Evidence_Type",
+        "Detail", "Upload_Bytes", "Destination", "Matched_Value",
+        "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
+        "id.orig_h", "host_name", "user_agent", "Risk_Score", "Policy_Verdict",
+    ]
+    for c in required:
+        if c not in mac_events.columns:
+            mac_events[c] = ""
+
+    mac_events["Upload_Bytes"] = pd.to_numeric(mac_events["Upload_Bytes"], errors="coerce").fillna(0)
+    mac_events["Risk_Score"] = pd.to_numeric(mac_events["Risk_Score"], errors="coerce").fillna(0)
+    mac_events = mac_events.sort_values("ts", ascending=False)
+
+    if mac_events.empty:
+        st.warning("No records found for this MAC with current page filters.")
+        return
+
+    mac_key = re.sub(r"[^0-9A-Za-z_]+", "_", active_mac).strip("_") or "mac"
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Events", len(mac_events))
+    d2.metric("Providers", mac_events["AI_Provider"].nunique())
+    d3.metric("Domains", mac_events["Domain"].astype(str).replace({"": None}).dropna().nunique())
+    d4.metric("Upload (MB)", f"{float(mac_events['Upload_Bytes'].sum())/1024/1024:.2f}")
+
+    cA, cB = st.columns([2, 1])
+    with cA:
+        figm = px.scatter(
+            mac_events,
+            x="ts",
+            y="AI_Provider",
+            size="Risk_Score",
+            color="Severity",
+            color_discrete_map=SEVERITY_COLORS,
+            hover_data=["Domain", "Detail", "Evidence_Type", "Matched_Value", "Detection_Basis"],
+            title=f"MAC timeline (provider events): {active_mac}",
+            template=get_plotly_template(),
+            render_mode="webgl" if len(mac_events) > 1500 else "auto",
+        )
+        style_plotly_figure(figm, height=360)
+        figm.update_xaxes(title="Time")
+        figm.update_yaxes(title="Provider")
+        st.plotly_chart(figm, use_container_width=True)
+
+    with cB:
+        byprov = mac_events.groupby("AI_Provider").agg(
+            Events=("ts", "count"),
+            Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
+        ).reset_index().sort_values("Events", ascending=False)
+        figp = px.bar(
+            byprov,
+            x="Events",
+            y="AI_Provider",
+            orientation="h",
+            title="Providers (this MAC)",
+            template=get_plotly_template(),
+        )
+        style_plotly_figure(figp, height=360, show_legend=False)
+        figp.update_xaxes(title="Events")
+        figp.update_yaxes(title=None)
+        st.plotly_chart(figp, use_container_width=True)
+
+    st.markdown("#### AI usage table (selected MAC)")
+    usage_df = mac_events.groupby(["AI_Provider", "Policy_Verdict"]).agg(
+        Events=("ts", "count"),
+        Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
+        First_Seen=("ts", "min"),
+        Last_Seen=("ts", "max"),
+        Top_Domain=("Domain", _safe_value_counts_top),
+        Top_Evidence=("Evidence_Type", _safe_value_counts_top),
+    ).reset_index().sort_values(["Events", "Upload_MB"], ascending=False)
+
+    if usage_df.empty:
+        st.info("No provider usage rows for this MAC.")
+    else:
+        usage_grid = usage_df.copy()
+        usage_grid.insert(0, "#", range(1, len(usage_grid) + 1))
+        usage_grid["Upload_MB"] = pd.to_numeric(usage_grid["Upload_MB"], errors="coerce").fillna(0).round(2)
+        usage_grid["First_Seen"] = pd.to_datetime(usage_grid["First_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+        usage_grid["Last_Seen"] = pd.to_datetime(usage_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+
+        gb_usage = _new_grid_builder(usage_grid, page_size=10)
+        gb_usage.configure_column("AI_Provider", header_name="Provider", minWidth=170, flex=1.3)
+        gb_usage.configure_column("Policy_Verdict", header_name="Verdict", minWidth=110, flex=0.9, cellStyle=_policy_cellstyle())
+        gb_usage.configure_column("Events", minWidth=90, flex=0.8)
+        gb_usage.configure_column("Upload_MB", header_name="Upload MB", minWidth=105, flex=0.9)
+        gb_usage.configure_column("First_Seen", header_name="First Seen", minWidth=150, flex=1.1)
+        gb_usage.configure_column("Last_Seen", header_name="Last Seen", minWidth=150, flex=1.1)
+        gb_usage.configure_column("Top_Domain", header_name="Top Domain", minWidth=170, flex=1.3)
+        gb_usage.configure_column("Top_Evidence", header_name="Top Evidence", minWidth=130, flex=1.0)
+        render_shadow_aggrid(
+            usage_grid,
+            gb_usage,
+            key=f"shadow_ai_mac_usage_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
+            height=330,
+        )
+
+    mac_event_cols = [
+        "ts", "Severity", "AI_Provider", "Domain", "Evidence_Type",
+        "Detail", "Upload_Bytes", "Destination", "Matched_Value",
+        "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
+        "id.orig_h", "host_name", "user_agent",
+    ]
+    mac_event_grid = mac_events[mac_event_cols].head(MAX_ROWS_DISPLAY).copy()
+    mac_event_grid.insert(0, "#", range(1, len(mac_event_grid) + 1))
+    mac_event_grid["ts"] = pd.to_datetime(mac_event_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+    mac_event_grid["Upload_Bytes"] = pd.to_numeric(mac_event_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+
+    gb_events = _new_grid_builder(mac_event_grid, page_size=20)
+    gb_events.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
+    gb_events.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
+    gb_events.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
+    gb_events.configure_column("Domain", minWidth=160, flex=1.2)
+    gb_events.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
+    gb_events.configure_column("Detail", minWidth=180, flex=1.7)
+    gb_events.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
+    gb_events.configure_column("Destination", minWidth=170, flex=1.5)
+    gb_events.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
+    gb_events.configure_column("Match_Field", header_name="Field", minWidth=120, flex=1.0)
+    gb_events.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
+    gb_events.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
+    gb_events.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.5)
+    gb_events.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
+    gb_events.configure_column("host_name", header_name="Host", minWidth=130, flex=1.1)
+    gb_events.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=2.0)
+    render_shadow_aggrid(
+        mac_event_grid,
+        gb_events,
+        key=f"shadow_ai_mac_events_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
+        height=540,
+    )
+
+
+@st.dialog("MAC Drilldown - Shadow AI", width="large")
+def show_shadow_ai_mac_dialog(mac_view: pd.DataFrame, *, selected_scope_key: str) -> None:
+    active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
+    if not active_mac:
+        st.info("No MAC selected.")
+        return
+
+    c_left, c_right = st.columns([3.5, 1.0])
+    with c_left:
+        st.caption(f"Scope locked to MAC `{active_mac}`")
+    with c_right:
+        if st.button("Close", use_container_width=True, type="primary", key=f"shadow_ai_mac_dlg_close_{selected_scope_key}"):
+            _close_shadow_ai_mac_dialog()
+            st.rerun()
+
+    mac_norm = mac_view["mac"].astype(str).str.strip().str.lower()
+    scoped = mac_view.loc[mac_norm == active_mac].copy()
+    _render_shadow_ai_mac_drilldown(
+        scoped,
+        selected_scope_key=selected_scope_key,
+        active_mac=active_mac,
+        key_prefix=f"dlg_{selected_scope_key}",
+    )
 
 
 def inject_shadow_ai_css():
@@ -1255,6 +1660,10 @@ def inject_shadow_ai_css():
 
 def render_shadow_ai(parquet_root: Path):
     inject_shadow_ai_css()
+    st.session_state.setdefault("shadow_ai_selected_mac", None)
+    st.session_state.setdefault("shadow_ai_mac_dialog_open", False)
+    st.session_state.setdefault("shadow_ai_mac_dialog_mac", None)
+    st.session_state.setdefault("shadow_ai_mac_dialog_last_selected", None)
     st.markdown("### Shadow AI & Data Leakage Monitor")
     st.markdown(
         "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN telemetry with signature and policy context to surface potential Shadow AI usage and leakage risk.</div>",
@@ -1298,14 +1707,20 @@ def render_shadow_ai(parquet_root: Path):
     with st.expander("Detection basis (how Shadow AI is decided)", expanded=False):
         st.write(
             "Events are generated when Zeek telemetry matches `ai_signatures.yaml` (HTTP host/uri, TLS SNI, DNS query) "
-            "or a configured local AI port (`conn id.resp_p`). Policy verdict is based on `authorized_providers`."
+            "or a configured local AI port (`conn id.resp_p`). Regex misses get a fuzzy alias fallback "
+            "(fuzzywuzzy) to catch close variants like ChatGPT/Llama/Ollama naming drift. "
+            "Policy verdict is based on `authorized_providers`."
         )
         st.write(
             "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, "
             "Policy_Basis, Evidence_Type, and Confidence."
         )
 
-    provider_values = sorted(list((RAW_AI_SIGNATURES or {}).keys()))
+    provider_values = sorted(
+        set((RAW_AI_SIGNATURES or {}).keys())
+        | set(FUZZY_PROVIDER_ALIASES.keys())
+        | set(LOCAL_AI_PORTS.values())
+    )
     signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])})
     match_field_values = ["HTTP host/uri", "TLS SNI", "DNS query", "conn id.resp_p"]
     evidence_values = ["HTTP+POST", "HTTP+GET", "TLS SNI", "DNS query", "Local Port", "HTTP"]
@@ -1682,6 +2097,7 @@ def render_shadow_ai(parquet_root: Path):
         mac_view = mac_view[mac_view["mac"].str.contains(":", na=False)]
 
         if mac_view.empty:
+            _close_shadow_ai_mac_dialog()
             st.info("No Shadow AI events with resolved MAC in the current view.")
         else:
             mac_view["transfer_bucket"] = mac_view["Upload_Bytes"].apply(lambda b: _bucket_transfer(float(b or 0)))
@@ -1707,7 +2123,6 @@ def render_shadow_ai(parquet_root: Path):
             mac_grid["Total_Upload_MB"] = pd.to_numeric(mac_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
 
             gb_mac = _new_grid_builder(mac_grid, page_size=15)
-            gb_mac.configure_column("mac", header_name="MAC", minWidth=150)
             gb_mac.configure_column("Host", minWidth=140)
             gb_mac.configure_column("Last_Seen", header_name="Last Seen", minWidth=150)
             gb_mac.configure_column("First_Seen", header_name="First Seen", minWidth=150)
@@ -1719,91 +2134,70 @@ def render_shadow_ai(parquet_root: Path):
             gb_mac.configure_column("Source_IP", header_name="IP", minWidth=120)
             gb_mac.configure_column("Top_Evidence", header_name="Top Evidence", minWidth=130)
             gb_mac.configure_column("Max_Severity", header_name="Max Severity", minWidth=110, cellStyle=_severity_cellstyle())
-            render_shadow_aggrid(mac_grid, gb_mac, key=f"shadow_ai_mac_summary_grid_{selected_scope_key}", height=430)
+            gb_mac.configure_selection(selection_mode="single", use_checkbox=False)
+            clickable_mac_style = JsCode(
+                """
+                function(params) {
+                    const v = String(params.value || '').trim();
+                    if (!v) return { 'color': '#93A6BF' };
+                    return {
+                        'color': '#8AB4F8',
+                        'fontWeight': '700',
+                        'cursor': 'pointer',
+                        'textDecoration': 'underline'
+                    };
+                }
+                """
+            )
+            mac_only_click_js = JsCode(
+                """
+                function(params) {
+                    if (!params || !params.column || !params.node) return;
+                    const colId = params.column.getColId ? params.column.getColId() : '';
+                    if (colId === 'mac') {
+                        params.node.setSelected(true, true);
+                    }
+                }
+                """
+            )
+            gb_mac.configure_column("mac", header_name="MAC (Click)", minWidth=150, cellStyle=clickable_mac_style)
+            mac_response = render_shadow_aggrid(
+                mac_grid,
+                gb_mac,
+                key=f"shadow_ai_mac_summary_grid_{selected_scope_key}",
+                height=430,
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                grid_options_overrides={
+                    "rowSelection": "single",
+                    "suppressRowClickSelection": True,
+                    "rowMultiSelectWithClick": False,
+                    "onCellClicked": mac_only_click_js,
+                },
+            )
 
-            st.markdown("### Drilldown (select MAC)")
-            mac_list = mac_summary["mac"].tolist()
-            selected_mac = st.selectbox("MAC", mac_list, index=0, key=f"shadow_ai_mac_select_{selected_scope_key}")
+            selected_mac = _extract_selected_mac(mac_response.get("selected_rows", None))
+            if selected_mac:
+                prev = st.session_state.get("shadow_ai_mac_dialog_last_selected")
+                if selected_mac != prev:
+                    st.session_state["shadow_ai_selected_mac"] = selected_mac
+                    st.session_state["shadow_ai_mac_dialog_last_selected"] = selected_mac
+                    st.session_state["shadow_ai_mac_dialog_mac"] = selected_mac
+                    st.session_state["shadow_ai_mac_dialog_open"] = True
+                    st.rerun()
+            else:
+                st.session_state["shadow_ai_mac_dialog_last_selected"] = None
 
-            mac_events = mac_view[mac_view["mac"] == selected_mac].copy().sort_values("ts", ascending=False)
+            mac_list = [str(x).strip().lower() for x in mac_summary["mac"].tolist() if str(x).strip()]
+            active_mac = str(st.session_state.get("shadow_ai_selected_mac") or st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
+            if active_mac not in mac_list and mac_list:
+                active_mac = mac_list[0]
+                st.session_state["shadow_ai_selected_mac"] = active_mac
 
-            # per-mac metrics
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Events", len(mac_events))
-            d2.metric("Providers", mac_events["AI_Provider"].nunique())
-            d3.metric("Domains", mac_events["Domain"].astype(str).replace({"": None}).dropna().nunique())
-            d4.metric("Upload (MB)", f"{float(mac_events['Upload_Bytes'].sum())/1024/1024:.2f}")
+            st.caption(f"Click a MAC row to open drilldown dialog. Current MAC: `{active_mac}`")
 
-            # charts
-            cA, cB = st.columns([2, 1])
-            with cA:
-                figm = px.scatter(
-                    mac_events,
-                    x="ts",
-                    y="AI_Provider",
-                    size="Risk_Score",
-                    color="Severity",
-                    color_discrete_map=SEVERITY_COLORS,
-                    hover_data=["Domain", "Detail", "Evidence_Type", "Matched_Value", "Detection_Basis"],
-                    title="MAC timeline (provider events)",
-                    template=get_plotly_template(),
-                    render_mode="webgl" if len(mac_events) > 1500 else "auto",
-                )
-                style_plotly_figure(figm, height=360)
-                figm.update_xaxes(title="Time")
-                figm.update_yaxes(title="Provider")
-                st.plotly_chart(figm, use_container_width=True)
-
-            with cB:
-                byprov = mac_events.groupby("AI_Provider").agg(
-                    Events=("ts", "count"),
-                    Upload_MB=("Upload_Bytes", lambda x: float(x.sum())/1024/1024),
-                ).reset_index().sort_values("Events", ascending=False)
-                figp = px.bar(
-                    byprov,
-                    x="Events",
-                    y="AI_Provider",
-                    orientation="h",
-                    title="Providers (this MAC)",
-                    template=get_plotly_template(),
-                )
-                style_plotly_figure(figp, height=360, show_legend=False)
-                figp.update_xaxes(title="Events")
-                figp.update_yaxes(title=None)
-                st.plotly_chart(figp, use_container_width=True)
-
-            mac_event_cols = [
-                "ts", "Severity", "AI_Provider", "Domain", "Evidence_Type",
-                "Detail", "Upload_Bytes", "Destination", "Matched_Value",
-                "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
-                "id.orig_h", "host_name", "user_agent",
-            ]
-            for c in mac_event_cols:
-                if c not in mac_events.columns:
-                    mac_events[c] = ""
-            mac_event_grid = mac_events[mac_event_cols].head(MAX_ROWS_DISPLAY).copy()
-            mac_event_grid.insert(0, "#", range(1, len(mac_event_grid) + 1))
-            mac_event_grid["ts"] = pd.to_datetime(mac_event_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-            mac_event_grid["Upload_Bytes"] = pd.to_numeric(mac_event_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
-
-            gb_events = _new_grid_builder(mac_event_grid, page_size=20)
-            gb_events.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
-            gb_events.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
-            gb_events.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
-            gb_events.configure_column("Domain", minWidth=160, flex=1.2)
-            gb_events.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
-            gb_events.configure_column("Detail", minWidth=180, flex=1.7)
-            gb_events.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
-            gb_events.configure_column("Destination", minWidth=170, flex=1.5)
-            gb_events.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
-            gb_events.configure_column("Match_Field", header_name="Field", minWidth=120, flex=1.0)
-            gb_events.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
-            gb_events.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
-            gb_events.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.5)
-            gb_events.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
-            gb_events.configure_column("host_name", header_name="Host", minWidth=130, flex=1.1)
-            gb_events.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=2.0)
-            render_shadow_aggrid(mac_event_grid, gb_events, key=f"shadow_ai_mac_events_grid_{selected_scope_key}", height=540)
+            if st.session_state.get("shadow_ai_mac_dialog_open") and st.session_state.get("shadow_ai_mac_dialog_mac"):
+                st.session_state["shadow_ai_mac_dialog_open"] = False
+                show_shadow_ai_mac_dialog(mac_view, selected_scope_key=selected_scope_key)
 
     # =============================================================================
     # TAB: BIG TRANSFERS

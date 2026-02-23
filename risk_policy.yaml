@@ -1,5 +1,10 @@
 # risk_policy.yaml
 # Shadow Apps risk policy (consumed by ui/pages/shadow_apps.py)
+# NOTE: This policy file is used by Shadow Apps only.
+# Verified source telemetry in this environment:
+#   - Shadow Apps `source_log`: CONN, DNS, FILES, HTTP, SOFTWARE, SSL, WEIRD
+#   - Shadow Sharings `log_source`: flow, dns
+#   - Shadow AI `Detection_Source`: HTTP, SSL, DNS (and CONN (Port) when matched)
 #
 # Read order (first match wins per event):
 # 1) Behavior rules from traffic patterns:
@@ -11,35 +16,55 @@
 # 4) default
 
 critical:
-  # Logs that usually indicate a security-relevant detection or protocol abuse
-  source_logs:
-    - "NOTICE"
-  # NOTE: WEIRD is already mapped by behavior rule to High before policy checks.
-  # Optional: add ports you consider "critical" in your environment
+  # Keep source-log matches strict for Critical to avoid broad false positives.
+  source_logs: []
+  # Commonly abused backdoor/C2 style ports.
   ports:
-    - 4444 # common C2/backdoor port (example)
-    - 31337 # common backdoor example
+    - 1337 # common backdoor convention
+    - 4444 # common C2 / reverse-shell listener
+    - 5555 # frequently abused remote shell / agent channel
+    - 31337 # classic backdoor example
 
 high:
-  # Remote admin / legacy / high-risk services
+  # Remote admin / legacy / high-risk services.
   ports:
+    - 21 # FTP (cleartext credentials/data)
     - 22 # SSH
     - 23 # Telnet
+    - 135 # RPC endpoint mapper
+    - 137 # NetBIOS name service
+    - 139 # NetBIOS session service
+    - 161 # SNMP (often weakly secured on networks)
+    - 427 # SLP (discovery protocol with abuse history)
+    - 445 # SMB
     - 3389 # RDP
     - 5900 # VNC
-  # Optional: treat certain logs as high signal in your environment
+    - 5985 # WinRM HTTP
+    - 5986 # WinRM HTTPS
+    - 51820 # WireGuard tunnel
+  # High-signal source logs currently ingested by Shadow Apps.
   source_logs:
-    - "SOFTWARE" # software inventory/install activity (optional)
+    - "SOFTWARE" # software inventory/install activity
 
 medium:
-  # Common database ports (often sensitive)
+  # Data services and infrastructure ports that are often sensitive.
   ports:
+    - 389 # LDAP
+    - 636 # LDAPS
+    - 853 # DNS-over-TLS
     - 1433 # SQL Server
+    - 1521 # Oracle DB
     - 3306 # MySQL
     - 5432 # PostgreSQL
-  # Optional: file activity can be meaningful for shadow upload / install trails
+    - 6379 # Redis
+    - 6881 # BitTorrent
+    - 51413 # BitTorrent
+    - 9200 # Elasticsearch
+    - 11211 # Memcached
+    - 27017 # MongoDB
+  # Medium-signal source logs currently ingested by Shadow Apps.
   source_logs:
-    - "FILES" # file transfers / file observations (optional)
+    - "FILES" # file transfers / file observations
 
 low:
   # Baseline "trusted/normal" status. Anything else falls to default below.
