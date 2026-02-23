@@ -83,16 +83,36 @@ def _coerce_ts_any(series: pd.Series) -> pd.Series:
         return pd.to_datetime(series, errors="coerce")
 
     if pd.api.types.is_datetime64_any_dtype(series):
-        return series
+        parsed_dt = pd.to_datetime(series, errors="coerce", utc=True)
+        try:
+            return parsed_dt.dt.tz_convert(None)
+        except Exception:
+            try:
+                return parsed_dt.dt.tz_localize(None)
+            except Exception:
+                return parsed_dt
 
     if pd.api.types.is_object_dtype(series):
-        parsed = pd.to_datetime(series, errors="coerce", utc=False)
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
         if parsed.notna().any():
-            return parsed
+            try:
+                return parsed.dt.tz_convert(None)
+            except Exception:
+                try:
+                    return parsed.dt.tz_localize(None)
+                except Exception:
+                    return parsed
 
     num = pd.to_numeric(series, errors="coerce")
     if not num.notna().any():
-        return pd.to_datetime(series, errors="coerce")
+        fallback = pd.to_datetime(series, errors="coerce", utc=True)
+        try:
+            return fallback.dt.tz_convert(None)
+        except Exception:
+            try:
+                return fallback.dt.tz_localize(None)
+            except Exception:
+                return fallback
 
     m = float(num.dropna().abs().max())
     if m > 1e17:
@@ -103,7 +123,14 @@ def _coerce_ts_any(series: pd.Series) -> pd.Series:
         unit = "ms"
     else:
         unit = "s"
-    return pd.to_datetime(num, unit=unit, errors="coerce")
+    parsed_num = pd.to_datetime(num, unit=unit, errors="coerce", utc=True)
+    try:
+        return parsed_num.dt.tz_convert(None)
+    except Exception:
+        try:
+            return parsed_num.dt.tz_localize(None)
+        except Exception:
+            return parsed_num
 
 
 @st.cache_data(show_spinner=False, ttl=30)
@@ -294,6 +321,118 @@ def load_visual_metrics_from_parquet(parquet_root: Path):
     known_hosts = pd.concat(known_hosts_all, ignore_index=True) if known_hosts_all else pd.DataFrame()
     dhcp = pd.concat(dhcp_all, ignore_index=True) if dhcp_all else pd.DataFrame()
     return known_hosts, dhcp
+
+
+# =====================================================
+# 1b) Alerts-aligned latest inventory (conn/dhcp/arp)
+# =====================================================
+@st.cache_data(show_spinner=False, ttl=120)
+def load_alerts_latest_inventory_rows(parquet_root: Path) -> pd.DataFrame:
+    """
+    Pull the same latest-per-MAC inventory basis used by Alerts page so
+    Device Inspection cards/table reconcile with Alerts.
+    """
+    base_cols = ["mac", "host", "ts"]
+
+    latest = None
+
+    try:
+        from ui.pages import alerts as alerts_page
+
+        by_date_str = alerts_page._discover_date_dirs(str(parquet_root))
+        selected_date_dirs_key = tuple(
+            (date_str, str(Path(day_dir)))
+            for date_str in sorted(by_date_str.keys(), reverse=True)
+            for day_dir in by_date_str.get(date_str, [])
+        )
+        if selected_date_dirs_key:
+            raw_events, known_hosts_norm = alerts_page._load_cached_for_date_dirs_cached(
+                str(parquet_root), selected_date_dirs_key
+            )
+            if raw_events is not None and not raw_events.empty:
+                mac_to_ip, _ = alerts_page.build_known_maps(known_hosts_norm)
+                latest = alerts_page.build_device_table(raw_events, mac_to_ip)
+    except Exception:
+        latest = None
+
+    # Fallback: read normalized alert cache files directly when the primary
+    # import/load path is unavailable, so Device Inspection still reconciles.
+    if latest is None or latest.empty:
+        cache_root = parquet_root / "_cache_alerts"
+        cache_files = sorted(cache_root.rglob("alerts_events.parquet")) if cache_root.exists() else []
+        if cache_files:
+            try:
+                import duckdb
+
+                con = duckdb.connect(database=":memory:")
+                fallback = con.execute(
+                    """
+                    WITH ev AS (
+                      SELECT
+                        try_cast(ts_dt AS timestamp) AS ts_dt,
+                        cast(mac_norm AS varchar) AS mac_norm,
+                        NULLIF(NULLIF(cast(ip AS varchar), ''), 'nan') AS ip,
+                        NULLIF(NULLIF(cast(host AS varchar), ''), 'nan') AS host
+                      FROM read_parquet(?, union_by_name=true)
+                      WHERE mac_norm IS NOT NULL
+                    )
+                    SELECT
+                      mac_norm AS mac,
+                      ip,
+                      host,
+                      ts_dt AS ts
+                    FROM ev
+                    WHERE ts_dt IS NOT NULL
+                    QUALIFY row_number() OVER (PARTITION BY mac_norm ORDER BY ts_dt DESC) = 1
+                    """,
+                    [[str(p) for p in cache_files]],
+                ).df()
+                con.close()
+
+                if fallback is not None and not fallback.empty:
+                    latest = fallback[["mac", "ip", "host", "ts"]].copy()
+            except Exception:
+                latest = None
+
+    if latest is None or latest.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    out = latest.copy()
+    out["mac"] = out.get("mac_norm", pd.Series(index=out.index, dtype="object")).map(normalize_mac)
+    if "mac" not in out.columns or out["mac"].isna().all():
+        if "mac_norm" in latest.columns:
+            out["mac"] = latest["mac_norm"].map(normalize_mac)
+        elif "mac" in latest.columns:
+            out["mac"] = latest["mac"].map(normalize_mac)
+
+    out["ts"] = pd.to_datetime(
+        out.get("ts_dt", pd.Series(index=out.index, dtype="object")),
+        errors="coerce",
+    )
+    if "ts" not in out.columns or out["ts"].isna().all():
+        ts_src = latest.get("ts", pd.Series(index=out.index, dtype="object"))
+        out["ts"] = _coerce_ts_any(ts_src)
+
+    ip_series = out.get("ip", pd.Series(index=out.index, dtype="object")).astype("string")
+    host_series = out.get("host", pd.Series(index=out.index, dtype="object")).astype("string")
+    out["host"] = (
+        ip_series.where(ip_series.notna(), host_series)
+        .replace(["", "nan", "None", "none", "<NA>"], pd.NA)
+        .fillna("-")
+        .astype(str)
+    )
+
+    out = out.dropna(subset=["mac", "ts"])
+    out = out[~out["mac"].map(is_broadcast_mac)]
+    if out.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    out = (
+        out.sort_values("ts", ascending=False)
+        .drop_duplicates(subset=["mac"], keep="first")[base_cols]
+        .reset_index(drop=True)
+    )
+    return out
 
 
 # =====================================================
@@ -1440,7 +1579,10 @@ def device_list_popup(
             return dtv if isinstance(dtv, datetime) else None
 
         inventory["authorized_at"] = inventory["mac"].map(_get_added_dt)
-        inventory["sort_dt"] = _coerce_ts_any(inventory["authorized_at"])
+        inventory["authorized_at"] = _coerce_ts_any(inventory["authorized_at"])
+        # Authorized popup should reflect activity in range filters:
+        # prefer last_seen, fallback to authorization-added time.
+        inventory["sort_dt"] = inventory["last_seen"].combine_first(inventory["authorized_at"])
     else:
         inventory["sort_dt"] = _coerce_ts_any(inventory["last_seen"])
 
@@ -1498,7 +1640,7 @@ def device_list_popup(
         )
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown(
-        "<div class='dialog-note'>Tip: Authorized dates use authorization-added time. Unauthorized dates use last seen time.</div>",
+        "<div class='dialog-note'>Tip: Authorized dates use last seen time when available (fallback: authorization-added time). Unauthorized dates use last seen time.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1783,6 +1925,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     PARQUET_ROOT = Path(logs_root)
     known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
+    alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT)
 
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
@@ -1797,15 +1940,37 @@ def render(logs_root: Path, authorized_mac_file: Path):
         banned_macs = banned_macs - intersect
         save_banned_macs(BAN_FILE, banned_macs)
 
-    if known_hosts.empty:
-        st.info("No device data available")
-        return
-
     if "mac" in known_hosts.columns:
         known_hosts = known_hosts.copy()
         known_hosts["mac"] = known_hosts["mac"].map(normalize_mac)
         known_hosts = known_hosts.dropna(subset=["mac"])
         known_hosts = known_hosts[~known_hosts["mac"].map(is_broadcast_mac)]
+    else:
+        known_hosts = pd.DataFrame(columns=["mac", "host", "ts"])
+
+    if "host" not in known_hosts.columns:
+        known_hosts["host"] = "-"
+    else:
+        known_hosts["host"] = known_hosts["host"].astype("string").fillna("-")
+
+    if "ts" in known_hosts.columns:
+        known_hosts["ts"] = _coerce_ts_any(known_hosts["ts"])
+    else:
+        known_hosts["ts"] = pd.NaT
+
+    # Supplement inventory with Alerts latest-per-MAC rows.
+    # We append even for existing MACs so downstream groupby(max ts) can pick the
+    # freshest sighting across both known_hosts and alert event sources.
+    if not alerts_latest_rows.empty:
+        known_hosts = pd.concat(
+            [known_hosts, alerts_latest_rows[["mac", "host", "ts"]]],
+            ignore_index=True,
+            sort=False,
+        )
+
+    if known_hosts.empty:
+        st.info("No device data available")
+        return
 
     # Merge DHCP (optional)
     if not dhcp.empty:
