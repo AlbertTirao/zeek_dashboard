@@ -11,6 +11,15 @@ from uuid import uuid4
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 # -----------------------------
+# Timezone Configuration
+# -----------------------------
+LOCAL_TZ = "Asia/Manila"
+
+def get_local_now():
+    """Returns the current local time as a naive datetime object."""
+    return pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None)
+
+# -----------------------------
 # Configuration & Constants
 # -----------------------------
 MAC_REGEX_PATTERN = r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
@@ -291,7 +300,7 @@ def render_auth_metric_card(label: str, value, note: str = "") -> None:
 # Helpers
 # -----------------------------
 def _now_str():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return get_local_now().strftime("%Y-%m-%d %H:%M:%S")
 
 def _parse_dt(s: str):
     if not s:
@@ -304,7 +313,8 @@ def _parse_dt(s: str):
 def _file_mtime_str(p: Path):
     try:
         ts = p.stat().st_mtime
-        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        # Use strictly localized fallback for file modified timestamps
+        return pd.Timestamp(ts, unit='s', tz='UTC').tz_convert(LOCAL_TZ).tz_localize(None).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return _now_str()
 
@@ -908,7 +918,7 @@ def render_device_manager(device_list: list[dict], filepath: Path):
     # Apply date filter (on df)
     if date_filter != "All" and not df.empty:
         df["_dt"] = df["date_modified"].apply(_parse_dt)
-        now = datetime.datetime.now()
+        now = get_local_now()
         if date_filter == "Today":
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elif date_filter == "Last 7 Days":
@@ -1509,7 +1519,7 @@ def render(mac_file: Path):
     ai_config = load_ai_config(ai_yaml_file)
     saved_bans = load_ban_list(ban_file)
 
-    updated_txt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updated_txt = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
     render_traffic_style_header(
         title="Authorization Overview",
         subtitle="Device, domain, and AI policy controls",

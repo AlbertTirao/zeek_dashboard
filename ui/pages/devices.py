@@ -13,6 +13,15 @@ import yaml
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 # =============================================================================
+# Timezone Configuration
+# =============================================================================
+LOCAL_TZ = "Asia/Manila"
+
+def get_local_now():
+    """Returns the current local time as a naive datetime object to match parquet formats."""
+    return pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None)
+
+# =============================================================================
 # Shared MAC normalization (same canonical MAC format as Alerts/Authorization)
 # =============================================================================
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
@@ -344,8 +353,6 @@ def load_alerts_latest_inventory_rows(parquet_root: Path) -> pd.DataFrame:
 
     latest = None
 
-    # Fast path: read normalized alert cache files directly.
-    # This avoids importing/rebuilding Alerts pipelines on Device page load.
     cache_files = list(_list_alert_event_cache_files(parquet_root))
     if cache_files:
         try:
@@ -381,8 +388,6 @@ def load_alerts_latest_inventory_rows(parquet_root: Path) -> pd.DataFrame:
         except Exception:
             latest = None
 
-    # Slow fallback: run Alerts loading path only when cache files are missing
-    # or unreadable, so reconciliation remains available.
     if latest is None or latest.empty:
         try:
             from ui.pages import alerts as alerts_page
@@ -496,7 +501,6 @@ def get_device_activity(
         return _coerce_ts_any(series)
 
     def _resolve_day_ips(day_dir: Path) -> set:
-        # dns/http/ssl logs usually do not include MAC, so we map MAC -> IP(s) by date.
         candidates = set()
         if target_ip_norm:
             candidates.add(target_ip_norm)
@@ -669,9 +673,6 @@ def save_metrics_store(authorized_mac_file: Path, store: dict) -> None:
     fp.write_text(json.dumps(store, indent=2), encoding="utf-8")
 
 
-# =====================================================
-# Authorized "Added At" store (persistent; does not touch YAML)
-# =====================================================
 def _auth_history_store_file(authorized_mac_file: Path) -> Path:
     return authorized_mac_file.with_name("authorized_macs_history.json")
 
@@ -774,7 +775,7 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
             file_path = yaml_path
 
     if not file_path.exists():
-        st.warning(f"Authorized file not found ({file_path.name}) Ã¢â‚¬â€ all devices Unauthorized")
+        st.warning(f"Authorized file not found ({file_path.name}) — all devices Unauthorized")
         return set(), {}
 
     try:
@@ -788,7 +789,7 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
     store = _load_auth_history_store(authorized_mac_file_for_store)
     store_norm = {normalize_mac(k): v for k, v in store.items() if normalize_mac(k)}
 
-    now = datetime.now()
+    now = get_local_now()
     authorized_set = set()
     added_at_map = {}
 
@@ -800,7 +801,8 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
             mac = normalize_mac(item)
         elif isinstance(item, dict):
             mac = normalize_mac(item.get("mac"))
-            for k in ["date_added", "added_at", "timestamp", "created_at", "date_modified"]:
+            # Specifically grab the date_modified stored by the authorization page
+            for k in ["date_modified", "date_added", "added_at", "timestamp", "created_at"]:
                 if k in item and item.get(k):
                     added_dt = _parse_any_dt(item.get(k))
                     if added_dt:
@@ -1172,8 +1174,6 @@ def inject_metric_card_css():
             background: rgba(255,255,255,0.055) !important;
         }
 
-
-
         .metric-overlay{
             margin-top: -166px !important;
             height: 146px !important;
@@ -1367,7 +1367,6 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
         st.info("No Active Today records found for today's folder.")
         return
 
-    # enrich with host_name + status from in_scope (already normalized)
     enrich = (
         in_scope.sort_values("ts", ascending=False)
         .groupby("mac", as_index=False)
@@ -1405,7 +1404,6 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
     inv = inv.sort_values("last_seen_today", ascending=False).reset_index(drop=True)
     inv.insert(0, "#", inv.index + 1)
 
-    # Build display DF
     display_df = inv[["#", "mac", "ip", "host_name", "status", "last_seen_today_str"]].copy()
     display_df.rename(columns={"last_seen_today_str": "Last Seen (Today)"}, inplace=True)
 
@@ -1495,7 +1493,7 @@ def device_list_popup(
         if auth_dates:
             available_dates_for_filter = sorted(set(available_dates_for_filter).union(auth_dates), reverse=True)
 
-    # Toolbar: Search | Time Range | History | Date | Download
+    # Toolbar
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
     t1, t2, t3, t4, t5 = st.columns([2.0, 1.15, 1.15, 1.8, 0.9], vertical_alignment="bottom")
 
@@ -1569,8 +1567,10 @@ def device_list_popup(
     inventory["ip"] = inventory.get("ip", "-").fillna("-").astype(str)
     inventory["host_name"] = inventory.get("host_name", "-").fillna("-").astype(str)
 
+    # ==========================================================
+    # CORE FIX: Explicitly separate Authorized Date and Last Seen
+    # ==========================================================
     if status_type == "Authorized":
-
         existing_macs = set(inventory["mac"].astype(str).tolist())
         missing_rows = []
         for mac in authorized_added_at_map.keys():
@@ -1587,19 +1587,23 @@ def device_list_popup(
             dtv = authorized_added_at_map.get(m)
             return dtv if isinstance(dtv, datetime) else None
 
+        # Fetch EXACT date from authorization page map
         inventory["authorized_at"] = inventory["mac"].map(_get_added_dt)
         inventory["authorized_at"] = _coerce_ts_any(inventory["authorized_at"])
-        # Authorized popup should reflect activity in range filters:
-        # prefer last_seen, fallback to authorization-added time.
-        inventory["sort_dt"] = inventory["last_seen"].combine_first(inventory["authorized_at"])
+        
+        # Sort and filter the table by the Authorization Date
+        inventory["sort_dt"] = inventory["authorized_at"]
+        inventory["Authorized Date"] = inventory["authorized_at"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
     else:
+        # For unauthorized, sort and filter by Last Seen
         inventory["sort_dt"] = _coerce_ts_any(inventory["last_seen"])
 
     inventory["vendor"] = inventory["mac"].map(get_mac_vendor)
     inventory["vendor"] = inventory["vendor"].fillna("Unknown").astype(str)
 
+    # Date Filtering
     if date_filter_mode == "Last 7 Days":
-        seven_days_ago = datetime.now() - timedelta(days=7)
+        seven_days_ago = get_local_now() - timedelta(days=7)
         inventory = inventory[inventory["sort_dt"].notna() & (inventory["sort_dt"] >= seven_days_ago)]
     elif date_filter_mode == "Specific Date":
         if spec_date:
@@ -1612,11 +1616,19 @@ def device_list_popup(
         st.info(f"No {status_type.lower()} devices found for this criteria.")
         return
 
-    # Default order stays newest-first; users can sort via AgGrid column menu.
-    inventory = inventory.sort_values("sort_dt", ascending=False, na_position="last")
-    inventory["date_str"] = inventory["sort_dt"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
-    inventory = inventory[["mac", "ip", "host_name", "vendor", "date_str", "last_seen", "sort_dt"]].copy()
+    # Create the distinct Last Seen column
+    inventory["Last Seen"] = _coerce_ts_any(inventory["last_seen"]).dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
 
+    # Sort descending
+    inventory = inventory.sort_values("sort_dt", ascending=False, na_position="last")
+    
+    # Filter columns for view
+    if status_type == "Authorized":
+        inventory = inventory[["mac", "ip", "host_name", "vendor", "Authorized Date", "Last Seen", "sort_dt"]].copy()
+    else:
+        inventory = inventory[["mac", "ip", "host_name", "vendor", "Last Seen", "sort_dt"]].copy()
+
+    # Search Logic
     if mac_query_norm:
         inv = inventory.copy()
         inv["_m"] = inv["mac"].astype(str).map(_norm_token)
@@ -1630,7 +1642,6 @@ def device_list_popup(
             st.markdown("</div>", unsafe_allow_html=True)
             st.info("No matching MAC address found.")
             return
-
         inventory = inv
 
     inventory = inventory.reset_index(drop=True)
@@ -1638,7 +1649,7 @@ def device_list_popup(
     inventory["#"] = pd.to_numeric(inventory["#"], errors="coerce").fillna(0).astype(int)
 
     with t5:
-        csv_bytes = inventory.drop(columns=["last_seen", "sort_dt"], errors="ignore").to_csv(index=False).encode("utf-8")
+        csv_bytes = inventory.drop(columns=["sort_dt"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download",
             data=csv_bytes,
@@ -1648,8 +1659,10 @@ def device_list_popup(
             use_container_width=True,
         )
     st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Explain the date columns clearly to users
     st.markdown(
-        "<div class='dialog-note'>Tip: Authorized dates use last seen time when available (fallback: authorization-added time). Unauthorized dates use last seen time.</div>",
+        "<div class='dialog-note'>Tip: <b>Date Authorized</b> matches the Authorization page exactly. <b>Last Seen</b> indicates the most recent network traffic detected.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1657,7 +1670,7 @@ def device_list_popup(
         history_view = auth_change_history_df.copy() if isinstance(auth_change_history_df, pd.DataFrame) else pd.DataFrame()
         if not history_view.empty:
             if history_filter_mode == "Last 7 Days":
-                seven_days_ago_hist = datetime.now() - timedelta(days=7)
+                seven_days_ago_hist = get_local_now() - timedelta(days=7)
                 history_view = history_view[
                     history_view["ts"].notna() & (history_view["ts"] >= seven_days_ago_hist)
                 ]
@@ -1728,6 +1741,7 @@ def device_list_popup(
     gb.configure_grid_options(suppressMenuHide=True)
     gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=15)
     gb.configure_selection(selection_mode="single", use_checkbox=False)
+    
     gb.configure_column(
         "#",
         header_name="#",
@@ -1736,13 +1750,20 @@ def device_list_popup(
         type=["numericColumn", "numberColumnFilter"],
         sort="asc",
     )
-    gb.configure_column("mac", header_name="MAC Address", width=190)
-    gb.configure_column("ip", header_name="IP Address", width=140)
-    gb.configure_column("host_name", header_name="Host Name", width=220)
-    gb.configure_column("vendor", header_name="Vendor", width=220)
-    gb.configure_column("date_str", header_name="Date", width=200)
-    gb.configure_column("last_seen", hide=True)
+    gb.configure_column("mac", header_name="MAC Address", width=170)
+    gb.configure_column("ip", header_name="IP Address", width=130)
+    gb.configure_column("host_name", header_name="Host Name", width=180)
+    gb.configure_column("vendor", header_name="Vendor", width=180)
+    
+    # Render two distinct date columns
+    if status_type == "Authorized":
+        gb.configure_column("Authorized Date", header_name="Date Authorized", width=180)
+        gb.configure_column("Last Seen", header_name="Last Seen", width=180)
+    else:
+        gb.configure_column("Last Seen", header_name="Last Seen", width=180)
+        
     gb.configure_column("sort_dt", hide=True)
+    
     grid_options = gb.build()
     grid_options["domLayout"] = "normal"
     grid_options["alwaysShowVerticalScroll"] = True
@@ -1968,8 +1989,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
         known_hosts["ts"] = pd.NaT
 
     # Supplement inventory with Alerts latest-per-MAC rows.
-    # We append even for existing MACs so downstream groupby(max ts) can pick the
-    # freshest sighting across both known_hosts and alert event sources.
     if not alerts_latest_rows.empty:
         known_hosts = pd.concat(
             [known_hosts, alerts_latest_rows[["mac", "host", "ts"]]],
@@ -1981,7 +2000,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         st.info("No device data available")
         return
 
-    # Merge DHCP (optional)
+    # Merge DHCP
     if not dhcp.empty:
         if "mac" in dhcp.columns:
             dhcp = dhcp.copy()
@@ -2002,7 +2021,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     merged["host_name"] = merged.get("host_name", "-").fillna("-")
 
-    # ts -> datetime + date
     if "ts" in merged.columns:
         merged = merged.copy()
         merged["ts"] = _coerce_ts_any(merged["ts"])
@@ -2011,57 +2029,53 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     merged["status"] = merged["mac"].apply(lambda m: "Authorized" if (m in authorized_macs) else "Unauthorized")
 
-    # EXCLUDE BANNED EVERYWHERE
     in_scope = merged.copy()
     if "mac" in in_scope.columns and banned_macs:
         in_scope = in_scope[~in_scope["mac"].isin(banned_macs)]
 
     # Metrics
-    today = datetime.now().date()
+    today = get_local_now().date()
     today_str = today.strftime("%Y-%m-%d")
 
-    total_devices = int(in_scope["mac"].nunique())
+    unauth_seen = int(in_scope[in_scope["status"] == "Unauthorized"]["mac"].nunique())
+    auth_seen = len(authorized_macs)
+    total_devices = auth_seen + unauth_seen
 
     active_today_set = load_active_today_macs_from_parquet(PARQUET_ROOT, today_str)
     if banned_macs:
         active_today_set = active_today_set - set(banned_macs)
     active_today = int(len(active_today_set))
 
-    auth_seen = int(in_scope[in_scope["status"] == "Authorized"]["mac"].nunique())
-    unauth_seen = int(in_scope[in_scope["status"] == "Unauthorized"]["mac"].nunique())
     risk = round((unauth_seen / total_devices * 100), 2) if total_devices else 0.0
 
-    current_state = {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
-
-    # DAILY DELTA
     store = load_metrics_store(authorized_mac_file)
     if not isinstance(store, dict):
         store = {}
 
     if store.get("daily_date") != today_str or not isinstance(store.get("daily_baseline"), dict):
         store["daily_date"] = today_str
-        store["daily_baseline"] = current_state
+        store["daily_baseline"] = {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
         store["daily_delta"] = {"total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0}
         store["daily_locked"] = False
 
-    baseline = store.get("daily_baseline") if isinstance(store.get("daily_baseline"), dict) else current_state
+    baseline = store.get("daily_baseline") if isinstance(store.get("daily_baseline"), dict) else {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
 
-    b_total = int(baseline.get("total", current_state["total"]))
-    b_active = int(baseline.get("active_today", current_state["active_today"]))
-    b_auth = int(baseline.get("auth", current_state["auth"]))
-    b_unauth = int(baseline.get("unauth", current_state["unauth"]))
-    b_risk = float(baseline.get("risk", current_state["risk"]))
+    b_total = int(baseline.get("total", total_devices))
+    b_active = int(baseline.get("active_today", active_today))
+    b_auth = int(baseline.get("auth", auth_seen))
+    b_unauth = int(baseline.get("unauth", unauth_seen))
+    b_risk = float(baseline.get("risk", float(risk)))
 
     daily_delta = {
-        "total": current_state["total"] - b_total,
-        "active_today": current_state["active_today"] - b_active,
-        "auth": current_state["auth"] - b_auth,
-        "unauth": current_state["unauth"] - b_unauth,
-        "risk": round(current_state["risk"] - b_risk, 2),
+        "total": total_devices - b_total,
+        "active_today": active_today - b_active,
+        "auth": auth_seen - b_auth,
+        "unauth": unauth_seen - b_unauth,
+        "risk": round(risk - b_risk, 2),
     }
 
     store["daily_delta"] = daily_delta
-    store["state"] = current_state
+    store["state"] = {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
     save_metrics_store(authorized_mac_file, store)
 
     d_total = int(daily_delta.get("total", 0))
@@ -2075,10 +2089,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     GREY = "#9aa0a6"
     CYAN = "#00F7FF"
 
-    # =====================================================
-    # Header (REMOVED the top metric pills per request)
-    # =====================================================
-    updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updated_txt = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
     risk_state = "Healthy" if risk <= 20 else ("Warning" if risk <= 50 else "High Risk")
     render_traffic_style_header(
         title="Device Overview",
@@ -2257,9 +2268,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             unsafe_allow_html=True,
         )
         st.markdown("</div>", unsafe_allow_html=True)
-    # =====================================================
-    # Dialog manager
-    # =====================================================
+    
     raw_dates = sorted([d for d, _ in iter_date_dirs(PARQUET_ROOT)], reverse=True)
     if not raw_dates and "date" in merged.columns:
         raw_dates = sorted([str(d) for d in merged["date"].unique() if pd.notnull(d)], reverse=True)

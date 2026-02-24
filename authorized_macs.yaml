@@ -40,7 +40,7 @@ authorized_macs:
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
 - mac: 1c:87:e3:a3:4a:48
-  ip: 192.168.201.34
+  ip: 192.168.201.55
   hostname: TECNO-CAMON-16
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
@@ -60,7 +60,7 @@ authorized_macs:
   vendor: Ruijie Networks Co.,LTD
   date_modified: '2026-02-12 15:31:30'
 - mac: 2c:3b:70:9f:7b:73
-  ip: 192.168.201.40
+  ip: 192.168.201.59
   hostname: PC-02
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-14 15:42:55'
@@ -70,17 +70,17 @@ authorized_macs:
   vendor: AltoBeam Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:8a:06:d5:3c:4e
-  ip: 192.168.201.41
+  ip: 192.168.201.58
   hostname: Galaxy-A15-5G
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:8f:30:9f:11:f3
-  ip: 192.168.201.36
+  ip: 192.168.201.57
   hostname: Lana-s-phone
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:d5:7a:78:15:5f
-  ip: 192.168.201.39
+  ip: 192.168.201.60
   hostname: Lana-HP
   vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
   date_modified: '2026-02-12 12:37:33'
@@ -134,6 +134,11 @@ authorized_macs:
   hostname: '-'
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
+- mac: b4:74:9f:d0:0d:b4
+  ip: 192.168.201.79
+  hostname: '-'
+  vendor: ASKEY COMPUTER CORP
+  date_modified: '2026-02-23 16:43:42'
 - mac: be:18:78:9d:3f:b1
   ip: 192.168.201.30
   hostname: Auggys-Phone
@@ -155,7 +160,7 @@ authorized_macs:
   vendor: None
   date_modified: '2026-02-12 12:37:33'
 - mac: dc:41:a9:64:da:c5
-  ip: 192.168.201.35
+  ip: 192.168.201.56
   hostname: Shiraishi
   vendor: Intel Corporate
   date_modified: '2026-02-14 15:22:42'
@@ -185,7 +190,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: f8:5e:0b:7c:50:f5
-  ip: 192.168.201.38
+  ip: 192.168.201.61
   hostname: Realme-X
   vendor: Realme Chongqing Mobile Telecommunications Corp.,Ltd.
   date_modified: '2026-02-12 12:37:33'
