@@ -1144,8 +1144,8 @@ def render_shadow_sharing(parquet_root: Path):
             gb_dev.configure_column("Total_MB", header_name="Total MB", width=116)
             gb_dev.configure_column("Top_Action", header_name="Top Action", minWidth=145)
             gb_dev.configure_column("Top_Dest", header_name="Top Destination", minWidth=180)
-            gb_dev.configure_column("Top_Dest_Risk_Level", header_name="Device Top Destination Risk Level", width=150, cellStyle=_severity_cellstyle())
-            gb_dev.configure_column("Max_Risk_Level", header_name="Device Max Risk Level", width=170, cellStyle=_severity_cellstyle())
+            gb_dev.configure_column("Top_Dest_Risk_Level", header_name="Top Destination Risk Level", width=150, cellStyle=_severity_cellstyle())
+            gb_dev.configure_column("Max_Risk_Level", header_name="Max Risk Level", width=170, cellStyle=_severity_cellstyle())
 
             dev_response = render_shadow_aggrid(
                 dev_grid,
