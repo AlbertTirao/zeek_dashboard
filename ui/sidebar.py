@@ -32,28 +32,70 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
 
     default_index = options.index(st.session_state.sidebar_page)
 
-    # 1) Base sidebar theme (2 colors only)
+    # --- Global CSS: sidebar + kill option_menu grey wrapper ---
     st.markdown(
         """
         <style>
         :root{
-            --sb-top:#151a28;
-            --sb-bot:#0f1422;
+            --sb:#151a28;
             --sb-text:#ffffff;
             --sb-dim:rgba(255,255,255,0.88);
+            --sb-hover:rgba(255,255,255,0.06);
+            --sb-selected:rgba(255,255,255,0.10);
         }
 
-        /* Sidebar background only (no divider) */
+        /* Sidebar base color + remove divider */
         section[data-testid="stSidebar"],
         [data-testid="stSidebar"],
         [data-testid="stSidebar"] > div:first-child{
-            background: linear-gradient(180deg, var(--sb-top) 0%, var(--sb-bot) 100%) !important;
+            background: var(--sb) !important;
             border-right: 0 !important;
             box-shadow: none !important;
         }
 
         [data-testid="stSidebar"] .block-container{
             padding: 0.9rem 0.85rem 0.8rem 0.85rem;
+            background: var(--sb) !important;
+        }
+
+        /* Some Streamlit versions add extra wrappers with their own background */
+        [data-testid="stSidebar"] div,
+        [data-testid="stSidebar"] aside{
+            border: 0 !important;
+            box-shadow: none !important;
+        }
+
+        /* ============================================================
+           streamlit_option_menu is inside a custom-component iframe.
+           The grey "card" is the wrapper/iframe background.
+           Force wrapper + iframe to #151a28.
+           ============================================================ */
+
+        /* Wrapper that directly contains the iframe (Chromium supports :has()) */
+        [data-testid="stSidebar"] div:has(> iframe[title="streamlit_option_menu.option_menu"]),
+        [data-testid="stSidebar"] div:has(> iframe[title*="option_menu"]) {
+            background: var(--sb) !important;
+            background-color: var(--sb) !important;
+            border: 0 !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            border-radius: 0 !important;
+        }
+
+        /* The iframe itself */
+        [data-testid="stSidebar"] iframe[title="streamlit_option_menu.option_menu"],
+        [data-testid="stSidebar"] iframe[title*="option_menu"]{
+            background: var(--sb) !important;
+            border: 0 !important;
+            box-shadow: none !important;
+        }
+
+        /* Fallback wrapper testid some builds use */
+        [data-testid="stSidebar"] [data-testid="stCustomComponentV1"]{
+            background: var(--sb) !important;
+            border: 0 !important;
+            box-shadow: none !important;
         }
         </style>
         """,
@@ -66,7 +108,7 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             unsafe_allow_html=True,
         )
 
-        # 2) Render option_menu with “as transparent as possible”
+        # --- option_menu with solid container bg (#151a28) ---
         page = option_menu(
             menu_title=None,
             options=options,
@@ -76,20 +118,23 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             styles={
                 "container": {
                     "padding": "0!important",
-                    "background-color": "transparent",
+                    "background-color": "#151a28",
                     "border": "0",
                     "border-radius": "0",
+                    "box-shadow": "none",
+                    "margin": "0",
                 },
                 "nav-link": {
-                    "background-color": "transparent",
+                    "background-color": "#151a28",
                     "color": "rgba(255,255,255,0.88)",
                     "margin": "0",
                     "padding": "0.55rem 0.2rem 0.55rem 0.6rem",
                     "border-radius": "0",
                     "border": "0",
                 },
+                # keep it non-gray: just a subtle white alpha highlight
                 "nav-link-selected": {
-                    "background-color": "transparent",
+                    "background-color": "rgba(255,255,255,0.10)",
                     "color": "#ffffff",
                     "font-weight": "800",
                     "border-radius": "0",
@@ -100,79 +145,13 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             key="sidebar_option_menu",
         )
 
-        # 3) HARD OVERRIDE AFTER render (this removes the grey box for real)
+        # Optional: make hover consistent (only affects non-iframe DOM if present)
         st.markdown(
             """
             <style>
-            /* Kill the grey rectangle: force ALL option_menu wrappers transparent */
-            [data-testid="stSidebar"] .option-menu,
-            [data-testid="stSidebar"] .option-menu > div,
-            [data-testid="stSidebar"] .option-menu ul,
-            [data-testid="stSidebar"] .option-menu li,
-            [data-testid="stSidebar"] .option-menu .nav,
-            [data-testid="stSidebar"] .option-menu .nav-pills,
-            [data-testid="stSidebar"] ul.nav,
-            [data-testid="stSidebar"] .nav,
-            [data-testid="stSidebar"] .nav-pills,
-            [data-testid="stSidebar"] .nav-item{
-                background: transparent !important;
-                background-color: transparent !important;
-                border: 0 !important;
-                border-radius: 0 !important;
-                box-shadow: none !important;
-                outline: none !important;
-                padding: 0 !important;
-                margin: 0 !important;
-            }
-
-            /* Remove bullets/indent that can look like a container */
-            [data-testid="stSidebar"] .option-menu ul,
-            [data-testid="stSidebar"] ul.nav{
-                list-style: none !important;
-            }
-
-            /* Links: no box, no border, no focus ring */
-            [data-testid="stSidebar"] .option-menu a.nav-link,
-            [data-testid="stSidebar"] .option-menu a.nav-link-selected{
-                background: transparent !important;
-                background-color: transparent !important;
-                border: 0 !important;
-                border-radius: 0 !important;
-                box-shadow: none !important;
-                outline: none !important;
-                text-decoration: none !important;
-                color: var(--sb-dim) !important;
-            }
-
-            [data-testid="stSidebar"] .option-menu a.nav-link:hover{
-                background: transparent !important;
-                color: var(--sb-text) !important;
-            }
-
-            [data-testid="stSidebar"] .option-menu a.nav-link-selected{
-                background: transparent !important;
-                color: var(--sb-text) !important;
-                font-weight: 800 !important;
-            }
-
-            [data-testid="stSidebar"] .option-menu a.nav-link:focus,
-            [data-testid="stSidebar"] .option-menu a.nav-link:focus-visible,
-            [data-testid="stSidebar"] .option-menu a.nav-link-selected:focus,
-            [data-testid="stSidebar"] .option-menu a.nav-link-selected:focus-visible{
-                outline: none !important;
-                box-shadow: none !important;
-            }
-
-            /* Icons: no border/box */
-            [data-testid="stSidebar"] .option-menu a.nav-link i,
-            [data-testid="stSidebar"] .option-menu a.nav-link-selected i,
-            [data-testid="stSidebar"] .option-menu a.nav-link svg,
-            [data-testid="stSidebar"] .option-menu a.nav-link-selected svg{
-                background: transparent !important;
-                border: 0 !important;
-                box-shadow: none !important;
-                outline: none !important;
-                color: var(--sb-text) !important;
+            [data-testid="stSidebar"] a.nav-link:hover{
+                background: rgba(255,255,255,0.06) !important;
+                color: #fff !important;
             }
             </style>
             """,
