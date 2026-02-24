@@ -13,80 +13,58 @@ def _inject_user_management_css() -> None:
         @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&display=swap');
 
         :root {
-            --um-panel-border: rgba(255, 255, 255, 0.14);
-            --um-panel-bg: rgba(255, 255, 255, 0.035);
-            --um-panel-shadow: 0 16px 42px rgba(0, 0, 0, 0.28);
-            --um-accent: #00f7ff;
+            /* === Devices theme (shared) === */
+            --panel-border: rgba(255,255,255,0.12);
+            --panel-bg: rgba(255,255,255,0.03);
+            --panel-shadow: 0 14px 38px rgba(0,0,0,0.25);
+            --accent-cyan: #00F7FF;
+            --accent-red: #F63049;
+
+            /* === UM aliases (keep existing class rules readable) === */
+            --um-panel-border: var(--panel-border);
+            --um-panel-bg: rgba(255,255,255,0.035);
+            --um-panel-shadow: 0 16px 45px rgba(0,0,0,0.28);
+            --um-accent: var(--accent-cyan);
         }
 
         html, body, [class*="css"] {
             font-family: 'Manrope', sans-serif;
         }
 
+        /* Match Devices page background */
+        .stApp {
+            background:
+                radial-gradient(1200px 550px at 10% -5%, rgba(0, 247, 255, 0.08), transparent 45%),
+                radial-gradient(900px 460px at 90% 8%, rgba(246, 48, 73, 0.08), transparent 42%),
+                #040B18;
+        }
+
+        /* Match Devices page container spacing */
         .block-container,
         .main .block-container,
         [data-testid="stMainBlockContainer"] {
-            padding-top: 0.15rem !important;
-            padding-bottom: 1rem !important;
+            padding-top: 0 !important;
+            padding-bottom: 1.05rem !important;
             padding-left: 30px !important;
             padding-right: 30px !important;
             max-width: 100% !important;
         }
 
-        .um-page-header {
-            display: flex;
-            align-items: flex-end;
-            justify-content: space-between;
-            gap: 18px;
-            margin-top: 15px;
-            margin-bottom: 14px;
-            padding: 18px 20px;
-            border-radius: 18px;
-            border: 1px solid var(--um-panel-border);
-            background:
-                radial-gradient(circle at top right, rgba(0, 247, 255, 0.08), transparent 40%),
-                linear-gradient(135deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015));
-            box-shadow: var(--um-panel-shadow);
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stAppViewContainer"] .main,
+        section.main {
+            padding-left: 0 !important;
+            padding-right: 0 !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            max-width: 100% !important;
         }
 
-        .um-title {
-            font-size: 44px;
-            font-weight: 800;
-            line-height: 1.0;
-            letter-spacing: -0.5px;
-        }
-
-        .um-sub {
-            opacity: 0.78;
-            font-size: 13px;
-            margin-top: 6px;
-        }
-
-        .um-chip {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 999px;
-            padding: 7px 12px;
-            font-size: 12px;
-            font-weight: 700;
-            white-space: nowrap;
-        }
-
-        .um-chip-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 999px;
-            background: var(--um-accent);
-            box-shadow: 0 0 10px rgba(0, 247, 255, 0.8);
-        }
-
+        /* --- User Management cards --- */
         .um-metric-card {
             height: 120px;
             padding: 15px;
-            border-radius: 16px;
+            border-radius: 18px;
             border: 1px solid var(--um-panel-border);
             background: var(--um-panel-bg);
             box-shadow: var(--um-panel-shadow);
@@ -118,10 +96,10 @@ def _inject_user_management_css() -> None:
 
         .um-card {
             border: 1px solid var(--um-panel-border);
-            background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.015));
-            border-radius: 16px;
+            background: var(--um-panel-bg);
+            border-radius: 18px;
             padding: 16px;
-            box-shadow: var(--um-panel-shadow);
+            box-shadow: var(--panel-shadow);
         }
 
         .um-card-title {
@@ -137,30 +115,108 @@ def _inject_user_management_css() -> None:
             margin-bottom: 10px;
         }
 
+        /* --- Table container (match Devices grid-card) --- */
         .um-table-shell {
             border: 1px solid rgba(148, 163, 184, 0.24);
-            background: linear-gradient(180deg, rgba(2, 6, 23, 0.52), rgba(2, 6, 23, 0.34));
+            background: linear-gradient(180deg, rgba(2,6,23,0.5), rgba(2,6,23,0.35));
             border-radius: 12px;
             padding: 0.56rem 0.62rem 0.46rem 0.62rem;
             margin-top: 0.5rem;
         }
 
+        /* Data editor uses stDataFrame markup under the hood */
         .um-table-shell [data-testid="stDataFrame"] {
-            border: 1px solid #2a466e !important;
+            border: 1px solid #2A466E !important;
             border-radius: 10px !important;
             overflow: hidden !important;
+            background: #061120 !important;
         }
 
         .um-table-shell [data-testid="stDataFrame"] table {
-            background: #050b16 !important;
+            background: #050B16 !important;
+            color: #EAEAEA !important;
+        }
+
+        .um-table-shell [data-testid="stDataFrame"] thead tr th {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border-bottom: 1px solid #29406A !important;
+        }
+
+        .um-table-shell [data-testid="stDataFrame"] tbody tr:nth-child(odd) td {
+            background: #071224 !important;
+        }
+
+        .um-table-shell [data-testid="stDataFrame"] tbody tr:nth-child(even) td {
+            background: #050E1D !important;
+        }
+
+        .um-table-shell [data-testid="stDataFrame"] tbody tr td {
+            color: #EAEAEA !important;
+            border-color: #13233D !important;
+        }
+
+        /* Dialog surface (match Devices) */
+        div[data-testid="stDialog"] > div {
+            border: 1px solid rgba(255,255,255,0.16);
+            border-radius: 20px;
+            background:
+                radial-gradient(700px 260px at 0% 0%, rgba(0,247,255,0.08), transparent 45%),
+                linear-gradient(165deg, rgba(7,18,38,0.98), rgba(5,12,26,0.98));
+            box-shadow: 0 20px 48px rgba(0,0,0,0.45);
+        }
+
+        div[data-testid="stDialog"] .block-container {
+            padding-top: 0.45rem !important;
+            padding-bottom: 0.55rem !important;
+            padding-left: 0.25rem !important;
+            padding-right: 0.25rem !important;
+            max-width: 100% !important;
+        }
+
+        /* Inputs/buttons corner radius (match Devices) */
+        div[data-testid="stTextInput"] input { border-radius: 14px !important; }
+        div[data-testid="stSelectbox"] > div { border-radius: 14px !important; }
+        button { border-radius: 14px !important; }
+
+        /* ---- Password toggle icon fix (keep Streamlit design, correct state) ---- */
+        div[data-baseweb="input"] button[aria-label*="Show password"],
+        div[data-baseweb="input"] button[aria-label*="Hide password"],
+        div[data-baseweb="input"] button[title*="Show password"],
+        div[data-baseweb="input"] button[title*="Hide password"] {
+            position: relative;
+        }
+
+        div[data-baseweb="input"] button[aria-label*="Show password"] svg,
+        div[data-baseweb="input"] button[aria-label*="Hide password"] svg,
+        div[data-baseweb="input"] button[title*="Show password"] svg,
+        div[data-baseweb="input"] button[title*="Hide password"] svg {
+            display: none !important;
+        }
+
+        div[data-baseweb="input"] button[aria-label*="Hide password"]::before,
+        div[data-baseweb="input"] button[title*="Hide password"]::before {
+            content: "";
+            width: 18px;
+            height: 18px;
+            display: block;
+            background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI0VBRjJGRiI+PHBhdGggZD0iTTEyIDQuNUM3IDQuNSAyLjczIDcuNjEgMSAxMmMxLjczIDQuMzkgNiA3LjUgMTEgNy41czkuMjctMy4xMSAxMS03LjVjLTEuNzMtNC4zOS02LTcuNS0xMS03LjV6bTAgMTIuNWMtMi43NiAwLTUtMi4yNC01LTVzMi4yNC01IDUtNSA1IDIuMjQgNSA1LTIuMjQgNS01IDV6bTAtOGMtMS42NiAwLTMgMS4zNC0zIDNzMS4zNCAzIDMgMyAzLTEuMzQgMy0zLTEuMzQtMy0zLTN6Ii8+PC9zdmc+") center/18px 18px no-repeat;
+        }
+
+        div[data-baseweb="input"] button[aria-label*="Show password"]::before,
+        div[data-baseweb="input"] button[title*="Show password"]::before {
+            content: "";
+            width: 18px;
+            height: 18px;
+            display: block;
+            background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI0VBRjJGRiI+PHBhdGggZD0iTTEyIDYuNWMzLjMgMCA2LjEgMS43IDcuOCA0LjUtLjcgMS4yLTEuNyAyLjItMi45IDNsMS40IDEuNGMxLjUtMS4xIDIuNy0yLjUgMy41LTQuNC0xLjczLTQuMzktNi03LjUtMTEtNy41LTEuNCAwLTIuNy4yLTQgLjZsMS43IDEuN2MuNy0uMiAxLjUtLjMgMi41LS4zem0tMTAtNC4xIDIuMyAyLjMuNS41QzMuNCA2LjYgMi4zIDkuMSAxIDEyYzEuNzMgNC4zOSA2IDcuNSAxMSA3LjUgMS43IDAgMy4zLS4zIDQuOC0uOGwuNC40IDIuOSAyLjkgMS4zLTEuM0wzLjMgMS4xIDIgMi40em01LjEgNS4xIDEuNSAxLjVjLS40LjctLjYgMS41LS42IDIuNSAwIDIuNzYgMi4yNCA1IDUgNSAxIDAgMS44LS4yIDIuNS0uNmwxLjUgMS41Yy0xLjEuNS0yLjMuOC00IC44LTMuMyAwLTYuMS0xLjctNy44LTQuNS45LTEuNiAyLjMtMi45IDMuOS0zLjd6bTQuOSA0LjkgMS43IDEuN2MtLjUuMi0xIC4zLTEuNy4zLTEuNjYgMC0zLTEuMzQtMy0zIDAtLjYuMS0xLjIuMy0xLjdsMS43IDEuN2MwIC4zLS4xLjQtLjEuNiAwIC42LjQgMSAxIDEgLjIgMCAuMyAwIC42LS4xeiIvPjwvc3ZnPg==") center/18px 18px no-repeat;
         }
 
         </style>
+
         """,
         unsafe_allow_html=True,
     )
-
-
 def _render_metric_card(label: str, value: str, note: str) -> None:
     st.markdown(
         f"""

@@ -8,6 +8,7 @@ MENU_OPTIONS = [
     "Zeek Logs",
     "Alerts",
     "Authorization",
+    "User Management",
 ]
 
 MENU_ICONS = [
@@ -16,6 +17,7 @@ MENU_ICONS = [
     "file-earmark-text",
     "bell",
     "shield-lock",
+    "people",
 ]
 
 DEFAULT_PAGE = MENU_OPTIONS[0]
@@ -29,66 +31,30 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
         st.session_state.sidebar_page = DEFAULT_PAGE
 
     default_index = options.index(st.session_state.sidebar_page)
+
+    # 1) Base sidebar theme (2 colors only)
     st.markdown(
         """
         <style>
-        [data-testid="stSidebar"] > div:first-child {
-            padding-top: 0rem;
-            background: linear-gradient(180deg, #171b24 0%, #11151d 100%);
-            border-right: 1px solid #242a35;
+        :root{
+            --sb-top:#151a28;
+            --sb-bot:#0f1422;
+            --sb-text:#ffffff;
+            --sb-dim:rgba(255,255,255,0.88);
         }
 
-        [data-testid="stSidebar"] .block-container {
-            padding-top: 1rem;
-            padding-bottom: 0.75rem;
-            padding-left: 0.75rem;
-            padding-right: 0.75rem;
+        /* Sidebar background only (no divider) */
+        section[data-testid="stSidebar"],
+        [data-testid="stSidebar"],
+        [data-testid="stSidebar"] > div:first-child{
+            background: linear-gradient(180deg, var(--sb-top) 0%, var(--sb-bot) 100%) !important;
+            border-right: 0 !important;
+            box-shadow: none !important;
         }
 
-        .sidebar-brand {
-            margin-bottom: 0.7rem;
-            padding: 0.15rem 0.1rem 0.35rem 0.1rem;
+        [data-testid="stSidebar"] .block-container{
+            padding: 0.9rem 0.85rem 0.8rem 0.85rem;
         }
-
-        .sidebar-brand-title {
-            color: #f7fbff;
-            font-size: 1.1rem;
-            font-weight: 700;
-            line-height: 1.2;
-            margin: 0;
-        }
-
-        .option-menu {
-            display: flex;
-            flex-direction: column;
-            gap: 0.3rem;
-            background: transparent;
-        }
-
-        .option-menu .nav-link {
-            transition: all 0.18s ease;
-            border: 1px solid transparent;
-            background: #1a202c;
-            color: #c0cbdb;
-            margin: 0 !important;
-            border-radius: 10px !important;
-            font-weight: 500;
-        }
-
-        .option-menu .nav-link:hover {
-            background: #222b39;
-            color: #edf3ff;
-            border-color: #2f3a4c;
-        }
-
-        .option-menu .nav-link-selected {
-            background: #263246;
-            color: #f4f8ff;
-            border: 1px solid #3a4b66;
-            font-weight: 600;
-            box-shadow: inset 3px 0 0 #60a5fa;
-        }
-
         </style>
         """,
         unsafe_allow_html=True,
@@ -96,51 +62,124 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
 
     with st.sidebar:
         st.markdown(
-            """
-            <div class="sidebar-brand">
-                <div class="sidebar-brand-title">Zeek Dashboard</div>
-            </div>
-            """,
+            "<div style='color:#fff;font-weight:800;font-size:1.05rem;margin-bottom:0.75rem;'>Zeek Dashboard</div>",
             unsafe_allow_html=True,
         )
 
+        # 2) Render option_menu with “as transparent as possible”
         page = option_menu(
             menu_title=None,
             options=options,
             icons=icons,
-            menu_icon=None,
             default_index=default_index,
             orientation="vertical",
             styles={
                 "container": {
                     "padding": "0!important",
                     "background-color": "transparent",
-                    "width": "100%",
+                    "border": "0",
                     "border-radius": "0",
                 },
-                "icon": {"color": "#d6e4f8", "font-size": "17px"},
                 "nav-link": {
-                    "font-size": "15px",
-                    "text-align": "left",
-                    "padding": "9px 12px",
+                    "background-color": "transparent",
+                    "color": "rgba(255,255,255,0.88)",
                     "margin": "0",
-                    "border-radius": "10px",
-                    "background-color": "#1a202c",
-                    "color": "#c0cbdb",
-                    "--hover-color": "#222b39",
+                    "padding": "0.55rem 0.2rem 0.55rem 0.6rem",
+                    "border-radius": "0",
+                    "border": "0",
                 },
                 "nav-link-selected": {
-                    "background-color": "#263246",
-                    "font-weight": "600",
-                    "color": "#f4f8ff",
-                    "border-radius": "10px",
+                    "background-color": "transparent",
+                    "color": "#ffffff",
+                    "font-weight": "800",
+                    "border-radius": "0",
+                    "border": "0",
                 },
+                "icon": {"color": "#ffffff", "font-size": "16px"},
             },
             key="sidebar_option_menu",
         )
 
-        st.session_state.sidebar_page = page
+        # 3) HARD OVERRIDE AFTER render (this removes the grey box for real)
+        st.markdown(
+            """
+            <style>
+            /* Kill the grey rectangle: force ALL option_menu wrappers transparent */
+            [data-testid="stSidebar"] .option-menu,
+            [data-testid="stSidebar"] .option-menu > div,
+            [data-testid="stSidebar"] .option-menu ul,
+            [data-testid="stSidebar"] .option-menu li,
+            [data-testid="stSidebar"] .option-menu .nav,
+            [data-testid="stSidebar"] .option-menu .nav-pills,
+            [data-testid="stSidebar"] ul.nav,
+            [data-testid="stSidebar"] .nav,
+            [data-testid="stSidebar"] .nav-pills,
+            [data-testid="stSidebar"] .nav-item{
+                background: transparent !important;
+                background-color: transparent !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                outline: none !important;
+                padding: 0 !important;
+                margin: 0 !important;
+            }
 
+            /* Remove bullets/indent that can look like a container */
+            [data-testid="stSidebar"] .option-menu ul,
+            [data-testid="stSidebar"] ul.nav{
+                list-style: none !important;
+            }
+
+            /* Links: no box, no border, no focus ring */
+            [data-testid="stSidebar"] .option-menu a.nav-link,
+            [data-testid="stSidebar"] .option-menu a.nav-link-selected{
+                background: transparent !important;
+                background-color: transparent !important;
+                border: 0 !important;
+                border-radius: 0 !important;
+                box-shadow: none !important;
+                outline: none !important;
+                text-decoration: none !important;
+                color: var(--sb-dim) !important;
+            }
+
+            [data-testid="stSidebar"] .option-menu a.nav-link:hover{
+                background: transparent !important;
+                color: var(--sb-text) !important;
+            }
+
+            [data-testid="stSidebar"] .option-menu a.nav-link-selected{
+                background: transparent !important;
+                color: var(--sb-text) !important;
+                font-weight: 800 !important;
+            }
+
+            [data-testid="stSidebar"] .option-menu a.nav-link:focus,
+            [data-testid="stSidebar"] .option-menu a.nav-link:focus-visible,
+            [data-testid="stSidebar"] .option-menu a.nav-link-selected:focus,
+            [data-testid="stSidebar"] .option-menu a.nav-link-selected:focus-visible{
+                outline: none !important;
+                box-shadow: none !important;
+            }
+
+            /* Icons: no border/box */
+            [data-testid="stSidebar"] .option-menu a.nav-link i,
+            [data-testid="stSidebar"] .option-menu a.nav-link-selected i,
+            [data-testid="stSidebar"] .option-menu a.nav-link svg,
+            [data-testid="stSidebar"] .option-menu a.nav-link-selected svg{
+                background: transparent !important;
+                border: 0 !important;
+                box-shadow: none !important;
+                outline: none !important;
+                color: var(--sb-text) !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.session_state.sidebar_page = page
         st_autorefresh(interval=auto_refresh_interval * 1000, key="auto_refresh_timer")
 
     return st.session_state.sidebar_page

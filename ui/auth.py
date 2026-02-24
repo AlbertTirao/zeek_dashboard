@@ -449,6 +449,39 @@ def require_authentication() -> None:
                     min-height: 300px;
                 }}
             }}
+
+                    /* ---- Password toggle icon fix (f-string safe) ---- */
+                    div[data-baseweb="input"] button[aria-label*="Hide password"],
+                    div[data-baseweb="input"] button[aria-label*="Show password"],
+                    div[data-baseweb="input"] button[title*="Hide password"],
+                    div[data-baseweb="input"] button[title*="Show password"] {{
+                        position: relative;
+                    }}
+
+                    div[data-baseweb="input"] button[aria-label*="Hide password"] svg,
+                    div[data-baseweb="input"] button[aria-label*="Show password"] svg,
+                    div[data-baseweb="input"] button[title*="Hide password"] svg,
+                    div[data-baseweb="input"] button[title*="Show password"] svg {{
+                        display: none !important;
+                    }}
+
+                    div[data-baseweb="input"] button[aria-label*="Hide password"]::before,
+                    div[data-baseweb="input"] button[title*="Show password"]::before {{
+                        content: "";
+                        width: 18px;
+                        height: 18px;
+                        display: block;
+                        background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzExMTgyNyI+PHBhdGggZD0iTTEyIDQuNUM3IDQuNSAyLjczIDcuNjEgMSAxMmMxLjczIDQuMzkgNiA3LjUgMTEgNy41czkuMjctMy4xMSAxMS03LjVjLTEuNzMtNC4zOS02LTcuNS0xMS03LjV6bTAgMTIuNWMtMi43NiAwLTUtMi4yNC01LTVzMi4yNC01IDUtNSA1IDIuMjQgNSA1LTIuMjQgNS01IDV6bTAtOGMtMS42NiAwLTMgMS4zNC0zIDNzMS4zNCAzIDMgMyAzLTEuMzQgMy0zLTEuMzQtMy0zLTN6Ii8+PC9zdmc+") center/18px 18px no-repeat;
+                    }}
+
+                    div[data-baseweb="input"] button[aria-label*="Show password"]::before,
+                    div[data-baseweb="input"] button[title*="Show password"]::before {{
+                        content: "";
+                        width: 18px;
+                        height: 18px;
+                        display: block;
+                        background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzExMTgyNyI+PHBhdGggZD0iTTEyIDYuNWMzLjMgMCA2LjEgMS43IDcuOCA0LjUtLjcgMS4yLTEuNyAyLjItMi45IDNsMS40IDEuNGMxLjUtMS4xIDIuNy0yLjUgMy41LTQuNC0xLjczLTQuMzktNi03LjUtMTEtNy41LTEuNCAwLTIuNy4yLTQgLjZsMS43IDEuN2MuNy0uMiAxLjUtLjMgMi41LS4zem0tMTAtNC4xIDIuMyAyLjMuNS41QzMuNCA2LjYgMi4zIDkuMSAxIDEyYzEuNzMgNC4zOSA2IDcuNSAxMSA3LjUgMS43IDAgMy4zLS4zIDQuOC0uOGwuNC40IDIuOSAyLjkgMS4zLTEuM0wzLjMgMS4xIDIgMi40em01LjEgNS4xIDEuNSAxLjVjLS40LjctLjYgMS41LS42IDIuNSAwIDIuNzYgMi4yNCA1IDUgNSAxIDAgMS44LS4yIDIuNS0uNmwxLjUgMS41Yy0xLjEuNS0yLjMuOC00IC44LTMuMyAwLTYuMS0xLjctNy44LTQuNS45LTEuNiAyLjMtMi45IDMuOS0zLjd6bTQuOSA0LjkgMS43IDEuN2MtLjUuMi0xIC4zLTEuNy4zLTEuNjYgMC0zLTEuMzQtMy0zIDAtLjYuMS0xLjIuMy0xLjdsMS43IDEuN2MwIC4zLS4xIC40LS4xIC42IDAgLjYuNCAxIDEgMSAuMiAwIC4zIDAgLjYtLjF6Ii8+PC9zdmc+") center/18px 18px no-repeat;
+                    }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -560,4 +593,3 @@ def require_role(*allowed_roles: str) -> None:
     if user.get("role") not in set(allowed_roles):
         st.error("You do not have permission to access this page.")
         st.stop()
-
