@@ -625,7 +625,7 @@ def show_shadow_sharing_device_dialog(
             Category=("Category", lambda x: x.value_counts().index[0] if len(x) else "Unknown"),
             Allow_Basis=("Allow_Basis", lambda x: next((v for v in x.astype(str) if v), "")),
             Last_Seen=("ts", "max"),
-            Events=("ts", "count"),
+            Events=("event_id", "nunique"),
             Unique_IPs=("id.orig_h", lambda x: x.astype(str).str.strip().replace({"": None, "nan": None, "None": None, "none": None, "-": None}).dropna().nunique()),
             Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
             Max_Risk=("Risk_Score", "max"),
@@ -1046,7 +1046,7 @@ def render_shadow_sharing(parquet_root: Path):
             top_dest = (
                 dev_src.groupby(["__device_key", "destination"], dropna=False)
                 .agg(
-                    dest_events=("ts", "count"),
+                    dest_events=("event_id", "nunique"),
                     dest_bytes=("bytes", "sum"),
                     Top_Dest_Max_Risk=("Risk_Score", "max"),
                 )
@@ -1064,7 +1064,7 @@ def render_shadow_sharing(parquet_root: Path):
                 IP=("__ip", _first_valid_ip),
                 Hostname=("host_name", _first_device_name),
                 Last_Seen=("ts", "max"),
-                Events=("ts", "count"),
+                Events=("event_id", "nunique"),
                 Unapproved=("Allowed", lambda x: int((x == False).sum())),  # noqa: E712
                 Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
                 Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
@@ -1153,7 +1153,7 @@ def render_shadow_sharing(parquet_root: Path):
         st.markdown(
             "This page correlates Zeek telemetry and flags potential Shadow Sharing / Exfiltration.\n"
             "- Primary events are correlated `flow` rows (`conn` joined with `http`/`ssl`/`files` by `uid`), plus `dns` rows for tunneling checks.\n"
-            "- Destination selection is prioritized as `http.host` -> `ssl.server_name` -> DNS answer mapping -> `conn.id.resp_h` fallback.\n"
+            "- Destination selection is prioritized as `http.host` -> `ssl.server_name` -> `conn.id.resp_h` fallback (DNS answers are not used for naming).\n"
             "- Dashboard transfer `bytes` is outbound-oriented (`bytes_out`/`orig_bytes` on flow rows).\n"
             "- `Allowed`/`Unapproved` uses boundary-safe suffix matching against `whitelist_domains.yaml`; matched evidence is shown in `Allow_Basis`.\n"
             "- `Action` + `Action_Basis` come from log source, HTTP method/URI/content-type, and automation user-agent hints.\n"

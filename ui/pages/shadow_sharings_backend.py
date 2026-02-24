@@ -15,7 +15,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v9-hostname-parity"
+CACHE_VERSION = "shadow-sharing-cache-v11-no-dns-fallback-no-mcast"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -645,7 +645,7 @@ def _normalize_host(value: str) -> str:
     s = _strip_scheme_path(value)
     host, _ = _split_host_port(s)
     host = str(host or "").strip().strip(".").lower()
-    if host in {"", "unknown", "nan", "none", "-"}:
+    if host in {"", "unknown", "nan", "none", "-", "(empty)", "*"}:
         return ""
     return host
 
@@ -676,7 +676,7 @@ def _is_internal_ip(value: str) -> bool:
     try:
         ip = ipaddress.ip_address(s)
         # Private, ULA, link-local, loopback are treated as internal
-        return bool(ip.is_private or ip.is_link_local or ip.is_loopback)
+        return bool(ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_multicast)
     except Exception:
         return False
 
@@ -880,7 +880,6 @@ def _build_correlated_flows(
     ssl_by_uid: pd.DataFrame,
     http_by_uid: pd.DataFrame,
     files_by_uid: pd.DataFrame,
-    dns_ip_map: Dict[str, str],
 ) -> pd.DataFrame:
     if conn_df is None or conn_df.empty:
         return pd.DataFrame()
@@ -944,17 +943,14 @@ def _build_correlated_flows(
 
     c["dest_host_http"] = c.get("host", "").astype(str).apply(_normalize_host)
     c["dest_host_sni"] = c.get("server_name", "").astype(str).apply(_normalize_host)
-    c["dest_host_dns"] = c.get("id.resp_h", "").astype(str).map(lambda ip: dns_ip_map.get(str(ip).strip(), ""))
-    c["dest_host_dns"] = c["dest_host_dns"].astype(str).apply(_normalize_host)
 
     def _pick_dest(row):
         if row.get("dest_host_http"):
             return row["dest_host_http"], "http.host"
         if row.get("dest_host_sni"):
             return row["dest_host_sni"], "ssl.server_name"
-        if row.get("dest_host_dns"):
-            return row["dest_host_dns"], "dns.answers->query"
-        return str(row.get("id.resp_h") or "").strip(), "conn.id.resp_h"
+        # Fallback: use conn.id.resp_h, but normalize and treat placeholders (e.g. "*") as invalid.
+        return _normalize_host(str(row.get("id.resp_h") or "")), "conn.id.resp_h"
 
     picked = c.apply(_pick_dest, axis=1, result_type="expand")
     c["destination"] = picked[0].replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
@@ -1349,7 +1345,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     New approach:
       - Use conn.log as the primary table (one row per uid / flow)
       - Correlate ssl/http/files onto conn via uid (and files.conn_uids)
-      - Use dns.answers->query as a fallback naming source when http.host / ssl.server_name are missing
+      - Destination naming uses http.host → ssl.server_name → conn.id.resp_h (no DNS answer fallback)
       - Keep dns.log rows separately for DNS exfil heuristics (tunneling / b64-like labels)
     """
     date_dir = Path(parquet_root) / date_str
@@ -1391,11 +1387,10 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     df_dns = _duck_read_parquet_union(buckets.get("dns") or [])
 
     # correlated flows
-    dns_ip_map = _build_dns_ip_map(df_dns) if not df_dns.empty else {}
     ssl_by_uid = _build_ssl_by_uid(df_ssl) if not df_ssl.empty else pd.DataFrame()
     http_by_uid = _build_http_by_uid(df_http) if not df_http.empty else pd.DataFrame()
     files_by_uid = _build_files_by_uid(df_files) if not df_files.empty else pd.DataFrame()
-    df_flow = _build_correlated_flows(df_conn, ssl_by_uid, http_by_uid, files_by_uid, dns_ip_map)
+    df_flow = _build_correlated_flows(df_conn, ssl_by_uid, http_by_uid, files_by_uid)
 
     # dns rows (kept for tunneling heuristics / supporting evidence)
     df_dns_events = pd.DataFrame()
@@ -1443,6 +1438,25 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
 
     out = pd.concat(frames, ignore_index=True)
     out = _ensure_ts_datetime(out).sort_values("ts", ascending=False)
+
+    # Stable event identifier for unique counting.
+    # - Prefer Zeek conn UID when present (correlated flow rows).
+    # - Fallback to a composite key for rows that do not have uid (e.g., dns rows).
+    if "event_id" not in out.columns:
+        uid_norm = out["uid"].astype(str).str.strip() if "uid" in out.columns else pd.Series("", index=out.index)
+        uid_ok = ~uid_norm.isin(["", "-", "(empty)", "nan", "none", "None"])
+        ts_str = pd.to_datetime(out["ts"], errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        ts_str = ts_str.fillna("")
+        log_src = out.get("log_source", pd.Series("", index=out.index)).astype(str).str.strip().str.lower().fillna("")
+        orig_h = out.get("id.orig_h", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
+        resp_h = out.get("id.resp_h", pd.Series("", index=out.index)).astype(str).str.strip().fillna("") if "id.resp_h" in out.columns else pd.Series("", index=out.index)
+        dest = out.get("destination", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
+        method = out.get("method", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
+        uri = out.get("uri", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
+        fallback = (
+            "row:" + log_src + "|" + ts_str + "|" + orig_h + "|" + resp_h + "|" + dest + "|" + method + "|" + uri
+        )
+        out["event_id"] = ("uid:" + uid_norm).where(uid_ok, fallback)
 
     # identity enrichment
     out = _enrich_identity(out, ip_map, mac_map)
