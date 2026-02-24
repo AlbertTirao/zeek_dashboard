@@ -1479,6 +1479,14 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     out["Allowed"] = allowed_basis.apply(lambda x: bool(x[0]))
     out["Allow_Basis"] = allowed_basis.apply(lambda x: str(x[1] or ""))
 
+
+    # Make Allow_Basis explicit for operator clarity.
+    # If not allowed and no whitelist match, show 'no match'.
+    # If destination is unknown/placeholder, show 'n/a (unknown destination)'.
+    _dest_norm = out["destination"].astype(str).str.strip().str.lower()
+    _dest_unknown = _dest_norm.isin({"", "unknown", "nan", "none", "(empty)", "*"})
+    out.loc[_dest_unknown & (out["Allowed"] == False), "Allow_Basis"] = "n/a (unknown destination)"  # noqa: E712
+    out.loc[(~_dest_unknown) & (out["Allowed"] == False) & (out["Allow_Basis"].astype(str).str.strip() == ""), "Allow_Basis"] = "no match"  # noqa: E712
     # category
     out["Category"] = out["destination"].apply(_tag_category)
 

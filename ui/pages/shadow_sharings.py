@@ -662,20 +662,55 @@ def show_shadow_sharing_device_dialog(
                     return v
             return ""
 
-        dest = dest_src.groupby("destination", dropna=False).agg(
-            Category=("Category", lambda x: x.value_counts().index[0] if len(x) else "Unknown"),
-            Allow_Basis=("Allow_Basis", _first_meaningful),
-            Last_Seen=("ts", "max"),
-            Events=("event_id", "nunique"),
-            Unique_IPs=("id.orig_h", lambda x: x.astype(str).str.strip()
+        def _mode_or_unknown(series: pd.Series) -> str:
+            try:
+                return series.astype(str).value_counts().index[0] if len(series) else "Unknown"
+            except Exception:
+                return "Unknown"
+
+        def _dest_rollup(g: pd.DataFrame) -> pd.Series:
+            g = g.copy()
+            # ensure numerics
+            g["bytes"] = pd.to_numeric(g.get("bytes", 0), errors="coerce").fillna(0)
+            g["Risk_Score"] = pd.to_numeric(g.get("Risk_Score", 0), errors="coerce").fillna(0)
+            g["ts"] = pd.to_datetime(g.get("ts"), errors="coerce")
+
+            # Pick the "representative" row for risk basis/action: highest risk, then most bytes, then newest.
+            g_sorted = g.sort_values(["Risk_Score", "bytes", "ts"], ascending=[False, False, False])
+            top = g_sorted.iloc[0] if len(g_sorted) else {}
+
+            allow_basis = _first_meaningful(g.get("Allow_Basis", pd.Series([], dtype=str)))
+            if not allow_basis:
+                # backend leaves blank when no whitelist entry matches; make it explicit for operators
+                allow_basis = "no match"
+
+            return pd.Series(
+                {
+                    "Category": _mode_or_unknown(g.get("Category", pd.Series([], dtype=str))),
+                    "Allow_Basis": allow_basis,
+                    "Last_Seen": g["ts"].max(),
+                    "Events": int(g.get("event_id", pd.Series([], dtype=str)).nunique()),
+                    "Unique_IPs": int(
+                        g.get("id.orig_h", pd.Series([], dtype=str))
+                        .astype(str)
+                        .str.strip()
                         .replace({"": None, "nan": None, "None": None, "none": None, "-": None})
-                        .dropna().nunique()),
-            Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
-            # IMPORTANT: Risk here is computed only from non-zero-volume rows,
-            # so metadata/DNS noise can't inflate destination risk.
-            Max_Risk=("Risk_Score", "max"),
-            Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
-        ).reset_index().sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False)
+                        .dropna()
+                        .nunique()
+                    ),
+                    "Total_MB": float(g["bytes"].sum()) / 1024 / 1024,
+                    "Max_Risk": int(top.get("Risk_Score", 0) or 0),
+                    "Risk_Basis": str(top.get("Risk_Basis", "") or ""),
+                    "Top_Action": str(top.get("Action", "") or ""),
+                }
+            )
+
+        dest = (
+            dest_src.groupby("destination", dropna=False)
+            .apply(_dest_rollup)
+            .reset_index()
+            .sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False)
+        )
 
         dest_grid = dest.copy()
         dest_grid.insert(0, "#", range(1, len(dest_grid) + 1))
@@ -700,6 +735,7 @@ def show_shadow_sharing_device_dialog(
         gb_dest.configure_column("Unique_IPs", header_name="IPs", width=90)
         gb_dest.configure_column("Total_MB", header_name="Total MB", width=116)
         gb_dest.configure_column("Max_Risk_Level", header_name="Risk Level", width=130, cellStyle=_severity_cellstyle())
+        gb_dest.configure_column("Risk_Basis", header_name="Risk Basis", minWidth=260)
         gb_dest.configure_column("Top_Action", header_name="Top Action", minWidth=145)
 
         render_shadow_aggrid(
