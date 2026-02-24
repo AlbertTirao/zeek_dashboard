@@ -1,5 +1,12 @@
+
+
+# ----------------------------------------------------------------------------
+# Hard filters for destination display
+# ----------------------------------------------------------------------------
+INVALID_DEST_STRINGS = {"", "unknown", "nan", "none", "(empty)", "*"}
 # ui/pages/shadow_sharings.py
 import re
+import ipaddress
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -589,7 +596,7 @@ def show_shadow_sharing_device_dialog(
     scoped_ts = pd.to_datetime(scoped_all["ts"], errors="coerce")
     first_seen = scoped_ts.min()
     last_seen = scoped_ts.max()
-    total_mb = float(scoped_all["bytes"].sum()) / 1024 / 1024
+    total_mb = float(scoped_all.loc[scoped_all["bytes"] > 0, "bytes"].sum()) / 1024 / 1024
     unapproved = int((scoped_all["Allowed"] == False).sum())  # noqa: E712
     unique_dest = int(scoped_all["destination"].replace({"": None, "Unknown": None}).dropna().nunique())
 
@@ -627,7 +634,7 @@ def show_shadow_sharing_device_dialog(
             Last_Seen=("ts", "max"),
             Events=("event_id", "nunique"),
             Unique_IPs=("id.orig_h", lambda x: x.astype(str).str.strip().replace({"": None, "nan": None, "None": None, "none": None, "-": None}).dropna().nunique()),
-            Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
+            Total_MB=("bytes", lambda x: float(x[x > 0].sum()) / 1024 / 1024),
             Max_Risk=("Risk_Score", "max"),
             Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
         ).reset_index().sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False)
@@ -839,6 +846,11 @@ def render_shadow_sharing(parquet_root: Path):
                 | filtered["Allow_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
             ]
 
+    # Hard filter: hide Unknown/placeholder destinations in tables and Top Dest computations
+    if "destination" in filtered.columns:
+        dest_norm = filtered["destination"].astype(str).str.strip().str.lower()
+        filtered = filtered[~dest_norm.isin(INVALID_DEST_STRINGS)]
+
     if filtered.empty:
         st.warning("No data matches your filters.")
         return
@@ -847,7 +859,7 @@ def render_shadow_sharing(parquet_root: Path):
     st.divider()
     m1, m2, m3, m4 = st.columns(4)
 
-    total_b = float(filtered["bytes"].sum())
+    total_b = float(filtered.loc[filtered["bytes"] > 0, "bytes"].sum())
     total_mb = total_b / 1024 / 1024
     unapproved = int((filtered["Allowed"] == False).sum())  # noqa: E712
     autom = int((filtered["Client_Type"] == "Automation / SDK").sum())
@@ -1043,8 +1055,25 @@ def render_shadow_sharing(parquet_root: Path):
             dev_src["Risk_Score"] = pd.to_numeric(dev_src["Risk_Score"], errors="coerce").fillna(0)
             dev_src["__device_key"] = dev_src["__mac"].where(dev_src["__mac"] != "", "ip:" + dev_src["__ip"])
 
+            # Hard filters: drop placeholder destinations (e.g. '*') and multicast group IPs
+            _invalid_dest = set(INVALID_DEST_STRINGS)
+            dev_src = dev_src[~dev_src["destination"].astype(str).str.strip().str.lower().isin(_invalid_dest)]
+
+            def _is_multicast_dest(v: object) -> bool:
+                try:
+                    s = str(v or "").strip().split("%", 1)[0]
+                    if not s:
+                        return False
+                    return ipaddress.ip_address(s).is_multicast
+                except Exception:
+                    return False
+
+            dev_src = dev_src[~dev_src["destination"].apply(_is_multicast_dest)]
+
+
+            dev_src_bytes = dev_src[dev_src["bytes"] > 0].copy()
             top_dest = (
-                dev_src.groupby(["__device_key", "destination"], dropna=False)
+                dev_src_bytes.groupby(["__device_key", "destination"], dropna=False)
                 .agg(
                     dest_events=("event_id", "nunique"),
                     dest_bytes=("bytes", "sum"),
@@ -1072,7 +1101,8 @@ def render_shadow_sharing(parquet_root: Path):
             ).reset_index()
 
             dev = dev.merge(top_dest[["__device_key", "Top_Dest", "Top_Dest_Max_Risk"]], on="__device_key", how="left")
-            dev["Top_Dest"] = dev["Top_Dest"].astype(str).replace({"nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
+            dev["Top_Dest"] = dev["Top_Dest"].astype(str).replace({"nan": "", "None": ""}).fillna("")
+            dev = dev[~dev["Top_Dest"].astype(str).str.strip().str.lower().isin(INVALID_DEST_STRINGS)]
             dev["Top_Dest_Max_Risk"] = pd.to_numeric(dev["Top_Dest_Max_Risk"], errors="coerce").fillna(0).astype(int)
             dev = dev.sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False).drop(columns=["__device_key"])
 

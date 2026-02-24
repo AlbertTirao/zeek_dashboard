@@ -15,7 +15,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v11-no-dns-fallback-no-mcast"
+CACHE_VERSION = "shadow-sharing-cache-v13-no-dns-no-mcast-no-star-zonefix-filters-v14"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -645,6 +645,8 @@ def _normalize_host(value: str) -> str:
     s = _strip_scheme_path(value)
     host, _ = _split_host_port(s)
     host = str(host or "").strip().strip(".").lower()
+    # strip IPv6 zone index like "%eth0" if present
+    host = host.split("%", 1)[0]
     if host in {"", "unknown", "nan", "none", "-", "(empty)", "*"}:
         return ""
     return host
@@ -673,9 +675,14 @@ def _is_internal_ip(value: str) -> bool:
     s = str(value or "").strip()
     if not s:
         return False
+    # Normalize any host/IP forms and strip IPv6 zone index if present.
+    s_norm = _normalize_host(s)
+    s_norm = (s_norm or s).split("%", 1)[0].strip()
+    if not s_norm:
+        return False
     try:
-        ip = ipaddress.ip_address(s)
-        # Private, ULA, link-local, loopback are treated as internal
+        ip = ipaddress.ip_address(s_norm)
+        # Treat local-only / non-routable categories as "internal/non-external" for this dashboard.
         return bool(ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_multicast)
     except Exception:
         return False
@@ -943,13 +950,11 @@ def _build_correlated_flows(
 
     c["dest_host_http"] = c.get("host", "").astype(str).apply(_normalize_host)
     c["dest_host_sni"] = c.get("server_name", "").astype(str).apply(_normalize_host)
-
     def _pick_dest(row):
         if row.get("dest_host_http"):
             return row["dest_host_http"], "http.host"
         if row.get("dest_host_sni"):
             return row["dest_host_sni"], "ssl.server_name"
-        # Fallback: use conn.id.resp_h, but normalize and treat placeholders (e.g. "*") as invalid.
         return _normalize_host(str(row.get("id.resp_h") or "")), "conn.id.resp_h"
 
     picked = c.apply(_pick_dest, axis=1, result_type="expand")
@@ -1150,7 +1155,11 @@ def _risk_score_row(row: pd.Series) -> Tuple[int, str]:
     basis: List[str] = []
 
     allowed = bool(row.get("Allowed", False))
-    if not allowed:
+    dest_raw = str(row.get("destination", "") or "").strip().lower()
+    dest_unknown = dest_raw in {"", "unknown", "nan", "none", "(empty)", "*"}
+    # If destination is unknown/placeholder, don't treat it as "unapproved" (avoid false penalties).
+    unapproved = (not allowed) and (not dest_unknown)
+    if unapproved:
         score += 15
         basis.append("destination not in whitelist")
 
@@ -1189,7 +1198,7 @@ def _risk_score_row(row: pd.Series) -> Tuple[int, str]:
         score += 12
         basis.append(">=10MB outbound")
 
-    if bytes_out >= 10 * 1024 * 1024 and ratio >= 5 and not allowed:
+    if bytes_out >= 10 * 1024 * 1024 and ratio >= 5 and unapproved:
         score += 10
         basis.append("high outbound ratio")
 
@@ -1229,6 +1238,9 @@ def _detect_exfil_signal_row(row: pd.Series) -> Tuple[bool, str]:
     dns_reason = str(row.get("DNS_Exfil_Reason", "") or "").strip()
     allowed = bool(row.get("Allowed", False))
 
+    dest_raw = str(row.get("destination", "") or "").strip().lower()
+    dest_unknown = dest_raw in {"", "unknown", "nan", "none", "(empty)", "*"}
+    unapproved = (not allowed) and (not dest_unknown)
     bytes_out = float(row.get("bytes_out", row.get("bytes", 0)) or 0)
     ratio = float(row.get("out_in_ratio", 0) or 0)
     file_bytes = float(row.get("file_total_bytes", 0) or 0)
@@ -1239,17 +1251,17 @@ def _detect_exfil_signal_row(row: pd.Series) -> Tuple[bool, str]:
     if dns_reason:
         reasons.append("dns exfil heuristic")
 
-    if not allowed and bytes_out >= 10 * 1024 * 1024 and ratio >= 5:
+    if unapproved and bytes_out >= 10 * 1024 * 1024 and ratio >= 5:
         reasons.append(">=10MB outbound with high ratio")
 
-    if not allowed and file_bytes >= 10 * 1024 * 1024:
+    if unapproved and file_bytes >= 10 * 1024 * 1024:
         reasons.append("files.log >=10MB on unapproved dest")
 
-    if not allowed and severity in {"CRITICAL", "HIGH"} and bytes_out >= 50 * 1024 * 1024:
+    if unapproved and severity in {"CRITICAL", "HIGH"} and bytes_out >= 50 * 1024 * 1024:
         reasons.append("high-risk large outbound transfer")
 
     # TLS-only, still suspicious: large raw flow to unapproved destination
-    if not allowed and log_source == "flow" and bytes_out >= 100 * 1024 * 1024:
+    if unapproved and log_source == "flow" and bytes_out >= 100 * 1024 * 1024:
         reasons.append("unapproved flow >=100MB outbound")
 
     if not reasons:
@@ -1345,7 +1357,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     New approach:
       - Use conn.log as the primary table (one row per uid / flow)
       - Correlate ssl/http/files onto conn via uid (and files.conn_uids)
-      - Destination naming uses http.host → ssl.server_name → conn.id.resp_h (no DNS answer fallback)
+      - Destination naming uses http.host -> ssl.server_name -> conn.id.resp_h (no DNS answer fallback)
       - Keep dns.log rows separately for DNS exfil heuristics (tunneling / b64-like labels)
     """
     date_dir = Path(parquet_root) / date_str
@@ -1408,7 +1420,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         # destination = query
         if "query" not in d.columns:
             d["query"] = ""
-        d["destination"] = d["query"].astype(str).fillna("").replace({"(empty)": "", "-": ""})
+        d["destination"] = d["query"].astype(str).fillna("").replace({"(empty)": "", "-": "", "*": ""})
         d.loc[d["destination"].eq(""), "destination"] = "Unknown"
         d["bytes"] = 0
         d["log_source"] = "dns"
@@ -1575,5 +1587,4 @@ def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.
         CACHE_VERSION,
         int(WHITELIST_MTIME_NS),
     )
-
 
