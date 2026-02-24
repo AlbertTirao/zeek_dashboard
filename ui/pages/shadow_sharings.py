@@ -1135,7 +1135,7 @@ def render_shadow_sharing(parquet_root: Path):
                 }
                 """
             )
-            gb_dev.configure_column("mac", header_name="MAC (Click)", minWidth=160, cellStyle=clickable_mac_style)
+            gb_dev.configure_column("mac", header_name="MAC", minWidth=160, cellStyle=clickable_mac_style)
             gb_dev.configure_column("IP", header_name="IP", minWidth=140)
             gb_dev.configure_column("Hostname", minWidth=170)
             gb_dev.configure_column("Last_Seen", header_name="Last Seen", width=150)
