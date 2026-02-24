@@ -627,14 +627,52 @@ def show_shadow_sharing_device_dialog(
 
     with st.container():
         st.markdown("#### Destination Forensics")
+        # --- Destination Forensics (NON-ZERO VOLUME ONLY) ---
+        # Destination Forensics is meant to reflect file-sized / transfer-sized activity.
+        # DNS (and other metadata-only rows) commonly carry 0 bytes and should not appear here.
 
-        dest = scoped.groupby("destination", dropna=False).agg(
+        scoped_bytes = scoped.copy()
+        scoped_bytes["bytes"] = pd.to_numeric(scoped_bytes.get("bytes", 0), errors="coerce").fillna(0)
+
+        # Keep only rows that actually have volume (this removes DNS rows too since they are 0 bytes)
+        dest_src = scoped_bytes[scoped_bytes["bytes"] > 0].copy()
+
+        # Drop invalid / placeholder destinations
+        if "destination" in dest_src.columns:
+            _d = dest_src["destination"].astype(str).str.strip().str.lower()
+            dest_src = dest_src[~_d.isin(INVALID_DEST_STRINGS)]
+
+        # Drop multicast destinations (e.g., mDNS / discovery noise)
+        def _is_multicast_dest(v: object) -> bool:
+            try:
+                s = str(v or "").strip().split("%", 1)[0]
+                if not s:
+                    return False
+                return ipaddress.ip_address(s).is_multicast
+            except Exception:
+                return False
+
+        if "destination" in dest_src.columns:
+            dest_src = dest_src[~dest_src["destination"].apply(_is_multicast_dest)]
+
+        def _first_meaningful(series: pd.Series) -> str:
+            for raw in series.astype(str):
+                v = raw.strip()
+                if v and v.lower() not in {"nan", "none", "-", "(empty)", "*"}:
+                    return v
+            return ""
+
+        dest = dest_src.groupby("destination", dropna=False).agg(
             Category=("Category", lambda x: x.value_counts().index[0] if len(x) else "Unknown"),
-            Allow_Basis=("Allow_Basis", lambda x: next((v for v in x.astype(str) if v), "")),
+            Allow_Basis=("Allow_Basis", _first_meaningful),
             Last_Seen=("ts", "max"),
             Events=("event_id", "nunique"),
-            Unique_IPs=("id.orig_h", lambda x: x.astype(str).str.strip().replace({"": None, "nan": None, "None": None, "none": None, "-": None}).dropna().nunique()),
-            Total_MB=("bytes", lambda x: float(x[x > 0].sum()) / 1024 / 1024),
+            Unique_IPs=("id.orig_h", lambda x: x.astype(str).str.strip()
+                        .replace({"": None, "nan": None, "None": None, "none": None, "-": None})
+                        .dropna().nunique()),
+            Total_MB=("bytes", lambda x: float(x.sum()) / 1024 / 1024),
+            # IMPORTANT: Risk here is computed only from non-zero-volume rows,
+            # so metadata/DNS noise can't inflate destination risk.
             Max_Risk=("Risk_Score", "max"),
             Top_Action=("Action", lambda x: x.value_counts().index[0] if len(x) else ""),
         ).reset_index().sort_values(["Max_Risk", "Total_MB", "Events"], ascending=False)
@@ -643,6 +681,10 @@ def show_shadow_sharing_device_dialog(
         dest_grid.insert(0, "#", range(1, len(dest_grid) + 1))
         dest_grid["Last_Seen"] = pd.to_datetime(dest_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M").fillna("")
         dest_grid["Total_MB"] = pd.to_numeric(dest_grid["Total_MB"], errors="coerce").fillna(0).round(2)
+
+        # Final display filter: drop anything that shows as 0.00 MB
+        dest_grid = dest_grid[dest_grid["Total_MB"] > 0].copy()
+
         dest_grid["Max_Risk"] = pd.to_numeric(dest_grid["Max_Risk"], errors="coerce").fillna(0).astype(int)
         dest_grid["Max_Risk_Level"] = dest_grid["Max_Risk"].apply(_severity_label)
         dest_grid = dest_grid.drop(columns=["Max_Risk"])
