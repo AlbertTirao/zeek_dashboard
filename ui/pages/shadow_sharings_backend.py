@@ -362,6 +362,91 @@ def _add_domain_to_whitelist(domain: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to write whitelist: {e}"
 
+
+def _remove_domain_from_whitelist(domain: str) -> Tuple[bool, str]:
+    """
+    Remove a domain/host from whitelist_domains.yaml.
+
+    Returns (ok, message).
+    """
+    host = _normalize_host(domain)
+    if not host:
+        return False, "Empty destination"
+
+    y = _safe_yaml_load(WHITELIST_FILE)
+    if not isinstance(y, dict):
+        y = {}
+
+    removed_from = ""
+    changed = False
+    keys = ["trusted_domains", "whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]
+    for k in keys:
+        v = y.get(k)
+        if isinstance(v, list):
+            lst = [str(x).strip().lower() for x in v if str(x).strip()]
+            kept = [d for d in lst if d != host]
+            if len(kept) != len(lst):
+                y[k] = sorted(set(kept))
+                removed_from = k
+                changed = True
+                break
+        elif isinstance(v, dict):
+            if host in v:
+                del v[host]
+                y[k] = v
+                removed_from = k
+                changed = True
+                break
+
+    if not changed:
+        return True, f"{host} not present in whitelist"
+
+    try:
+        WHITELIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
+            yaml.safe_dump(y, f, sort_keys=True)
+        return True, f"Removed {host} from {removed_from}"
+    except Exception as e:
+        return False, f"Failed to write whitelist: {e}"
+
+
+def refresh_shadow_sharing_runtime_state() -> None:
+    """
+    Refresh in-memory whitelist/signature metadata and clear shadow-sharing caches.
+    Call after mutating whitelist/signature files.
+    """
+    global WHITELIST_DOMAINS, WHITELIST_MTIME_NS
+    global SIGNATURES_MAP, SIGNATURES_MTIME_NS
+
+    try:
+        load_whitelist.clear()
+    except Exception:
+        pass
+    try:
+        WHITELIST_DOMAINS, WHITELIST_MTIME_NS = load_whitelist()
+    except Exception:
+        WHITELIST_DOMAINS, WHITELIST_MTIME_NS = ([], 0)
+
+    try:
+        load_sharing_signatures.clear()
+    except Exception:
+        pass
+    try:
+        SIGNATURES_MAP, SIGNATURES_MTIME_NS = load_sharing_signatures()
+    except Exception:
+        SIGNATURES_MAP, SIGNATURES_MTIME_NS = ({}, 0)
+
+    for fn_name in [
+        "_load_shadow_sharing_data_cached",
+        "load_shadow_sharing_incidents_data",
+    ]:
+        try:
+            fn = globals().get(fn_name)
+            if fn is not None and hasattr(fn, "clear"):
+                fn.clear()
+        except Exception:
+            pass
+
 # -----------------------------------------------------------------------------
 # Normalization helpers
 # -----------------------------------------------------------------------------
@@ -1114,6 +1199,59 @@ def _build_correlated_flows(
     c["Action"] = [a for a, _ in act]
     c["Action_Basis"] = [b for _, b in act]
 
+    def _is_meaningful_text(v: object) -> bool:
+        s = str(v or "").strip().lower()
+        return s not in {"", "nan", "none", "-", "unknown", "(empty)"}
+
+    def _to_boolish(v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        return s in {"1", "true", "t", "yes", "y"}
+
+    def _flow_source_types(row: pd.Series) -> str:
+        sources: List[str] = ["conn"]
+
+        http_present = (
+            _is_meaningful_text(row.get("method", ""))
+            or _is_meaningful_text(row.get("uri", ""))
+            or _is_meaningful_text(row.get("user_agent", ""))
+            or _is_meaningful_text(row.get("content_type", ""))
+            or _is_meaningful_text(row.get("host", ""))
+            or float(pd.to_numeric(row.get("request_body_len", 0), errors="coerce") or 0) > 0
+            or float(pd.to_numeric(row.get("response_body_len", 0), errors="coerce") or 0) > 0
+            or _to_boolish(row.get("http_any_upload", False))
+            or _to_boolish(row.get("http_any_share", False))
+        )
+        if http_present:
+            sources.append("http")
+
+        ssl_present = (
+            _is_meaningful_text(row.get("server_name", ""))
+            or _is_meaningful_text(row.get("ja3", ""))
+            or _is_meaningful_text(row.get("ja3s", ""))
+            or _is_meaningful_text(row.get("version", ""))
+            or _is_meaningful_text(row.get("cipher", ""))
+            or _is_meaningful_text(row.get("curve", ""))
+            or _is_meaningful_text(row.get("next_protocol", ""))
+        )
+        if ssl_present:
+            sources.append("ssl")
+
+        files_present = (
+            float(pd.to_numeric(row.get("file_total_bytes", 0), errors="coerce") or 0) > 0
+            or float(pd.to_numeric(row.get("file_seen_bytes", 0), errors="coerce") or 0) > 0
+            or _is_meaningful_text(row.get("file_mime_types", ""))
+            or _is_meaningful_text(row.get("file_names", ""))
+            or _is_meaningful_text(row.get("file_sources", ""))
+        )
+        if files_present:
+            sources.append("files")
+
+        return ", ".join(sources)
+
+    c["source_types"] = c.apply(_flow_source_types, axis=1)
+
     c["log_source"] = "flow"
 
     keep_cols = [
@@ -1126,6 +1264,7 @@ def _build_correlated_flows(
         "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol",
         "host", "status_code", "request_body_len", "response_body_len", "http_any_upload", "http_any_share",
         "file_total_bytes", "file_seen_bytes", "file_mime_types", "file_names", "file_sources",
+        "source_types",
         "Action", "Action_Basis",
     ]
     keep_cols = [c0 for c0 in keep_cols if c0 in c.columns]
@@ -1571,6 +1710,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         d.loc[d["destination"].eq(""), "destination"] = "Unknown"
         d["bytes"] = 0
         d["log_source"] = "dns"
+        d["source_types"] = "dns"
         d["method"] = ""
         d["uri"] = ""
         d["user_agent"] = ""
@@ -1578,7 +1718,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         d["Action"] = "DNS Lookup"
         d["Action_Basis"] = "dns query"
         keep = [
-            "ts", "log_source", "id.orig_h", "destination", "bytes",
+            "ts", "log_source", "source_types", "id.orig_h", "destination", "bytes",
             "method", "uri", "user_agent", "content_type",
             "orig_l2_addr", "query", "answers", "rcode_name", "qtype_name",
             "Action", "Action_Basis",
@@ -1777,12 +1917,62 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     if df.empty:
         return pd.DataFrame()
 
+    if "event_id" in df.columns:
+        df = df.drop_duplicates(subset=["event_id"], keep="last")
+    else:
+        dedupe_cols = [c for c in ["uid", "ts", "id.orig_h", "destination", "bytes_out", "bytes_in", "duration"] if c in df.columns]
+        if dedupe_cols:
+            df = df.drop_duplicates(subset=dedupe_cols, keep="last")
+        else:
+            df = df.drop_duplicates()
+
     mac = df.get("orig_l2_addr", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
     ip = df.get("id.orig_h", pd.Series("", index=df.index)).astype(str).str.strip()
     df["device_id"] = mac.where(mac.replace({"nan": "", "none": "", "-": ""}).ne(""), "ip:" + ip)
 
     df["domain"] = df.get("dest_domain", df.get("destination", "")).astype(str).str.strip().str.lower()
     df.loc[df["domain"].isin(["", "nan", "none", "unknown", "-", "*"]), "domain"] = df.get("destination", "").astype(str).str.strip().str.lower()
+
+    if "source_types" not in df.columns:
+        src = pd.Series("conn", index=df.index, dtype="object")
+
+        http_mask = pd.Series(False, index=df.index)
+        for col in ["method", "uri", "user_agent", "content_type", "host"]:
+            if col in df.columns:
+                t = df[col].astype(str).str.strip().str.lower()
+                http_mask = http_mask | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
+        for col in ["request_body_len", "response_body_len"]:
+            if col in df.columns:
+                v = pd.to_numeric(df[col], errors="coerce").fillna(0)
+                http_mask = http_mask | (v > 0)
+        for col in ["http_any_upload", "http_any_share"]:
+            if col in df.columns:
+                b = df[col]
+                if pd.api.types.is_bool_dtype(b):
+                    http_mask = http_mask | b.fillna(False).astype(bool)
+                else:
+                    http_mask = http_mask | b.astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
+        src = src.where(~http_mask, src + ", http")
+
+        ssl_mask = pd.Series(False, index=df.index)
+        for col in ["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"]:
+            if col in df.columns:
+                t = df[col].astype(str).str.strip().str.lower()
+                ssl_mask = ssl_mask | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
+        src = src.where(~ssl_mask, src + ", ssl")
+
+        files_mask = pd.Series(False, index=df.index)
+        for col in ["file_total_bytes", "file_seen_bytes"]:
+            if col in df.columns:
+                v = pd.to_numeric(df[col], errors="coerce").fillna(0)
+                files_mask = files_mask | (v > 0)
+        for col in ["file_mime_types", "file_names", "file_sources"]:
+            if col in df.columns:
+                t = df[col].astype(str).str.strip().str.lower()
+                files_mask = files_mask | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
+        src = src.where(~files_mask, src + ", files")
+
+        df["source_types"] = src
 
     df["bytes_out"] = pd.to_numeric(df.get("bytes_out", 0), errors="coerce").fillna(0)
     df["bytes_in"] = pd.to_numeric(df.get("bytes_in", 0), errors="coerce").fillna(0)
@@ -1792,15 +1982,8 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     df["is_long"] = df["duration"] >= LONG_DURATION_SEC
     df["is_big_out"] = df["bytes_out"] >= BIG_OUT_BYTES
 
-    http_any_upload = df.get("http_any_upload", False)
     http_any_share = df.get("http_any_share", False)
-    df["http_upload_evidence"] = pd.Series(http_any_upload, index=df.index).fillna(False).astype(bool)
     df["http_share_evidence"] = pd.Series(http_any_share, index=df.index).fillna(False).astype(bool)
-
-    meth = df.get("method", "").astype(str).str.upper()
-    df["http_upload_evidence"] = df["http_upload_evidence"] | meth.isin(["POST", "PUT", "PATCH"])
-
-    df["file_evidence"] = (pd.to_numeric(df.get("file_total_bytes", 0), errors="coerce").fillna(0) >= BIG_OUT_BYTES) | (pd.to_numeric(df.get("file_seen_bytes", 0), errors="coerce").fillna(0) >= BIG_OUT_BYTES)
 
     df["day"] = df["ts"].dt.date
     rep = df.groupby(["device_id", "domain"], dropna=False)["day"].nunique().reset_index().rename(columns={"day": "active_days"})
@@ -1815,6 +1998,18 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         except Exception:
             return ""
 
+    def _mode_nonempty(series: pd.Series) -> str:
+        try:
+            vals = (
+                series.astype(str)
+                .str.strip()
+                .replace({"nan": "", "none": "", "None": "", "-": "", "(empty)": ""})
+            )
+            vals = vals[vals != ""]
+            return vals.value_counts().index[0] if len(vals) else ""
+        except Exception:
+            return ""
+
     def _first_nonempty(series: pd.Series) -> str:
         for raw in series.astype(str):
             v = raw.strip()
@@ -1822,29 +2017,47 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
                 return v
         return ""
 
+    def _merge_source_types(series: pd.Series) -> str:
+        order = ["conn", "http", "ssl", "dns", "files"]
+        seen = set()
+        out: List[str] = []
+        for raw in series.astype(str):
+            parts = [p.strip().lower() for p in str(raw or "").split(",") if p.strip()]
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+        if not out:
+            return "conn"
+        out_sorted = [p for p in order if p in seen]
+        out_sorted.extend([p for p in out if p not in set(order)])
+        return ", ".join(out_sorted)
+
     gb = df.groupby(["device_id", "domain", "time_window"], dropna=False)
     agg = gb.agg(
         first_ts=("ts", "min"),
         last_ts=("ts", "max"),
         mac=("orig_l2_addr", _first_nonempty),
         orig_ip=("id.orig_h", _first_nonempty),
-        dest=("destination", _mode),
+        destination=("destination", _mode_nonempty),
+        source_types=("source_types", _merge_source_types),
         sig_match=("Signature_Match", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        sig_service=("Signature_Service", _mode),
+        sig_service=("Signature_Service", _mode_nonempty),
         allowed=("Allowed", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        allow_basis=("Allow_Basis", _mode),
+        allow_basis=("Allow_Basis", _mode_nonempty),
         bytes_out_total=("bytes_out", "sum"),
         bytes_in_total=("bytes_in", "sum"),
         conn_count=("uid", pd.Series.nunique),
         total_duration=("duration", "sum"),
-        http_upload=("http_upload_evidence", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
         http_share=("http_share_evidence", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        file_visible=("file_evidence", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        method=("method", _mode),
+        action=("Action", _mode_nonempty),
+        action_basis=("Action_Basis", _mode_nonempty),
+        category=("Category", _mode_nonempty),
+        method=("method", _mode_nonempty),
         uri=("uri", _first_nonempty),
-        user_agent=("user_agent", _mode),
+        user_agent=("user_agent", _mode_nonempty),
         file_names=("file_names", _first_nonempty),
-        file_mime_types=("file_mime_types", _mode),
+        file_mime_types=("file_mime_types", _mode_nonempty),
         any_long=("is_long", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
         any_big_out=("is_big_out", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
         active_days=("active_days", "max"),
@@ -1884,28 +2097,30 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     agg["confidence_reasons"] = reasons
     agg["is_shadow_sharing"] = (agg["sig_match"] == True) & (agg["allowed"] == False) & (agg["confidence_score"] >= 50)  # noqa: E712
     agg["incident_id"] = agg["device_id"].astype(str) + "|" + agg["domain"].astype(str) + "|" + agg["time_window"].astype(str)
-    agg["category"] = "file_sharing"
+    agg["category"] = agg["category"].where(agg["category"].astype(str).str.strip() != "", "file_sharing")
 
     cols = [
         "incident_id",
         "first_ts", "last_ts",
         "mac", "orig_ip",
-        "domain", "dest",
+        "source_types",
+        "destination", "domain",
         "category",
+        "action", "action_basis",
         "sig_service",
         "allowed", "allow_basis",
         "bytes_out_total", "bytes_in_total", "out_in_ratio_total",
         "conn_count", "total_duration",
         "method", "uri", "user_agent",
         "file_names", "file_mime_types",
-        "http_upload", "http_share", "file_visible",
         "any_long", "any_big_out",
         "active_days",
         "confidence_score", "confidence", "confidence_reasons",
         "is_shadow_sharing",
     ]
     cols = [c for c in cols if c in agg.columns]
-    return agg[cols].sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
+    out = agg[cols].drop_duplicates(subset=["incident_id"], keep="last")
+    return out.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
 
 @st.cache_data(show_spinner=False, ttl=300, max_entries=24)
 def load_shadow_sharing_incidents_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
