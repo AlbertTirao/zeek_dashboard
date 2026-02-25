@@ -108,6 +108,29 @@ def _known_hosts_sig_for_day(parquet_root: Path, day_str: str) -> tuple[float, i
     return _path_stat_sig(_resolve_known_hosts_for_day(parquet_root, day_str))
 
 
+def _resolve_active_devices_day(parquet_root: Path, preferred_day: str) -> tuple[str | None, tuple[float, int]]:
+    """
+    Resolve the day used for active-device metrics.
+    Prefer today's known_hosts.parquet. If missing, fallback to the latest date folder
+    that contains known_hosts.parquet so the card reflects actual captured activity.
+    """
+    preferred_kh = _resolve_known_hosts_for_day(parquet_root, preferred_day)
+    if preferred_kh is not None:
+        return preferred_day, _path_stat_sig(preferred_kh)
+
+    latest_day = None
+    latest_kh = None
+    for day_str, day_dir in iter_date_dirs(parquet_root):
+        kh = day_dir / "known_hosts.parquet"
+        if kh.exists():
+            latest_day = day_str
+            latest_kh = kh
+
+    if latest_day is None or latest_kh is None:
+        return None, (0.0, 0)
+    return latest_day, _path_stat_sig(latest_kh)
+
+
 def _inventory_file_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
     sig = []
     for _day_str, day_dir in iter_date_dirs(parquet_root):
@@ -1481,20 +1504,27 @@ def render_metric_card_dialog(
 
 
 # =====================================================
-# Dialog: Active Today list (shows active MACs)
+# Dialog: Active Devices list (shows active MACs)
 # =====================================================
 @st.dialog(" ", width="large", dismissible=False)
-def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: str, available_dates_list):
+def active_today_popup(
+    in_scope: pd.DataFrame,
+    parquet_root: Path,
+    active_day_str: str,
+    today_str: str,
+    available_dates_list,
+):
     hide_dialog_header()
     inject_page_css()
+    is_today_source = active_day_str == today_str
 
     h1, h2 = st.columns([0.82, 0.18], vertical_alignment="center")
     with h1:
         st.markdown(
             f"""
             <div class='dialog-head'>
-              <div class='dialog-title'>Active Today</div>
-              <div class='dialog-sub'>Devices seen in <b>{today_str}</b> from today's date folder.</div>
+              <div class='dialog-title'>Active Devices</div>
+              <div class='dialog-sub'>Devices seen in <b>{active_day_str}</b> from {"today's" if is_today_source else "the latest available"} date folder.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1503,10 +1533,10 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
         if st.button("Close", key="dlg_active_close", use_container_width=True):
             _close_dialog()
 
-    known_hosts_sig = _known_hosts_sig_for_day(parquet_root, today_str)
-    inv_today = load_active_today_inventory_from_parquet(parquet_root, today_str, known_hosts_sig)
+    known_hosts_sig = _known_hosts_sig_for_day(parquet_root, active_day_str)
+    inv_today = load_active_today_inventory_from_parquet(parquet_root, active_day_str, known_hosts_sig)
     if inv_today.empty:
-        st.info("No Active Today records found for today's folder.")
+        st.info(f"No active device records found for {active_day_str}.")
         return
 
     enrich = (
@@ -1550,7 +1580,7 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
     inv.insert(0, "#", inv.index + 1)
 
     display_df = inv[["#", "mac", "ip", "host_name", "status", "last_seen_today_str"]].copy()
-    display_df.rename(columns={"last_seen_today_str": "Last Seen (Today)"}, inplace=True)
+    display_df.rename(columns={"last_seen_today_str": "Last Seen"}, inplace=True)
 
     ag_theme, ag_css = get_shadow_aggrid_theme_and_css()
     st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
@@ -1562,7 +1592,7 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
     gb.configure_column("ip", header_name="IP Address", width=140)
     gb.configure_column("host_name", header_name="Host Name", width=220)
     gb.configure_column("status", header_name="Status", width=140)
-    gb.configure_column("Last Seen (Today)", width=200)
+    gb.configure_column("Last Seen", width=200)
     grid_options = _apply_copyable_grid_options(gb.build())
     grid_options["rowSelection"] = "single"
     grid_options["suppressRowClickSelection"] = True
@@ -2192,16 +2222,19 @@ def render(logs_root: Path, authorized_mac_file: Path):
     # Metrics
     today = get_local_now().date()
     today_str = today.strftime("%Y-%m-%d")
+    active_day_str, active_known_hosts_sig = _resolve_active_devices_day(PARQUET_ROOT, today_str)
 
     unauth_seen = int(in_scope[in_scope["status"] == "Unauthorized"]["mac"].nunique())
     auth_seen = len(authorized_macs)
     total_devices = auth_seen + unauth_seen
 
-    active_today_set = load_active_today_macs_from_parquet(
-        PARQUET_ROOT,
-        today_str,
-        _known_hosts_sig_for_day(PARQUET_ROOT, today_str),
-    )
+    active_today_set = set()
+    if active_day_str:
+        active_today_set = load_active_today_macs_from_parquet(
+            PARQUET_ROOT,
+            active_day_str,
+            active_known_hosts_sig,
+        )
     if banned_macs:
         active_today_set = active_today_set - set(banned_macs)
     active_today = int(len(active_today_set))
@@ -2266,7 +2299,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     with m2:
         render_metric_card_dialog(
-            "Active Today",
+            "Active Devices",
             active_today,
             d_active,
             open_dialog_name="active_today",
@@ -2313,6 +2346,9 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     with m5:
         render_metric_card_static("Risk Ratio", f"{risk}%", d_risk, delta_is_percent=True, up_color=RED, down_color=GREY)
+
+    if active_day_str and active_day_str != today_str:
+        st.caption(f"Active Devices source date: {active_day_str} (latest available known_hosts capture).")
 
     hourly = pd.DataFrame()
     if not in_scope.empty:
@@ -2445,7 +2481,13 @@ def render(logs_root: Path, authorized_mac_file: Path):
         )
 
     elif st.session_state.active_dialog == "active_today":
-        active_today_popup(in_scope, PARQUET_ROOT, today_str, raw_dates)
+        active_today_popup(
+            in_scope,
+            PARQUET_ROOT,
+            active_day_str=active_day_str or today_str,
+            today_str=today_str,
+            available_dates_list=raw_dates,
+        )
 
     elif st.session_state.active_dialog == "forensics":
         forensic_popup(
