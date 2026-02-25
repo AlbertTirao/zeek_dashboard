@@ -437,18 +437,32 @@ def require_authentication() -> None:
     right_panel_style = ""
     if bg_image_data:
         right_panel_style = (
-            f"background-image: linear-gradient(0deg, rgba(3, 10, 28, 0.72), "
-            f"rgba(3, 10, 28, 0.72)), url('data:image/png;base64,{bg_image_data}');"
+            f"background-image: linear-gradient(0deg, rgba(3, 10, 28, 0.34), "
+            f"rgba(3, 10, 28, 0.20)), url('data:image/png;base64,{bg_image_data}');"
         )
 
     st.markdown(
         f"""
         <style>
+            @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Space+Grotesk:wght@600;700&display=swap');
+
+            :root {{
+                --auth-text-strong: #eef5ff;
+                --auth-text-muted: #b7c7e6;
+                --auth-border-soft: rgba(133, 164, 215, 0.34);
+                --auth-border-strong: rgba(149, 188, 247, 0.62);
+                --auth-fill-soft: rgba(10, 22, 47, 0.66);
+                --auth-focus: rgba(98, 168, 255, 0.8);
+                --auth-focus-ring: rgba(98, 168, 255, 0.35);
+            }}
+
             .stApp {{
                 background:
-                    radial-gradient(circle at 14% 18%, rgba(0, 44, 104, 0.24) 0%, rgba(0, 18, 48, 0) 34%),
-                    radial-gradient(circle at 86% 84%, rgba(0, 58, 138, 0.20) 0%, rgba(0, 18, 48, 0) 36%),
-                    #020913;
+                    radial-gradient(circle at 10% 12%, rgba(41, 127, 255, 0.23) 0%, rgba(0, 23, 56, 0) 38%),
+                    radial-gradient(circle at 84% 86%, rgba(0, 177, 255, 0.20) 0%, rgba(0, 28, 70, 0) 36%),
+                    linear-gradient(130deg, #010913 0%, #05132a 52%, #020d1d 100%);
+                color: var(--auth-text-strong);
+                font-family: "Manrope", "Segoe UI", sans-serif;
             }}
             [data-testid="stSidebar"],
             [data-testid="collapsedControl"] {{
@@ -456,149 +470,276 @@ def require_authentication() -> None:
             }}
             section.main > div {{
                 max-width: 1240px;
-                padding-top: 2.0rem;
-                padding-bottom: 2.0rem;
+                padding-top: 1.3rem;
+                padding-bottom: 1.3rem;
                 margin-left: auto;
                 margin-right: auto;
             }}
             [data-testid="stMainBlockContainer"] {{
                 max-width: 1240px !important;
-                padding-top: 2.0rem !important;
-                padding-bottom: 2.0rem !important;
+                padding-top: 1.3rem !important;
+                padding-bottom: 1.3rem !important;
                 width: 100% !important;
                 margin-left: auto !important;
                 margin-right: auto !important;
-                min-height: calc(100vh - 7.2rem) !important;
+                min-height: calc(100vh - 5.8rem) !important;
                 display: flex !important;
                 align-items: center !important;
                 justify-content: center !important;
             }}
             .st-key-login_shell {{
-                border: 1px solid rgba(112, 146, 205, 0.30);
-                border-radius: 20px;
+                position: relative;
+                isolation: isolate;
+                border: 1px solid var(--auth-border-soft);
+                border-radius: 24px;
                 overflow: hidden;
-                background: linear-gradient(180deg, rgba(2, 11, 32, 0.95), rgba(1, 9, 24, 0.96));
-                box-shadow: 0 18px 60px rgba(0, 0, 0, 0.38);
-                padding: 0.35rem;
+                background: linear-gradient(160deg, rgba(4, 16, 39, 0.95), rgba(3, 12, 30, 0.97));
+                box-shadow:
+                    0 28px 78px rgba(0, 0, 0, 0.45),
+                    inset 0 1px 0 rgba(221, 237, 255, 0.06);
+                padding: 0.5rem;
                 width: 100%;
                 max-width: 1120px;
                 margin: 0 auto;
+                animation: auth-fade-up 420ms ease-out;
+            }}
+            .st-key-login_shell::before {{
+                content: "";
+                position: absolute;
+                inset: 0;
+                border-radius: inherit;
+                pointer-events: none;
+                background:
+                    radial-gradient(circle at 20% 0%, rgba(117, 199, 255, 0.12) 0%, rgba(117, 199, 255, 0) 48%),
+                    radial-gradient(circle at 98% 96%, rgba(54, 130, 230, 0.16) 0%, rgba(54, 130, 230, 0) 44%);
+                z-index: -1;
             }}
             .st-key-login_form_panel {{
                 min-height: 560px;
                 max-width: 460px;
                 margin: 0 auto;
-                padding: 1.2rem 1rem;
-                border: 1px solid rgba(112, 146, 205, 0.36);
-                border-radius: 16px;
-                padding: 1.25rem 1.25rem 1.35rem 1.25rem;
-                background: linear-gradient(180deg, rgba(14, 24, 44, 0.72), rgba(7, 14, 29, 0.72));
-                backdrop-filter: blur(3px);
+                border: 1px solid rgba(126, 160, 214, 0.38);
+                border-radius: 18px;
+                padding: 1.45rem 1.45rem 1.55rem 1.45rem;
+                background:
+                    radial-gradient(circle at 14% 12%, rgba(112, 174, 255, 0.12) 0%, rgba(112, 174, 255, 0) 42%),
+                    linear-gradient(180deg, rgba(11, 23, 47, 0.84), rgba(6, 14, 31, 0.84));
+                backdrop-filter: blur(4px);
+                animation: auth-fade-up 520ms ease-out;
             }}
             .st-key-login_image_panel {{
                 min-height: 560px;
-                background-color: #091223;
+                background-color: #071326;
                 background-repeat: no-repeat;
                 background-size: cover;
-                background-position: right center;
-                border-radius: 14px;
-                border: 1px solid rgba(112, 146, 205, 0.25);
+                background-position: center center;
+                border-radius: 18px;
+                border: 1px solid rgba(124, 156, 209, 0.30);
                 {right_panel_style}
+                position: relative;
+                overflow: hidden;
+                animation: auth-fade-up 620ms ease-out;
+                filter: saturate(1.08) contrast(1.05);
+            }}
+            .st-key-login_image_panel::after {{
+                content: "";
+                position: absolute;
+                inset: 0;
+                background: linear-gradient(162deg, rgba(5, 16, 35, 0.10) 0%, rgba(5, 16, 35, 0.34) 100%);
+                backdrop-filter: blur(1.5px);
+                -webkit-backdrop-filter: blur(1.5px);
+                pointer-events: none;
+                z-index: 1;
+            }}
+            .st-key-login_image_panel > * {{
+                position: relative;
+                z-index: 2;
             }}
             .st-key-login_form_panel h1 {{
-                margin: 0 0 0.2rem 0;
-                font-size: 1.9rem;
+                margin: 0 0 0.28rem 0;
+                font-family: "Space Grotesk", "Segoe UI", sans-serif;
+                font-size: clamp(1.68rem, 1.35rem + 0.9vw, 2.08rem);
                 font-weight: 700;
                 letter-spacing: 0.02em;
-                color: #eef4ff;
+                color: var(--auth-text-strong);
             }}
             .st-key-login_form_panel p {{
-                margin: 0 0 1rem 0;
-                color: #b3c4e2;
+                margin: 0 0 1.2rem 0;
+                color: var(--auth-text-muted);
                 font-size: 0.95rem;
+                line-height: 1.5;
+            }}
+            .st-key-login_form_panel form {{
+                display: grid;
+                gap: 0.3rem;
             }}
             .st-key-login_form_panel label {{
-                color: #d5e1f7;
+                color: #d8e7ff;
                 font-weight: 600;
-                letter-spacing: 0.01em;
+                letter-spacing: 0.015em;
+                font-size: 0.87rem;
             }}
             .st-key-login_form_panel div[data-baseweb="input"] > div {{
-                border: 1px solid rgba(148, 176, 219, 0.35);
+                border: 1px solid rgba(145, 173, 216, 0.38);
                 border-radius: 14px;
-                background: rgba(239, 244, 255, 0.14);
-                min-height: 48px;
-                transition: border-color 0.2s ease, box-shadow 0.2s ease;
+                background: var(--auth-fill-soft);
+                min-height: 50px;
+                transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
             }}
             .st-key-login_form_panel div[data-baseweb="input"] > div:focus-within {{
-                border-color: rgba(140, 182, 255, 0.85);
-                box-shadow: 0 0 0 1px rgba(140, 182, 255, 0.45);
+                border-color: var(--auth-focus);
+                box-shadow:
+                    0 0 0 1px var(--auth-focus),
+                    0 0 0 5px var(--auth-focus-ring);
+                transform: translateY(-1px);
+            }}
+            .st-key-login_form_panel div[data-testid="stTextInputRootElement"]:has(input[type="password"]) {{
+                padding-right: 0 !important;
+                padding-inline-end: 0 !important;
+            }}
+            .st-key-login_form_panel div[data-testid="stTextInputRootElement"]:has(input[type="password"]) > div[data-baseweb="base-input"] {{
+                padding-right: 0 !important;
+                padding-inline-end: 0 !important;
             }}
             .st-key-login_form_panel input {{
-                color: #f0f5ff !important;
+                color: #f3f8ff !important;
+                font-size: 0.98rem !important;
+                font-weight: 600 !important;
             }}
             .st-key-login_form_panel input::placeholder {{
-                color: rgba(225, 236, 255, 0.64) !important;
+                color: rgba(200, 220, 249, 0.72) !important;
             }}
             .st-key-login_form_panel button[kind="formSubmit"] {{
-                margin-top: 0.35rem;
-                min-height: 48px;
-                border-radius: 12px;
-                border: 1px solid rgba(160, 188, 228, 0.4);
-                background: linear-gradient(180deg, rgba(8, 20, 43, 0.95), rgba(4, 13, 31, 0.95));
+                margin-top: 0.52rem;
+                min-height: 50px;
+                border-radius: 14px;
+                border: 1px solid var(--auth-border-strong);
+                background: linear-gradient(180deg, rgba(26, 74, 145, 0.98) 0%, rgba(13, 44, 96, 0.98) 100%);
                 color: #eef5ff;
+                font-family: "Space Grotesk", "Segoe UI", sans-serif;
+                font-size: 0.92rem;
                 font-weight: 700;
-                letter-spacing: 0.03em;
+                letter-spacing: 0.05em;
+                text-transform: uppercase;
+                box-shadow:
+                    0 12px 30px rgba(10, 37, 86, 0.44),
+                    inset 0 1px 0 rgba(231, 242, 255, 0.18);
+                transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease, filter 0.18s ease;
             }}
             .st-key-login_form_panel button[kind="formSubmit"]:hover {{
-                border-color: rgba(175, 204, 242, 0.62);
+                border-color: rgba(196, 223, 255, 0.86);
+                transform: translateY(-1px);
+                box-shadow:
+                    0 15px 34px rgba(7, 30, 72, 0.52),
+                    inset 0 1px 0 rgba(231, 242, 255, 0.22);
+                filter: brightness(1.04);
             }}
+            .st-key-login_form_panel button[kind="formSubmit"]:focus-visible {{
+                outline: none;
+                box-shadow:
+                    0 0 0 2px rgba(102, 176, 255, 0.92),
+                    0 0 0 5px rgba(102, 176, 255, 0.28),
+                    0 14px 32px rgba(7, 30, 72, 0.52);
+            }}
+            .st-key-login_form_panel button[kind="formSubmit"]:active {{
+                transform: translateY(0);
+            }}
+            .st-key-login_form_panel .stCaption {{
+                color: rgba(194, 214, 244, 0.92) !important;
+                margin-top: 0.2rem !important;
+                font-size: 0.81rem !important;
+                line-height: 1.45 !important;
+            }}
+            .st-key-login_form_panel div[data-baseweb="input"] button[aria-label*="password"],
+            .st-key-login_form_panel div[data-baseweb="input"] button[title*="password"] {{
+                width: 32px;
+                height: 32px;
+                border-radius: 10px;
+                margin-right: 4px;
+                transition: background-color 0.16s ease;
+            }}
+            .st-key-login_form_panel div[data-baseweb="input"] button[aria-label*="password"]:hover,
+            .st-key-login_form_panel div[data-baseweb="input"] button[title*="password"]:hover {{
+                background: rgba(155, 196, 252, 0.16);
+            }}
+
+            @keyframes auth-fade-up {{
+                from {{
+                    opacity: 0;
+                    transform: translateY(12px);
+                }}
+                to {{
+                    opacity: 1;
+                    transform: translateY(0);
+                }}
+            }}
+
             @media (max-width: 980px) {{
                 [data-testid="stMainBlockContainer"] {{
                     min-height: auto !important;
                     display: block !important;
+                    padding-top: 0.95rem !important;
+                    padding-bottom: 0.95rem !important;
+                }}
+                .st-key-login_shell {{
+                    border-radius: 18px;
+                    padding: 0.38rem;
                 }}
                 .st-key-login_form_panel {{
                     min-height: auto;
                     max-width: 100%;
-                    padding: 0.9rem 0.8rem;
+                    border-radius: 14px;
+                    padding: 1.05rem 0.95rem 1.12rem 0.95rem;
                 }}
                 .st-key-login_image_panel {{
-                    min-height: 300px;
+                    min-height: 250px;
+                    border-radius: 14px;
+                }}
+            }}
+            @media (max-width: 640px) {{
+                .st-key-login_shell {{
+                    padding: 0.28rem;
+                }}
+                .st-key-login_form_panel h1 {{
+                    margin-bottom: 0.22rem;
+                }}
+                .st-key-login_form_panel p {{
+                    margin-bottom: 0.9rem;
                 }}
             }}
 
-                    /* ---- Password toggle icon fix (f-string safe) ---- */
-                    div[data-baseweb="input"] button[aria-label*="Hide password"],
-                    div[data-baseweb="input"] button[aria-label*="Show password"],
-                    div[data-baseweb="input"] button[title*="Hide password"],
-                    div[data-baseweb="input"] button[title*="Show password"] {{
-                        position: relative;
-                    }}
+            /* ---- Password toggle icon fix (f-string safe) ---- */
+            div[data-baseweb="input"] button[aria-label*="Hide password"],
+            div[data-baseweb="input"] button[aria-label*="Show password"],
+            div[data-baseweb="input"] button[title*="Hide password"],
+            div[data-baseweb="input"] button[title*="Show password"] {{
+                position: relative;
+            }}
 
-                    div[data-baseweb="input"] button[aria-label*="Hide password"] svg,
-                    div[data-baseweb="input"] button[aria-label*="Show password"] svg,
-                    div[data-baseweb="input"] button[title*="Hide password"] svg,
-                    div[data-baseweb="input"] button[title*="Show password"] svg {{
-                        display: none !important;
-                    }}
+            div[data-baseweb="input"] button[aria-label*="Hide password"] svg,
+            div[data-baseweb="input"] button[aria-label*="Show password"] svg,
+            div[data-baseweb="input"] button[title*="Hide password"] svg,
+            div[data-baseweb="input"] button[title*="Show password"] svg {{
+                display: none !important;
+            }}
 
-                    div[data-baseweb="input"] button[aria-label*="Hide password"]::before,
-                    div[data-baseweb="input"] button[title*="Show password"]::before {{
-                        content: "";
-                        width: 18px;
-                        height: 18px;
-                        display: block;
-                        background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzExMTgyNyI+PHBhdGggZD0iTTEyIDQuNUM3IDQuNSAyLjczIDcuNjEgMSAxMmMxLjczIDQuMzkgNiA3LjUgMTEgNy41czkuMjctMy4xMSAxMS03LjVjLTEuNzMtNC4zOS02LTcuNS0xMS03LjV6bTAgMTIuNWMtMi43NiAwLTUtMi4yNC01LTVzMi4yNC01IDUtNSA1IDIuMjQgNSA1LTIuMjQgNS01IDV6bTAtOGMtMS42NiAwLTMgMS4zNC0zIDNzMS4zNCAzIDMgMyAzLTEuMzQgMy0zLTEuMzQtMy0zLTN6Ii8+PC9zdmc+") center/18px 18px no-repeat;
-                    }}
+            div[data-baseweb="input"] button[aria-label*="Hide password"]::before,
+            div[data-baseweb="input"] button[title*="Hide password"]::before {{
+                content: "";
+                width: 18px;
+                height: 18px;
+                display: block;
+                background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI0U3RjJGRiI+PHBhdGggZD0iTTEyIDQuNUM3IDQuNSAyLjczIDcuNjEgMSAxMmMxLjczIDQuMzkgNiA3LjUgMTEgNy41czkuMjctMy4xMSAxMS03LjVjLTEuNzMtNC4zOS02LTcuNS0xMS03LjV6bTAgMTIuNWMtMi43NiAwLTUtMi4yNC01LTVzMi4yNC01IDUtNSA1IDIuMjQgNSA1LTIuMjQgNS01IDV6bTAtOGMtMS42NiAwLTMgMS4zNC0zIDNzMS4zNCAzIDMgMyAzLTEuMzQtMy0zLTEuMzQtMy0zLTN6Ii8+PC9zdmc+") center/18px 18px no-repeat;
+            }}
 
-                    div[data-baseweb="input"] button[aria-label*="Show password"]::before,
-                    div[data-baseweb="input"] button[title*="Show password"]::before {{
-                        content: "";
-                        width: 18px;
-                        height: 18px;
-                        display: block;
-                        background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzExMTgyNyI+PHBhdGggZD0iTTEyIDYuNWMzLjMgMCA2LjEgMS43IDcuOCA0LjUtLjcgMS4yLTEuNyAyLjItMi45IDNsMS40IDEuNGMxLjUtMS4xIDIuNy0yLjUgMy41LTQuNC0xLjczLTQuMzktNi03LjUtMTEtNy41LTEuNCAwLTIuNy4yLTQgLjZsMS43IDEuN2MuNy0uMiAxLjUtLjMgMi41LS4zem0tMTAtNC4xIDIuMyAyLjMuNS41QzMuNCA2LjYgMi4zIDkuMSAxIDEyYzEuNzMgNC4zOSA2IDcuNSAxMSA3LjUgMS43IDAgMy4zLS4zIDQuOC0uOGwuNC40IDIuOSAyLjkgMS4zLTEuM0wzLjMgMS4xIDIgMi40em01LjEgNS4xIDEuNSAxLjVjLS40LjctLjYgMS41LS42IDIuNSAwIDIuNzYgMi4yNCA1IDUgNSAxIDAgMS44LS4yIDIuNS0uNmwxLjUgMS41Yy0xLjEuNS0yLjMuOC00IC44LTMuMyAwLTYuMS0xLjctNy44LTQuNS45LTEuNiAyLjMtMi45IDMuOS0zLjd6bTQuOSA0LjkgMS43IDEuN2MtLjUuMi0xIC4zLTEuNy4zLTEuNjYgMC0zLTEuMzQtMy0zIDAtLjYuMS0xLjIuMy0xLjdsMS43IDEuN2MwIC4zLS4xIC40LS4xIC42IDAgLjYuNCAxIDEgMSAuMiAwIC4zIDAgLjYtLjF6Ii8+PC9zdmc+") center/18px 18px no-repeat;
-                    }}
+            div[data-baseweb="input"] button[aria-label*="Show password"]::before,
+            div[data-baseweb="input"] button[title*="Show password"]::before {{
+                content: "";
+                width: 18px;
+                height: 18px;
+                display: block;
+                background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI0U3RjJGRiI+PHBhdGggZD0iTTEyIDYuNWMzLjMgMCA2LjEgMS43IDcuOCA0LjUtLjcgMS4yLTEuNyAyLjItMi45IDNsMS40IDEuNGMxLjUtMS4xIDIuNy0yLjUgMy41LTQuNC0xLjczLTQuMzktNi03LjUtMTEtNy41LTEuNCAwLTIuNy4yLTQgLjZsMS43IDEuN2MuNy0uMiAxLjUtLjMgMi41LS4zem0tMTAtNC4xIDIuMyAyLjMuNS41QzMuNCA2LjYgMi4zIDkuMSAxIDEyYzEuNzMgNC4zOSA2IDcuNSAxMSA3LjUgMS43IDAgMy4zLS4zIDQuOC0uOGwuNC40IDIuOSAyLjkgMS4zLTEuM0wzLjMgMS4xIDIgMi40em01LjEgNS4xIDEuNSAxLjVjLS40LjctLjYgMS41LS42IDIuNSAwIDIuNzYgMi4yNCA1IDUgNSAxIDAgMS44LS4yIDIuNS0uNmwxLjUgMS41Yy0xLjEuNS0yLjMuOC00IC44LTMuMyAwLTYuMS0xLjctNy44LTQuNS45LTEuNiAyLjMtMi45IDMuOS0zLjd6bTQuOSA0LjkgMS43IDEuN2MtLjUuMi0xIC4zLTEuNy4zLTEuNjYgMC0zLTEuMzQtMy0zIDAtLjYuMS0xLjIuMy0xLjdsMS43IDEuN2MwIC4zLS4xIC40LS4xIC42IDAgLjYuNCAxIDEgMSAuMiAwIC4zIDAgLjYtLjF6Ii8+PC9zdmc+") center/18px 18px no-repeat;
+            }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -608,7 +749,7 @@ def require_authentication() -> None:
         submitted = False
         username = ""
         password = ""
-        col_form, col_image = st.columns([1, 1.18], gap="small")
+        col_form, col_image = st.columns([1, 1.2], gap="medium")
         with col_form:
             with st.container(key="login_form_panel"):
                 if google_oauth_ready:
