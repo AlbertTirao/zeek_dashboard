@@ -22,6 +22,8 @@ try:
         _severity_label,
         get_available_dates,
         load_shadow_sharing_data,
+        build_shadow_sharing_incidents,
+        load_shadow_sharing_incidents_data,
     )
 except ImportError:
     from shadow_sharings_backend import (  # type: ignore
@@ -30,6 +32,8 @@ except ImportError:
         _severity_label,
         get_available_dates,
         load_shadow_sharing_data,
+        build_shadow_sharing_incidents,
+        load_shadow_sharing_incidents_data,
     )
 
 SEVERITY_COLORS = {
@@ -428,6 +432,9 @@ def _close_shadow_sharing_dialog() -> None:
     st.session_state.pop("shadow_sharing_dialog_base_df", None)
     st.session_state.pop("shadow_sharing_dialog_base_key", None)
     st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
+    st.session_state["shadow_sharing_dialog_ip"] = None
+    st.session_state["shadow_sharing_dialog_time_min"] = ""
+    st.session_state["shadow_sharing_dialog_time_max"] = ""
 
 
 def _extract_selected_mac(selected_rows) -> Optional[str]:
@@ -455,11 +462,13 @@ def show_shadow_sharing_device_dialog(
     selected_scope_key: str,
 ):
     target_mac = str(st.session_state.get("shadow_sharing_dialog_mac") or "").strip().lower()
-    if not target_mac:
-        st.info("No MAC selected.")
+    target_ip = str(st.session_state.get("shadow_sharing_dialog_ip") or "").strip()
+    if not target_mac and not target_ip:
+        st.info("No MAC/IP selected.")
         return
 
-    mac_key = re.sub(r"[^0-9A-Za-z_]+", "_", target_mac).strip("_") or "mac"
+    device_label = target_mac if target_mac else f"ip_{target_ip}"
+    mac_key = re.sub(r"[^0-9A-Za-z_]+", "_", device_label).strip("_") or "device"
 
     st.markdown(
         """
@@ -525,18 +534,31 @@ def show_shadow_sharing_device_dialog(
         st.warning("MAC column is not available in this dataset.")
         return
 
-    dialog_base_key = f"{selected_scope_key}:{target_mac}:{len(filtered)}"
+    dialog_base_key = f"{selected_scope_key}:{device_label}:{len(filtered)}"
     cached_base = st.session_state.get("shadow_sharing_dialog_base_df")
     cached_base_key = st.session_state.get("shadow_sharing_dialog_base_key")
 
     if isinstance(cached_base, pd.DataFrame) and cached_base_key == dialog_base_key:
         scoped = cached_base.copy()
     else:
-        mac_norm = filtered["mac"].astype(str).str.strip().str.lower()
-        scoped = filtered.loc[mac_norm == target_mac].copy()
-        scoped["mac"] = target_mac
+        scoped = filtered.copy()
+        if target_mac:
+            mac_norm = scoped["mac"].astype(str).str.strip().str.lower()
+            scoped = scoped.loc[mac_norm == target_mac].copy()
+            scoped["mac"] = target_mac
+        elif target_ip:
+            ip_norm = scoped["id.orig_h"].astype(str).str.strip()
+            scoped = scoped.loc[ip_norm == target_ip].copy()
+
         st.session_state["shadow_sharing_dialog_base_df"] = scoped.copy()
         st.session_state["shadow_sharing_dialog_base_key"] = dialog_base_key
+
+    # Optional incident time window constraint (set by incident table selection)
+    tmin = pd.to_datetime(st.session_state.get("shadow_sharing_dialog_time_min") or "", errors="coerce")
+    tmax = pd.to_datetime(st.session_state.get("shadow_sharing_dialog_time_max") or "", errors="coerce")
+    if pd.notna(tmin) and pd.notna(tmax):
+        scoped_ts = pd.to_datetime(scoped["ts"], errors="coerce")
+        scoped = scoped[(scoped_ts >= tmin) & (scoped_ts <= tmax)].copy()
 
     if scoped.empty:
         st.warning("No records found for this MAC with current page filters.")
@@ -788,6 +810,106 @@ def render_shadow_sharing(parquet_root: Path):
     if df.empty:
         st.info("No data detected for the selected timeframe.")
         return
+
+    # -------------------------------------------------------------------------
+    # Incident Rollup (Algorithms #2/#4/#5/#6)
+    # -------------------------------------------------------------------------
+    incidents = build_shadow_sharing_incidents(df)
+
+    st.markdown("### Shadow Sharing Incidents")
+    st.caption("Incidents roll up conn/ssl/http/files evidence into 5-minute windows and score confidence (HIGH/PROBABLE/WEAK).")
+
+    if incidents.empty:
+        st.info("No flow-based incidents were found in this scope.")
+    else:
+        inc = incidents.copy()
+        inc["first_ts"] = pd.to_datetime(inc["first_ts"], errors="coerce")
+        inc["last_ts"] = pd.to_datetime(inc["last_ts"], errors="coerce")
+
+        # Keep raw timestamps for selection (hidden columns)
+        inc["__first_ts"] = inc["first_ts"]
+        inc["__last_ts"] = inc["last_ts"]
+
+        inc_grid = inc.copy()
+        inc_grid.insert(0, "#", range(1, len(inc_grid) + 1))
+        inc_grid["First_Seen"] = inc_grid["first_ts"].dt.strftime("%m-%d %H:%M").fillna("")
+        inc_grid["Last_Seen"] = inc_grid["last_ts"].dt.strftime("%m-%d %H:%M").fillna("")
+        inc_grid["Outbound_MB"] = (pd.to_numeric(inc_grid["bytes_out_total"], errors="coerce").fillna(0) / 1024 / 1024).round(2)
+        inc_grid["Inbound_MB"] = (pd.to_numeric(inc_grid["bytes_in_total"], errors="coerce").fillna(0) / 1024 / 1024).round(2)
+        inc_grid["Ratio"] = pd.to_numeric(inc_grid["out_in_ratio_total"], errors="coerce").fillna(0).round(2)
+        inc_grid["Conns"] = pd.to_numeric(inc_grid["conn_count"], errors="coerce").fillna(0).astype(int)
+        inc_grid["Duration_s"] = pd.to_numeric(inc_grid["total_duration"], errors="coerce").fillna(0).round(1)
+        inc_grid["Allowed"] = inc_grid["allowed"].astype(bool)
+        inc_grid["Service"] = inc_grid.get("sig_service", "").astype(str)
+        inc_grid["Confidence"] = inc_grid.get("confidence", "").astype(str)
+        inc_grid["Score"] = pd.to_numeric(inc_grid.get("confidence_score", 0), errors="coerce").fillna(0).astype(int)
+        inc_grid["Reasons"] = inc_grid.get("confidence_reasons", "").astype(str)
+
+        show_cols = [
+            "#", "First_Seen", "Last_Seen",
+            "mac", "orig_ip",
+            "domain", "Service",
+            "Allowed", "allow_basis",
+            "Outbound_MB", "Inbound_MB", "Ratio",
+            "Conns", "Duration_s",
+            "http_upload", "http_share", "file_visible",
+            "Confidence", "Score",
+            "Reasons",
+            "__first_ts", "__last_ts",
+        ]
+        show_cols = [c for c in show_cols if c in inc_grid.columns]
+        inc_grid = inc_grid[show_cols].copy()
+
+        gb_inc = GridOptionsBuilder.from_dataframe(inc_grid)
+        gb_inc.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
+        gb_inc.configure_selection(selection_mode="single", use_checkbox=False)
+
+        # Basic widths
+        gb_inc.configure_column("#", width=60, pinned="left")
+        gb_inc.configure_column("First_Seen", width=110)
+        gb_inc.configure_column("Last_Seen", width=110)
+        gb_inc.configure_column("mac", header_name="MAC", width=150)
+        gb_inc.configure_column("orig_ip", header_name="Orig IP", width=120)
+        gb_inc.configure_column("domain", header_name="Domain", minWidth=260)
+        gb_inc.configure_column("Service", width=170)
+        gb_inc.configure_column("Allowed", width=95, cellStyle=_allowed_cellstyle())
+        gb_inc.configure_column("Outbound_MB", header_name="Out MB", width=100)
+        gb_inc.configure_column("Inbound_MB", header_name="In MB", width=95)
+        gb_inc.configure_column("Ratio", width=90)
+        gb_inc.configure_column("Conns", width=85)
+        gb_inc.configure_column("Duration_s", header_name="Dur(s)", width=95)
+        gb_inc.configure_column("http_upload", header_name="HTTP Upload", width=115)
+        gb_inc.configure_column("http_share", header_name="Share Link", width=105)
+        gb_inc.configure_column("file_visible", header_name="Files.log", width=95)
+        gb_inc.configure_column("Confidence", width=110)
+        gb_inc.configure_column("Score", width=80)
+        gb_inc.configure_column("Reasons", minWidth=320)
+
+        # Hide raw timestamp columns but keep for selection
+        gb_inc.configure_column("__first_ts", hide=True)
+        gb_inc.configure_column("__last_ts", hide=True)
+
+        grid_inc = AgGrid(
+            inc_grid,
+            gridOptions=gb_inc.build(),
+            height=min(520, 90 + 34 * (len(inc_grid) + 1)),
+            update_mode=GridUpdateMode.SELECTION_CHANGED,
+            data_return_mode=DataReturnMode.FILTERED,
+            theme="streamlit",
+            allow_unsafe_jscode=True,
+            key=f"shadow_incidents_grid_{selected_scope_key}_{st.session_state.get('shadow_sharing_grid_nonce', 0)}",
+        )
+
+        sel = (grid_inc or {}).get("selected_rows") or []
+        if sel:
+            r0 = sel[0]
+            st.session_state["shadow_sharing_dialog_mac"] = str(r0.get("mac") or "").strip().lower() or None
+            st.session_state["shadow_sharing_dialog_ip"] = str(r0.get("orig_ip") or "").strip() or None
+            st.session_state["shadow_sharing_dialog_time_min"] = str(r0.get("__first_ts") or "")
+            st.session_state["shadow_sharing_dialog_time_max"] = str(r0.get("__last_ts") or "")
+            st.session_state["shadow_sharing_dialog_open"] = True
+
+    st.divider()
 
     def _token_options(series: pd.Series) -> List[str]:
         vals = (

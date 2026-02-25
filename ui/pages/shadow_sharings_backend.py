@@ -22,6 +22,17 @@ DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WHITELIST_FILE = PROJECT_ROOT / "whitelist_domains.yaml"
 
+# Sharing/service signatures (algorithm #6)
+# Optional override file. If missing, built-in defaults are used.
+SIGNATURES_FILE = PROJECT_ROOT / "shadow_sharing_signatures.yaml"
+
+# Incident model (algorithm #2/#4/#5)
+INCIDENT_WINDOW_MINUTES = 5
+BIG_OUT_BYTES = 10 * 1024 * 1024          # 10 MB
+LONG_DURATION_SEC = 60                    # 60 seconds
+CHUNK_CONN_COUNT = 5
+RATIO_HIGH = 5.0
+
 # -----------------------------------------------------------------------------
 # CACHE HELPERS (same pattern as shadow apps)
 # -----------------------------------------------------------------------------
@@ -150,6 +161,136 @@ def load_whitelist() -> Tuple[List[str], int]:
 
 
 WHITELIST_DOMAINS, WHITELIST_MTIME_NS = load_whitelist()
+
+
+# -----------------------------------------------------------------------------
+# Host/Domain Normalization (must be defined early; used during module import)
+# -----------------------------------------------------------------------------
+def _strip_scheme_path(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    # remove scheme
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    # remove path/query/fragment
+    s = s.split("/", 1)[0]
+    s = s.split("?", 1)[0]
+    s = s.split("#", 1)[0]
+    return s.strip()
+
+
+def _split_host_port(hostport: str):
+    s = str(hostport or "").strip()
+    if not s:
+        return "", None
+    # IPv6 in brackets: [2001:db8::1]:443
+    if s.startswith("[") and "]" in s:
+        host = s[1 : s.index("]")]
+        rest = s[s.index("]") + 1 :]
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:])
+            except Exception:
+                return host, None
+        return host, None
+    # plain host:port (avoid treating IPv6 as host:port)
+    if s.count(":") == 1:
+        h, p = s.rsplit(":", 1)
+        if p.isdigit():
+            try:
+                return h, int(p)
+            except Exception:
+                return h, None
+    return s, None
+
+
+def _normalize_host(value: str) -> str:
+    """Normalize URL/hostport/host into lowercase host without port/path."""
+    s = _strip_scheme_path(value)
+    host, _ = _split_host_port(s)
+    host = str(host or "").strip().strip(".").lower()
+    # strip IPv6 zone index like "%eth0" if present
+    host = host.split("%", 1)[0]
+    if host in {"", "unknown", "nan", "none", "-", "(empty)", "*"}:
+        return ""
+    return host
+
+# -----------------------------------------------------------------------------
+# SIGNATURES (algorithm #6)
+# -----------------------------------------------------------------------------
+
+_DEFAULT_SHARING_SIGNATURES: Dict[str, List[str]] = {
+    "Google Drive": ["drive.google.com", "drive.usercontent.google.com", "googleusercontent.com"],
+    "Dropbox": ["dropbox.com", "dropboxapi.com", "dropboxusercontent.com"],
+    "Microsoft OneDrive/SharePoint": ["onedrive.live.com", "1drv.ms", "sharepoint.com", "sharepointonline.com", "microsoftonline.com"],
+    "Box": ["box.com", "boxcdn.net"],
+    "WeTransfer": ["wetransfer.com", "we.tl"],
+    "MEGA": ["mega.nz", "mega.co.nz"],
+    "Telegram": ["telegram.org", "t.me", "telegram.me", "telegram-cdn.org"],
+    "Discord": ["discord.com", "discord.gg", "discordapp.com", "discordapp.net"],
+    "Pastebin/Gist": ["pastebin.com", "gist.github.com", "raw.githubusercontent.com"],
+}
+
+def _extract_signature_map(y: dict) -> Dict[str, List[str]]:
+    if not isinstance(y, dict):
+        return {}
+    for k in ["services", "sharing_signatures", "signatures"]:
+        v = y.get(k)
+        if isinstance(v, dict):
+            out: Dict[str, List[str]] = {}
+            for svc, doms in v.items():
+                if isinstance(doms, list):
+                    out[str(svc).strip() or "Uncategorized"] = [str(d).strip().lower() for d in doms if str(d).strip()]
+            return out
+        if isinstance(v, list):
+            return {"Uncategorized": [str(d).strip().lower() for d in v if str(d).strip()]}
+    if "domains" in y and isinstance(y["domains"], list):
+        return {"Uncategorized": [str(d).strip().lower() for d in y["domains"] if str(d).strip()]}
+    out2: Dict[str, List[str]] = {}
+    for svc, doms in y.items():
+        if isinstance(doms, list):
+            out2[str(svc).strip() or "Uncategorized"] = [str(d).strip().lower() for d in doms if str(d).strip()]
+    return out2
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sharing_signatures() -> Tuple[Dict[str, List[str]], int]:
+    y = _safe_yaml_load(SIGNATURES_FILE)
+    m = _extract_signature_map(y)
+    if not m:
+        m = dict(_DEFAULT_SHARING_SIGNATURES)
+    norm: Dict[str, List[str]] = {}
+    for svc, doms in (m or {}).items():
+        svc0 = str(svc).strip() or "Uncategorized"
+        dom_list: List[str] = []
+        for d in doms or []:
+            d0 = _normalize_host(str(d))
+            if d0:
+                dom_list.append(d0)
+        if dom_list:
+            norm[svc0] = sorted(set(dom_list))
+    mtime_ns = int(SIGNATURES_FILE.stat().st_mtime_ns) if SIGNATURES_FILE.exists() else 0
+    return norm, mtime_ns
+
+SIGNATURES_MAP, SIGNATURES_MTIME_NS = load_sharing_signatures()
+
+def _domain_in_signatures(dest: str, sig_map: Dict[str, List[str]]) -> Tuple[bool, str, str]:
+    host = _normalize_host(dest)
+    if not host:
+        return (False, "", "")
+    for svc, doms in (sig_map or {}).items():
+        for d in (doms or []):
+            d0 = str(d or "").strip().lower()
+            if not d0:
+                continue
+            if d0.startswith("*."):
+                d0 = d0[2:]
+            d0 = _normalize_host(d0) or d0.strip(".")
+            if not d0:
+                continue
+            if host == d0 or host.endswith("." + d0):
+                return (True, str(svc), d0)
+    return (False, "", "")
 
 
 def _is_admin_user() -> bool:
@@ -895,7 +1036,8 @@ def _build_correlated_flows(
     c = _ensure_ts_datetime(c)
     c = c.dropna(subset=["ts"])
 
-    for col in ["uid", "id.orig_h", "id.resp_h", "id.resp_p", "proto", "service", "duration", "orig_bytes", "resp_bytes", "orig_ip_bytes", "resp_ip_bytes", "orig_l2_addr"]:
+    for col in ["uid", "id.orig_h", "id.resp_h", "id.resp_p", "proto", "service", "duration",
+        "orig_bytes", "resp_bytes", "orig_pkts", "resp_pkts", "conn_state", "history", "orig_bytes", "resp_bytes", "orig_ip_bytes", "resp_ip_bytes", "orig_l2_addr"]:
         if col not in c.columns:
             c[col] = None
 
@@ -976,10 +1118,10 @@ def _build_correlated_flows(
 
     keep_cols = [
         "ts", "uid", "log_source",
-        "id.orig_h", "orig_l2_addr",
+        "id.orig_h", "id.orig_p", "orig_l2_addr",
         "id.resp_h", "id.resp_p", "proto", "service", "duration",
         "destination", "dest_domain", "Destination_Basis",
-        "bytes", "bytes_out", "bytes_in", "out_in_ratio",
+        "bytes", "bytes_out", "bytes_in", "out_in_ratio", "is_long", "is_big_out",
         "method", "uri", "user_agent", "content_type",
         "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol",
         "host", "status_code", "request_body_len", "response_body_len", "http_any_upload", "http_any_share",
@@ -1022,6 +1164,11 @@ def _tag_category(dest: str) -> str:
         if any(r in d for r in rules):
             return cat
     return "Unknown"
+
+    # Derived fields (algorithm #2)
+    c["duration"] = pd.to_numeric(c.get("duration", 0), errors="coerce").fillna(0)
+    c["is_long"] = c["duration"] >= LONG_DURATION_SEC
+    c["is_big_out"] = pd.to_numeric(c.get("bytes_out", 0), errors="coerce").fillna(0) >= BIG_OUT_BYTES
 
 
 def _detect_action(log_source: str, method: str, uri: str, user_agent: str, dest: str, content_type: str = "") -> Tuple[str, str]:
@@ -1486,7 +1633,14 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     _dest_norm = out["destination"].astype(str).str.strip().str.lower()
     _dest_unknown = _dest_norm.isin({"", "unknown", "nan", "none", "(empty)", "*"})
     out.loc[_dest_unknown & (out["Allowed"] == False), "Allow_Basis"] = "n/a (unknown destination)"  # noqa: E712
-    out.loc[(~_dest_unknown) & (out["Allowed"] == False) & (out["Allow_Basis"].astype(str).str.strip() == ""), "Allow_Basis"] = "no match"  # noqa: E712
+    out.loc[(~_dest_unknown) & (out["Allowed"] == False) & (out["Allow_Basis"].astype(str).str.strip() == ""), "Allow_Basis"] = "no match"
+
+    # Sharing signature match (algorithm #6)
+    sig_target = out.get("dest_domain", out["destination"]).astype(str)
+    sig = sig_target.apply(lambda d: _domain_in_signatures(d, SIGNATURES_MAP))
+    out["Signature_Match"] = sig.apply(lambda x: bool(x[0]))
+    out["Signature_Service"] = sig.apply(lambda x: str(x[1] or ""))
+    out["Signature_Basis"] = sig.apply(lambda x: str(x[2] or ""))  # noqa: E712
     # category
     out["Category"] = out["destination"].apply(_tag_category)
 
@@ -1559,10 +1713,12 @@ def _load_shadow_sharing_data_cached(
     target_dates: Tuple[str, ...],
     cache_version: str,
     whitelist_mtime_ns: int,
+    signatures_mtime_ns: int,
 ) -> pd.DataFrame:
     # cache_version + whitelist_mtime_ns are explicit cache-busters.
     _ = cache_version
     _ = whitelist_mtime_ns
+    _ = signatures_mtime_ns
 
     parquet_root = Path(parquet_root_str)
     if not parquet_root.exists():
@@ -1594,5 +1750,164 @@ def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.
         dates_key,
         CACHE_VERSION,
         int(WHITELIST_MTIME_NS),
+        int(SIGNATURES_MTIME_NS),
     )
 
+
+
+# -----------------------------------------------------------------------------
+# INCIDENT ROLLUP (algorithm #5) + CONFIDENCE MODEL (algorithm #4)
+# -----------------------------------------------------------------------------
+
+def _confidence_label(score: int) -> str:
+    if score >= 80:
+        return "HIGH"
+    if score >= 50:
+        return "PROBABLE"
+    return "WEAK"
+
+def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int = INCIDENT_WINDOW_MINUTES) -> pd.DataFrame:
+    if events_df is None or events_df.empty:
+        return pd.DataFrame()
+
+    df = events_df.copy()
+    df = _ensure_ts_datetime(df)
+    log_src = df.get("log_source", "").astype(str).str.strip().str.lower()
+    df = df[log_src.eq("flow")].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    mac = df.get("orig_l2_addr", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
+    ip = df.get("id.orig_h", pd.Series("", index=df.index)).astype(str).str.strip()
+    df["device_id"] = mac.where(mac.replace({"nan": "", "none": "", "-": ""}).ne(""), "ip:" + ip)
+
+    df["domain"] = df.get("dest_domain", df.get("destination", "")).astype(str).str.strip().str.lower()
+    df.loc[df["domain"].isin(["", "nan", "none", "unknown", "-", "*"]), "domain"] = df.get("destination", "").astype(str).str.strip().str.lower()
+
+    df["bytes_out"] = pd.to_numeric(df.get("bytes_out", 0), errors="coerce").fillna(0)
+    df["bytes_in"] = pd.to_numeric(df.get("bytes_in", 0), errors="coerce").fillna(0)
+    df["duration"] = pd.to_numeric(df.get("duration", 0), errors="coerce").fillna(0)
+
+    df["out_in_ratio"] = (df["bytes_out"] / df["bytes_in"].clip(lower=1)).replace([math.inf, -math.inf], 0).fillna(0)
+    df["is_long"] = df["duration"] >= LONG_DURATION_SEC
+    df["is_big_out"] = df["bytes_out"] >= BIG_OUT_BYTES
+
+    http_any_upload = df.get("http_any_upload", False)
+    http_any_share = df.get("http_any_share", False)
+    df["http_upload_evidence"] = pd.Series(http_any_upload, index=df.index).fillna(False).astype(bool)
+    df["http_share_evidence"] = pd.Series(http_any_share, index=df.index).fillna(False).astype(bool)
+
+    meth = df.get("method", "").astype(str).str.upper()
+    df["http_upload_evidence"] = df["http_upload_evidence"] | meth.isin(["POST", "PUT", "PATCH"])
+
+    df["file_evidence"] = (pd.to_numeric(df.get("file_total_bytes", 0), errors="coerce").fillna(0) >= BIG_OUT_BYTES) | (pd.to_numeric(df.get("file_seen_bytes", 0), errors="coerce").fillna(0) >= BIG_OUT_BYTES)
+
+    df["day"] = df["ts"].dt.date
+    rep = df.groupby(["device_id", "domain"], dropna=False)["day"].nunique().reset_index().rename(columns={"day": "active_days"})
+    df = df.merge(rep, on=["device_id", "domain"], how="left")
+
+    w = max(1, int(window_minutes))
+    df["time_window"] = df["ts"].dt.floor(f"{w}min")
+
+    def _mode(series: pd.Series) -> str:
+        try:
+            return series.astype(str).value_counts().index[0] if len(series) else ""
+        except Exception:
+            return ""
+
+    def _first_nonempty(series: pd.Series) -> str:
+        for raw in series.astype(str):
+            v = raw.strip()
+            if v and v.lower() not in {"nan", "none", "-", "(empty)"}:
+                return v
+        return ""
+
+    gb = df.groupby(["device_id", "domain", "time_window"], dropna=False)
+    agg = gb.agg(
+        first_ts=("ts", "min"),
+        last_ts=("ts", "max"),
+        mac=("orig_l2_addr", _first_nonempty),
+        orig_ip=("id.orig_h", _first_nonempty),
+        dest=("destination", _mode),
+        sig_match=("Signature_Match", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        sig_service=("Signature_Service", _mode),
+        allowed=("Allowed", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        allow_basis=("Allow_Basis", _mode),
+        bytes_out_total=("bytes_out", "sum"),
+        bytes_in_total=("bytes_in", "sum"),
+        conn_count=("uid", pd.Series.nunique),
+        total_duration=("duration", "sum"),
+        http_upload=("http_upload_evidence", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        http_share=("http_share_evidence", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        file_visible=("file_evidence", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        method=("method", _mode),
+        uri=("uri", _first_nonempty),
+        user_agent=("user_agent", _mode),
+        file_names=("file_names", _first_nonempty),
+        file_mime_types=("file_mime_types", _mode),
+        any_long=("is_long", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        any_big_out=("is_big_out", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        active_days=("active_days", "max"),
+    ).reset_index()
+
+    agg["out_in_ratio_total"] = (agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)).replace([math.inf, -math.inf], 0).fillna(0)
+
+    scores: List[int] = []
+    reasons: List[str] = []
+    for _, r in agg.iterrows():
+        score = 0
+        why: List[str] = []
+        if bool(r.get("sig_match", False)):
+            score += 40
+            why.append("signature: known sharing service")
+        if not bool(r.get("allowed", False)):
+            score += 30
+            why.append("policy: not allowlisted")
+        if float(r.get("bytes_out_total", 0)) >= BIG_OUT_BYTES and float(r.get("out_in_ratio_total", 0)) >= RATIO_HIGH:
+            score += 30
+            why.append("upload: >=10MB and high out/in ratio")
+        if int(r.get("conn_count", 0) or 0) >= CHUNK_CONN_COUNT:
+            score += 15
+            why.append("chunking: many conns in window")
+        if bool(r.get("http_share", False)):
+            score += 40
+            why.append("sharing: HTTP share-link evidence")
+        if (int(r.get("active_days", 0) or 0) >= 2) and (not bool(r.get("allowed", False))):
+            score += 20
+            why.append("repeat: seen across >=2 days")
+        score = min(100, int(score))
+        scores.append(score)
+        reasons.append("; ".join(why))
+
+    agg["confidence_score"] = scores
+    agg["confidence"] = agg["confidence_score"].apply(_confidence_label)
+    agg["confidence_reasons"] = reasons
+    agg["is_shadow_sharing"] = (agg["sig_match"] == True) & (agg["allowed"] == False) & (agg["confidence_score"] >= 50)  # noqa: E712
+    agg["incident_id"] = agg["device_id"].astype(str) + "|" + agg["domain"].astype(str) + "|" + agg["time_window"].astype(str)
+    agg["category"] = "file_sharing"
+
+    cols = [
+        "incident_id",
+        "first_ts", "last_ts",
+        "mac", "orig_ip",
+        "domain", "dest",
+        "category",
+        "sig_service",
+        "allowed", "allow_basis",
+        "bytes_out_total", "bytes_in_total", "out_in_ratio_total",
+        "conn_count", "total_duration",
+        "method", "uri", "user_agent",
+        "file_names", "file_mime_types",
+        "http_upload", "http_share", "file_visible",
+        "any_long", "any_big_out",
+        "active_days",
+        "confidence_score", "confidence", "confidence_reasons",
+        "is_shadow_sharing",
+    ]
+    cols = [c for c in cols if c in agg.columns]
+    return agg[cols].sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=24)
+def load_shadow_sharing_incidents_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
+    df = load_shadow_sharing_data(parquet_root, target_dates)
+    return build_shadow_sharing_incidents(df, INCIDENT_WINDOW_MINUTES)
