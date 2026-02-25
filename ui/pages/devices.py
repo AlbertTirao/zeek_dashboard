@@ -86,6 +86,51 @@ def iter_date_dirs(parquet_root: Path):
             yield d, p
 
 
+def _path_stat_sig(path: Path | None) -> tuple[float, int]:
+    if path is None or not path.exists():
+        return (0.0, 0)
+    try:
+        st_ = path.stat()
+        return (float(st_.st_mtime_ns), int(st_.st_size))
+    except Exception:
+        return (0.0, 0)
+
+
+def _resolve_known_hosts_for_day(parquet_root: Path, day_str: str) -> Path | None:
+    for d, p in iter_date_dirs(parquet_root):
+        if d == day_str:
+            kh = p / "known_hosts.parquet"
+            return kh if kh.exists() else None
+    return None
+
+
+def _known_hosts_sig_for_day(parquet_root: Path, day_str: str) -> tuple[float, int]:
+    return _path_stat_sig(_resolve_known_hosts_for_day(parquet_root, day_str))
+
+
+def _inventory_file_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
+    sig = []
+    for _day_str, day_dir in iter_date_dirs(parquet_root):
+        for name in ("known_hosts.parquet", "dhcp.parquet"):
+            fp = day_dir / name
+            if not fp.exists():
+                continue
+            mtime_ns, size = _path_stat_sig(fp)
+            sig.append((str(fp), mtime_ns, size))
+    return tuple(sig)
+
+
+def _alerts_event_cache_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
+    cache_root = parquet_root / "_cache_alerts"
+    if not cache_root.exists():
+        return tuple()
+    sig = []
+    for fp in sorted(cache_root.rglob("alerts_events.parquet")):
+        mtime_ns, size = _path_stat_sig(fp)
+        sig.append((str(fp), mtime_ns, size))
+    return tuple(sig)
+
+
 def _coerce_ts_any(series: pd.Series) -> pd.Series:
     """Robust timestamp coercion (seconds/ms/us/ns, datetime, string)."""
     if series is None or len(series) == 0:
@@ -142,82 +187,85 @@ def _coerce_ts_any(series: pd.Series) -> pd.Series:
             return parsed_num
 
 
-@st.cache_data(show_spinner=False, ttl=30)
-def load_active_today_macs_from_parquet(parquet_root: Path, today_str: str) -> set:
+@st.cache_data(show_spinner=False)
+def load_active_today_macs_from_parquet(
+    parquet_root: Path,
+    today_str: str,
+    known_hosts_sig: tuple[float, int],
+) -> set:
     """Active Today = MACs present in today's known_hosts parquet (folder date)."""
-    for d, p in iter_date_dirs(parquet_root):
-        if d == today_str:
-            kh = p / "known_hosts.parquet"
-            if not kh.exists():
-                return set()
-            try:
-                df = pd.read_parquet(kh)
-            except Exception:
-                return set()
-            if "mac" not in df.columns:
-                return set()
-            macs = df["mac"].map(normalize_mac).dropna()
-            macs = macs[~macs.map(is_broadcast_mac)]
-            return set(macs.tolist())
-    return set()
+    _ = known_hosts_sig
+    kh = _resolve_known_hosts_for_day(parquet_root, today_str)
+    if kh is None:
+        return set()
+    try:
+        df = pd.read_parquet(kh)
+    except Exception:
+        return set()
+    if "mac" not in df.columns:
+        return set()
+    macs = df["mac"].map(normalize_mac).dropna()
+    macs = macs[~macs.map(is_broadcast_mac)]
+    return set(macs.tolist())
 
 
-@st.cache_data(show_spinner=False, ttl=30)
-def load_active_today_inventory_from_parquet(parquet_root: Path, today_str: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_active_today_inventory_from_parquet(
+    parquet_root: Path,
+    today_str: str,
+    known_hosts_sig: tuple[float, int],
+) -> pd.DataFrame:
     """
     Build an inventory DF from today's known_hosts.parquet:
       mac, ip(host), last_seen_today (ts)
     """
-    for d, p in iter_date_dirs(parquet_root):
-        if d == today_str:
-            kh = p / "known_hosts.parquet"
-            if not kh.exists():
-                return pd.DataFrame()
+    _ = known_hosts_sig
+    kh = _resolve_known_hosts_for_day(parquet_root, today_str)
+    if kh is None:
+        return pd.DataFrame()
 
-            try:
-                df = pd.read_parquet(kh)
-            except Exception:
-                return pd.DataFrame()
+    try:
+        df = pd.read_parquet(kh)
+    except Exception:
+        return pd.DataFrame()
 
-            if df.empty or "mac" not in df.columns:
-                return pd.DataFrame()
+    if df.empty or "mac" not in df.columns:
+        return pd.DataFrame()
 
-            out = df.copy()
-            out["mac"] = out["mac"].map(normalize_mac)
-            out = out.dropna(subset=["mac"])
-            out = out[~out["mac"].map(is_broadcast_mac)]
+    out = df.copy()
+    out["mac"] = out["mac"].map(normalize_mac)
+    out = out.dropna(subset=["mac"])
+    out = out[~out["mac"].map(is_broadcast_mac)]
 
-            if "ts" in out.columns:
-                out["ts"] = _coerce_ts_any(out["ts"])
-            else:
-                out["ts"] = pd.NaT
+    if "ts" in out.columns:
+        out["ts"] = _coerce_ts_any(out["ts"])
+    else:
+        out["ts"] = pd.NaT
 
-            # try common ip column names
-            ip_col = None
-            for c in ["host", "id.orig_h", "client_addr", "ip", "addr"]:
-                if c in out.columns:
-                    ip_col = c
-                    break
+    # try common ip column names
+    ip_col = None
+    for c in ["host", "id.orig_h", "client_addr", "ip", "addr"]:
+        if c in out.columns:
+            ip_col = c
+            break
 
-            if ip_col is None:
-                out["ip"] = "-"
-            else:
-                out["ip"] = out[ip_col].astype(str)
+    if ip_col is None:
+        out["ip"] = "-"
+    else:
+        out["ip"] = out[ip_col].astype(str)
 
-            inv = (
-                out.sort_values("ts", ascending=False)
-                .groupby("mac", as_index=False)
-                .agg(ip=("ip", "first"), last_seen_today=("ts", "max"))
-            )
+    inv = (
+        out.sort_values("ts", ascending=False)
+        .groupby("mac", as_index=False)
+        .agg(ip=("ip", "first"), last_seen_today=("ts", "max"))
+    )
 
-            return inv
-
-    return pd.DataFrame()
+    return inv
 
 
 # --- IMPORTS FOR CLICKABLE TABLE ---
 try:
-    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 except ImportError:
     st.error("This solution requires the 'streamlit-aggrid' library.")
     st.info("Please run: pip install streamlit-aggrid")
@@ -294,6 +342,82 @@ def get_shadow_aggrid_theme_and_css():
     return theme, custom_css
 
 
+_MAC_CLICK_CELL_STYLE = JsCode(
+    """
+    function(params) {
+        return {
+            'color': '#8AB4F8',
+            'fontWeight': '700',
+            'cursor': 'pointer',
+            'textDecoration': 'underline'
+        };
+    }
+    """
+)
+
+_MAC_ONLY_CLICK_JS = JsCode(
+    """
+    function(params) {
+        if (!params || !params.column || !params.node) return;
+        const colId = params.column.getColId ? params.column.getColId() : '';
+        if (colId === 'mac') {
+            params.node.setSelected(true, true);
+            return;
+        }
+        if (params.api && params.api.deselectAll) {
+            params.api.deselectAll();
+        }
+    }
+    """
+)
+
+
+def _apply_copyable_grid_options(grid_options: dict) -> dict:
+    opts = dict(grid_options or {})
+    opts["enableCellTextSelection"] = True
+    opts["ensureDomOrder"] = True
+    opts["enableRangeSelection"] = True
+    return opts
+
+
+def _extract_first_selected_row(selected_rows):
+    if isinstance(selected_rows, pd.DataFrame):
+        if selected_rows.empty:
+            return None
+        return selected_rows.iloc[0].to_dict()
+    if isinstance(selected_rows, list) and selected_rows and isinstance(selected_rows[0], dict):
+        return selected_rows[0]
+    return None
+
+
+def _row_selection_key(row: dict, origin: str) -> str:
+    mac = normalize_mac(row.get("mac")) or str(row.get("mac") or "").strip().lower()
+    ip = str(row.get("ip") or "-").strip() or "-"
+    return f"{origin}|{mac}|{ip}"
+
+
+def _bump_devices_grid_nonce():
+    st.session_state.devices_grid_nonce = int(st.session_state.get("devices_grid_nonce", 0)) + 1
+
+
+def _open_forensics_from_row(row: dict, origin: str):
+    if not isinstance(row, dict):
+        return
+    mac = normalize_mac(row.get("mac")) or str(row.get("mac") or "").strip().lower()
+    if not mac:
+        return
+    key = _row_selection_key(row, origin)
+    if key == st.session_state.get("devices_last_selection_key"):
+        return
+
+    st.session_state.devices_last_selection_key = key
+    st.session_state.selected_forensic_mac = mac
+    st.session_state.selected_forensic_ip = str(row.get("ip") or "-").strip() or "-"
+    st.session_state.prev_dialog = origin
+    st.session_state.active_dialog = "forensics"
+    st.rerun()
+
+
 def _table_height_for_rows(
     n_rows: int,
     *,
@@ -313,7 +437,11 @@ def _table_height_for_rows(
 # 1) Load Visual Metrics from Parquet
 # =====================================================
 @st.cache_data(show_spinner=False)
-def load_visual_metrics_from_parquet(parquet_root: Path):
+def load_visual_metrics_from_parquet(
+    parquet_root: Path,
+    inventory_sig: tuple[tuple[str, float, int], ...],
+):
+    _ = inventory_sig
     known_hosts_all = []
     dhcp_all = []
     if not parquet_root.exists():
@@ -335,25 +463,34 @@ def load_visual_metrics_from_parquet(parquet_root: Path):
 # =====================================================
 # 1b) Alerts-aligned latest inventory (conn/dhcp/arp)
 # =====================================================
-@st.cache_data(show_spinner=False, ttl=180)
-def _list_alert_event_cache_files(parquet_root: Path) -> tuple[str, ...]:
+@st.cache_data(show_spinner=False)
+def _list_alert_event_cache_files(
+    parquet_root: Path,
+    alert_cache_sig: tuple[tuple[str, float, int], ...],
+) -> tuple[str, ...]:
+    _ = alert_cache_sig
     cache_root = parquet_root / "_cache_alerts"
     if not cache_root.exists():
         return tuple()
     return tuple(str(p) for p in sorted(cache_root.rglob("alerts_events.parquet")))
 
 
-@st.cache_data(show_spinner=False, ttl=600)
-def load_alerts_latest_inventory_rows(parquet_root: Path) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_alerts_latest_inventory_rows(
+    parquet_root: Path,
+    alert_cache_sig: tuple[tuple[str, float, int], ...],
+    inventory_sig: tuple[tuple[str, float, int], ...],
+) -> pd.DataFrame:
     """
     Pull the same latest-per-MAC inventory basis used by Alerts page so
     Device Inspection cards/table reconcile with Alerts.
     """
+    _ = inventory_sig
     base_cols = ["mac", "host", "ts"]
 
     latest = None
 
-    cache_files = list(_list_alert_event_cache_files(parquet_root))
+    cache_files = list(_list_alert_event_cache_files(parquet_root, alert_cache_sig))
     if cache_files:
         try:
             import duckdb
@@ -698,7 +835,7 @@ def _activity_log_file(authorized_mac_file: Path) -> Path:
     return authorized_mac_file.with_name("activity_log.csv")
 
 
-@st.cache_data(show_spinner=False, ttl=15)
+@st.cache_data(show_spinner=False)
 def _load_device_change_history_cached(log_file_str: str, sig: tuple) -> pd.DataFrame:
     _ = sig
     log_file = Path(log_file_str)
@@ -1121,12 +1258,16 @@ def _close_dialog():
     st.session_state.prev_dialog = None
     st.session_state.selected_forensic_mac = None
     st.session_state.selected_forensic_ip = None
+    st.session_state.devices_last_selection_key = None
+    _bump_devices_grid_nonce()
     st.rerun()
 
 
 def _go_back_from_forensics():
     prev = st.session_state.get("prev_dialog") or "list"
     st.session_state.active_dialog = prev
+    st.session_state.devices_last_selection_key = None
+    _bump_devices_grid_nonce()
     st.rerun()
 
 
@@ -1362,7 +1503,8 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
         if st.button("Close", key="dlg_active_close", use_container_width=True):
             _close_dialog()
 
-    inv_today = load_active_today_inventory_from_parquet(parquet_root, today_str)
+    known_hosts_sig = _known_hosts_sig_for_day(parquet_root, today_str)
+    inv_today = load_active_today_inventory_from_parquet(parquet_root, today_str, known_hosts_sig)
     if inv_today.empty:
         st.info("No Active Today records found for today's folder.")
         return
@@ -1385,7 +1527,10 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
     q = st.text_input("Search MAC:", value="", placeholder="aa:bb:cc:dd:ee:ff", key="active_search").strip().lower()
     st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("<div class='dialog-note'>Tip: Click a row to open forensics for that device.</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='dialog-note'>Tip: Click a <b>MAC Address</b> cell to open forensics for that device.</div>",
+        unsafe_allow_html=True,
+    )
 
     def _tok(x: str) -> str:
         return "".join(ch for ch in (x or "").lower() if ch.isalnum())
@@ -1413,14 +1558,21 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
     gb = GridOptionsBuilder.from_dataframe(display_df)
     gb.configure_selection(selection_mode="single", use_checkbox=False)
     gb.configure_column("#", width=52, pinned="left")
-    gb.configure_column("mac", header_name="MAC Address", width=190)
+    gb.configure_column("mac", header_name="MAC Address (Click)", width=190, cellStyle=_MAC_CLICK_CELL_STYLE)
     gb.configure_column("ip", header_name="IP Address", width=140)
     gb.configure_column("host_name", header_name="Host Name", width=220)
     gb.configure_column("status", header_name="Status", width=140)
     gb.configure_column("Last Seen (Today)", width=200)
-    grid_options = gb.build()
+    grid_options = _apply_copyable_grid_options(gb.build())
+    grid_options["rowSelection"] = "single"
+    grid_options["suppressRowClickSelection"] = True
+    grid_options["rowMultiSelectWithClick"] = False
     grid_options["domLayout"] = "normal"
     grid_options["alwaysShowVerticalScroll"] = True
+    grid_options["onCellClicked"] = _MAC_ONLY_CLICK_JS
+
+    st.caption("Copy cells with Ctrl/Cmd + C.")
+    grid_key = f"devices_active_today_grid_{int(st.session_state.get('devices_grid_nonce', 0))}"
 
     grid_response = AgGrid(
         display_df,
@@ -1432,21 +1584,16 @@ def active_today_popup(in_scope: pd.DataFrame, parquet_root: Path, today_str: st
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
         reload_data=False,
+        key=grid_key,
     )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    selected = grid_response["selected_rows"]
-    if selected is not None:
-        if isinstance(selected, pd.DataFrame):
-            selected = selected.to_dict("records")
-        if len(selected) > 0:
-            row = selected[0]
-            st.session_state.selected_forensic_mac = row.get("mac")
-            st.session_state.selected_forensic_ip = row.get("ip")
-            st.session_state.prev_dialog = "active_today"
-            st.session_state.active_dialog = "forensics"
-            st.rerun()
+    row = _extract_first_selected_row(grid_response.get("selected_rows", None))
+    if row:
+        _open_forensics_from_row(row, "active_today")
+    else:
+        st.session_state.devices_last_selection_key = None
 
 
 # =====================================================
@@ -1471,7 +1618,7 @@ def device_list_popup(
             f"""
             <div class='dialog-head'>
               <div class='dialog-title'>{status_type} Devices</div>
-              <div class='dialog-sub'>Search and filter inventory, then click a row to open forensics.</div>
+              <div class='dialog-sub'>Search and filter inventory, then click a MAC Address cell to open forensics.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1598,9 +1745,6 @@ def device_list_popup(
         # For unauthorized, sort and filter by Last Seen
         inventory["sort_dt"] = _coerce_ts_any(inventory["last_seen"])
 
-    inventory["vendor"] = inventory["mac"].map(get_mac_vendor)
-    inventory["vendor"] = inventory["vendor"].fillna("Unknown").astype(str)
-
     # Date Filtering
     if date_filter_mode == "Last 7 Days":
         seven_days_ago = get_local_now() - timedelta(days=7)
@@ -1621,12 +1765,6 @@ def device_list_popup(
 
     # Sort descending
     inventory = inventory.sort_values("sort_dt", ascending=False, na_position="last")
-    
-    # Filter columns for view
-    if status_type == "Authorized":
-        inventory = inventory[["mac", "ip", "host_name", "vendor", "Authorized Date", "Last Seen", "sort_dt"]].copy()
-    else:
-        inventory = inventory[["mac", "ip", "host_name", "vendor", "Last Seen", "sort_dt"]].copy()
 
     # Search Logic
     if mac_query_norm:
@@ -1643,6 +1781,15 @@ def device_list_popup(
             st.info("No matching MAC address found.")
             return
         inventory = inv
+
+    inventory["vendor"] = inventory["mac"].map(get_mac_vendor)
+    inventory["vendor"] = inventory["vendor"].fillna("Unknown").astype(str)
+
+    # Filter columns for view
+    if status_type == "Authorized":
+        inventory = inventory[["mac", "ip", "host_name", "vendor", "Authorized Date", "Last Seen", "sort_dt"]].copy()
+    else:
+        inventory = inventory[["mac", "ip", "host_name", "vendor", "Last Seen", "sort_dt"]].copy()
 
     inventory = inventory.reset_index(drop=True)
     inventory.insert(0, "#", pd.RangeIndex(start=1, stop=len(inventory) + 1, step=1))
@@ -1662,7 +1809,7 @@ def device_list_popup(
     
     # Explain the date columns clearly to users
     st.markdown(
-        "<div class='dialog-note'>Tip: <b>Date Authorized</b> matches the Authorization page exactly. <b>Last Seen</b> indicates the most recent network traffic detected.</div>",
+        "<div class='dialog-note'>Tip: Click a <b>MAC Address</b> cell to open forensics. <b>Date Authorized</b> matches the Authorization page exactly. <b>Last Seen</b> indicates the most recent network traffic detected.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1713,10 +1860,11 @@ def device_list_popup(
             gb_hist.configure_column("Action", width=110)
             gb_hist.configure_column("Device", width=220)
             gb_hist.configure_column("When", width=210)
+            hist_options = _apply_copyable_grid_options(gb_hist.build())
 
             AgGrid(
                 history_show,
-                gridOptions=gb_hist.build(),
+                gridOptions=hist_options,
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 height=220,
                 allow_unsafe_jscode=True,
@@ -1750,7 +1898,7 @@ def device_list_popup(
         type=["numericColumn", "numberColumnFilter"],
         sort="asc",
     )
-    gb.configure_column("mac", header_name="MAC Address", width=170)
+    gb.configure_column("mac", header_name="MAC Address (Click)", width=170, cellStyle=_MAC_CLICK_CELL_STYLE)
     gb.configure_column("ip", header_name="IP Address", width=130)
     gb.configure_column("host_name", header_name="Host Name", width=180)
     gb.configure_column("vendor", header_name="Vendor", width=180)
@@ -1763,10 +1911,17 @@ def device_list_popup(
         gb.configure_column("Last Seen", header_name="Last Seen", width=180)
         
     gb.configure_column("sort_dt", hide=True)
-    
-    grid_options = gb.build()
+
+    grid_options = _apply_copyable_grid_options(gb.build())
+    grid_options["rowSelection"] = "single"
+    grid_options["suppressRowClickSelection"] = True
+    grid_options["rowMultiSelectWithClick"] = False
     grid_options["domLayout"] = "normal"
     grid_options["alwaysShowVerticalScroll"] = True
+    grid_options["onCellClicked"] = _MAC_ONLY_CLICK_JS
+
+    st.caption("Copy cells with Ctrl/Cmd + C.")
+    grid_key = f"devices_list_grid_{status_type.lower()}_{int(st.session_state.get('devices_grid_nonce', 0))}"
 
     grid_response = AgGrid(
         inventory,
@@ -1778,21 +1933,16 @@ def device_list_popup(
         custom_css=ag_css,
         fit_columns_on_grid_load=True,
         reload_data=False,
+        key=grid_key,
     )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    selected = grid_response["selected_rows"]
-    if selected is not None:
-        if isinstance(selected, pd.DataFrame):
-            selected = selected.to_dict("records")
-        if len(selected) > 0:
-            row = selected[0]
-            st.session_state.selected_forensic_mac = row.get("mac")
-            st.session_state.selected_forensic_ip = row.get("ip")
-            st.session_state.prev_dialog = "list"
-            st.session_state.active_dialog = "forensics"
-            st.rerun()
+    row = _extract_first_selected_row(grid_response.get("selected_rows", None))
+    if row:
+        _open_forensics_from_row(row, "list")
+    else:
+        st.session_state.devices_last_selection_key = None
 
 
 # =====================================================
@@ -1816,7 +1966,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
         )
     with h2:
         if st.button("Close", key="dlg_forensics_close", use_container_width=True):
-            _go_back_from_forensics()
+            _close_dialog()
 
     if not available_dates_list:
         st.warning("No dates available for analysis.")
@@ -1949,13 +2099,19 @@ def render(logs_root: Path, authorized_mac_file: Path):
         st.session_state.selected_forensic_ip = None
     if "prev_dialog" not in st.session_state:
         st.session_state.prev_dialog = None
+    if "devices_grid_nonce" not in st.session_state:
+        st.session_state.devices_grid_nonce = 0
+    if "devices_last_selection_key" not in st.session_state:
+        st.session_state.devices_last_selection_key = None
 
     inject_page_css()
     inject_traffic_style_header_css()
 
     PARQUET_ROOT = Path(logs_root)
-    known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT)
-    alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT)
+    inventory_sig = _inventory_file_signature(PARQUET_ROOT)
+    alerts_cache_sig = _alerts_event_cache_signature(PARQUET_ROOT)
+    known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT, inventory_sig)
+    alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
 
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
@@ -2041,7 +2197,11 @@ def render(logs_root: Path, authorized_mac_file: Path):
     auth_seen = len(authorized_macs)
     total_devices = auth_seen + unauth_seen
 
-    active_today_set = load_active_today_macs_from_parquet(PARQUET_ROOT, today_str)
+    active_today_set = load_active_today_macs_from_parquet(
+        PARQUET_ROOT,
+        today_str,
+        _known_hosts_sig_for_day(PARQUET_ROOT, today_str),
+    )
     if banned_macs:
         active_today_set = active_today_set - set(banned_macs)
     active_today = int(len(active_today_set))
