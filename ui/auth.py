@@ -593,9 +593,17 @@ def require_authentication() -> None:
                     0 0 0 5px var(--auth-focus-ring);
                 transform: translateY(-1px);
             }}
+            .st-key-login_form_panel div[data-testid="stTextInputRootElement"] {{
+                padding-right: 0px !important;
+                padding-inline-end: 0px !important;
+            }}
             .st-key-login_form_panel div[data-testid="stTextInputRootElement"]:has(input[type="password"]) {{
                 padding-right: 0 !important;
                 padding-inline-end: 0 !important;
+            }}
+            .st-key-login_form_panel div[data-testid="stTextInputRootElement"][style*="padding-right"] {{
+                padding-right: 0px !important;
+                padding-inline-end: 0px !important;
             }}
             .st-key-login_form_panel div[data-testid="stTextInputRootElement"]:has(input[type="password"]) > div[data-baseweb="base-input"] {{
                 padding-right: 0 !important;
