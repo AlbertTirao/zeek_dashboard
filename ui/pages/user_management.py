@@ -5,6 +5,15 @@ from datetime import datetime
 from services import auth_service
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
+try:
+    from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, GridUpdateMode, JsCode
+except Exception:  # pragma: no cover - optional dependency at runtime
+    AgGrid = None
+    DataReturnMode = None
+    GridOptionsBuilder = None
+    GridUpdateMode = None
+    JsCode = None
+
 
 def _inject_user_management_css() -> None:
     st.markdown(
@@ -236,6 +245,188 @@ def _with_row_numbers(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _aggrid_payload_to_df(payload) -> pd.DataFrame:
+    if isinstance(payload, pd.DataFrame):
+        return payload.copy()
+    if isinstance(payload, list):
+        return pd.DataFrame(payload)
+    return pd.DataFrame()
+
+
+def _user_table_aggrid_theme_and_css() -> tuple[str, dict]:
+    custom_css = {
+        ".ag-root-wrapper": {
+            "background-color": "#061120",
+            "color": "#EAF2FF",
+            "border": "1px solid #2A466E",
+        },
+        ".ag-header": {
+            "background-color": "#0A1730",
+            "color": "#EAF2FF",
+            "border-bottom": "1px solid #29406A",
+        },
+        ".ag-header-cell, .ag-header-group-cell": {
+            "background-color": "#0A1730",
+            "color": "#EAF2FF",
+            "border-right": "1px solid #20365A",
+        },
+        ".ag-header-cell-label": {
+            "font-weight": "800",
+            "letter-spacing": "0.02em",
+        },
+        ".ag-cell": {
+            "background-color": "#050B16",
+            "color": "#EAEAEA",
+            "border-color": "#13233D",
+            "display": "flex",
+            "align-items": "center",
+        },
+        ".ag-row-odd": {
+            "background-color": "#071224",
+        },
+        ".ag-row-even": {
+            "background-color": "#050E1D",
+        },
+        ".ag-row-hover": {
+            "background-color": "#0F203D",
+        },
+        ".ag-row-selected": {
+            "background-color": "#102540",
+        },
+        ".ag-cell[col-id='Action']": {
+            "justify-content": "center",
+        },
+        ".ag-header-cell[col-id='Action'] .ag-header-cell-label": {
+            "justify-content": "center",
+        },
+        ".ag-header-cell[col-id='Action'] .ag-header-cell-text": {
+            "font-size": "17px",
+            "font-weight": "800",
+        },
+        ".ag-center-cols-viewport": {
+            "overflow-x": "hidden !important",
+        },
+    }
+    return "alpine-dark", custom_css
+
+
+_UM_ACTION_CELL_STYLE = (
+    JsCode(
+        """
+        function() {
+            return {
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                textAlign: 'center',
+                fontSize: '22px',
+                lineHeight: '1',
+                letterSpacing: '0.12em',
+                color: '#F6FAFF',
+                cursor: 'pointer',
+                paddingTop: '3px',
+                paddingBottom: '3px'
+            };
+        }
+        """
+    )
+    if JsCode
+    else None
+)
+
+_UM_ACTION_CLICK_JS = (
+    JsCode(
+        """
+        function(params) {
+            if (!params || !params.column || !params.event) return;
+            const colId = params.column.getColId ? params.column.getColId() : '';
+            if (colId !== 'Action') return;
+
+            const username = ((params.data && params.data.Username) || '').toString().trim().toLowerCase();
+            if (!username) return;
+
+            let actionType = 'edit';
+            let cellEl = null;
+            if (params.event.target && params.event.target.closest) {
+                cellEl = params.event.target.closest('.ag-cell');
+            }
+            if (cellEl && cellEl.getBoundingClientRect) {
+                const rect = cellEl.getBoundingClientRect();
+                const clickX = params.event.clientX - rect.left;
+                if (clickX > (rect.width * 0.5)) {
+                    actionType = 'delete';
+                }
+            }
+
+            const token = actionType + '|' + username + '|' + Date.now().toString();
+            if (params.node && params.node.setDataValue) {
+                params.node.setDataValue('_ActionToken', token);
+            } else if (params.setValue) {
+                params.setValue(token);
+            }
+        }
+        """
+    )
+    if JsCode
+    else None
+)
+
+
+@st.dialog("Delete User")
+def _render_delete_user_dialog(target_username: str, current_username: str) -> None:
+    users = auth_service.list_users()
+    user_map = {str(u.get("username", "")).strip().lower(): u for u in users}
+    target = (target_username or "").strip().lower()
+    current = (current_username or "").strip().lower()
+
+    if target not in user_map:
+        st.error("Selected user no longer exists.")
+        if st.button("Close", use_container_width=True, key="um_delete_missing_close"):
+            st.session_state.pop("um_delete_target", None)
+            st.rerun()
+        return
+
+    target_role = str(user_map[target].get("role", "staff")).strip().lower()
+    st.warning(f"Delete user '{target}'? This action cannot be undone.")
+    if target_role == "admin":
+        st.caption("This account currently has admin role.")
+
+    c1, c2 = st.columns(2, gap="small")
+    with c1:
+        do_delete = st.button(
+            "Delete User",
+            use_container_width=True,
+            key=f"um_confirm_delete_{target}",
+            type="primary",
+        )
+    with c2:
+        cancel = st.button(
+            "Cancel",
+            use_container_width=True,
+            key=f"um_cancel_delete_{target}",
+        )
+
+    if do_delete:
+        try:
+            if target == current:
+                raise ValueError("You cannot delete your own account.")
+
+            admin_count = sum(1 for u in users if str(u.get("role", "")).strip().lower() == "admin")
+            if target_role == "admin" and admin_count <= 1:
+                raise ValueError("At least one admin account must remain.")
+
+            auth_service.delete_user(username=target)
+            st.session_state.pop("um_delete_target", None)
+            st.success("User deleted successfully.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    if cancel:
+        st.session_state.pop("um_delete_target", None)
+        st.rerun()
+
+
 @st.dialog("Edit User")
 def _render_edit_user_dialog(
     target_username: str,
@@ -288,6 +479,10 @@ def _render_edit_user_dialog(
 def render(current_username: str):
     _inject_user_management_css()
     inject_traffic_style_header_css()
+
+    if AgGrid is None:
+        st.error("streamlit-aggrid is required for the Action column UI.")
+        return
 
     users = auth_service.list_users()
     total_users = len(users)
@@ -363,67 +558,109 @@ def render(current_username: str):
                     "Created By": str(row.get("created_by", "") or ""),
                     "Created At": str(row.get("created_at", "") or ""),
                     "Last Login": str(row.get("last_login_at", "") or ""),
-                    "Edit": False,
                 }
             )
 
         df = pd.DataFrame(table_rows)
-        editor_df = _with_row_numbers(
-            df[["Username", "Role", "Created By", "Created At", "Last Login", "Edit"]].copy()
-        )
+        editor_df = _with_row_numbers(df[["Username", "Role", "Created By", "Created At", "Last Login"]].copy())
+        editor_df["Action"] = "✎  🗑"
+        editor_df["_ActionToken"] = ""
         # Fit the table to actual rows so empty visual rows are not shown.
-        table_height = min(420, max(140, 40 * (len(editor_df) + 1)))
+        table_height = min(520, max(170, 52 * (len(editor_df) + 1)))
 
         st.markdown("<div class='um-table-shell'>", unsafe_allow_html=True)
-        edited_df = st.data_editor(
-            editor_df,
-            num_rows="fixed",
-            use_container_width=True,
-            hide_index=True,
-            key="um_user_editor_v2",
-            column_config={
-                "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
-                "Username": st.column_config.TextColumn("Username", disabled=True, width="medium"),
-                "Role": st.column_config.SelectboxColumn("Role", options=["staff", "admin"], required=True),
-                "Created By": st.column_config.TextColumn("Created By", disabled=True, width="medium"),
-                "Created At": st.column_config.TextColumn("Created At", disabled=True, width="medium"),
-                "Last Login": st.column_config.TextColumn("Last Login", disabled=True, width="medium"),
-                "Edit": st.column_config.CheckboxColumn(
-                    "Edit",
-                    help="Tick one user to open edit modal.",
-                    width="small",
-                ),
-            },
-            height=table_height,
+        gb = GridOptionsBuilder.from_dataframe(editor_df)
+        gb.configure_default_column(
+            sortable=True,
+            filter=True,
+            resizable=True,
+            minWidth=95,
+            editable=False,
         )
+        gb.configure_column("#", header_name="#", width=56, pinned="left", suppressMovable=True)
+        gb.configure_column("Username", minWidth=230, flex=1.5, editable=False, tooltipField="Username")
+        gb.configure_column(
+            "Role",
+            width=110,
+            editable=True,
+            cellEditor="agSelectCellEditor",
+            cellEditorParams={"values": ["staff", "admin"]},
+            singleClickEdit=True,
+        )
+        gb.configure_column("Created By", minWidth=150, flex=1.05, editable=False, tooltipField="Created By")
+        gb.configure_column("Created At", minWidth=175, flex=1.1, editable=False, tooltipField="Created At")
+        gb.configure_column("Last Login", minWidth=175, flex=1.1, editable=False, tooltipField="Last Login")
+        gb.configure_column(
+            "Action",
+            width=128,
+            editable=False,
+            sortable=False,
+            filter=False,
+            suppressMenu=True,
+            suppressMovable=True,
+            cellStyle=_UM_ACTION_CELL_STYLE,
+        )
+        gb.configure_column("_ActionToken", hide=True)
+        grid_options = gb.build()
+        grid_options["stopEditingWhenCellsLoseFocus"] = True
+        grid_options["singleClickEdit"] = True
+        grid_options["suppressRowClickSelection"] = True
+        grid_options["rowSelection"] = "single"
+        grid_options["rowMultiSelectWithClick"] = False
+        grid_options["enableCellTextSelection"] = True
+        grid_options["ensureDomOrder"] = True
+        grid_options["rowHeight"] = 54
+        grid_options["headerHeight"] = 50
+        grid_options["onCellClicked"] = _UM_ACTION_CLICK_JS
+
+        ag_theme, ag_css = _user_table_aggrid_theme_and_css()
+        grid_response = AgGrid(
+            editor_df,
+            gridOptions=grid_options,
+            update_mode=GridUpdateMode.MODEL_CHANGED,
+            data_return_mode=DataReturnMode.AS_INPUT,
+            server_sync_strategy="server_wins",
+            height=table_height,
+            theme=ag_theme,
+            custom_css=ag_css,
+            allow_unsafe_jscode=True,
+            fit_columns_on_grid_load=True,
+            key="um_user_editor_v5",
+        )
+        edited_df = _aggrid_payload_to_df(grid_response.get("data", None))
+        if edited_df.empty:
+            edited_df = editor_df.copy()
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.caption("Tip: Tick Edit to open modal for username/password, then click Save Changes for role updates.")
+        st.caption("Tip: Use Action icons to edit/delete users. Update roles in the Role column, then click Save Changes.")
 
-        edit_candidates = []
         for row in edited_df.to_dict("records"):
-            if bool(row.get("Edit", False)):
-                username = str(row.get("Username", "")).strip().lower()
-                if username:
-                    edit_candidates.append(username)
+            raw_action = str(row.get("_ActionToken", "") or "").strip()
+            if "|" not in raw_action:
+                continue
+            last_action_token = str(st.session_state.get("um_last_action_token", "") or "").strip()
+            if raw_action == last_action_token:
+                continue
 
-        current_edit_set = sorted(set(edit_candidates))
-        if "um_prev_edit_users" not in st.session_state:
-            st.session_state["um_prev_edit_users"] = current_edit_set
-        else:
-            prev_edit_set = set(st.session_state.get("um_prev_edit_users", []))
-            newly_checked = [u for u in current_edit_set if u not in prev_edit_set]
-            if newly_checked:
-                st.session_state["um_edit_target"] = newly_checked[0]
-            st.session_state["um_prev_edit_users"] = current_edit_set
+            parts = raw_action.split("|", 2)
+            action_type = str(parts[0] if len(parts) > 0 else "").strip().lower()
+            action_user = str(parts[1] if len(parts) > 1 else "").strip().lower()
+            if action_type not in {"edit", "delete"} or not action_user:
+                continue
+
+            st.session_state["um_last_action_token"] = raw_action
+            if action_type == "edit":
+                st.session_state["um_edit_target"] = action_user
+            else:
+                st.session_state["um_delete_target"] = action_user
+            st.rerun()
 
         if st.button("Save Changes", use_container_width=True, key="save_user_table_changes"):
             try:
-                if "#" in edited_df.columns:
-                    edited_df = edited_df.drop(columns=["#"], errors="ignore")
+                clean_df = edited_df.drop(columns=["#", "Action", "_ActionToken"], errors="ignore")
 
                 updated_rows = {}
-                for row in edited_df.to_dict("records"):
+                for row in clean_df.to_dict("records"):
                     username = str(row.get("Username", "")).strip().lower()
                     if not username:
                         continue
@@ -439,19 +676,13 @@ def render(current_username: str):
                 before_map = {
                     str(u.get("username", "")).strip().lower(): {
                         "role": str(u.get("role", "staff")).strip().lower(),
-                        "is_active": bool(u.get("is_active", True)),
                     }
                     for u in users
                 }
 
                 before_usernames = set(before_map.keys())
                 after_usernames = set(updated_rows.keys())
-                deleted_usernames = before_usernames - after_usernames
                 common_usernames = before_usernames & after_usernames
-
-                clean_current_user = (current_username or "").strip().lower()
-                if clean_current_user in deleted_usernames:
-                    raise ValueError("You cannot delete your own account.")
 
                 final_admin_count = 0
                 for username in after_usernames:
@@ -460,9 +691,6 @@ def render(current_username: str):
                         final_admin_count += 1
                 if final_admin_count == 0:
                     raise ValueError("At least one admin account must remain.")
-
-                for username in sorted(deleted_usernames):
-                    auth_service.delete_user(username=username)
 
                 for username in sorted(common_usernames):
                     before = before_map[username]
@@ -477,6 +705,13 @@ def render(current_username: str):
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
+
+        delete_target = str(st.session_state.get("um_delete_target", "") or "").strip().lower()
+        if delete_target:
+            _render_delete_user_dialog(
+                target_username=delete_target,
+                current_username=current_username,
+            )
 
         edit_target = st.session_state.pop("um_edit_target", None)
         if edit_target:
