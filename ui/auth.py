@@ -24,6 +24,8 @@ from services.auth_service import (
 
 
 PERSISTENT_AUTH_QUERY_KEY = "auth"
+PERSISTENT_AUTH_STORE_FILE = Path(".streamlit") / "auth_session_store.json"
+PERSISTENT_AUTH_STORE_MAX_ROWS = 256
 DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 GOOGLE_OAUTH_STATE_SESSION_KEY = "google_oauth_state"
 GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY = "google_oauth_expected_email"
@@ -189,15 +191,127 @@ def _query_param_auth_token() -> Optional[str]:
     return _query_param_value(PERSISTENT_AUTH_QUERY_KEY)
 
 
+def _current_client_fingerprint() -> Optional[str]:
+    try:
+        ip_address = str(getattr(st.context, "ip_address", "") or "").strip().lower()
+        headers = getattr(st.context, "headers", {}) or {}
+        user_agent = str(
+            headers.get("User-Agent")
+            or headers.get("user-agent")
+            or ""
+        ).strip().lower()
+    except Exception:
+        return None
+
+    if not ip_address and not user_agent:
+        return None
+
+    source = f"{ip_address}|{user_agent}"
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _load_persistent_auth_store() -> dict:
+    path = PERSISTENT_AUTH_STORE_FILE
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_persistent_auth_store(store: dict) -> None:
+    path = PERSISTENT_AUTH_STORE_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(store, separators=(",", ":"), sort_keys=True)
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(serialized, encoding="utf-8")
+        temp_path.replace(path)
+    except Exception:
+        return
+
+
+def _save_local_persistent_auth_token(token: str) -> None:
+    client_key = _current_client_fingerprint()
+    clean_token = str(token or "").strip()
+    if not client_key or not clean_token:
+        return
+
+    store = _load_persistent_auth_store()
+    sessions = store.get("sessions")
+    if not isinstance(sessions, dict):
+        sessions = {}
+
+    sessions[client_key] = {
+        "token": clean_token,
+        "updated_at": int(time.time()),
+    }
+
+    if len(sessions) > PERSISTENT_AUTH_STORE_MAX_ROWS:
+        oldest_rows = sorted(
+            sessions.items(),
+            key=lambda row: int((row[1] or {}).get("updated_at", 0)) if isinstance(row[1], dict) else 0,
+        )
+        overflow = len(sessions) - PERSISTENT_AUTH_STORE_MAX_ROWS
+        for key, _ in oldest_rows[:overflow]:
+            sessions.pop(key, None)
+
+    store["sessions"] = sessions
+    _save_persistent_auth_store(store)
+
+
+def _remove_local_persistent_auth_token() -> None:
+    client_key = _current_client_fingerprint()
+    if not client_key:
+        return
+
+    store = _load_persistent_auth_store()
+    sessions = store.get("sessions")
+    if not isinstance(sessions, dict):
+        return
+
+    if client_key in sessions:
+        sessions.pop(client_key, None)
+        store["sessions"] = sessions
+        _save_persistent_auth_store(store)
+
+
+def _local_persistent_auth_token() -> Optional[str]:
+    client_key = _current_client_fingerprint()
+    if not client_key:
+        return None
+
+    store = _load_persistent_auth_store()
+    sessions = store.get("sessions")
+    if not isinstance(sessions, dict):
+        return None
+
+    row = sessions.get(client_key)
+    if not isinstance(row, dict):
+        return None
+
+    token = str(row.get("token") or "").strip()
+    if not token:
+        sessions.pop(client_key, None)
+        store["sessions"] = sessions
+        _save_persistent_auth_store(store)
+        return None
+    return token
+
+
 def persist_auth_session(username: str) -> None:
     token = _issue_persistent_auth_token(username)
     if token:
         st.query_params[PERSISTENT_AUTH_QUERY_KEY] = token
+        _save_local_persistent_auth_token(token)
 
 
 def clear_persistent_auth_session() -> None:
     if PERSISTENT_AUTH_QUERY_KEY in st.query_params:
         del st.query_params[PERSISTENT_AUTH_QUERY_KEY]
+    _remove_local_persistent_auth_token()
 
 
 def _clear_google_oauth_query_params() -> None:
@@ -269,6 +383,8 @@ def _restore_user_from_persistent_auth() -> None:
 
     token = _query_param_auth_token()
     if not token:
+        token = _local_persistent_auth_token()
+    if not token:
         return
 
     username = _verify_persistent_auth_token(token)
@@ -291,6 +407,7 @@ def _restore_user_from_persistent_auth() -> None:
         "role": user.role,
         "is_active": user.is_active,
     }
+    _save_local_persistent_auth_token(token)
 
 
 def current_user():
