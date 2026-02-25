@@ -7,11 +7,25 @@ banned_macs:
   date_modified: '2026-02-16 10:14:30'
 - mac: 00:08:22:40:7c:7c
   date_modified: '2026-02-13 10:11:20'
+- mac: 00:08:22:48:a1:dc
+  date_modified: '2026-02-23 16:28:42'
 - mac: 00:08:22:78:3c:cc
   date_modified: '2026-02-12 16:49:05'
+- mac: 00:08:22:80:13:1a
+  date_modified: '2026-02-23 16:28:00'
 - mac: 00:08:22:80:3b:7a
   date_modified: '2026-02-12 13:25:50'
+- mac: 00:08:22:90:3e:63
+  date_modified: '2026-02-23 16:28:00'
+- mac: 00:08:22:98:c7:9d
+  date_modified: '2026-02-23 16:28:00'
 - mac: 00:08:22:a8:40:69
   date_modified: '2026-02-12 16:50:36'
+- mac: 00:08:22:b8:eb:bd
+  date_modified: '2026-02-23 16:28:00'
 - mac: 00:08:22:e0:70:e5
   date_modified: '2026-02-13 12:39:54'
+- mac: 00:08:22:e4:0d:f8
+  date_modified: '2026-02-23 16:28:00'
+- mac: 00:08:22:f8:a0:f6
+  date_modified: '2026-02-23 16:28:00'

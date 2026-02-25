@@ -39,6 +39,11 @@ authorized_macs:
   hostname: Mikamiks
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
+- mac: 18:3d:2d:eb:91:90
+  ip: ''
+  hostname: ''
+  vendor: ''
+  date_modified: '2026-02-23 16:43:30'
 - mac: 1c:87:e3:a3:4a:48
   ip: 192.168.201.55
   hostname: TECNO-CAMON-16
@@ -89,6 +94,11 @@ authorized_macs:
   hostname: LAPTOP-8SDVCIRA
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
+- mac: 42:1d:bc:d8:d1:71
+  ip: ''
+  hostname: ''
+  vendor: ''
+  date_modified: '2026-02-23 16:52:39'
 - mac: 46:0c:77:ad:7b:82
   ip: 192.168.201.68
   hostname: '-'
@@ -114,6 +124,11 @@ authorized_macs:
   hostname: ''
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
+- mac: 72:88:84:63:71:0c
+  ip: ''
+  hostname: ''
+  vendor: ''
+  date_modified: '2026-02-23 16:52:39'
 - mac: 74:56:3c:46:e1:19
   ip: 192.168.201.243
   hostname: zeek-intern-B760M-DS3H-AX-DDR4
@@ -135,12 +150,19 @@ authorized_macs:
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
 - mac: b4:74:9f:d0:0d:b4
+<<<<<<< Updated upstream
   ip: 192.168.201.79
   hostname: '-'
   vendor: ASKEY COMPUTER CORP
   date_modified: '2026-02-23 16:43:42'
+=======
+  ip: ''
+  hostname: ''
+  vendor: ''
+  date_modified: '2026-02-23 16:34:22'
+>>>>>>> Stashed changes
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.30
+  ip: 192.168.201.15
   hostname: Auggys-Phone
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -174,6 +196,11 @@ authorized_macs:
   hostname: ''
   vendor: Infinix mobility limited
   date_modified: '2026-02-12 12:37:33'
+- mac: e0:bc:c6:33:77:c8
+  ip: ''
+  hostname: ''
+  vendor: ''
+  date_modified: '2026-02-23 16:45:52'
 - mac: e2:7d:95:d9:2e:fd
   ip: 192.168.201.58
   hostname: '-'
@@ -185,7 +212,7 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.26
+  ip: 192.168.201.13
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'

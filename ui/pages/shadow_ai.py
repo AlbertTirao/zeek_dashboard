@@ -18,7 +18,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v10"
+CACHE_VERSION = "shadow-ai-cache-v18-dialog-reopen-mac-ui-polish"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -267,6 +267,8 @@ HIGH_FREQUENCY_CALLS_PER_HOUR = int(DETECTION_SETTINGS.get("high_frequency_calls
 JSON_POST_CALLS_PER_HOUR = int(DETECTION_SETTINGS.get("json_post_calls_per_hour", 20))
 SMALL_REQUEST_MAX_BYTES = int(DETECTION_SETTINGS.get("small_request_max_kb", 64) * 1024)
 SMB_WINDOW_MINUTES = int(DETECTION_SETTINGS.get("smb_window_minutes", 5))
+IDENTITY_TOLERANCE_DAYS = 2  # attribution guard: IP->MAC mapping must be within this lookback window
+
 
 
 def _build_master_pattern(hardened_ai: Dict[str, List[str]]) -> str:
@@ -524,67 +526,231 @@ _ISO_LIKE = re.compile(
     r"(?:Z|[+-]\d{2}:\d{2})?)?$"
 )
 
+# Zeek ts is epoch seconds (UTC). Convert to local for correct per-day scoping + identity joins.
+LOCAL_TZ = "Asia/Manila"
+
 
 def normalize_mac(value) -> Optional[str]:
     """Normalize MAC to 'aa:bb:cc:dd:ee:ff'. Return None if invalid."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
 
+    # 6-byte raw address
     if isinstance(value, (bytes, bytearray)) and len(value) == 6:
         hx = bytes(value).hex()
     else:
         s = str(value).strip()
         if not s or s == "-" or s.lower() in ("nan", "none"):
             return None
+        # Strip separators and any non-hex characters.
         hx = _MAC_HEX_RE.sub("", s)
 
     if len(hx) != 12:
         return None
+
     hx = hx.lower()
-    return ":".join(hx[i:i + 2] for i in range(0, 12, 2))
+    return ":".join(hx[i : i + 2] for i in range(0, 12, 2))
+
+
+
+
+def _is_private_ip_series(ip_series: pd.Series) -> pd.Series:
+    """
+    Fast RFC1918/loopback/link-local check for IPv4/IPv6 text.
+    Used to gate LOCAL_AI_PORTS detections so they only trigger for internal/local services.
+    """
+    s = ip_series.astype(str).fillna("")
+    # IPv4 common private/loopback/link-local
+    m = (
+        s.str.startswith(("10.", "192.168.", "127.", "169.254."))
+        | s.str.match(r"^172\.(1[6-9]|2\d|3[0-1])\.", na=False)
+    )
+    # IPv6 common local ranges: fc00::/7, fe80::/10, ::1
+    m = m | s.str.startswith(("fc", "fd", "fe80", "::1"))
+    return m
+def _to_local_naive(ts_series: pd.Series) -> pd.Series:
+    """
+    Convert a datetime-like Series to Asia/Manila *naive* timestamps.
+
+    - If tz-naive: assume UTC (typical when converting Zeek epoch seconds without tz)
+    - If tz-aware: convert to Asia/Manila
+    - Output: tz-naive local time for consistent display + merge_asof joins + day scoping
+    """
+    if ts_series is None:
+        return ts_series
+    t = pd.to_datetime(ts_series, errors="coerce")
+    try:
+        tz = getattr(t.dt, "tz", None)
+        if tz is None:
+            t = t.dt.tz_localize("UTC")
+        t = t.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
+    except Exception:
+        # best-effort fallback
+        t = pd.to_datetime(t, errors="coerce")
+    return t
 
 
 def _ensure_ts_datetime(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize ts to datetime.
-    Avoids pandas warning and reduces NaT when ts is epoch seconds.
+    Normalize df['ts'] to a tz-naive datetime for downstream joins/sorts.
+
+    Design goals:
+      - Preserve correctness across common ingestion variants:
+          * Zeek epoch seconds (float/int) -> UTC datetime (naive)
+          * epoch milliseconds -> UTC datetime (naive)
+          * ISO strings (tz-aware) -> UTC datetime (naive)
+          * ISO strings (tz-naive) -> keep as-is (assumed already local/consistent)
+          * datetime64 tz-aware -> UTC datetime (naive)
+          * datetime64 tz-naive -> keep as-is
+      - Never drop data silently (avoid turning everything into NaT unless truly unparseable).
     """
+    if df is None:
+        return pd.DataFrame()
+    if df.empty:
+        return df
     if "ts" not in df.columns:
         df["ts"] = pd.NaT
         return df
 
     s = df["ts"]
+
+    # datetime dtype
     if pd.api.types.is_datetime64_any_dtype(s):
+        try:
+            # tz-aware -> convert to UTC naive
+            if getattr(s.dt, "tz", None) is not None:
+                df["ts"] = s.dt.tz_convert("UTC").dt.tz_localize(None)
+            else:
+                df["ts"] = s
+        except Exception:
+            df["ts"] = s
         return df
 
-    # numeric epoch seconds
+    # numeric epoch seconds/milliseconds
     if pd.api.types.is_numeric_dtype(s):
-        df["ts"] = pd.to_datetime(s, unit="s", errors="coerce")
+        try:
+            # Heuristic: epoch ms is ~1e12, epoch seconds ~1e9
+            med = float(pd.to_numeric(s, errors="coerce").median())
+        except Exception:
+            med = 0.0
+        unit = "ms" if med > 1e11 else "s"
+        dt = pd.to_datetime(s, unit=unit, errors="coerce", utc=True)
+        df["ts"] = dt.dt.tz_localize(None)
         return df
 
     # string/object
     s_str = s.astype(str).str.strip()
     s_str = s_str.replace({"": None, "-": None, "nan": None, "None": None})
 
-    # numeric strings -> epoch seconds
+    # numeric strings -> epoch seconds/milliseconds
     num = pd.to_numeric(s_str, errors="coerce")
     if num.notna().mean() >= 0.80:
-        df["ts"] = pd.to_datetime(num, unit="s", errors="coerce")
+        try:
+            med = float(num.median())
+        except Exception:
+            med = 0.0
+        unit = "ms" if med > 1e11 else "s"
+        dt = pd.to_datetime(num, unit=unit, errors="coerce", utc=True)
+        df["ts"] = dt.dt.tz_localize(None)
         return df
 
-    # mostly ISO-like
-    non_na = s_str.dropna()
-    if len(non_na) > 0 and non_na.str.match(_ISO_LIKE).mean() >= 0.80:
-        df["ts"] = pd.to_datetime(s_str, format="ISO8601", errors="coerce")
-        return df
-
-    # last resort (slow): suppress only this warning
+    # parse timestamps (no forced utc; preserve tz if present)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Could not infer format", category=UserWarning)
-        df["ts"] = pd.to_datetime(s_str, errors="coerce")
+        dt = pd.to_datetime(s_str, errors="coerce")
 
+    try:
+        if getattr(dt.dt, "tz", None) is not None:
+            df["ts"] = dt.dt.tz_convert("UTC").dt.tz_localize(None)
+        else:
+            df["ts"] = dt
+    except Exception:
+        df["ts"] = dt
     return df
 
+def _apply_date_scope(df: pd.DataFrame, date_str: str, *, mode: str = "local_auto") -> Tuple[pd.DataFrame, str]:
+    """
+    Apply a *display* date scope for a local day (Asia/Manila) without breaking ingestion variants.
+
+    This function is used in the UI layer (after caches are loaded). It can:
+      - Convert UTC-naive timestamps to local for charts/tables
+      - Filter rows to the selected local day
+
+    mode:
+      - "folder": no filtering; only best-effort local conversion
+      - "local": assume df['ts'] is already local-naive; filter by local day
+      - "utc": assume df['ts'] is UTC-naive; convert->local and filter by local day
+      - "local_auto" (default): try both local/utc interpretations, choose the one that yields more rows in the local day
+    Returns: (scoped_df, decision_string)
+    """
+    if df is None:
+        return pd.DataFrame(), "empty"
+    if df.empty:
+        return df, "empty"
+    if "ts" not in df.columns:
+        return df, "no_ts"
+
+    df = _ensure_ts_datetime(df)
+
+    try:
+        day_start_local = datetime.strptime(str(date_str), "%Y-%m-%d")
+    except Exception:
+        return df, "bad_date"
+
+    day_end_local = day_start_local + timedelta(days=1)
+
+    # Candidate A: ts already local-naive
+    ts_a = df["ts"]
+
+    # Candidate B: ts is UTC-naive -> convert to local-naive
+    try:
+        ts_b = pd.to_datetime(df["ts"], errors="coerce").dt.tz_localize("UTC").dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
+    except Exception:
+        ts_b = ts_a
+
+    def _mask(ts_series: pd.Series) -> pd.Series:
+        try:
+            return (ts_series >= day_start_local) & (ts_series < day_end_local)
+        except Exception:
+            return pd.Series([True] * len(df), index=df.index)
+
+    m_a = _mask(ts_a)
+    m_b = _mask(ts_b)
+
+    # Decide interpretation
+    decision = mode
+    if mode == "folder":
+        # still prefer local display if it doesn't destroy ts
+        df = df.copy()
+        df["ts"] = ts_b
+        return df, "folder"
+    if mode == "local":
+        df = df.copy()
+        df["ts"] = ts_a
+        return df.loc[m_a].copy(), "local"
+    if mode == "utc":
+        df = df.copy()
+        df["ts"] = ts_b
+        return df.loc[m_b].copy(), "utc"
+
+    # local_auto: choose the mask with more hits; tie-break to utc (typical Zeek case)
+    ca = int(m_a.sum()) if hasattr(m_a, "sum") else 0
+    cb = int(m_b.sum()) if hasattr(m_b, "sum") else 0
+    if cb > ca:
+        df = df.copy()
+        df["ts"] = ts_b
+        return df.loc[m_b].copy(), "utc_auto"
+    if ca > cb:
+        df = df.copy()
+        df["ts"] = ts_a
+        return df.loc[m_a].copy(), "local_auto"
+
+    # Tie or both zero -> prefer utc conversion but do not silently drop everything if both are zero
+    df = df.copy()
+    df["ts"] = ts_b
+    if cb == 0 and ca == 0:
+        return df, "auto_no_in_day"
+    return df.loc[m_b].copy(), "utc_auto_tie"
 
 def _clean_ip_series(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.strip()
@@ -607,11 +773,25 @@ def _read_parquet_columns(path: Path, desired_cols: List[str]) -> pd.DataFrame:
     """
     Robust parquet read:
       - Try reading only desired columns
-      - If it fails (missing columns), read full file then subset
+      - If it fails (missing columns), probe parquet schema (fast) and retry with existing cols
+      - Fallback: read full file then subset
     """
     try:
         return pd.read_parquet(path, columns=desired_cols)
     except Exception:
+        # Fast retry: intersect desired columns with parquet schema (avoid full read on missing columns)
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            pf = pq.ParquetFile(path)
+            available = set(pf.schema.names)
+            cols = [c for c in desired_cols if c in available]
+            if cols:
+                return pd.read_parquet(path, columns=cols)
+        except Exception:
+            pass
+
+        # Last resort (slower): read full file then subset
         try:
             df = pd.read_parquet(path)
             if df.empty:
@@ -621,17 +801,20 @@ def _read_parquet_columns(path: Path, desired_cols: List[str]) -> pd.DataFrame:
         except Exception:
             return pd.DataFrame()
 
-
 def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     """
     First matching provider wins via regex; remaining rows get fuzzy fallback.
-    Signature_Match stores raw fragment or fuzzy alias marker.
+
+    IMPORTANT (AI-only mode):
+      - We do NOT label "generic" SaaS as AI. If a row does not match a known AI signature
+        (or a known provider via fuzzy alias), it stays "Unknown" and is excluded upstream.
     """
     text_series = text_series.astype(str).replace({"nan": "", "None": ""}).fillna("")
     provider = pd.Series(index=text_series.index, dtype="object")
     sig = pd.Series(index=text_series.index, dtype="object")
     remaining = provider.isna()
 
+    # 1) strict signature match
     for prov, raw_list in (RAW_AI_SIGNATURES or {}).items():
         hard_list = AI_SIGNATURES.get(prov, [])
         for raw_frag, hard_pat in zip(raw_list, hard_list):
@@ -646,12 +829,23 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
                 sig[m] = raw_frag
                 remaining = provider.isna()
 
+    # 2) fuzzy alias fallback (only for texts that contain known AI alias tokens)
     if remaining.any():
         rem = text_series[remaining]
         if not rem.empty:
-            # Gate fuzzy work to AI-like tokens only, then run once per unique text.
-            rem_hint = rem[rem.str.contains(FUZZY_HINT_PATTERN, na=False, regex=True)]
+            try:
+                rem_hint = rem[rem.str.contains(FUZZY_HINT_PATTERN, na=False, regex=True)]
+            except Exception:
+                rem_hint = pd.Series([], dtype="object")
             if not rem_hint.empty:
+                # Guard: only apply fuzzy to host-ish values (no whitespace, has dot/colon)
+                try:
+                    rem_hint = rem_hint[
+                        (~rem_hint.astype(str).str.contains(r"\s", regex=True, na=False))
+                        & (rem_hint.astype(str).str.contains(r"[\.:]", regex=True, na=False))
+                    ]
+                except Exception:
+                    pass
                 fuzzy_map: Dict[str, Tuple[str, str]] = {}
                 for raw_text in rem_hint.drop_duplicates().tolist():
                     prov, fuzzy_sig = _fuzzy_provider_match(raw_text, min_score=FUZZY_MIN_SCORE)
@@ -666,33 +860,28 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
                             sig[m] = fuzzy_sig
                             remaining = provider.isna()
 
-    if remaining.any():
-        # Final heuristic fallback for new/unknown brands that still look AI-related.
-        rem = text_series[remaining]
-        try:
-            m_generic = rem.str.contains(GENERIC_PROVIDER_HINT_PATTERN, na=False, regex=True)
-        except Exception:
-            m_generic = pd.Series(False, index=rem.index)
-        if m_generic.any():
-            idx = rem.index[m_generic]
-            provider.loc[idx] = "Unidentified AI-like SaaS"
-            sig.loc[idx] = "generic-ai-pattern"
-
     return provider.fillna("Unknown"), sig.fillna("-")
 
 
-def _build_identity_maps(dhcp_files: List[Path], known_files: List[Path]) -> Tuple[Dict[str, Tuple[Optional[str], str]], Dict[str, str]]:
+def _build_identity_maps(dhcp_files: List[Path], known_files: List[Path]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Build:
-      ip_map: ip -> (mac, host_name)
-      mac_map: mac -> host_name
+    Build time-aware identity observations.
+
+    Why:
+      A simple "last seen" IP->MAC map can mis-attribute events when IPs are re-used.
+      This returns observation tables so enrichment can use a backward asof join (ts-aware),
+      avoiding future mappings and reducing false attribution.
+
+    Returns:
+      ip_hist:  columns [ts, ip, mac, host_name]
+      mac_hist: columns [ts, mac, host_name]
     """
-    ip_map: Dict[str, Tuple[Optional[str], str]] = {}
-    mac_map: Dict[str, str] = {}
+    ip_rows: List[pd.DataFrame] = []
+    mac_rows: List[pd.DataFrame] = []
 
     def ingest(df: pd.DataFrame) -> None:
-        nonlocal ip_map, mac_map
-        if df.empty:
+        nonlocal ip_rows, mac_rows
+        if df is None or df.empty:
             return
 
         df = _ensure_ts_datetime(df)
@@ -701,12 +890,11 @@ def _build_identity_maps(dhcp_files: List[Path], known_files: List[Path]) -> Tup
         mac_col = next((c for c in ["mac", "l2_addr", "orig_l2_addr", "hwaddr", "src_mac"] if c in df.columns), None)
         host_col = next((c for c in ["host_name", "hostname", "device_name", "host"] if c in df.columns), None)
 
-        if ip_col is None and mac_col is None:
+        if "ts" not in df.columns:
             return
 
         if ip_col is not None:
             df[ip_col] = _clean_ip_series(df[ip_col])
-
         if mac_col is not None:
             df[mac_col] = df[mac_col].apply(normalize_mac)
 
@@ -716,115 +904,206 @@ def _build_identity_maps(dhcp_files: List[Path], known_files: List[Path]) -> Tup
             host_col = "__host"
             df[host_col] = ""
 
-        # Sort by ts so "last" is most recent
-        if "ts" in df.columns:
-            df = df.sort_values("ts")
-
-        # ip -> (mac, host)
+        # ip observations
         if ip_col is not None:
-            sub_cols = ["ts", ip_col, host_col] + ([mac_col] if mac_col is not None else [])
-            sub = df[sub_cols].copy()
-            sub = sub.dropna(subset=[ip_col])
-
-            def last_non_null_mac(x: pd.Series):
-                x = x.dropna()
-                return x.iloc[-1] if len(x) else None
-
-            def last_non_empty_host(x: pd.Series):
-                x = x.astype(str).replace({"nan": "", "None": "", "-": ""})
-                x = x[x != ""]
-                return x.iloc[-1] if len(x) else ""
-
+            cols = ["ts", ip_col, host_col] + ([mac_col] if mac_col is not None else [])
+            sub = df[cols].copy()
+            sub = sub.rename(columns={ip_col: "ip", host_col: "host_name"})
+            sub["ip"] = sub["ip"].astype(str).str.strip().replace({"nan": "", "None": "", "-": ""})
             if mac_col is not None:
-                g = sub.groupby(ip_col, dropna=True).agg(
-                    mac=(mac_col, last_non_null_mac),
-                    host=(host_col, last_non_empty_host),
-                )
+                sub = sub.rename(columns={mac_col: "mac"})
             else:
-                g = sub.groupby(ip_col, dropna=True).agg(host=(host_col, last_non_empty_host))
-                g["mac"] = None
+                sub["mac"] = None
+            sub["mac"] = sub["mac"].apply(normalize_mac)
+            sub["host_name"] = sub["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+            sub = sub.dropna(subset=["ip"])
+            sub = sub[sub["ip"] != ""]
+            if not sub.empty:
+                ip_rows.append(sub[["ts", "ip", "mac", "host_name"]])
 
-            for ip, r in g.iterrows():
-                ip_map[str(ip)] = (r.get("mac", None), r.get("host", "") or "")
-
-        # mac -> host
+        # mac observations (for host backfill)
         if mac_col is not None:
-            subm = df[[mac_col, host_col] + (["ts"] if "ts" in df.columns else [])].copy()
-            subm = subm.dropna(subset=[mac_col])
-            subm[host_col] = subm[host_col].astype(str).replace({"nan": "", "None": "", "-": ""})
-            subm = subm[subm[host_col] != ""]
+            subm = df[["ts", mac_col, host_col]].copy()
+            subm = subm.rename(columns={mac_col: "mac", host_col: "host_name"})
+            subm["mac"] = subm["mac"].apply(normalize_mac)
+            subm["host_name"] = subm["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+            subm = subm.dropna(subset=["mac"])
+            subm = subm[subm["mac"].astype(str) != ""]
+            subm = subm[subm["host_name"] != ""]
             if not subm.empty:
-                if "ts" in subm.columns:
-                    subm = subm.sort_values("ts")
-                gm = subm.groupby(mac_col, dropna=True).agg(host=(host_col, lambda x: x.iloc[-1] if len(x) else ""))
-                for mac, r in gm.iterrows():
-                    if mac and r.get("host", ""):
-                        mac_map[str(mac)] = r["host"]
+                mac_rows.append(subm[["ts", "mac", "host_name"]])
 
     # DHCP
-    for f in dhcp_files:
+    for f in dhcp_files or []:
         df = _read_parquet_columns(f, ["ts", "mac", "client_addr", "assigned_addr", "host_name", "hostname", "id.orig_h", "orig_l2_addr"])
         ingest(df)
 
     # known_hosts / known_devices
-    for f in known_files:
+    for f in known_files or []:
         df = _read_parquet_columns(f, ["ts", "mac", "l2_addr", "orig_l2_addr", "addr", "ip", "host_name", "hostname", "device_name", "id.orig_h"])
         ingest(df)
 
-    return ip_map, mac_map
+    ip_hist = pd.concat(ip_rows, ignore_index=True) if ip_rows else pd.DataFrame(columns=["ts", "ip", "mac", "host_name"])
+    mac_hist = pd.concat(mac_rows, ignore_index=True) if mac_rows else pd.DataFrame(columns=["ts", "mac", "host_name"])
+
+    ip_hist = _ensure_ts_datetime(ip_hist)
+    mac_hist = _ensure_ts_datetime(mac_hist)
+
+    # stable sort for merge_asof
+    if not ip_hist.empty:
+        ip_hist["ip"] = ip_hist["ip"].astype(str).str.strip()
+        ip_hist["mac"] = ip_hist["mac"].apply(normalize_mac)
+        ip_hist["host_name"] = ip_hist["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+        ip_hist = ip_hist.dropna(subset=["ts", "ip"])
+        ip_hist = ip_hist[ip_hist["ip"] != ""]
+        ip_hist = ip_hist.sort_values(["ip", "ts"]).drop_duplicates(subset=["ip", "ts", "mac", "host_name"], keep="last")
+
+    if not mac_hist.empty:
+        mac_hist["mac"] = mac_hist["mac"].apply(normalize_mac)
+        mac_hist["host_name"] = mac_hist["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+        mac_hist = mac_hist.dropna(subset=["ts", "mac"])
+        mac_hist = mac_hist[mac_hist["mac"].astype(str) != ""]
+        mac_hist = mac_hist.sort_values(["mac", "ts"]).drop_duplicates(subset=["mac", "ts", "host_name"], keep="last")
+
+    return ip_hist, mac_hist
 
 
-def _enrich_identity(events: pd.DataFrame, ip_map: Dict[str, Tuple[Optional[str], str]], mac_map: Dict[str, str]) -> pd.DataFrame:
+
+def _enrich_identity(events: pd.DataFrame, ip_hist: pd.DataFrame, mac_hist: pd.DataFrame) -> pd.DataFrame:
     """
-    Enrich mac/host_name.
+    Enrich mac/host_name with ts-aware attribution.
+
     Priority:
-      1) orig_l2_addr/l2_addr/src_mac in events
-      2) id.orig_h -> ip_map
-      3) mac -> mac_map
+      1) L2 fields present on the event row (orig_l2_addr/l2_addr/src_mac)
+      2) Backward asof join: (id.orig_h, ts) -> last known (ip, mac, host) within IDENTITY_TOLERANCE_DAYS
+      3) Backward asof join: (mac, ts) -> last known host_name within IDENTITY_TOLERANCE_DAYS
     """
-    if events.empty:
+    if events is None or events.empty:
         return events
+
+    events = events.copy()
+    events = _ensure_ts_datetime(events)
 
     if "mac" not in events.columns:
         events["mac"] = None
     if "host_name" not in events.columns:
         events["host_name"] = None
 
-    # 1) L2 fields in event
+    # 1) L2 fields in event (most trustworthy)
     for c in ["orig_l2_addr", "l2_addr", "src_mac"]:
         if c in events.columns:
             tmp = events[c].apply(normalize_mac)
-            events["mac"] = events["mac"].where(events["mac"].notna() & (events["mac"] != ""), tmp)
+            cur = events["mac"].apply(normalize_mac)
+            events["mac"] = cur.where(cur.notna() & (cur != ""), tmp)
             break
 
     events["mac"] = events["mac"].apply(normalize_mac)
+    tol = pd.Timedelta(days=int(IDENTITY_TOLERANCE_DAYS or 7))
 
-    # 2) IP map
-    if "id.orig_h" in events.columns:
-        ips = _clean_ip_series(events["id.orig_h"])
-        mac_from_ip = ips.map(lambda ip: ip_map.get(ip, (None, ""))[0] if ip else None)
-        host_from_ip = ips.map(lambda ip: ip_map.get(ip, (None, ""))[1] if ip else "")
+    # 2) IP -> (mac, host) via backward asof join
+    if (
+        isinstance(ip_hist, pd.DataFrame)
+        and not ip_hist.empty
+        and "id.orig_h" in events.columns
+        and "ts" in events.columns
+    ):
+        right = ip_hist.copy()
+        right = _ensure_ts_datetime(right)
+        for c in ["ip", "mac", "host_name"]:
+            if c not in right.columns:
+                right[c] = None
+        right["ip"] = right["ip"].astype(str).str.strip().replace({"nan": "", "None": "", "-": ""})
+        right["mac"] = right["mac"].apply(normalize_mac)
+        right["host_name"] = right["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+        right = right.dropna(subset=["ts", "ip"])
+        right = right[right["ip"] != ""]
 
-        events["mac"] = events["mac"].where(events["mac"].notna(), mac_from_ip)
-        events["host_name"] = events["host_name"].where(
-            events["host_name"].notna() & (events["host_name"] != ""),
-            host_from_ip,
-        )
+        if not right.empty:
+            left = events[["ts", "id.orig_h"]].copy()
+            left["ip"] = _clean_ip_series(left["id.orig_h"]).astype(str).str.strip().replace({"nan": "", "None": "", "-": ""})
+            left["__idx"] = left.index
+            left = left.dropna(subset=["ts", "ip"])
+            left = left[left["ip"] != ""]
+            if not left.empty:
+                left = left.sort_values("ts")
+                right = right.sort_values("ts")
+                try:
+                    joined = pd.merge_asof(
+                        left,
+                        right[["ts", "ip", "mac", "host_name"]],
+                        on="ts",
+                        by="ip",
+                        direction="backward",
+                        tolerance=tol,
+                        allow_exact_matches=True,
+                    )
+                except Exception:
+                    joined = pd.DataFrame()
 
-    # 3) mac map
+                if joined is not None and not joined.empty:
+                    cur_mac = events["mac"].apply(normalize_mac)
+                    cur_host = events["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+                    for _, r in joined.iterrows():
+                        i = r.get("__idx")
+                        if i is None:
+                            continue
+                        mval = normalize_mac(r.get("mac"))
+                        hval = str(r.get("host_name") or "").strip()
+                        if (cur_mac.loc[i] is None or cur_mac.loc[i] == "") and mval:
+                            events.at[i, "mac"] = mval
+                        if (not cur_host.loc[i]) and hval:
+                            events.at[i, "host_name"] = hval
+
     events["mac"] = events["mac"].apply(normalize_mac)
-    macs = events["mac"].astype(str).replace({"nan": "", "None": ""})
-    host_from_mac = macs.map(lambda m: mac_map.get(m, "") if m else "")
-    events["host_name"] = events["host_name"].where(
-        events["host_name"].notna() & (events["host_name"] != ""),
-        host_from_mac,
-    )
+
+    # 3) MAC -> host_name via backward asof join
+    if isinstance(mac_hist, pd.DataFrame) and not mac_hist.empty and "ts" in events.columns:
+        right = mac_hist.copy()
+        right = _ensure_ts_datetime(right)
+        for c in ["mac", "host_name"]:
+            if c not in right.columns:
+                right[c] = None
+        right["mac"] = right["mac"].apply(normalize_mac)
+        right["host_name"] = right["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+        right = right.dropna(subset=["ts", "mac"])
+        right = right[right["mac"].astype(str) != ""]
+
+        if not right.empty:
+            left = events[["ts", "mac"]].copy()
+            left["mac"] = left["mac"].apply(normalize_mac)
+            left["__idx"] = left.index
+            left = left.dropna(subset=["ts", "mac"])
+            left = left[left["mac"].astype(str) != ""]
+            if not left.empty:
+                left = left.sort_values("ts")
+                right = right.sort_values("ts")
+                try:
+                    joined = pd.merge_asof(
+                        left,
+                        right[["ts", "mac", "host_name"]],
+                        on="ts",
+                        by="mac",
+                        direction="backward",
+                        tolerance=tol,
+                        allow_exact_matches=True,
+                    )
+                except Exception:
+                    joined = pd.DataFrame()
+
+                if joined is not None and not joined.empty:
+                    cur_host = events["host_name"].astype(str).replace({"nan": "", "None": "", "-": ""})
+                    for _, r in joined.iterrows():
+                        i = r.get("__idx")
+                        if i is None:
+                            continue
+                        hval = str(r.get("host_name") or "").strip()
+                        if (not cur_host.loc[i]) and hval:
+                            events.at[i, "host_name"] = hval
 
     # final clean (no forced "Unknown")
     events["mac"] = events["mac"].astype(str).fillna("").replace({"None": "", "nan": ""})
     events["host_name"] = events["host_name"].astype(str).fillna("").replace({"None": "", "nan": ""})
     return events
-
 
 # =============================================================================
 # SCORING / POLICY
@@ -945,6 +1224,74 @@ def _domain_series_from_destination(dest_series: pd.Series) -> pd.Series:
     has_numeric_tail = tail.str.fullmatch(r"\d+").fillna(False)
     s = s.where(~has_numeric_tail, base)
     return s.str.lower()
+
+
+# =============================================================================
+# FALSE POSITIVE FILTERS (DROP NOISE BEFORE UI)
+# =============================================================================
+
+_FP_HTTP_URI_RE = re.compile(
+    r"(?:/ncsi\.txt$|/connecttest\.txt$|generate_204|hotspot-detect\.html|success\.html)",
+    re.IGNORECASE,
+)
+_FP_UA_HINTS = [
+    "Microsoft NCSI",
+    "CaptiveNetworkSupport",
+    "ConnectivityCheck",
+    "NetworkManager",
+    "Windows-Connectivity",
+]
+try:
+    _FP_UA_RE = re.compile("|".join(re.escape(x) for x in _FP_UA_HINTS), re.IGNORECASE)
+except Exception:
+    _FP_UA_RE = None
+
+
+def _drop_false_positive_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop common background-noise events that frequently appear as "false positives".
+
+    Notes:
+      - This is applied BEFORE caching, so filtered rows won't show anywhere in Shadow AI.
+      - These rules are intentionally conservative.
+    """
+    if df is None or df.empty:
+        return df
+
+    ds = df.get("Detection_Source", pd.Series("", index=df.index)).astype(str).str.upper()
+    drop = pd.Series(False, index=df.index)
+
+    # 1) SSL: handshake not established (if field exists)
+    if "established" in df.columns:
+        est = df["established"].astype(str).str.upper().fillna("")
+        est_known = est.ne("")
+        est_ok = est.isin(["T", "TRUE", "1", "YES"])
+        drop = drop | (ds.eq("SSL") & est_known & (~est_ok))
+
+    # 2) DNS: non-success rcode (NXDOMAIN/SERVFAIL/etc.) is typically not actual "usage"
+    if "rcode_name" in df.columns:
+        rcode = df["rcode_name"].astype(str).str.upper().fillna("")
+        rcode_known = rcode.ne("")
+        drop = drop | (ds.eq("DNS") & rcode_known & (~rcode.eq("NOERROR")))
+
+    # 3) HTTP: OS connectivity checks (NCSI / captive portal probes)
+    if "uri" in df.columns:
+        uri = df["uri"].astype(str).fillna("")
+        drop = drop | (ds.eq("HTTP") & uri.str.contains(_FP_HTTP_URI_RE, na=False, regex=True))
+
+    if _FP_UA_RE is not None and "user_agent" in df.columns:
+        ua = df["user_agent"].astype(str).fillna("")
+        drop = drop | (ds.eq("HTTP") & ua.str.contains(_FP_UA_RE, na=False, regex=True))
+
+    # 4) Drop rows with empty destinations (cannot attribute)
+    dest = df.get("Destination", pd.Series("", index=df.index)).astype(str).fillna("")
+    drop = drop | dest.eq("")
+
+    try:
+        return df.loc[~drop].copy()
+    except Exception:
+        return df
+
 
 
 def _is_public_domain_series(domain_series: pd.Series) -> pd.Series:
@@ -1392,6 +1739,36 @@ def _collect_known_files_by_date(parquet_root: Path) -> Dict[str, List[str]]:
     return out
 
 
+
+def _choose_known_files_lookback(known_files_by_date: Dict[str, List[str]], date_str: str, *, lookback_days: int = 30) -> List[Path]:
+    """
+    Choose known_hosts/known_devices parquet files for identity enrichment WITHOUT using future dates.
+    If the selected date has no known_* parquet, pull from a lookback window (default 30 days) ending at date_str.
+    """
+    try:
+        target = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+    except Exception:
+        return []
+
+    start = target - timedelta(days=int(lookback_days or 30))
+    out: List[Path] = []
+    for d, files in (known_files_by_date or {}).items():
+        try:
+            dd = datetime.strptime(str(d), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if dd < start or dd > target:
+            continue
+        for p in files or []:
+            try:
+                out.append(Path(p))
+            except Exception:
+                continue
+    uniq = sorted({str(p) for p in out})
+    return [Path(p) for p in uniq]
+
+
+
 @st.cache_data(show_spinner=False)
 def _collect_date_logs(date_dir: Path) -> Dict[str, List[Path]]:
     buckets = {"http": [], "ssl": [], "dns": [], "conn": [], "dhcp": []}
@@ -1465,9 +1842,10 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     if cpath.exists() and meta == expected:
         try:
             df_cached = pd.read_parquet(cpath)
-            if not df_cached.empty:
-                df_cached = _ensure_ts_datetime(df_cached)
+            df_cached = _ensure_ts_datetime(df_cached)
+            if "ts" in df_cached.columns:
                 return df_cached.sort_values("ts", ascending=False)
+            return df_cached
         except Exception:
             pass
 
@@ -1479,6 +1857,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
 
     # --- HTTP ---
     http_cols = [
+        "uid",
         "ts", "id.orig_h", "id.resp_h", "id.resp_p",
         "host", "uri", "user_agent", "method", "request_body_len", "content_type",
         "orig_l2_addr", "l2_addr", "src_mac",
@@ -1488,14 +1867,13 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         if df.empty:
             continue
         df = _ensure_ts_datetime(df)
-
         host_col = "host" if "host" in df.columns else ("id.resp_h" if "id.resp_h" in df.columns else None)
         if host_col is None:
             continue
 
         host_s = df[host_col].astype(str).fillna("")
         uri_s = df["uri"].astype(str).fillna("") if "uri" in df.columns else ""
-        combined = (host_s + " " + uri_s).astype(str)
+        combined = host_s.astype(str)
 
         prov_all, sig_all = _assign_provider_and_signature(combined)
         mask = prov_all != "Unknown"
@@ -1510,7 +1888,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         hit["AI_Provider"] = prov_all.loc[mask].values
         hit["Signature_Match"] = sig_all.loc[mask].values
         hit["Detection_Source"] = "HTTP"
-        hit["Match_Field"] = "HTTP host/uri"
+        hit["Match_Field"] = "HTTP host"
 
         if "user_agent" in hit.columns:
             hit["Client_Type"] = hit["user_agent"].apply(fingerprint_client)
@@ -1531,19 +1909,18 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
             hit["Destination"] = host_s_hit
 
         # Show exact matched value for evidence
-        hit["Matched_Value"] = (host_s_hit + " " + uri_s_hit).astype(str)
+        hit["Matched_Value"] = host_s_hit.astype(str)
 
         hit["Detection_Basis"] = hit["Match_Field"] + " matched '" + hit["Signature_Match"].astype(str) + "'"
         events.append(hit)
 
     # --- SSL ---
-    ssl_cols = ["ts", "id.orig_h", "id.resp_h", "server_name", "orig_l2_addr", "l2_addr", "src_mac"]
+    ssl_cols = ["uid", "ts", "id.orig_h", "id.resp_h", "server_name", "established", "orig_l2_addr", "l2_addr", "src_mac"]
     for f in buckets["ssl"]:
         df = _read_parquet_columns(f, ssl_cols)
         if df.empty:
             continue
         df = _ensure_ts_datetime(df)
-
         if "server_name" not in df.columns:
             continue
 
@@ -1573,13 +1950,12 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         events.append(hit)
 
     # --- DNS ---
-    dns_cols = ["ts", "id.orig_h", "id.resp_h", "query", "qtype_name", "rcode_name", "orig_l2_addr", "l2_addr", "src_mac"]
+    dns_cols = ["uid", "ts", "id.orig_h", "id.resp_h", "query", "qtype_name", "rcode_name", "orig_l2_addr", "l2_addr", "src_mac"]
     for f in buckets["dns"]:
         df = _read_parquet_columns(f, dns_cols)
         if df.empty:
             continue
         df = _ensure_ts_datetime(df)
-
         if "query" not in df.columns:
             continue
 
@@ -1612,14 +1988,21 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         events.append(hit)
 
     # --- CONN (local AI ports) ---
-    conn_cols = ["ts", "id.orig_h", "id.resp_h", "id.resp_p", "orig_ip_bytes", "orig_l2_addr", "l2_addr", "src_mac"]
+    conn_cols = ["uid", "ts", "id.orig_h", "id.resp_h", "id.resp_p", "orig_ip_bytes", "orig_l2_addr", "l2_addr", "src_mac"]
     ports = sorted(LOCAL_AI_PORTS.keys())
+    conn_uid_map_frames: List[pd.DataFrame] = []
     for f in buckets["conn"]:
         df = _read_parquet_columns(f, conn_cols)
         if df.empty or "id.resp_p" not in df.columns:
             continue
         df = _ensure_ts_datetime(df)
-
+        # Build exact uid→MAC mapping from conn.log (most accurate for per-event attribution)
+        try:
+            if "uid" in df.columns and "orig_l2_addr" in df.columns:
+                um = df[["uid", "ts", "orig_l2_addr"]].copy()
+                conn_uid_map_frames.append(um)
+        except Exception:
+            pass
         rp = pd.to_numeric(df["id.resp_p"], errors="coerce")
         if "id.orig_h" in df.columns:
             smb_mask = rp.eq(445)
@@ -1633,6 +2016,12 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
             continue
 
         mask = rp.isin(ports)
+        # Gate local-port detections to internal destinations to avoid tagging non-AI external services.
+        try:
+            resp_h_series = df.get("id.resp_h", pd.Series("", index=df.index))
+            mask = mask & _is_private_ip_series(resp_h_series)
+        except Exception:
+            pass
         if not mask.any():
             continue
 
@@ -1656,12 +2045,26 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         hit["Detection_Basis"] = "Local port match (" + hit["Signature_Match"].astype(str) + ")"
         events.append(hit)
 
+    
+    # Finalize uid→MAC map for this day
+    if conn_uid_map_frames:
+        try:
+            conn_uid_map = pd.concat(conn_uid_map_frames, ignore_index=True)
+            conn_uid_map = _ensure_ts_datetime(conn_uid_map)
+            conn_uid_map["uid"] = conn_uid_map["uid"].astype(str)
+            conn_uid_map["orig_l2_addr"] = conn_uid_map["orig_l2_addr"].apply(normalize_mac)
+            conn_uid_map = conn_uid_map.dropna(subset=["uid"]).sort_values("ts")
+            conn_uid_map = conn_uid_map.drop_duplicates(subset=["uid"], keep="last")
+            conn_uid_map = conn_uid_map.dropna(subset=["orig_l2_addr"])
+        except Exception:
+            conn_uid_map = pd.DataFrame(columns=["uid", "ts", "orig_l2_addr"])
+    else:
+        conn_uid_map = pd.DataFrame(columns=["uid", "ts", "orig_l2_addr"])
     if not events:
         return pd.DataFrame()
 
     final_df = pd.concat(events, ignore_index=True)
     final_df = _ensure_ts_datetime(final_df)
-
     # Required columns
     required = [
         "ts", "id.orig_h", "mac", "host_name", "AI_Provider", "Policy_Verdict",
@@ -1678,6 +2081,31 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         if c not in final_df.columns:
             final_df[c] = ""
 
+    # de-duplicate exact duplicates (common when logs are split into multiple parquet parts)
+    try:
+        final_df = final_df.drop_duplicates()
+    except Exception:
+        pass
+
+    # Attach conn-level L2 MAC by uid (exact match). This prevents IP→MAC drift and fixes
+    # 'MAC shows providers I never used' caused by stale DHCP/known_hosts attribution.
+    try:
+        if isinstance(conn_uid_map, pd.DataFrame) and not conn_uid_map.empty and "uid" in final_df.columns:
+            uid_map = conn_uid_map[["uid", "orig_l2_addr"]].copy()
+            uid_map["uid"] = uid_map["uid"].astype(str)
+            uid_map["orig_l2_addr"] = uid_map["orig_l2_addr"].apply(normalize_mac)
+            uid_map = uid_map.dropna(subset=["uid", "orig_l2_addr"]) 
+            if not uid_map.empty:
+                final_df["uid"] = final_df["uid"].astype(str)
+                final_df = final_df.merge(uid_map, on="uid", how="left", suffixes=("", "_conn"))
+                if "orig_l2_addr_conn" in final_df.columns:
+                    a = final_df.get("orig_l2_addr", pd.Series([None] * len(final_df), index=final_df.index)).apply(normalize_mac)
+                    b = final_df["orig_l2_addr_conn"].apply(normalize_mac)
+                    final_df["orig_l2_addr"] = a.where(a.notna() & (a != ""), b)
+                    final_df = final_df.drop(columns=["orig_l2_addr_conn"])
+    except Exception:
+        pass
+
     # identity enrichment
     final_df = _enrich_identity(final_df, ip_map, mac_map)
 
@@ -1686,6 +2114,9 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
 
     # derived domain
     final_df["Domain"] = _domain_series_from_destination(final_df.get("Destination", pd.Series("", index=final_df.index)))
+
+    # Drop common false positives / background noise
+    final_df = _drop_false_positive_rows(final_df)
 
     # policy
     verdict, basis = _policy_columns(final_df["AI_Provider"])
@@ -1729,10 +2160,30 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     return final_df
 
 
-@st.cache_data(show_spinner=False, ttl=180)
-def load_shadow_ai_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
+# =============================================================================
+# CORE LOADER (FAST, REUSABLE CACHE)
+# =============================================================================
+
+def _normalize_target_dates(target_dates) -> Tuple[str, ...]:
+    if not target_dates:
+        return tuple()
+    out: List[str] = []
+    if isinstance(target_dates, (list, tuple, set)):
+        iterable = target_dates
+    else:
+        iterable = [target_dates]
+    for d in iterable:
+        d = str(d).strip()
+        if d and DATE_DIR_RE.match(d):
+            out.append(d)
+    # deterministic key (order doesn't matter for output because we sort by ts)
+    return tuple(sorted(set(out), reverse=True))
+
+
+def _load_shadow_ai_data_uncached(parquet_root: Path, target_dates: Tuple[str, ...]) -> pd.DataFrame:
     """
     Multi-date loader that reuses per-day caches (fast).
+    Uncached: used behind a resource cache and/or session state.
     """
     parquet_root = Path(parquet_root)
     if not parquet_root.exists():
@@ -1742,12 +2193,15 @@ def load_shadow_ai_data(parquet_root: Path, target_dates: List[str]) -> pd.DataF
     known_files_by_date = _collect_known_files_by_date(parquet_root)
 
     frames: List[pd.DataFrame] = []
-    for d in (target_dates or []):
+    for d in (target_dates or ()):
         if not d or not DATE_DIR_RE.match(str(d)):
             continue
         known_for_date = [Path(p) for p in known_files_by_date.get(str(d), [])]
         if not known_for_date:
-            known_for_date = known_files_all
+            # IMPORTANT: do not use future-known_* files (can mis-attribute MACs).
+            known_for_date = _choose_known_files_lookback(known_files_by_date, str(d), lookback_days=max(7, int(BASELINE_DAYS or 30)))
+        if not known_for_date:
+            known_for_date = []
         df_d = _build_one_date(parquet_root, str(d), known_for_date)
         if not df_d.empty:
             frames.append(df_d)
@@ -1757,19 +2211,60 @@ def load_shadow_ai_data(parquet_root: Path, target_dates: List[str]) -> pd.DataF
 
     out = pd.concat(frames, ignore_index=True)
     out = _ensure_ts_datetime(out)
+    try:
+        out = out.drop_duplicates()
+    except Exception:
+        pass
+
+
+    # Cross-date baseline: compute first-seen SaaS relative to prior days.
     all_dates = get_available_dates(parquet_root)
-    lookback_dates = _resolve_lookback_dates(all_dates, target_dates, BASELINE_DAYS)
+    lookback_dates = _resolve_lookback_dates(all_dates, list(target_dates), BASELINE_DAYS)
     historical_pairs = set(_load_historical_host_domain_pairs_from_cache(parquet_root, lookback_dates)) if lookback_dates else set()
+
     out = _apply_behavioral_signals(
         out,
         historical_pairs=historical_pairs,
         smb_events=None,
         baseline_days=BASELINE_DAYS,
     )
+
     out["Risk_Score"] = _compute_risk_score(out)
     out["Severity"] = _severity_from_scores(out["Risk_Score"])
     out = _apply_critical_overrides(out)
     return out.sort_values("ts", ascending=False)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_shadow_ai_data_cached(
+    parquet_root_str: str,
+    target_dates: Tuple[str, ...],
+    cache_bust: int,
+    cache_version: str,
+    sig_mtime_ns: int,
+    baseline_days: int,
+) -> pd.DataFrame:
+    """
+    Resource cache (in-memory, no pickle roundtrip) so search/filter/dialog reruns don't reload/parquet-scan again.
+    cache_bust + cache_version + sig_mtime_ns + baseline_days are part of the key for safe invalidation.
+    """
+    _ = cache_bust, cache_version, sig_mtime_ns, baseline_days  # key-only; keep lint quiet
+    return _load_shadow_ai_data_uncached(Path(parquet_root_str), target_dates)
+
+
+def load_shadow_ai_data(parquet_root: Path, target_dates: List[str], *, cache_bust: int = 0) -> pd.DataFrame:
+    """Public loader used by the UI."""
+    root = str(Path(parquet_root).resolve())
+    td = _normalize_target_dates(target_dates)
+    return _load_shadow_ai_data_cached(
+        root,
+        td,
+        int(cache_bust or 0),
+        str(CACHE_VERSION),
+        int(SIG_MTIME_NS),
+        int(BASELINE_DAYS),
+    )
+
 
 
 # =============================================================================
@@ -1895,7 +2390,7 @@ def _apply_shadow_ai_filters(
     ignore_dns_only: bool,
     search_q: str,
 ) -> pd.DataFrame:
-    filtered = df.copy()
+    filtered = df
 
     if selected_verdict:
         filtered = filtered[filtered["Policy_Verdict"].isin(selected_verdict)]
@@ -2214,13 +2709,23 @@ def _new_grid_builder(df_grid: pd.DataFrame, page_size: int = 15) -> GridOptions
 
 
 def _close_shadow_ai_mac_dialog(*, preserve_last_selected: bool = True) -> None:
+    """
+    Close the MAC drilldown dialog and reset grid selection.
+    
+    Why: AgGrid keeps the last selected row. If we preserve selection + last_selected,
+    clicking the same MAC again won't trigger a new open. We bump a nonce so the MAC
+    grid re-mounts and clears selection.
+    """
     active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     st.session_state["shadow_ai_mac_dialog_open"] = False
     st.session_state["shadow_ai_mac_dialog_mac"] = None
+    # Always clear last_selected so the next click (even same MAC) can re-open.
+    st.session_state["shadow_ai_mac_dialog_last_selected"] = None
     if preserve_last_selected and active_mac:
-        st.session_state["shadow_ai_mac_dialog_last_selected"] = active_mac
+        st.session_state["shadow_ai_mac_dialog_last_selected_preserved"] = active_mac
     else:
-        st.session_state["shadow_ai_mac_dialog_last_selected"] = None
+        st.session_state["shadow_ai_mac_dialog_last_selected_preserved"] = None
+    st.session_state["shadow_ai_mac_grid_nonce"] = int(st.session_state.get("shadow_ai_mac_grid_nonce", 0)) + 1
 
 
 def _render_shadow_ai_mac_drilldown(
@@ -2230,19 +2735,33 @@ def _render_shadow_ai_mac_drilldown(
     active_mac: str,
     key_prefix: str,
 ) -> None:
+    """
+    Device-scoped drilldown. Built to be accurate (MAC-locked) and fast to render.
+
+    Notes:
+      - We show a deduplicated view by default to avoid double-counting the same evidence row in the UI.
+      - Use the "Show raw duplicates" toggle if you need to see every matching row.
+    """
     mac_events = mac_events.copy()
+
     required = [
         "ts", "Severity", "AI_Provider", "Domain", "Evidence_Type",
         "Detail", "Upload_Bytes", "Destination", "Matched_Value",
         "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
         "id.orig_h", "host_name", "user_agent", "Risk_Score", "Policy_Verdict",
+        "Detection_Source", "Behavior_Indicators", "First_Seen_SaaS", "Governance_Alert",
+        "Client_Type", "Confidence",
     ]
     for c in required:
         if c not in mac_events.columns:
-            mac_events[c] = ""
+            mac_events[c] = "" if c not in ["First_Seen_SaaS", "Governance_Alert"] else False
 
+    mac_events = _ensure_ts_datetime(mac_events)
     mac_events["Upload_Bytes"] = pd.to_numeric(mac_events["Upload_Bytes"], errors="coerce").fillna(0)
     mac_events["Risk_Score"] = pd.to_numeric(mac_events["Risk_Score"], errors="coerce").fillna(0)
+    mac_events["Severity"] = mac_events["Severity"].astype(str).str.upper()
+    mac_events["Policy_Verdict"] = mac_events["Policy_Verdict"].astype(str)
+
     mac_events = mac_events.sort_values("ts", ascending=False)
 
     if mac_events.empty:
@@ -2251,130 +2770,351 @@ def _render_shadow_ai_mac_drilldown(
 
     mac_key = re.sub(r"[^0-9A-Za-z_]+", "_", active_mac).strip("_") or "mac"
 
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Events", len(mac_events))
-    d2.metric("Providers", mac_events["AI_Provider"].nunique())
-    d3.metric("Domains", mac_events["Domain"].astype(str).replace({"": None}).dropna().nunique())
-    d4.metric("Upload (MB)", f"{float(mac_events['Upload_Bytes'].sum())/1024/1024:.2f}")
+    # --- optional dedupe for UI ---
+    dedupe_cols = [
+        "ts", "AI_Provider", "Domain", "Evidence_Type", "Detail", "Destination",
+        "id.orig_h", "Match_Field", "Signature_Match", "Matched_Value", "Detection_Source",
+    ]
+    dedupe_cols = [c for c in dedupe_cols if c in mac_events.columns]
+    mac_events_unique = mac_events.drop_duplicates(subset=dedupe_cols, keep="first") if dedupe_cols else mac_events
 
-    chart_events = mac_events
-    if len(chart_events) > DIALOG_TIMELINE_MAX_POINTS:
-        chart_events = chart_events.head(DIALOG_TIMELINE_MAX_POINTS).copy()
-        st.caption(f"Timeline limited to latest {DIALOG_TIMELINE_MAX_POINTS:,} events for faster rendering.")
+    show_raw = st.toggle("Show raw duplicates", value=False, key=f"shadow_ai_mac_show_raw_{selected_scope_key}_{mac_key}_{key_prefix}")
+    view_df = mac_events if show_raw else mac_events_unique
 
-    cA, cB = st.columns([2, 1])
-    with cA:
-        figm = px.scatter(
-            chart_events,
-            x="ts",
-            y="AI_Provider",
-            size="Risk_Score",
-            color="Severity",
-            color_discrete_map=SEVERITY_COLORS,
-            hover_data=["Domain", "Detail", "Evidence_Type", "Matched_Value", "Detection_Basis"],
-            title=f"MAC timeline (provider events): {active_mac}",
-            template=get_plotly_template(),
-            render_mode="webgl" if len(mac_events) > 1500 else "auto",
+    # --- search inside dialog (applies to Overview/Forensics/Event Log) ---
+    base_view_df = view_df
+    base_n = int(len(base_view_df))
+
+    _search_key = f"shadow_ai_mac_search_{selected_scope_key}_{mac_key}_{key_prefix}"
+    q = st.text_input(
+        "Search (this MAC)",
+        placeholder="provider, domain, detail, destination, IP, host, user-agent…",
+        key=_search_key,
+    )
+
+    q = str(q or "").strip()
+    search_applied = False
+    if q:
+        terms = [t for t in re.split(r"\s+", q) if t]
+        search_cols = [
+            "AI_Provider", "Domain", "Evidence_Type", "Detail", "Destination",
+            "Matched_Value", "Match_Field", "Signature_Match",
+            "Detection_Basis", "Policy_Basis",
+            "id.orig_h", "host_name", "user_agent",
+            "Policy_Verdict", "Severity",
+        ]
+        existing = [c for c in search_cols if c in base_view_df.columns]
+        if existing and terms:
+            mask = pd.Series(True, index=base_view_df.index)
+            for term in terms:
+                pat = re.escape(term)
+                term_mask = pd.Series(False, index=base_view_df.index)
+                for col in existing:
+                    s = base_view_df[col]
+                    if not pd.api.types.is_string_dtype(s):
+                        s = s.astype(str)
+                    term_mask |= s.fillna("").str.contains(pat, case=False, na=False)
+                mask &= term_mask
+            view_df = base_view_df.loc[mask].copy()
+        else:
+            view_df = base_view_df
+
+        search_applied = True
+        after_n = int(len(view_df))
+        st.caption(
+            f"Search: **{q}** — showing **{after_n:,}** of **{base_n:,}** rows "
+            f"(space-separated terms are ANDed)."
         )
-        style_plotly_figure(figm, height=360)
-        figm.update_xaxes(title="Time")
-        figm.update_yaxes(title="Provider")
-        st.plotly_chart(figm, use_container_width=True)
+        if after_n == 0:
+            st.warning("No matching records. Clear the search to see all events for this MAC.")
 
-    with cB:
-        byprov = mac_events.groupby("AI_Provider").agg(
-            Events=("ts", "count"),
-            Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
-        ).reset_index().sort_values("Events", ascending=False)
-        figp = px.bar(
-            byprov,
-            x="Events",
-            y="AI_Provider",
-            orientation="h",
-            title="Providers (this MAC)",
-            template=get_plotly_template(),
-        )
-        style_plotly_figure(figp, height=360, show_legend=False)
-        figp.update_xaxes(title="Events")
-        figp.update_yaxes(title=None)
-        st.plotly_chart(figp, use_container_width=True)
+    raw_n = int(len(mac_events))
+    dedup_n = int(len(mac_events_unique))
+    base_n_eff = raw_n if show_raw else dedup_n
+    view_n = int(len(view_df))
+    dup_removed = int(max(0, raw_n - base_n_eff))
+    search_removed = int(max(0, base_n_eff - view_n))
 
-    st.markdown("#### AI usage table (selected MAC)")
-    usage_df = mac_events.groupby(["AI_Provider", "Policy_Verdict"]).agg(
-        Events=("ts", "count"),
-        Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
-        First_Seen=("ts", "min"),
-        Last_Seen=("ts", "max"),
-        Top_Domain=("Domain", _safe_value_counts_top),
-        Top_Evidence=("Evidence_Type", _safe_value_counts_top),
-    ).reset_index().sort_values(["Events", "Upload_MB"], ascending=False)
+    high_n = int(view_df["Severity"].isin(["CRITICAL", "HIGH"]).sum())
+    providers_n = int(view_df["AI_Provider"].astype(str).replace({"": None, "nan": None}).dropna().nunique())
+    upload_mb = float(view_df["Upload_Bytes"].sum()) / 1024 / 1024
 
-    if usage_df.empty:
-        st.info("No provider usage rows for this MAC.")
+    top_host = (
+        view_df["host_name"].astype(str).replace({"": None, "nan": None}).dropna().value_counts().head(1).index[0]
+        if "host_name" in view_df.columns and view_df["host_name"].astype(str).replace({"": None, "nan": None}).dropna().shape[0] > 0
+        else ""
+    )
+    uniq_ips = int(view_df["id.orig_h"].astype(str).replace({"": None, "nan": None}).dropna().nunique()) if "id.orig_h" in view_df.columns else 0
+
+    d1, d2, d3, d4, d5 = st.columns(5, gap="small")
+    d1.metric("Events (view)", f"{view_n:,}")
+    d2.metric("Raw events", f"{raw_n:,}")
+    d3.metric("Providers", f"{providers_n:,}")
+    d4.metric("High/Critical", f"{high_n:,}")
+    d5.metric("Upload (MB)", f"{upload_mb:.2f}")
+
+    if dup_removed or (search_applied and search_removed):
+        bits = []
+        if dup_removed:
+            bits.append(f"dedup removed {dup_removed:,} row(s)")
+        if search_applied and search_removed:
+            bits.append(f"search filtered {search_removed:,} row(s)")
+        st.caption(" · ".join(bits))
+
+    meta_line = f"MAC: `{active_mac}`"
+    if top_host:
+        meta_line += f" | Host: `{top_host}`"
+    if uniq_ips:
+        meta_line += f" | Unique IPs: **{uniq_ips:,}**"
+    st.caption(meta_line)
+
+    st.markdown("#### AI services used by this MAC")
+    st.caption("Summary is based on the current view (page filters + duplicate toggle + dialog search).")
+
+    prov_src = view_df.copy()
+    prov_src["AI_Provider"] = prov_src["AI_Provider"].astype(str)
+    prov_src = prov_src[prov_src["AI_Provider"].str.strip().str.lower().replace({"nan": ""}) != ""].copy()
+
+    if prov_src.empty:
+        st.info("No AI providers found for this MAC in the current view.")
     else:
-        usage_grid = usage_df.copy()
-        usage_grid.insert(0, "#", range(1, len(usage_grid) + 1))
-        usage_grid["Upload_MB"] = pd.to_numeric(usage_grid["Upload_MB"], errors="coerce").fillna(0).round(2)
-        usage_grid["First_Seen"] = pd.to_datetime(usage_grid["First_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-        usage_grid["Last_Seen"] = pd.to_datetime(usage_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+        # Local severity rank for aggregation
+        _sev_rank_map = {"SAFE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+        _inv_sev = {v: k for k, v in _sev_rank_map.items()}
 
-        gb_usage = _new_grid_builder(usage_grid, page_size=10)
-        gb_usage.configure_column("AI_Provider", header_name="Provider", minWidth=170, flex=1.3)
-        gb_usage.configure_column("Policy_Verdict", header_name="Verdict", minWidth=110, flex=0.9, cellStyle=_policy_cellstyle())
-        gb_usage.configure_column("Events", minWidth=90, flex=0.8)
-        gb_usage.configure_column("Upload_MB", header_name="Upload MB", minWidth=105, flex=0.9)
-        gb_usage.configure_column("First_Seen", header_name="First Seen", minWidth=150, flex=1.1)
-        gb_usage.configure_column("Last_Seen", header_name="Last Seen", minWidth=150, flex=1.1)
-        gb_usage.configure_column("Top_Domain", header_name="Top Domain", minWidth=170, flex=1.3)
-        gb_usage.configure_column("Top_Evidence", header_name="Top Evidence", minWidth=130, flex=1.0)
+        def _mode_nonempty(s: pd.Series) -> str:
+            s = s.astype(str).replace({"nan": "", "None": ""}).fillna("")
+            s = s[s.str.strip() != ""]
+            if s.empty:
+                return ""
+            return str(s.value_counts().index[0])
+
+        def _nunique_nonempty(s: pd.Series) -> int:
+            s = s.astype(str).replace({"nan": "", "None": ""}).fillna("").map(lambda v: v.strip())
+            s = s[s != ""]
+            return int(s.nunique())
+
+        prov_src["_sev_rank"] = prov_src["Severity"].astype(str).str.upper().map(_sev_rank_map).fillna(0).astype(int)
+
+        prov_tbl = prov_src.groupby("AI_Provider", dropna=False).agg(
+            Events=("ts", "count"),
+            Domains=("Domain", _nunique_nonempty),
+            Upload_MB=("Upload_Bytes", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).sum()) / 1024 / 1024),
+            First_Seen=("ts", "min"),
+            Last_Seen=("ts", "max"),
+            Highest_Severity_Rank=("_sev_rank", "max"),
+            Top_Domain=("Domain", _mode_nonempty),
+            Top_Verdict=("Policy_Verdict", _mode_nonempty),
+        ).reset_index()
+
+        prov_tbl["Highest_Severity"] = prov_tbl["Highest_Severity_Rank"].map(_inv_sev).fillna("")
+        prov_tbl = prov_tbl.drop(columns=["Highest_Severity_Rank"])
+        prov_tbl["Upload_MB"] = pd.to_numeric(prov_tbl["Upload_MB"], errors="coerce").fillna(0).round(2)
+
+        prov_tbl["First_Seen"] = pd.to_datetime(prov_tbl["First_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+        prov_tbl["Last_Seen"] = pd.to_datetime(prov_tbl["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+
+        prov_tbl = prov_tbl.sort_values(["Events", "Upload_MB"], ascending=False).head(60).copy()
+        prov_tbl.insert(0, "#", range(1, len(prov_tbl) + 1))
+
+        gb_prov = _new_grid_builder(prov_tbl, page_size=20)
+        gb_prov.configure_column("AI_Provider", header_name="AI Provider", minWidth=175, flex=1.25)
+        gb_prov.configure_column("Events", minWidth=90, flex=0.6)
+        gb_prov.configure_column("Domains", minWidth=90, flex=0.6)
+        gb_prov.configure_column("Upload_MB", header_name="Upload (MB)", minWidth=115, flex=0.7)
+        gb_prov.configure_column("Highest_Severity", header_name="Highest Sev", minWidth=115, flex=0.7, cellStyle=_severity_cellstyle())
+        gb_prov.configure_column("First_Seen", header_name="First Seen", minWidth=150, flex=0.95)
+        gb_prov.configure_column("Last_Seen", header_name="Last Seen", minWidth=150, flex=0.95)
+        gb_prov.configure_column("Top_Domain", header_name="Top Domain", minWidth=180, flex=1.25)
+        gb_prov.configure_column("Top_Verdict", header_name="Top Verdict", minWidth=125, flex=0.85, cellStyle=_policy_cellstyle())
+
         render_shadow_aggrid(
-            usage_grid,
-            gb_usage,
-            key=f"shadow_ai_mac_usage_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
-            height=330,
+            prov_tbl,
+            gb_prov,
+            key=f"shadow_ai_mac_providers_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
+            height=280,
             auto_fit_columns=False,
         )
 
-    mac_event_cols = [
-        "ts", "Severity", "AI_Provider", "Domain", "Evidence_Type",
-        "Detail", "Upload_Bytes", "Destination", "Matched_Value",
-        "Match_Field", "Signature_Match", "Detection_Basis", "Policy_Basis",
-        "id.orig_h", "host_name", "user_agent",
-    ]
-    mac_event_grid = mac_events[mac_event_cols].head(DIALOG_MAX_ROWS).copy()
-    mac_event_grid.insert(0, "#", range(1, len(mac_event_grid) + 1))
-    mac_event_grid["ts"] = pd.to_datetime(mac_event_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-    mac_event_grid["Upload_Bytes"] = pd.to_numeric(mac_event_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
-    if len(mac_events) > DIALOG_MAX_ROWS:
-        st.caption(f"Showing latest {DIALOG_MAX_ROWS:,} rows in event table.")
+    tabs = st.tabs(["Overview", "Forensics", "Event Log"])
 
-    gb_events = _new_grid_builder(mac_event_grid, page_size=20)
-    gb_events.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
-    gb_events.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
-    gb_events.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
-    gb_events.configure_column("Domain", minWidth=160, flex=1.2)
-    gb_events.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
-    gb_events.configure_column("Detail", minWidth=180, flex=1.7)
-    gb_events.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
-    gb_events.configure_column("Destination", minWidth=170, flex=1.5)
-    gb_events.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
-    gb_events.configure_column("Match_Field", header_name="Field", minWidth=120, flex=1.0)
-    gb_events.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
-    gb_events.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
-    gb_events.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.5)
-    gb_events.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
-    gb_events.configure_column("host_name", header_name="Host", minWidth=130, flex=1.1)
-    gb_events.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=2.0)
-    render_shadow_aggrid(
-        mac_event_grid,
-        gb_events,
-        key=f"shadow_ai_mac_events_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
-        height=540,
-        auto_fit_columns=False,
-    )
+    with tabs[0]:
+        chart_df = view_df
+        if len(chart_df) > DIALOG_TIMELINE_MAX_POINTS:
+            chart_df = chart_df.head(DIALOG_TIMELINE_MAX_POINTS).copy()
+            st.caption(f"Timeline limited to latest {DIALOG_TIMELINE_MAX_POINTS:,} events for faster rendering.")
 
+        cA, cB = st.columns([2, 1])
+        with cA:
+            figm = px.scatter(
+                chart_df,
+                x="ts",
+                y="AI_Provider",
+                size="Risk_Score",
+                color="Severity",
+                color_discrete_map=SEVERITY_COLORS,
+                hover_data=["Domain", "Detail", "Evidence_Type", "Matched_Value", "Detection_Basis", "id.orig_h", "host_name"],
+                title="Timeline (this MAC)",
+                template=get_plotly_template(),
+                render_mode="webgl" if len(chart_df) > 1500 else "auto",
+            )
+            style_plotly_figure(figm, height=360)
+            figm.update_xaxes(title="Time")
+            figm.update_yaxes(title="Provider")
+            st.plotly_chart(figm, use_container_width=True)
 
-@st.dialog("MAC Drilldown - Shadow AI", width="large")
+        with cB:
+            byprov = view_df.groupby("AI_Provider").agg(
+                Events=("ts", "count"),
+                Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
+            ).reset_index()
+            byprov = byprov.sort_values(["Events", "Upload_MB"], ascending=False).head(25)
+            figp = px.bar(
+                byprov,
+                x="Events",
+                y="AI_Provider",
+                orientation="h",
+                title="Top providers (events)",
+                template=get_plotly_template(),
+            )
+            style_plotly_figure(figp, height=360, show_legend=False)
+            figp.update_xaxes(title="Events")
+            figp.update_yaxes(title=None)
+            st.plotly_chart(figp, use_container_width=True)
+
+        dom = view_df["Domain"].astype(str).replace({"": None, "nan": None}).dropna()
+        if not dom.empty:
+            top_dom = dom.value_counts().head(15).reset_index()
+            top_dom.columns = ["Domain", "Events"]
+            figd = px.bar(
+                top_dom.sort_values("Events", ascending=True),
+                x="Events",
+                y="Domain",
+                orientation="h",
+                title="Top domains (events)",
+                template=get_plotly_template(),
+            )
+            style_plotly_figure(figd, height=340, show_legend=False)
+            figd.update_xaxes(title="Events")
+            figd.update_yaxes(title=None)
+            st.plotly_chart(figd, use_container_width=True)
+
+    with tabs[1]:
+        st.markdown("#### Priority incidents (this MAC)")
+        pri = view_df[
+            view_df["Severity"].isin(["CRITICAL", "HIGH"])
+            | view_df.get("Governance_Alert", pd.Series(False, index=view_df.index)).astype(bool)
+            | view_df.get("First_Seen_SaaS", pd.Series(False, index=view_df.index)).astype(bool)
+        ].copy()
+
+        if pri.empty:
+            st.success("No high-severity or governance incidents for this MAC in the current view.")
+        else:
+            pri_cols = [
+                "ts", "Severity", "Policy_Verdict",
+                "AI_Provider", "Domain", "Evidence_Type",
+                "Upload_Bytes", "Detail", "Destination",
+                "id.orig_h", "host_name", "user_agent",
+                "Behavior_Indicators", "Detection_Basis", "Policy_Basis",
+            ]
+            for c in pri_cols:
+                if c not in pri.columns:
+                    pri[c] = ""
+            pri_grid = pri[pri_cols].head(150).copy()
+            pri_grid.insert(0, "#", range(1, len(pri_grid) + 1))
+            pri_grid["ts"] = pd.to_datetime(pri_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            pri_grid["Upload_Bytes"] = pd.to_numeric(pri_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+
+            gb_pri = _new_grid_builder(pri_grid, page_size=20)
+            gb_pri.configure_column("ts", header_name="Time", minWidth=150, flex=1.0)
+            gb_pri.configure_column("Severity", minWidth=90, flex=0.7, cellStyle=_severity_cellstyle())
+            gb_pri.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.8, cellStyle=_policy_cellstyle())
+            gb_pri.configure_column("AI_Provider", header_name="Provider", minWidth=150, flex=1.1)
+            gb_pri.configure_column("Domain", minWidth=170, flex=1.2)
+            gb_pri.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=0.9)
+            gb_pri.configure_column("Upload_Bytes", header_name="Bytes", minWidth=95, flex=0.7)
+            gb_pri.configure_column("Detail", minWidth=220, flex=1.8)
+            gb_pri.configure_column("Destination", minWidth=180, flex=1.4)
+            gb_pri.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=0.9)
+            gb_pri.configure_column("host_name", header_name="Host", minWidth=130, flex=0.9)
+            gb_pri.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=1.7)
+            gb_pri.configure_column("Behavior_Indicators", header_name="Indicators", minWidth=160, flex=1.1)
+            gb_pri.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=190, flex=1.4)
+            gb_pri.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.2)
+
+            render_shadow_aggrid(
+                pri_grid,
+                gb_pri,
+                key=f"shadow_ai_mac_priority_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
+                height=520,
+                auto_fit_columns=False,
+            )
+
+        st.markdown("#### Evidence breakdown (this MAC)")
+        ev = view_df["Evidence_Type"].astype(str).replace({"": None, "nan": None}).dropna()
+        if not ev.empty:
+            evc = ev.value_counts().head(10).reset_index()
+            evc.columns = ["Evidence", "Events"]
+            fige = px.bar(
+                evc.sort_values("Events", ascending=True),
+                x="Events",
+                y="Evidence",
+                orientation="h",
+                title="Top evidence types",
+                template=get_plotly_template(),
+            )
+            style_plotly_figure(fige, height=320, show_legend=False)
+            fige.update_xaxes(title="Events")
+            fige.update_yaxes(title=None)
+            st.plotly_chart(fige, use_container_width=True)
+
+    with tabs[2]:
+        mac_event_cols = [
+            "ts", "Severity", "Policy_Verdict",
+            "AI_Provider", "Domain", "Evidence_Type",
+            "Detail", "Upload_Bytes", "Destination",
+            "Matched_Value", "Match_Field", "Signature_Match",
+            "Detection_Basis", "Policy_Basis",
+            "id.orig_h", "host_name", "user_agent",
+        ]
+        for c in mac_event_cols:
+            if c not in view_df.columns:
+                view_df[c] = ""
+        mac_event_grid = view_df[mac_event_cols].head(DIALOG_MAX_ROWS).copy()
+        mac_event_grid.insert(0, "#", range(1, len(mac_event_grid) + 1))
+        mac_event_grid["ts"] = pd.to_datetime(mac_event_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+        mac_event_grid["Upload_Bytes"] = pd.to_numeric(mac_event_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+        if len(view_df) > DIALOG_MAX_ROWS:
+            st.caption(f"Showing latest {DIALOG_MAX_ROWS:,} rows in the event log.")
+
+        gb_events = _new_grid_builder(mac_event_grid, page_size=25)
+        gb_events.configure_column("ts", header_name="Time", minWidth=150, flex=1.0)
+        gb_events.configure_column("Severity", minWidth=90, flex=0.7, cellStyle=_severity_cellstyle())
+        gb_events.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.8, cellStyle=_policy_cellstyle())
+        gb_events.configure_column("AI_Provider", header_name="Provider", minWidth=150, flex=1.1)
+        gb_events.configure_column("Domain", minWidth=170, flex=1.2)
+        gb_events.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=0.9)
+        gb_events.configure_column("Detail", minWidth=220, flex=1.8)
+        gb_events.configure_column("Upload_Bytes", header_name="Bytes", minWidth=95, flex=0.7)
+        gb_events.configure_column("Destination", minWidth=180, flex=1.4)
+        gb_events.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.3)
+        gb_events.configure_column("Match_Field", header_name="Field", minWidth=120, flex=0.9)
+        gb_events.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.0)
+        gb_events.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=190, flex=1.4)
+        gb_events.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.2)
+        gb_events.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=0.9)
+        gb_events.configure_column("host_name", header_name="Host", minWidth=130, flex=0.9)
+        gb_events.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=1.7)
+
+        render_shadow_aggrid(
+            mac_event_grid,
+            gb_events,
+            key=f"shadow_ai_mac_events_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
+            height=560,
+            auto_fit_columns=False,
+        )
+
+@st.dialog("MAC Drilldown - Shadow AI (Forensics)", width="large")
 def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: str) -> None:
     active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     if not active_mac:
@@ -2477,7 +3217,9 @@ def inject_shadow_ai_css():
             border: 1px solid var(--panel-border);
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
+            min-height: 88px;
         }
+
         [data-testid="stMetricLabel"] p {
             font-size: 0.75rem;
             letter-spacing: 0.06em;
@@ -2514,6 +3256,27 @@ def inject_shadow_ai_css():
     )
 
 
+def _shadow_ai_bust_ui_caches() -> None:
+    """Clear Shadow AI session caches and refresh Streamlit caches (used by this page)."""
+    st.session_state["_shadow_ai_cache_bust_v1"] = int(st.session_state.get("_shadow_ai_cache_bust_v1", 0)) + 1
+    # Drop only Shadow AI page caches (scope + filters + MAC tab)
+    for k in [
+        "_shadow_ai_scope_df_key_v1",
+        "_shadow_ai_scope_df_v1",
+        "_shadow_ai_filtered_cache_v1",
+        "_shadow_ai_mac_tab_cache_v1",
+    ]:
+        st.session_state.pop(k, None)
+    # Close any pending dialog so rerun doesn't double-open it
+    st.session_state["shadow_ai_mac_dialog_open"] = False
+    st.session_state["shadow_ai_mac_dialog_mac"] = None
+
+
+    # Full refresh (re-read yaml/signatures and rebuild caches)
+    st.cache_data.clear()
+    st.cache_resource.clear()
+
+
 # =============================================================================
 # UI RENDERER
 # =============================================================================
@@ -2524,6 +3287,7 @@ def render_shadow_ai(parquet_root: Path):
     st.session_state.setdefault("shadow_ai_mac_dialog_open", False)
     st.session_state.setdefault("shadow_ai_mac_dialog_mac", None)
     st.session_state.setdefault("shadow_ai_mac_dialog_last_selected", None)
+    st.session_state.setdefault("shadow_ai_mac_grid_nonce", 0)
     st.markdown("### Shadow AI & Data Leakage Monitor")
     st.markdown(
         "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN telemetry with signature and policy context to surface potential Shadow AI usage and leakage risk.</div>",
@@ -2560,8 +3324,7 @@ def render_shadow_ai(parquet_root: Path):
         st.write("")
         st.write("")
         if st.button("Refresh", key="shadow_ai_refresh_v2"):
-            st.cache_data.clear()
-            st.cache_resource.clear()
+            _shadow_ai_bust_ui_caches()
             st.rerun()
 
     with st.expander("Detection basis (how Shadow AI is decided)", expanded=False):
@@ -2584,9 +3347,9 @@ def render_shadow_ai(parquet_root: Path):
         set((RAW_AI_SIGNATURES or {}).keys())
         | set(FUZZY_PROVIDER_ALIASES.keys())
         | set(LOCAL_AI_PORTS.values())
-        | {"Unidentified AI-like SaaS"}
     )
-    signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])} | {"generic-ai-pattern"})
+    port_signature_values = {f"port {p}" for p in sorted(LOCAL_AI_PORTS.keys())}
+    signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])} | port_signature_values)
     match_field_values = ["HTTP host/uri", "TLS SNI", "DNS query", "conn id.resp_p"]
     evidence_values = ["HTTP+POST", "HTTP+GET", "TLS SNI", "DNS query", "Local Port", "HTTP"]
 
@@ -2663,10 +3426,55 @@ def render_shadow_ai(parquet_root: Path):
         f"<div class='shadow-filter-hint'>Verdict: <strong>{verdict_summary}</strong> | Severity: <strong>{severity_summary}</strong> | Providers: <strong>{provider_summary}</strong> | Search: <strong>{search_summary}</strong></div>",
         unsafe_allow_html=True,
     )
+    # Scope behavior: always interpret selected day in Asia/Manila local time (with automatic boundary coverage)
+    scope_mode = "local_auto"
 
-    target_dates = available_dates if selected_date == "All Available Dates" else ([selected_date] if selected_date else [])
-    with st.spinner("Analyzing telemetry (fast cache)..."):
-        df = load_shadow_ai_data(parquet_root, target_dates)
+    # If selecting a single day, also load the previous folder date to cover UTC↔local boundaries.
+    if selected_date == "All Available Dates":
+        target_dates = available_dates
+    else:
+        target_dates = [selected_date] if selected_date else []
+        if target_dates:
+            try:
+                d0 = datetime.strptime(str(target_dates[0]), "%Y-%m-%d").date()
+                prev = (d0 - timedelta(days=1)).strftime("%Y-%m-%d")
+                if prev in available_dates and prev not in target_dates:
+                    target_dates.append(prev)
+            except Exception:
+                pass
+    # Keep a hot in-session copy so search/filter/dialog reruns don't reload/unpickle.
+    st.session_state.setdefault("_shadow_ai_cache_bust_v1", 0)
+    cache_bust = int(st.session_state.get("_shadow_ai_cache_bust_v1", 0))
+    scope_df_key = (
+        cache_bust,
+        str(parquet_root.resolve()),
+        tuple(target_dates),
+        str(CACHE_VERSION),
+        int(SIG_MTIME_NS),
+        int(BASELINE_DAYS),
+    )
+
+    if st.session_state.get("_shadow_ai_scope_df_key_v1") == scope_df_key and isinstance(st.session_state.get("_shadow_ai_scope_df_v1"), pd.DataFrame):
+        df = st.session_state.get("_shadow_ai_scope_df_v1")
+    else:
+        with st.spinner("Analyzing telemetry (cache warm-up)..."):
+            df = load_shadow_ai_data(parquet_root, target_dates, cache_bust=cache_bust)
+        st.session_state["_shadow_ai_scope_df_key_v1"] = scope_df_key
+        st.session_state["_shadow_ai_scope_df_v1"] = df
+        # Base changed => drop derived caches
+        st.session_state.pop("_shadow_ai_filtered_cache_v1", None)
+        st.session_state.pop("_shadow_ai_mac_tab_cache_v1", None)
+
+    # Apply display scope for a single selected day (keeps UI accurate without rebuilding caches)
+    raw_df = df
+    scope_decision = "all_dates"
+    if selected_date != "All Available Dates" and selected_date and DATE_DIR_RE.match(str(selected_date)):
+        scoped, scope_decision = _apply_date_scope(raw_df, str(selected_date), mode=scope_mode)
+        # If strict local-day scope yields nothing, fall back to showing raw folder contents.
+        if scoped.empty and scope_mode != "folder":
+            scoped, scope_decision = _apply_date_scope(raw_df, str(selected_date), mode="folder")
+        df = scoped
+
 
     if df.empty:
         st.info("No AI signatures detected in the selected range.")
@@ -2759,7 +3567,6 @@ def render_shadow_ai(parquet_root: Path):
         "Top Destinations",
         "Shadow AI by MAC",
         "Big Transfers",
-        "Forensics",
         "Policy / Noise Control",
     ])
 
@@ -3049,7 +3856,7 @@ def render_shadow_ai(parquet_root: Path):
             mac_response = render_shadow_aggrid(
                 mac_grid,
                 gb_mac,
-                key=f"shadow_ai_mac_summary_grid_{selected_scope_key}",
+                key=f"shadow_ai_mac_summary_grid_{selected_scope_key}_{st.session_state.get('shadow_ai_mac_grid_nonce', 0)}",
                 height=430,
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 grid_options_overrides={
@@ -3151,137 +3958,9 @@ def render_shadow_ai(parquet_root: Path):
             render_shadow_aggrid(alert_grid, gb_alert, key=f"shadow_ai_alert_grid_{selected_scope_key}", height=560)
 
     # =============================================================================
-    # TAB: FORENSICS
-    # =============================================================================
-    with tabs[5]:
-        st.markdown("### Incident forensics")
-
-        ftab = st.tabs(["Priority Alerts", "Full Traffic Log", "Top Exfiltrators"])
-
-        with ftab[0]:
-            hi = filtered[filtered["Severity"].isin(["CRITICAL", "HIGH"])].copy()
-            if hi.empty:
-                st.success("No high severity incidents in the current view.")
-            else:
-                hi_cols = [
-                    "ts", "Severity", "Policy_Verdict",
-                    "mac", "host_name", "id.orig_h",
-                    "AI_Provider", "Domain", "Evidence_Type",
-                    "Upload_Bytes", "Detail", "Destination",
-                    "Match_Field", "Signature_Match", "Matched_Value",
-                    "Detection_Basis", "Policy_Basis", "Behavior_Indicators",
-                    "First_Seen_SaaS", "Governance_Alert", "Confidence",
-                ]
-                for c in hi_cols:
-                    if c not in hi.columns:
-                        hi[c] = ""
-                hi_grid = hi[hi_cols].head(MAX_ROWS_DISPLAY).copy()
-                hi_grid.insert(0, "#", range(1, len(hi_grid) + 1))
-                hi_grid["ts"] = pd.to_datetime(hi_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-                hi_grid["Upload_Bytes"] = pd.to_numeric(hi_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
-
-                gb_hi = _new_grid_builder(hi_grid, page_size=20)
-                gb_hi.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
-                gb_hi.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
-                gb_hi.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.9, cellStyle=_policy_cellstyle())
-                gb_hi.configure_column("mac", header_name="MAC", minWidth=145, flex=1.1)
-                gb_hi.configure_column("host_name", header_name="Host", minWidth=130, flex=1.0)
-                gb_hi.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
-                gb_hi.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
-                gb_hi.configure_column("Domain", minWidth=165, flex=1.3)
-                gb_hi.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
-                gb_hi.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
-                gb_hi.configure_column("Detail", minWidth=170, flex=1.6)
-                gb_hi.configure_column("Destination", minWidth=160, flex=1.4)
-                gb_hi.configure_column("Match_Field", header_name="Field", minWidth=110, flex=1.0)
-                gb_hi.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
-                gb_hi.configure_column("Matched_Value", header_name="Matched", minWidth=170, flex=1.5)
-                gb_hi.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
-                gb_hi.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=170, flex=1.6)
-                gb_hi.configure_column("Confidence", minWidth=95, flex=0.8)
-                render_shadow_aggrid(hi_grid, gb_hi, key=f"shadow_ai_hi_grid_{selected_scope_key}", height=560)
-
-        with ftab[1]:
-            cols = [
-                "ts", "mac", "host_name", "id.orig_h",
-                "Severity", "Risk_Score",
-                "AI_Provider", "Policy_Verdict", "Policy_Basis",
-                "Evidence_Type", "Confidence",
-                "Client_Type", "Detection_Source",
-                "Domain", "Destination", "Detail",
-                "Match_Field", "Signature_Match", "Matched_Value",
-                "Detection_Basis", "Behavior_Indicators",
-                "First_Seen_SaaS", "Governance_Alert",
-                "Large_HTTPS_Upload", "High_Freq_API", "JSON_Heavy_API",
-                "File_Upload_Indicator", "Strong_Signal_Pattern",
-                "user_agent",
-            ]
-            for c in cols:
-                if c not in filtered.columns:
-                    filtered[c] = ""
-
-            log_grid = filtered[cols].head(MAX_ROWS_DISPLAY).copy()
-            log_grid.insert(0, "#", range(1, len(log_grid) + 1))
-            log_grid["ts"] = pd.to_datetime(log_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-            log_grid["Risk_Score"] = pd.to_numeric(log_grid["Risk_Score"], errors="coerce").fillna(0).astype(int)
-
-            gb_log = _new_grid_builder(log_grid, page_size=20)
-            gb_log.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
-            gb_log.configure_column("mac", header_name="MAC", minWidth=145, flex=1.1)
-            gb_log.configure_column("host_name", header_name="Host", minWidth=130, flex=1.0)
-            gb_log.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
-            gb_log.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
-            gb_log.configure_column("Risk_Score", header_name="Risk", minWidth=85, flex=0.8, cellStyle=_risk_score_cellstyle())
-            gb_log.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
-            gb_log.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.9, cellStyle=_policy_cellstyle())
-            gb_log.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.5)
-            gb_log.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
-            gb_log.configure_column("Confidence", minWidth=95, flex=0.8)
-            gb_log.configure_column("Client_Type", header_name="Client", minWidth=120, flex=1.0)
-            gb_log.configure_column("Detection_Source", header_name="Source", minWidth=110, flex=0.9)
-            gb_log.configure_column("Domain", minWidth=160, flex=1.3)
-            gb_log.configure_column("Destination", minWidth=170, flex=1.5)
-            gb_log.configure_column("Detail", minWidth=180, flex=1.7)
-            gb_log.configure_column("Match_Field", header_name="Field", minWidth=120, flex=1.0)
-            gb_log.configure_column("Signature_Match", header_name="Signature", minWidth=130, flex=1.1)
-            gb_log.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
-            gb_log.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
-            gb_log.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=2.0)
-            render_shadow_aggrid(log_grid, gb_log, key=f"shadow_ai_log_grid_{selected_scope_key}", height=650)
-
-        with ftab[2]:
-            leakers = filtered.groupby(["Policy_Verdict", "host_name", "mac", "AI_Provider"]).agg(
-                Total_Upload_MB=("Upload_Bytes", lambda x: float(x.sum()) / 1024 / 1024),
-                Event_Count=("ts", "count"),
-                Last_Seen=("ts", "max"),
-                Top_Domain=("Domain", _safe_value_counts_top),
-                Top_Evidence=("Evidence_Type", _safe_value_counts_top),
-            ).reset_index().sort_values("Total_Upload_MB", ascending=False)
-
-            if leakers.empty:
-                st.info("No upload activity in the current view.")
-            else:
-                leak_grid = leakers.copy()
-                leak_grid.insert(0, "#", range(1, len(leak_grid) + 1))
-                leak_grid["Last_Seen"] = pd.to_datetime(leak_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-                leak_grid["Total_Upload_MB"] = pd.to_numeric(leak_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
-
-                gb_leak = _new_grid_builder(leak_grid, page_size=15)
-                gb_leak.configure_column("Policy_Verdict", header_name="Verdict", minWidth=110, cellStyle=_policy_cellstyle())
-                gb_leak.configure_column("host_name", header_name="Host", minWidth=145)
-                gb_leak.configure_column("mac", header_name="MAC", minWidth=150)
-                gb_leak.configure_column("AI_Provider", header_name="Provider", minWidth=145)
-                gb_leak.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=110)
-                gb_leak.configure_column("Event_Count", header_name="Events", minWidth=90)
-                gb_leak.configure_column("Last_Seen", header_name="Last Seen", minWidth=150)
-                gb_leak.configure_column("Top_Domain", header_name="Top Domain", minWidth=180)
-                gb_leak.configure_column("Top_Evidence", header_name="Top Evidence", minWidth=130)
-                render_shadow_aggrid(leak_grid, gb_leak, key=f"shadow_ai_leak_grid_{selected_scope_key}", height=450)
-
-    # =============================================================================
     # TAB: POLICY / NOISE CONTROL
     # =============================================================================
-    with tabs[6]:
+    with tabs[5]:
         st.markdown("### Policy posture / noise controls")
 
         st.write("Allowlist behavior: if `authorized_providers` is empty, the system defaults to deny and everything is Shadow AI.")
