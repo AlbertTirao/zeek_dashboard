@@ -1,0 +1,100 @@
+# shadow_sharing_signatures.yaml
+# Signature list of common file-sharing / cloud-storage / quick-transfer / paste services.
+# Matching is typically done as a boundary-safe suffix match against normalized destinations
+# (e.g., sub.domain.example.com matches example.com).
+#
+# Keep entries as BASE DOMAINS whenever possible (eTLD+1), unless you intentionally want
+# a specific subdomain only.
+
+version: 1
+updated_at_utc: "2026-02-24T17:48:22Z"
+
+services:
+  # --------------------------
+  # Cloud Storage / File Sync
+  # --------------------------
+  Google Drive:
+    - drive.google.com
+    - googleusercontent.com        # NOTE: broad; used by Google file/content hosting/CDNs
+    - gvt1.com                     # Google video/content CDN (optional; broad)
+
+  Microsoft OneDrive / SharePoint:
+    - onedrive.live.com
+    - sharepoint.com
+    - 1drv.com                     # short links
+    - 1drv.ms                      # short links
+    - live.com                     # can be broad; keep only if you want it
+
+  Dropbox:
+    - dropbox.com
+    - dropboxapi.com
+    - dropboxusercontent.com
+
+  Box:
+    - box.com
+    - box.net
+
+  iCloud Drive:
+    - icloud.com
+    - apple.com                    # broad; keep only if you want Apple services grouped
+
+  # --------------------------
+  # Quick Transfer / Large Send
+  # --------------------------
+  WeTransfer:
+    - wetransfer.com
+    - we.tl
+
+  MEGA:
+    - mega.nz
+    - mega.co.nz
+
+  MediaFire:
+    - mediafire.com
+
+  pCloud:
+    - pcloud.com
+
+  Send Anywhere:
+    - send-anywhere.com
+
+  # --------------------------
+  # Messaging-based file movement
+  # --------------------------
+  Telegram:
+    - telegram.org
+    - t.me
+    - telegram.me
+    - telegram-cdn.org
+
+  Discord:
+    - discord.com
+    - discord.gg
+    - discordapp.com
+    - discordapp.net
+    - discord.media
+
+  # --------------------------
+  # Paste / “drop sites” (often used for leaks)
+  # --------------------------
+  Pastebin:
+    - pastebin.com
+
+  PrivateBin:
+    - privatebin.net
+
+  Rentry:
+    - rentry.co
+
+  Ghostbin:
+    - ghostbin.com
+
+  Hastebin:
+    - hastebin.com
+
+  Dpaste:
+    - dpaste.org
+    - dpaste.com
+
+  Paste.ee:
+    - paste.ee
