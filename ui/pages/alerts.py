@@ -1,5 +1,6 @@
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
@@ -142,6 +143,27 @@ def is_broadcast_mac(mac: Optional[str]) -> bool:
 
 
 # =============================================================================
+# IP HELPERS
+# =============================================================================
+def _normalize_ip(value) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "-"}:
+        return None
+    return s
+
+
+def _is_private_ip(ip_value: Optional[str]) -> bool:
+    if not ip_value:
+        return False
+    try:
+        return ipaddress.ip_address(ip_value).is_private
+    except Exception:
+        return False
+
+
+# =============================================================================
 # CHANGED: BANNED MACS (shared across pages) + INVENTORY MAC SET (known_hosts)
 # - Alerts still builds event-driven tables, but header metrics now use the same
 #   "device inventory" as Device Overview: unique MACs from known_hosts parquets.
@@ -270,6 +292,235 @@ def load_authorized_macs(auth_file: str) -> set:
 
     sig = _auth_file_sig(file_path)
     return set(_load_authorized_macs_cached(str(file_path), sig))
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _build_ip_to_mac_map_cached(
+    parquet_root_str: str,
+    auth_file_str: str,
+    auth_sig: Tuple[str, float, int],
+) -> Dict[str, str]:
+    # Keep this argument in the signature so cache invalidates when allowlist changes.
+    _ = auth_sig
+
+    ip_to_mac: Dict[str, str] = {}
+
+    # Seed map from authorized YAML entries that include explicit IPs.
+    auth_path = Path(auth_file_str)
+    if auth_path.suffix != ".yaml":
+        yaml_path = auth_path.with_suffix(".yaml")
+        if yaml_path.exists():
+            auth_path = yaml_path
+
+    if auth_path.exists():
+        try:
+            auth_data = yaml.safe_load(auth_path.read_text(encoding="utf-8"))
+        except Exception:
+            auth_data = None
+
+        auth_rows = _extract_yaml_list(auth_data, auth_path.stem, PREFERRED_AUTH_KEYS)
+        for item in auth_rows:
+            if not isinstance(item, dict):
+                continue
+            mac_norm = normalize_mac(item.get("mac"))
+            ip_norm = _normalize_ip(item.get("ip"))
+            if mac_norm and ip_norm and _is_private_ip(ip_norm):
+                ip_to_mac[ip_norm] = mac_norm
+
+    # Strengthen map with historical known_hosts observations (latest IP ownership wins).
+    by_date_str = _discover_date_dirs(parquet_root_str)
+    con = _duckdb_conn()
+    kh_frames: List[pd.DataFrame] = []
+
+    for _date_str, day_dirs in by_date_str.items():
+        for day_dir_str in day_dirs:
+            day_dir = Path(day_dir_str)
+            known_hosts_path = _find_log_file_in_day(day_dir, KNOWN_HOSTS_KEYWORDS)
+            if not known_hosts_path or not known_hosts_path.exists():
+                continue
+
+            cols = _duckdb_schema_cols(con, known_hosts_path)
+            if not cols:
+                continue
+
+            mac_col = _choose_first_present(cols, ["mac", "MAC Address", "host_mac", "l2addr"])
+            ip_col = _choose_first_present(
+                cols,
+                ["host_ip", "host", "ip", "addr", "IP Address", "client_addr", "assigned_addr"],
+            )
+            ts_col = _choose_first_present(cols, ["ts", "timestamp", "time"])
+            if not mac_col or not ip_col:
+                continue
+
+            mac_expr = _duck_mac_norm_expr(f'"{mac_col}"')
+            ts_expr = _duck_ts_expr(f'"{ts_col}"') if ts_col else "NULL"
+            ip_expr = f'cast("{ip_col}" as varchar)'
+
+            sql = f"""
+            SELECT
+              {ts_expr} AS ts_dt,
+              {mac_expr} AS mac_norm,
+              NULLIF(NULLIF({ip_expr}, ''), 'nan') AS ip
+            FROM parquet_scan('{_sql_quote_path(known_hosts_path)}')
+            WHERE {mac_expr} IS NOT NULL
+              AND {ip_expr} IS NOT NULL
+            """
+            try:
+                kh_frames.append(con.execute(sql).df())
+            except Exception:
+                continue
+
+    if kh_frames:
+        kh = pd.concat(kh_frames, ignore_index=True)
+        kh["ip"] = kh["ip"].map(_normalize_ip)
+        kh = kh.dropna(subset=["mac_norm", "ip"])
+        kh = kh[kh["ip"].map(_is_private_ip)]
+
+        if not kh.empty:
+            kh["ts_dt"] = pd.to_datetime(kh["ts_dt"], errors="coerce", utc=True)
+            kh = kh.sort_values("ts_dt", na_position="first")
+            kh = kh.drop_duplicates(subset=["ip"], keep="last")
+            for ip_value, mac_norm in zip(kh["ip"].astype(str), kh["mac_norm"].astype(str)):
+                ip_to_mac[ip_value] = mac_norm
+
+    return ip_to_mac
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _infer_events_from_ip_logs_cached(
+    parquet_root_str: str,
+    selected_date_dirs_str: Tuple[Tuple[str, str], ...],
+    auth_file_str: str,
+    auth_sig: Tuple[str, float, int],
+) -> pd.DataFrame:
+    """
+    Fallback when DHCP/ARP/CONN are missing for a selected day:
+    infer MAC activity from private IP observations in other Zeek logs.
+    """
+    ip_to_mac = _build_ip_to_mac_map_cached(parquet_root_str, auth_file_str, auth_sig)
+    if not ip_to_mac:
+        return pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
+
+    con = _duckdb_conn()
+    ip_candidates = [
+        "id.orig_h",
+        "id.resp_h",
+        "src_ip",
+        "dst_ip",
+        "ip",
+        "host",
+        "host_ip",
+        "client_addr",
+        "assigned_addr",
+    ]
+    chunks: List[pd.DataFrame] = []
+
+    for _date_str, day_dir_str in selected_date_dirs_str:
+        day_dir = Path(day_dir_str)
+        candidates: List[Path] = []
+
+        try:
+            candidates.extend(sorted(day_dir.glob("*.parquet")))
+        except Exception:
+            pass
+
+        try:
+            for sub in day_dir.iterdir():
+                if not sub.is_dir():
+                    continue
+                name_l = sub.name.lower()
+                if CACHE_DIRNAME.lower() in name_l or "_shadow_cache" in name_l:
+                    continue
+                candidates.extend(sorted(sub.glob("*.parquet")))
+        except Exception:
+            pass
+
+        for fp in candidates:
+            fp_name_l = fp.name.lower()
+            if (
+                "dhcp" in fp_name_l
+                or "arp" in fp_name_l
+                or "conn" in fp_name_l
+                or "known_hosts" in fp_name_l
+            ):
+                continue
+
+            cols = _duckdb_schema_cols(con, fp)
+            if not cols:
+                continue
+
+            ts_col = _choose_first_present(cols, ["ts", "timestamp", "time"])
+            if not ts_col:
+                continue
+
+            present_ip_cols = [c for c in ip_candidates if c in cols]
+            if not present_ip_cols:
+                continue
+
+            ts_expr = _duck_ts_expr(f'"{ts_col}"')
+            for ip_col in present_ip_cols:
+                ip_expr = f'cast("{ip_col}" as varchar)'
+                sql = f"""
+                SELECT
+                  {ts_expr} AS ts_dt,
+                  {ip_expr} AS ip
+                FROM parquet_scan('{_sql_quote_path(fp)}')
+                WHERE {ip_expr} IS NOT NULL
+                """
+                try:
+                    df = con.execute(sql).df()
+                except Exception:
+                    continue
+
+                if df.empty:
+                    continue
+
+                df["ip"] = df["ip"].map(_normalize_ip)
+                df = df.dropna(subset=["ip", "ts_dt"])
+                if df.empty:
+                    continue
+
+                df["mac_norm"] = df["ip"].map(ip_to_mac)
+                df = df.dropna(subset=["mac_norm"])
+                if df.empty:
+                    continue
+
+                df["host"] = pd.NA
+                df["source"] = f"{fp.stem}:{ip_col}"
+                chunks.append(df[["ts_dt", "mac_norm", "ip", "host", "source"]])
+
+    if not chunks:
+        return pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
+
+    inferred = pd.concat(chunks, ignore_index=True)
+    inferred["ts_dt"] = pd.to_datetime(inferred["ts_dt"], errors="coerce")
+    inferred = inferred.dropna(subset=["ts_dt", "mac_norm"])
+
+    if inferred.empty:
+        return pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"])
+
+    inferred["mac_norm"] = inferred["mac_norm"].astype(str)
+    inferred["source"] = inferred["source"].fillna("").astype(str)
+
+    source_map = (
+        inferred[inferred["source"] != ""]
+        .groupby("mac_norm")["source"]
+        .agg(lambda s: ", ".join(sorted(set(s))))
+        .to_dict()
+    )
+
+    latest = (
+        inferred.sort_values("ts_dt", ascending=False)
+        .drop_duplicates(subset=["mac_norm"], keep="first")
+        .copy()
+    )
+    latest["source"] = latest["mac_norm"].map(source_map).fillna(latest["source"])
+
+    return (
+        latest[["ts_dt", "mac_norm", "ip", "host", "source"]]
+        .sort_values("ts_dt", ascending=False)
+        .reset_index(drop=True)
+    )
 
 
 # =============================================================================
@@ -758,14 +1009,23 @@ def _load_cached_for_date_dirs_cached(
 # =============================================================================
 def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[str]) -> Tuple[pd.DataFrame, str]:
     if events is None or events.empty:
-        return events, ""
+        if mode == "Specific Date" and selected_date:
+            return (
+                pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]),
+                f"Specific Date ({selected_date})",
+            )
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=7)
+        return (
+            pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]),
+            f"Last 7 Days (since {cutoff.strftime('%Y-%m-%d %H:%M')})",
+        )
 
     tmp = events.copy()
     tmp["ts_dt"] = pd.to_datetime(tmp["ts_dt"], errors="coerce")
 
     tz = getattr(tmp["ts_dt"].dtype, "tz", None)
     is_tz_aware = tz is not None
-    now = pd.Timestamp.now(tz="UTC") if is_tz_aware else pd.Timestamp.now()
+    now = pd.Timestamp.now(tz=tz) if is_tz_aware else pd.Timestamp.now()
 
     tmp = tmp.dropna(subset=["ts_dt", "mac_norm"])
 
@@ -777,7 +1037,7 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
     if mode == "Specific Date" and selected_date:
         start_naive = datetime.strptime(selected_date, "%Y-%m-%d")
         if is_tz_aware:
-            start = pd.Timestamp(start_naive, tz="UTC")
+            start = pd.Timestamp(start_naive).tz_localize(tz)
             end = start + pd.Timedelta(days=1)
         else:
             start = pd.Timestamp(start_naive)
@@ -1345,6 +1605,22 @@ def render(parquet_root: str, authorized_macs_file: str):
         raw_events, known_hosts_norm = _load_cached_for_date_dirs_cached(str(root), selected_date_dirs_key)
 
     events, range_label = _apply_time_filter(raw_events, time_mode, selected_date)
+    fallback_scope_note = None
+
+    if time_mode == "Specific Date" and selected_date and (events is None or events.empty):
+        auth_sig = _auth_file_sig(auth_path)
+        inferred_events = _infer_events_from_ip_logs_cached(
+            str(root),
+            selected_date_dirs_key,
+            str(auth_path),
+            auth_sig,
+        )
+        if inferred_events is not None and not inferred_events.empty:
+            events, range_label = _apply_time_filter(inferred_events, time_mode, selected_date)
+            fallback_scope_note = (
+                "Selected date has no DHCP/ARP/CONN capture. "
+                "Counts are inferred from private-IP activity mapped to known MAC addresses."
+            )
 
     mac_to_ip, mac_to_vendor = build_known_maps(known_hosts_norm)
     devices = build_device_table(events, mac_to_ip) if not events.empty else pd.DataFrame(
@@ -1380,6 +1656,7 @@ def render(parquet_root: str, authorized_macs_file: str):
         inventory_total=inventory_total,
         inventory_verified=inventory_verified,
         inventory_unauthorized=inventory_unauthorized,
+        inference_note=fallback_scope_note,
     )
 
 
@@ -1399,9 +1676,13 @@ def _render_alerts_ui(
     inventory_total: int,
     inventory_verified: int,
     inventory_unauthorized: int,
+    inference_note: Optional[str] = None,
 ) -> None:
     if devices is None:
         devices = pd.DataFrame()
+
+    if inference_note:
+        st.info(inference_note)
 
     verified_df = devices[devices.get("status", "") == "Verified"].copy() if not devices.empty else pd.DataFrame()
     unauth_df = devices[devices.get("status", "") == "Unauthorized"].copy() if not devices.empty else pd.DataFrame()
