@@ -485,6 +485,57 @@ def _coerce_bool_value(v) -> bool:
     return str(v).strip().lower() in {"1", "true", "t", "yes", "y"}
 
 
+def _clean_reason_value(value: object) -> str:
+    s = str(value or "").strip()
+    if s.lower() in {"", "nan", "none", "-", "(empty)", "n/a", "na", "unknown"}:
+        return ""
+    return s
+
+
+def _compose_incident_reason(base_reason: object, action: object, action_basis: object, category: object) -> str:
+    parts: List[str] = []
+    base = _clean_reason_value(base_reason)
+    if base:
+        parts.append(base)
+
+    action_txt = _clean_reason_value(action)
+    action_basis_txt = _clean_reason_value(action_basis)
+    if action_txt and action_txt.lower() not in {"access", "baseline access"}:
+        if action_basis_txt and action_basis_txt.lower() != "baseline access":
+            parts.append(f"action: {action_txt} ({action_basis_txt})")
+        else:
+            parts.append(f"action: {action_txt}")
+
+    category_txt = _clean_reason_value(category)
+    if category_txt and category_txt.lower() not in {"file_sharing", "uncategorized", "other"}:
+        parts.append(f"category: {category_txt}")
+
+    deduped: List[str] = []
+    seen = set()
+    for p in parts:
+        k = p.strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        deduped.append(p)
+    return "; ".join(deduped)
+
+
+def _filter_incidents_nonzero_outbound(incidents_df: pd.DataFrame) -> pd.DataFrame:
+    if incidents_df is None or incidents_df.empty:
+        return pd.DataFrame()
+    out = incidents_df.copy()
+    out_bytes = pd.to_numeric(out.get("bytes_out_total", 0), errors="coerce").fillna(0)
+    out = out[out_bytes > 0].copy()
+    if out.empty:
+        return pd.DataFrame()
+    if "incident_id" in out.columns:
+        out = out.drop_duplicates(subset=["incident_id"], keep="last")
+    else:
+        out = out.drop_duplicates()
+    return out
+
+
 def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
     if incidents_df is None or incidents_df.empty:
         return pd.DataFrame()
@@ -529,13 +580,9 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
     inc_src["Allowed_Domain"] = inc_src["allowed"].apply(_coerce_bool_value)
     inc_src["Service"] = inc_src["sig_service"].astype(str).str.strip()
     inc_src.loc[inc_src["Service"].isin(["", "nan", "None", "none"]), "Service"] = "No signature match"
-    inc_src["Action"] = inc_src["action"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
-    inc_src["Action_Basis"] = inc_src["action_basis"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
-    inc_src["Action_Desc"] = inc_src["Action"]
-    has_action_basis = inc_src["Action_Basis"] != ""
-    inc_src.loc[has_action_basis, "Action_Desc"] = inc_src.loc[has_action_basis, "Action"] + " (" + inc_src.loc[has_action_basis, "Action_Basis"] + ")"
-    inc_src["Category"] = inc_src["category"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
-    inc_src.loc[inc_src["Category"] == "", "Category"] = "file_sharing"
+    action_txt = inc_src["action"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
+    action_basis_txt = inc_src["action_basis"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
+    category_txt = inc_src["category"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
     inc_src["allow_basis"] = inc_src["allow_basis"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
     inc_src.loc[(inc_src["allow_basis"] == "") & (inc_src["Allowed_Domain"] == False), "allow_basis"] = "no match"  # noqa: E712
     inc_src["Confidence"] = inc_src["confidence"].astype(str).str.upper()
@@ -546,7 +593,11 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
     inc_src["Ratio"] = pd.to_numeric(inc_src["out_in_ratio_total"], errors="coerce").fillna(0).round(2)
     inc_src["Conns"] = pd.to_numeric(inc_src["conn_count"], errors="coerce").fillna(0).astype(int)
     inc_src["Duration_sec"] = pd.to_numeric(inc_src["total_duration"], errors="coerce").fillna(0).round(1)
-    inc_src["Reasons"] = inc_src["confidence_reasons"].astype(str)
+    base_reasons = inc_src["confidence_reasons"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
+    inc_src["Reasons"] = [
+        _compose_incident_reason(br, a, ab, c)
+        for br, a, ab, c in zip(base_reasons.tolist(), action_txt.tolist(), action_basis_txt.tolist(), category_txt.tolist())
+    ]
 
     if "incident_id" not in inc_src.columns:
         inc_src["incident_id"] = (
@@ -585,8 +636,6 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
         "Ratio",
         "Conns",
         "Duration_sec",
-        "Category",
-        "Action_Desc",
         "Confidence",
         "Score",
         "Reasons",
@@ -662,11 +711,9 @@ def _configure_incident_grid_columns(
     gb.configure_column("Ratio", width=90)
     gb.configure_column("Conns", width=86)
     gb.configure_column("Duration_sec", header_name="Duration(sec)", width=125)
-    gb.configure_column("Category", width=140)
-    gb.configure_column("Action_Desc", header_name="Action (Description/Reason)", minWidth=260)
     gb.configure_column("Confidence", width=110, cellStyle=_confidence_cellstyle())
     gb.configure_column("Score", width=82)
-    gb.configure_column("Reasons", minWidth=320)
+    gb.configure_column("Reasons", minWidth=420)
     gb.configure_column("incident_id", hide=True)
 
 
@@ -865,7 +912,7 @@ def show_shadow_sharing_device_dialog(
         )
 
     dialog_search = st.text_input(
-        "Search (time, destination, domain, source, action, basis)",
+        "Search (time, destination, domain, source, reason/basis)",
         placeholder="e.g., drive.google.com",
         key=f"shadow_sharing_dlg_search_{selected_scope_key}_{mac_key}",
     ).strip()
@@ -898,8 +945,9 @@ def show_shadow_sharing_device_dialog(
             search_mask = search_mask | last_txt.str.lower().str.contains(q, na=False, regex=False)
         scoped_incidents = scoped_incidents[search_mask].copy()
 
+    scoped_incidents = _filter_incidents_nonzero_outbound(scoped_incidents)
     if scoped_incidents.empty:
-        st.info("No incident rows match your dialog search.")
+        st.info("No non-zero outbound incident rows match your dialog search.")
         return
 
     grid_rows = _build_incident_grid_frame(scoped_incidents)
@@ -1014,6 +1062,7 @@ def render_shadow_sharing(parquet_root: Path):
     # Incident Rollup (Algorithms #2/#4/#5/#6)
     # -------------------------------------------------------------------------
     incidents = load_shadow_sharing_incidents_data(parquet_root, target_dates)
+    incidents = _filter_incidents_nonzero_outbound(incidents)
 
     st.markdown("### Shadow Sharing Incidents")
     st.caption("Incidents roll up conn/ssl/http/files evidence into 5-minute windows and score confidence (HIGH/PROBABLE/WEAK).")
@@ -1026,17 +1075,6 @@ def render_shadow_sharing(parquet_root: Path):
         )
 
     st.divider()
-
-    def _token_options(series: pd.Series) -> List[str]:
-        vals = (
-            series.astype(str)
-            .str.strip()
-            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
-            .dropna()
-            .unique()
-            .tolist()
-        )
-        return sorted(str(v) for v in vals)
 
     def _has_text(s: pd.Series) -> pd.Series:
         t = s.astype(str).str.strip().str.lower()
@@ -1091,8 +1129,6 @@ def render_shadow_sharing(parquet_root: Path):
             "files": files_mask,
         }
 
-    action_options = _token_options(df["Action"]) if "Action" in df.columns else []
-    category_options = _token_options(df["Category"]) if "Category" in df.columns else []
     source_masks = _build_real_source_masks(df)
     ordered_sources = ["conn", "http", "ssl", "dns", "files"]
     source_options = [s for s in ordered_sources if bool(source_masks[s].any())]
@@ -1101,28 +1137,14 @@ def render_shadow_sharing(parquet_root: Path):
 
     search_q = st.text_input("Search (MAC, Host, IP, Destination, Basis)", placeholder="e.g., 192.168.1.14",)
 
-    c1, c2, c3 = st.columns([1.8, 1.4, 1.2])
+    c1, c2, c3 = st.columns([1.2, 1.4, 2.2])
     with c1:
-        action_filter = st.multiselect(
-            "Action",
-            action_options,
-            default=[],
-            placeholder="All actions",
-        )
-    with c2:
-        category_filter = st.multiselect(
-            "Category",
-            category_options,
-            default=[],
-            placeholder="All categories",
-        )
-    with c3:
         min_bytes_mb = st.number_input("Min Bytes (MB)", min_value=0, value=0, step=10)
 
-    c4, c5 = st.columns([1.55, 2.0])
-    with c4:
+    with c2:
         selected_risk_levels = st.multiselect("Risk Level", ["CRITICAL", "HIGH", "MEDIUM", "LOW"], default=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
-    with c5:
+
+    with c3:
         selected_sources = st.multiselect("Source Logs", source_options, default=source_options)
 
     # Apply filters
@@ -1142,12 +1164,6 @@ def render_shadow_sharing(parquet_root: Path):
 
     if min_bytes_mb > 0:
         filtered = filtered[filtered["bytes"] >= float(min_bytes_mb) * 1024 * 1024]
-
-    if action_filter:
-        filtered = filtered[filtered["Action"].isin(action_filter)]
-
-    if category_filter:
-        filtered = filtered[filtered["Category"].isin(category_filter)]
 
     if search_q:
         q = search_q.lower().strip()
@@ -1172,7 +1188,7 @@ def render_shadow_sharing(parquet_root: Path):
     if "event_id" in filtered.columns:
         filtered = filtered.drop_duplicates(subset=["event_id"], keep="last")
     else:
-        dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes", "Action", "Category"] if c in filtered.columns]
+        dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes"] if c in filtered.columns]
         if dedupe_cols:
             filtered = filtered.drop_duplicates(subset=dedupe_cols, keep="last")
         else:
@@ -1183,13 +1199,7 @@ def render_shadow_sharing(parquet_root: Path):
         return
 
     filtered_incidents = build_shadow_sharing_incidents(filtered)
-    if not filtered_incidents.empty:
-        if "incident_id" in filtered_incidents.columns:
-            filtered_incidents = filtered_incidents.drop_duplicates(subset=["incident_id"], keep="last")
-        else:
-            filtered_incidents = filtered_incidents.drop_duplicates()
-        out_mb = (pd.to_numeric(filtered_incidents.get("bytes_out_total", 0), errors="coerce").fillna(0) / 1024 / 1024)
-        filtered_incidents = filtered_incidents[out_mb > 0].copy()
+    filtered_incidents = _filter_incidents_nonzero_outbound(filtered_incidents)
 
     # Metrics
     st.divider()

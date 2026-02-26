@@ -135,8 +135,10 @@ def _poll_background_sync():
         if not WARMUP_FLAG.exists():
             WARMUP_FLAG.touch()
 
-        # Important: pages use st.cache_data; clear so new parquet is reflected
+        # Important: pages use both st.cache_data and st.cache_resource.
+        # Clear both so freshly-synced parquet is reflected immediately.
         st.cache_data.clear()
+        st.cache_resource.clear()
         APP_LOGGER.info(f"✅ Sync finished ({updated} logs updated)")
 
         # refresh UI immediately to reflect new parquet

@@ -15,7 +15,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v13-no-dns-no-mcast-no-star-zonefix-filters-v14"
+CACHE_VERSION = "shadow-sharing-cache-v15-duckdb-cache-tuning"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -79,10 +79,15 @@ def _file_signature(paths: List[Path]) -> List[List[object]]:
     return sig
 
 
-def _meta_expected(files_sig: Dict[str, List[List[object]]], whitelist_mtime_ns: int) -> dict:
+def _meta_expected(
+    files_sig: Dict[str, List[List[object]]],
+    whitelist_mtime_ns: int,
+    signatures_mtime_ns: int,
+) -> dict:
     return {
         "cache_version": CACHE_VERSION,
         "whitelist_mtime_ns": int(whitelist_mtime_ns),
+        "signatures_mtime_ns": int(signatures_mtime_ns),
         "files_sig": files_sig,
     }
 
@@ -92,11 +97,38 @@ def _meta_expected(files_sig: Dict[str, List[List[object]]], whitelist_mtime_ns:
 
 @st.cache_resource
 def get_duckdb_connection():
-    return duckdb.connect(database=":memory:")
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("SET memory_limit='4GB'")
+    except Exception:
+        pass
+    try:
+        con.execute("SET threads TO 4")
+    except Exception:
+        pass
+    try:
+        con.execute("PRAGMA enable_object_cache")
+    except Exception:
+        pass
+    try:
+        con.execute("PRAGMA enable_progress_bar=false")
+    except Exception:
+        pass
+    try:
+        tmp = PROJECT_ROOT / ".duckdb_temp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        con.execute(f"SET temp_directory='{tmp.as_posix()}'")
+    except Exception:
+        pass
+    return con
 
 
 def _sql_list(paths: List[Path]) -> str:
-    return "[" + ",".join(f"'{p.as_posix()}'" for p in paths) + "]"
+    escaped = []
+    for p in paths:
+        p0 = p.resolve().as_posix().replace("'", "''")
+        escaped.append("'" + p0 + "'")
+    return "[" + ",".join(escaped) + "]"
 
 
 def _duck_read_parquet_union(paths: List[Path]) -> pd.DataFrame:
@@ -561,9 +593,25 @@ def _collect_known_files(parquet_root: Path) -> List[Path]:
     known: List[Path] = []
     if not parquet_root.exists():
         return known
+
+    def _is_cache_derived_path(p: Path) -> bool:
+        for part in p.parts:
+            pl = str(part).strip().lower()
+            if pl.startswith("_shadow_cache"):
+                return True
+            if pl.startswith("_cache_"):
+                return True
+            if pl == ".duckdb_temp":
+                return True
+        return False
+
     try:
         for f in parquet_root.rglob("*.parquet"):
+            if _is_cache_derived_path(f):
+                continue
             n = f.name.lower()
+            if n == "known_hosts_norm.parquet":
+                continue
             if ("known_hosts" in n) or ("knownhost" in n) or ("known_devices" in n) or ("knowndevices" in n):
                 known.append(f)
     except Exception:
@@ -1662,7 +1710,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     cpath = cache_events_path(parquet_root, date_str)
     mpath = cache_meta_path(parquet_root, date_str)
 
-    expected = _meta_expected(files_sig, WHITELIST_MTIME_NS)
+    expected = _meta_expected(files_sig, WHITELIST_MTIME_NS, SIGNATURES_MTIME_NS)
     meta = read_yaml(mpath)
 
     if cpath.exists() and meta == expected:
@@ -1847,7 +1895,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     return out
 
 
-@st.cache_data(show_spinner=False, ttl=300, max_entries=24)
+@st.cache_resource(show_spinner=False)
 def _load_shadow_sharing_data_cached(
     parquet_root_str: str,
     target_dates: Tuple[str, ...],
@@ -1883,8 +1931,13 @@ def _load_shadow_sharing_data_cached(
 
 
 def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
-    parquet_root = Path(parquet_root)
-    dates_key = tuple(str(d) for d in (target_dates or []) if d and DATE_DIR_RE.match(str(d)))
+    parquet_root = Path(parquet_root).resolve()
+    dates_key = tuple(
+        sorted(
+            {str(d) for d in (target_dates or []) if d and DATE_DIR_RE.match(str(d))},
+            reverse=True,
+        )
+    )
     return _load_shadow_sharing_data_cached(
         str(parquet_root),
         dates_key,
@@ -2063,6 +2116,12 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         active_days=("active_days", "max"),
     ).reset_index()
 
+    agg["bytes_out_total"] = pd.to_numeric(agg.get("bytes_out_total", 0), errors="coerce").fillna(0)
+    agg["bytes_in_total"] = pd.to_numeric(agg.get("bytes_in_total", 0), errors="coerce").fillna(0)
+    agg = agg[agg["bytes_out_total"] > 0].copy()
+    if agg.empty:
+        return pd.DataFrame()
+
     agg["out_in_ratio_total"] = (agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)).replace([math.inf, -math.inf], 0).fillna(0)
 
     scores: List[int] = []
@@ -2122,7 +2181,7 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     out = agg[cols].drop_duplicates(subset=["incident_id"], keep="last")
     return out.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
 
-@st.cache_data(show_spinner=False, ttl=300, max_entries=24)
+@st.cache_resource(show_spinner=False)
 def load_shadow_sharing_incidents_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
     df = load_shadow_sharing_data(parquet_root, target_dates)
     return build_shadow_sharing_incidents(df, INCIDENT_WINDOW_MINUTES)
