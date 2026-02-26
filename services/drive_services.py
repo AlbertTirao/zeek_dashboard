@@ -1,8 +1,10 @@
 import os
+import re
 import time
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -13,6 +15,86 @@ import duckdb
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from pydrive2.files import ApiRequestError
+
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def _extract_date_from_dirname(name: str) -> Optional[str]:
+    """Accept both YYYY-MM-DD and date=YYYY-MM-DD folder names."""
+    base = (name or "").strip()
+    if not base:
+        return None
+
+    if DATE_DIR_RE.match(base):
+        return base
+
+    if base.startswith("date="):
+        tail = base.split("date=", 1)[1].strip()
+        if DATE_DIR_RE.match(tail):
+            return tail
+
+    return None
+
+
+def _parse_drive_modified_date(modified_date: str) -> Optional[str]:
+    """
+    Parse Google Drive modifiedDate safely and return YYYY-MM-DD.
+    Keep the source date component (no local timezone shifting).
+    """
+    raw = (modified_date or "").strip()
+    if not raw:
+        return None
+
+    try:
+        dt_obj = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt_obj.date().strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    # Fallback for malformed values that still carry a prefix timestamp.
+    try:
+        dt_obj = datetime.strptime(raw.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+        return dt_obj.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _resolve_log_date(file_obj, folder_date_hint: Optional[str], default_date: str) -> str:
+    if folder_date_hint:
+        return folder_date_hint
+
+    parsed_date = _parse_drive_modified_date(str(file_obj.get("modifiedDate", "")))
+    return parsed_date or default_date
+
+
+def _is_dead_loopback_proxy(proxy_value: str) -> bool:
+    raw = (proxy_value or "").strip().lower()
+    if not raw:
+        return False
+    return "127.0.0.1:9" in raw or "localhost:9" in raw
+
+
+def _disable_dead_loopback_proxies() -> dict:
+    disabled = {}
+    for key in PROXY_ENV_KEYS:
+        val = os.environ.get(key, "")
+        if _is_dead_loopback_proxy(val):
+            disabled[key] = val
+            os.environ.pop(key, None)
+    return disabled
+
+
+def _restore_env_vars(values: dict):
+    for key, val in values.items():
+        os.environ[key] = val
 
 
 # =====================================================
@@ -52,10 +134,16 @@ def authenticate_drive_oauth(client_secret_path: str, credentials_file: str) -> 
         # First time only -> opens browser
         gauth.LocalWebserverAuth()
     else:
-        if gauth.access_token_expired:
-            gauth.Refresh()
-        else:
-            gauth.Authorize()
+        try:
+            if gauth.access_token_expired:
+                gauth.Refresh()
+            else:
+                gauth.Authorize()
+        except Exception:
+            # Revoked/expired tokens can fail refresh with invalid_grant.
+            # Reset credentials and re-run OAuth to recover.
+            gauth.credentials = None
+            gauth.LocalWebserverAuth()
 
     # Save for future runs
     try:
@@ -229,7 +317,7 @@ def sync_drive_to_parquet(
     """
     Sync Google Drive logs to local Parquet cache.
     - Skips historical logs that already exist.
-    - Overwrites today's logs to capture new events.
+    - Overwrites newest available date logs to capture rolling updates.
     """
 
     # Import config here to avoid circular imports elsewhere
@@ -245,74 +333,86 @@ def sync_drive_to_parquet(
         except Exception:
             pass
 
-    # Authenticate with chosen mode
+    proxy_overrides = _disable_dead_loopback_proxies()
+    if proxy_overrides:
+        _log("Detected loopback proxy on port 9; bypassing proxy for Drive sync.")
+
     try:
-        drive = authenticate_drive_auto(
-            DRIVE_AUTH_MODE,
-            client_secret_path=client_secret_path,
-            oauth_credentials_file=DRIVE_CREDENTIALS_FILE,
-            service_account_file=SERVICE_ACCOUNT_FILE,
-        )
-    except Exception as e:
-        _log(f"❌ Drive authentication failed: {e}")
-        raise
-
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    files_processed = 0
-
-    # Recursive generator
-    def walk_folder(fid):
-        items = list_files_with_retry(drive, f"'{fid}' in parents and trashed=false")
-        for item in items:
-            if item.get("mimeType") == "application/vnd.google-apps.folder":
-                yield from walk_folder(item["id"])
-            else:
-                yield item
-
-    for f in walk_folder(folder_id):
-        name = f["title"]
-
-        # Filter: Only .log files, ignore summaries
-        if not name.endswith(".log") or "conn-summary" in name:
-            continue
-
-        log_type = name.replace(".log", "")
-
-        # Determine partition date
+        # Authenticate with chosen mode
         try:
-            mod_time = f["modifiedDate"]
-            dt_obj = datetime.strptime(mod_time.split(".")[0], "%Y-%m-%dT%H:%M:%S")
-            log_date = dt_obj.strftime("%Y-%m-%d")
-        except Exception:
-            log_date = today_str
-
-        target_path = parquet_root / log_date / f"{log_type}.parquet"
-
-        # Incremental logic
-        if target_path.exists():
-            # Skip old dates entirely
-            if log_date != today_str:
-                continue
-            # Rebuild today's log to capture latest
-            try:
-                os.remove(target_path)
-            except OSError:
-                pass
-
-        _log(f"📥 Ingesting: {log_date} / {name} ...")
-
-        try:
-            stream_zeek_log_to_parquet(drive, f, target_path)
-            files_processed += 1
+            drive = authenticate_drive_auto(
+                DRIVE_AUTH_MODE,
+                client_secret_path=client_secret_path,
+                oauth_credentials_file=DRIVE_CREDENTIALS_FILE,
+                service_account_file=SERVICE_ACCOUNT_FILE,
+            )
         except Exception as e:
-            _log(f"❌ Error on {name}: {e}")
+            _log(f"❌ Drive authentication failed: {e}")
+            raise
 
-    if files_processed > 0:
-        _log(f"✅ Sync Complete: {files_processed} new logs.")
-    else:
-        _log("⚡ Cache is up to date.")
+        default_date = datetime.now().strftime("%Y-%m-%d")
+        files_processed = 0
 
-    return files_processed
+        # Recursive generator
+        def walk_folder(fid: str, inherited_date_hint: Optional[str] = None):
+            items = list_files_with_retry(drive, f"'{fid}' in parents and trashed=false")
+            for item in items:
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    folder_date_hint = _extract_date_from_dirname(str(item.get("title", "")))
+                    next_hint = folder_date_hint or inherited_date_hint
+                    yield from walk_folder(item["id"], next_hint)
+                else:
+                    yield item, inherited_date_hint
+
+        log_candidates: List[Tuple[dict, str, str, str]] = []
+        for f, folder_date_hint in walk_folder(folder_id):
+            name = str(f.get("title", ""))
+
+            # Filter: Only .log files, ignore summaries
+            if not name.endswith(".log") or "conn-summary" in name:
+                continue
+
+            log_type = name.replace(".log", "")
+            log_date = _resolve_log_date(f, folder_date_hint, default_date)
+            log_candidates.append((f, name, log_type, log_date))
+
+        if not log_candidates:
+            _log("No Zeek .log files discovered in Drive.")
+            return 0
+
+        refresh_date = max(row[3] for row in log_candidates)
+        _log(f"Refreshing rolling date partition: {refresh_date}")
+
+        for f, name, log_type, log_date in log_candidates:
+            target_path = parquet_root / log_date / f"{log_type}.parquet"
+
+            # Incremental logic
+            if target_path.exists():
+                # Skip immutable historical dates; keep newest date hot.
+                if log_date != refresh_date:
+                    continue
+                # Rebuild newest date logs to capture latest events.
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    pass
+
+            _log(f"📥 Ingesting: {log_date} / {name} ...")
+
+            try:
+                stream_zeek_log_to_parquet(drive, f, target_path)
+                files_processed += 1
+            except Exception as e:
+                _log(f"❌ Error on {name}: {e}")
+
+        if files_processed > 0:
+            _log(f"✅ Sync Complete: {files_processed} new logs.")
+        else:
+            _log("⚡ Cache is up to date.")
+
+        return files_processed
+    finally:
+        _restore_env_vars(proxy_overrides)
 
 
 # =====================================================
