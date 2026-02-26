@@ -369,6 +369,7 @@ def _handle_google_oauth_callback() -> None:
         return
 
     st.session_state.auth_user = {
+        "name": user.name,
         "username": user.username,
         "role": user.role,
         "is_active": user.is_active,
@@ -403,6 +404,7 @@ def _restore_user_from_persistent_auth() -> None:
         return
 
     st.session_state.auth_user = {
+        "name": user.name,
         "username": user.username,
         "role": user.role,
         "is_active": user.is_active,
@@ -842,6 +844,7 @@ def require_authentication() -> None:
             st.error("Invalid e-mail or password.")
             st.stop()
         st.session_state.auth_user = {
+            "name": user.name,
             "username": user.username,
             "role": user.role,
             "is_active": user.is_active,

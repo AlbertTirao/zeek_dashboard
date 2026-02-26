@@ -1,3 +1,4 @@
+import html
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_option_menu import option_menu
@@ -55,19 +56,28 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
 
     # Profile info (best-effort from session)
     auth_user = st.session_state.get("auth_user") or st.session_state.get("user") or {}
-    profile_name = (
-        auth_user.get("username")
-        or auth_user.get("email")
-        or st.session_state.get("current_username")
-        or st.session_state.get("email")
-        or "User"
-    )
+    profile_name = str(
+        auth_user.get("name")
+        or st.session_state.get("current_name")
+        or ""
+    ).strip()
+    if not profile_name:
+        username_fallback = str(
+            auth_user.get("username")
+            or st.session_state.get("current_username")
+            or ""
+        ).strip()
+        profile_name = username_fallback.split("@", 1)[0] if "@" in username_fallback else username_fallback
+    if not profile_name:
+        profile_name = "User"
     profile_role = (
         auth_user.get("role")
         or st.session_state.get("current_role")
         or st.session_state.get("role")
         or "Admin"
     )
+    profile_name_safe = html.escape(str(profile_name))
+    profile_role_safe = html.escape(str(profile_role))
 
     sidebar_width_px = SIDEBAR_COLLAPSED_WIDTH_PX if collapsed else SIDEBAR_EXPANDED_WIDTH_PX
     sidebar_block_padding = "0.78rem 0.56rem 0.68rem 0.56rem"
@@ -324,8 +334,8 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
                 <div class="sb-profile">
                     <div class="sb-avatar"><div class="sb-initials">{_initials(str(profile_name))}</div></div>
                     <div>
-                        <div class="sb-name">{profile_name}</div>
-                        <div class="sb-role">{profile_role}</div>
+                        <div class="sb-name">{profile_name_safe}</div>
+                        <div class="sb-role">{profile_role_safe}</div>
                     </div>
                 </div>
                 <div class="sb-divider"></div>

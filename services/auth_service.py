@@ -31,6 +31,7 @@ SPECIAL_CHARACTER_SET = set(string.punctuation)
 
 @dataclass(frozen=True)
 class AuthUser:
+    name: str
     username: str
     role: str
     is_active: bool
@@ -63,6 +64,19 @@ def validate_username_policy(username: str) -> str:
     if not is_valid_gmail_email(clean_user):
         raise ValueError("E-mail must be a valid @gmail.com address.")
     return clean_user
+
+
+def normalize_display_name(name: str) -> str:
+    return " ".join(str(name or "").strip().split())
+
+
+def validate_display_name_policy(name: str) -> str:
+    clean_name = normalize_display_name(name)
+    if not clean_name:
+        raise ValueError("Name is required.")
+    if len(clean_name) > 100:
+        raise ValueError("Name must be 100 characters or fewer.")
+    return clean_name
 
 
 def validate_password_policy(password: str) -> None:
@@ -320,6 +334,7 @@ def authenticate_google_oauth_code(code: str, expected_email: Optional[str] = No
 
     _audit_login(email, True, "ok_google_oauth")
     return AuthUser(
+        name=normalize_display_name(str(row.get("name", "") or "")),
         username=str(row.get("username", email)),
         role=str(row.get("role", "staff")),
         is_active=bool(row.get("is_active", True)),
@@ -441,6 +456,7 @@ def seed_bootstrap_admin() -> None:
     now = datetime.now(timezone.utc)
     users.insert_one(
         {
+            "name": "Administrator",
             "username": clean_username,
             "password_hash": hash_password(password),
             "role": "admin",
@@ -513,6 +529,7 @@ def authenticate_user_password_only(username: str, password: str) -> Optional[Au
 
                 _audit_login(clean_user, True, "ok_migrated_legacy_username")
                 return AuthUser(
+                    name=normalize_display_name(str(legacy_row.get("name", "") or "")),
                     username=clean_user,
                     role=str(legacy_row.get("role", "staff")),
                     is_active=bool(legacy_row.get("is_active", True)),
@@ -536,6 +553,7 @@ def authenticate_user_password_only(username: str, password: str) -> Optional[Au
 
     _audit_login(clean_user, True, "ok")
     return AuthUser(
+        name=normalize_display_name(str(row.get("name", "") or "")),
         username=str(row.get("username", clean_user)),
         role=str(row.get("role", "staff")),
         is_active=bool(row.get("is_active", True)),
@@ -562,13 +580,15 @@ def get_active_user(username: str) -> Optional[AuthUser]:
         return None
 
     return AuthUser(
+        name=normalize_display_name(str(row.get("name", "") or "")),
         username=str(row.get("username", clean_user)),
         role=str(row.get("role", "staff")),
         is_active=bool(row.get("is_active", True)),
     )
 
 
-def create_user(username: str, password: str, role: str, created_by: str) -> None:
+def create_user(name: str, username: str, password: str, role: str, created_by: str) -> None:
+    clean_name = validate_display_name_policy(name)
     clean_user = validate_username_policy(username)
     clean_role = (role or "").strip().lower()
     if clean_role not in {"admin", "staff"}:
@@ -578,6 +598,7 @@ def create_user(username: str, password: str, role: str, created_by: str) -> Non
     try:
         _get_db()["app_users"].insert_one(
             {
+                "name": clean_name,
                 "username": clean_user,
                 "password_hash": hash_password(password),
                 "role": clean_role,
@@ -656,6 +677,7 @@ def list_users():
     for row in rows:
         users.append(
             {
+                "name": normalize_display_name(str(row.get("name", "") or "")),
                 "username": row.get("username", ""),
                 "role": row.get("role", ""),
                 "is_active": bool(row.get("is_active")),

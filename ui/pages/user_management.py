@@ -515,25 +515,28 @@ def render(current_username: str):
     )
 
     with st.form("create_user_form", clear_on_submit=True):
+        name = st.text_input("Name", placeholder="Full name")
         username = st.text_input("E-mail", placeholder="name@gmail.com")
         password = st.text_input(
             "Password",
             type="password",
             placeholder="At least 8 characters and 1 special character",
         )
-        st.caption("Only @gmail.com e-mail accounts are allowed.")
+        st.caption("Name is required. Only @gmail.com e-mail accounts are allowed.")
         role = st.selectbox("Role", options=["staff", "admin"], index=0)
         submit_create = st.form_submit_button("Create User", use_container_width=True)
 
     if submit_create:
         try:
             auth_service.create_user(
+                name=name,
                 username=username,
                 password=password,
                 role=role,
                 created_by=current_username,
             )
-            st.success(f"User '{username.strip().lower()}' created.")
+            created_name = " ".join(str(name or "").strip().split())
+            st.success(f"User '{created_name or username.strip().lower()}' created.")
             st.rerun()
         except Exception as e:
             st.error(str(e))
@@ -550,9 +553,11 @@ def render(current_username: str):
     if users:
         table_rows = []
         for row in users:
+            display_name = str(row.get("name", "") or "").strip()
             username = str(row.get("username", "")).strip().lower()
             table_rows.append(
                 {
+                    "Name": display_name,
                     "Username": username,
                     "Role": str(row.get("role", "staff")).strip().lower(),
                     "Created By": str(row.get("created_by", "") or ""),
@@ -562,7 +567,7 @@ def render(current_username: str):
             )
 
         df = pd.DataFrame(table_rows)
-        editor_df = _with_row_numbers(df[["Username", "Role", "Created By", "Created At", "Last Login"]].copy())
+        editor_df = _with_row_numbers(df[["Name", "Username", "Role", "Created By", "Created At", "Last Login"]].copy())
         editor_df["Action"] = "✎  🗑"
         editor_df["_ActionToken"] = ""
         # Fit the table to actual rows so empty visual rows are not shown.
@@ -578,7 +583,8 @@ def render(current_username: str):
             editable=False,
         )
         gb.configure_column("#", header_name="#", width=56, pinned="left", suppressMovable=True)
-        gb.configure_column("Username", minWidth=230, flex=1.5, editable=False, tooltipField="Username")
+        gb.configure_column("Name", minWidth=180, flex=1.2, editable=False, tooltipField="Name")
+        gb.configure_column("Username", minWidth=220, flex=1.4, editable=False, tooltipField="Username")
         gb.configure_column(
             "Role",
             width=110,
