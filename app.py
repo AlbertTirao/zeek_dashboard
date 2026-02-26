@@ -161,11 +161,8 @@ def _poll_background_sync():
         if not WARMUP_FLAG.exists():
             WARMUP_FLAG.touch()
 
-<<<<<<< Updated upstream
         # Important: pages use both st.cache_data and st.cache_resource.
         # Clear both so freshly-synced parquet is reflected immediately.
-=======
->>>>>>> Stashed changes
         st.cache_data.clear()
         st.cache_resource.clear()
         st.session_state["_parquet_sync_token"] = int(st.session_state.get("_parquet_sync_token", 0)) + 1
