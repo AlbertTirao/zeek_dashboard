@@ -475,7 +475,8 @@ def inject_shadow_sharing_css():
             border: 1px solid var(--panel-border);
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
-            min-height: 125px;
+            min-height: 115px;
+            height: 115px;
             display: flex;
             flex-direction: column;
             justify-content: space-between;
