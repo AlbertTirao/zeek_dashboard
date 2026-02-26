@@ -4131,8 +4131,8 @@ def inject_shadow_ai_css():
             border: 1px solid var(--panel-border);
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
-            min-height: 106px;
-            height: 106px;
+            min-height: 115px;
+            height: 115px;
             display: flex;
             flex-direction: column;
             justify-content: space-between;

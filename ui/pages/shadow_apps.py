@@ -464,6 +464,18 @@ def get_aggrid_theme_and_css():
             "color": "#EAF2FF",
             "border-right": "1px solid #20365A",
         },
+        ".ag-header-cell-menu-button, .ag-header-cell-filter-button": {
+            "opacity": "1 !important",
+            "visibility": "visible !important",
+            "display": "inline-flex !important",
+            "align-items": "center !important",
+            "justify-content": "center !important",
+            "color": "#FFFFFF !important",
+        },
+        ".ag-header-cell-menu-button .ag-icon, .ag-header-cell-filter-button .ag-icon, .ag-header-cell-menu-button .ag-icon-menu": {
+            "opacity": "1 !important",
+            "color": "#FFFFFF !important",
+        },
         ".ag-header-cell-label": {"font-weight": "700", "letter-spacing": "0.02em"},
         ".ag-cell": {"background-color": "#050B16", "color": "#EAEAEA", "border-color": "#13233D"},
         ".ag-row": {"background-color": "#050B16"},
@@ -471,6 +483,26 @@ def get_aggrid_theme_and_css():
         ".ag-row-even": {"background-color": "#050E1D"},
         ".ag-row-hover": {"background-color": "#0F203D"},
         ".ag-row-selected": {"background-color": "#1E3A5F"},
+        ".ag-menu, .ag-popup-child, .ag-filter, .ag-filter-body-wrapper, .ag-set-filter-list, .ag-virtual-list-viewport, .ag-rich-select-list": {
+            "background-color": "#071224 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2E4E7A !important",
+        },
+        ".ag-menu-option": {"background-color": "#071224 !important", "color": "#EAF2FF !important"},
+        ".ag-menu-option:hover, .ag-menu-option.ag-menu-option-active, .ag-set-filter-item:hover": {
+            "background-color": "#13305A !important",
+            "color": "#EAF2FF !important",
+        },
+        ".ag-menu .ag-input-field-input, .ag-filter-body input, .ag-mini-filter input, .ag-floating-filter-input": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #32517F !important",
+        },
+        ".ag-picker-field-wrapper, .ag-picker-field-display, .ag-select-list, .ag-list-item": {
+            "background-color": "#071224 !important",
+            "color": "#EAF2FF !important",
+            "border-color": "#2E4E7A !important",
+        },
         ".ag-floating-filter-body input": {
             "background-color": "#0A1730 !important",
             "color": "#EAEAEA !important",
@@ -544,6 +576,11 @@ def _apply_shadow_grid_filter_sort(grid_options: dict) -> dict:
     opts["ensureDomOrder"] = True
     opts["enableRtl"] = False
     opts["suppressColumnVirtualisation"] = True
+    opts.setdefault("pagination", True)
+    if opts.get("pagination"):
+        opts.setdefault("paginationAutoPageSize", False)
+        opts.setdefault("paginationPageSize", 25)
+        opts.setdefault("paginationPageSizeSelector", [25, 50, 100])
 
     autosize_js = JsCode(
         """
@@ -613,6 +650,8 @@ def inject_shadow_apps_css():
         [data-testid="stMetric"] {
             background: var(--panel-bg);
             border: 1px solid var(--panel-border);
+            min-height: 115px;
+            height: 115px;
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
         }
@@ -657,6 +696,46 @@ def inject_shadow_apps_css():
             display: none !important;
             width: 0 !important;
             height: 0 !important;
+        }
+
+        /* Keep AG Grid overlays dark (never white) and make menu dots always visible. */
+        .ag-theme-alpine .ag-root-wrapper,
+        .ag-theme-alpine-dark .ag-root-wrapper,
+        .ag-theme-alpine .ag-root-wrapper-body,
+        .ag-theme-alpine-dark .ag-root-wrapper-body,
+        .ag-theme-alpine .ag-center-cols-clipper,
+        .ag-theme-alpine-dark .ag-center-cols-clipper {
+            background: rgba(6, 17, 32, 0.95) !important;
+        }
+        .ag-theme-alpine .ag-menu,
+        .ag-theme-alpine-dark .ag-menu,
+        .ag-theme-alpine .ag-popup-child,
+        .ag-theme-alpine-dark .ag-popup-child,
+        .ag-theme-alpine .ag-filter,
+        .ag-theme-alpine-dark .ag-filter,
+        .ag-theme-alpine .ag-set-filter-list,
+        .ag-theme-alpine-dark .ag-set-filter-list,
+        .ag-theme-alpine .ag-virtual-list-viewport,
+        .ag-theme-alpine-dark .ag-virtual-list-viewport {
+            background: #071224 !important;
+            color: #EAF2FF !important;
+            border-color: #2E4E7A !important;
+        }
+        .ag-theme-alpine .ag-header-cell-menu-button,
+        .ag-theme-alpine-dark .ag-header-cell-menu-button,
+        .ag-theme-alpine .ag-header-cell-filter-button,
+        .ag-theme-alpine-dark .ag-header-cell-filter-button {
+            opacity: 1 !important;
+            visibility: visible !important;
+            display: inline-flex !important;
+            color: #FFFFFF !important;
+        }
+        .ag-theme-alpine .ag-header-cell-menu-button .ag-icon,
+        .ag-theme-alpine-dark .ag-header-cell-menu-button .ag-icon,
+        .ag-theme-alpine .ag-header-cell-filter-button .ag-icon,
+        .ag-theme-alpine-dark .ag-header-cell-filter-button .ag-icon {
+            opacity: 1 !important;
+            color: #FFFFFF !important;
         }
         </style>
         """,
