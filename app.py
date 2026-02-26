@@ -10,15 +10,13 @@ import streamlit as st
 # Use one global page layout so auth/logout cycles render consistently.
 st.set_page_config(page_title="Zeek Dashboard", layout="wide")
 
-# CHANGED: import PARQUET_DIR from config (single source of truth)
 from config.client import (
     CLIENT_SECRET_FILE,
     FOLDER_ID,
     AUTO_REFRESH_INTERVAL,
-    PARQUET_DIR,   # CHANGED (was local Path("data/parquet"))
+    PARQUET_DIR,
 )
 
-# CHANGED: import once
 from services.drive_services import sync_drive_to_parquet
 from services import auth_service
 
@@ -38,6 +36,45 @@ if not APP_LOGGER.handlers:
     APP_LOGGER.addHandler(_handler)
 APP_LOGGER.setLevel(logging.INFO)
 APP_LOGGER.propagate = False
+
+
+# =====================================================
+# Helpers
+# =====================================================
+
+def _clear_query_params():
+    """
+    Important: if your login uses ?auth=... in the URL, this MUST be cleared
+    on logout or require_authentication() may instantly log you back in.
+    """
+    try:
+        # Newer Streamlit
+        st.query_params.clear()
+    except Exception:
+        try:
+            # Older Streamlit
+            st.experimental_set_query_params()
+        except Exception:
+            pass
+
+
+def perform_logout():
+    """
+    Hard logout:
+      - clears persistent auth (cookie/file/etc.)
+      - clears URL query params (auth token)
+      - clears session_state
+      - reruns -> login page is shown by require_authentication()
+    """
+    clear_persistent_auth_session()
+    _clear_query_params()
+
+    preserve_keys = {"auth_schema_initialized"}
+    for key in list(st.session_state.keys()):
+        if key not in preserve_keys:
+            st.session_state.pop(key, None)
+
+    st.rerun()
 
 
 # =====================================================
@@ -68,13 +105,8 @@ if not auth_user:
 # One-time Zeek log → Parquet warm-up (DISK GUARDED)
 # =====================================================
 
-# CHANGED: ensure parquet root exists before warmup flag operations
 PARQUET_DIR.mkdir(parents=True, exist_ok=True)
-
-# CHANGED: warmup flag lives under the parquet root
 WARMUP_FLAG = PARQUET_DIR / ".WARMED"
-
-# NOTE: LOGS_DIR imported previously but unused in your code; removed to keep clean.
 
 
 # =====================================================
@@ -85,14 +117,12 @@ WARMUP_FLAG = PARQUET_DIR / ".WARMED"
 def _bg_executor():
     return ThreadPoolExecutor(max_workers=1)
 
-# CHANGED: per-session toast queue (avoids cross-session log mixing)
 def _sync_log_queue():
     if "sync_log_queue" not in st.session_state:
         st.session_state.sync_log_queue = queue.Queue()
     return st.session_state.sync_log_queue
 
 def _drain_sync_toasts(max_items: int = 4):
-    """Write queued Drive/Parquet messages to terminal logs."""
     q = _sync_log_queue()
     shown = 0
     while shown < max_items:
@@ -104,7 +134,6 @@ def _drain_sync_toasts(max_items: int = 4):
         shown += 1
 
 def _start_background_sync(reason: str):
-    """Schedule sync without blocking the dashboard render."""
     fut = st.session_state.get("sync_future")
     if fut is not None and not fut.done():
         return  # already running
@@ -112,18 +141,16 @@ def _start_background_sync(reason: str):
     st.session_state.sync_reason = reason
     st.session_state.sync_started_ts = time.time()
 
-    # CHANGED: call sync_drive_to_parquet exactly once; auth mode handled inside drive_services.py
     st.session_state.sync_future = _bg_executor().submit(
         sync_drive_to_parquet,
         client_secret_path=CLIENT_SECRET_FILE,
         folder_id=FOLDER_ID,
         parquet_root=PARQUET_DIR,
-        log_callback=_sync_log_queue().put,  # log → queue → terminal logs
+        log_callback=_sync_log_queue().put,
     )
     APP_LOGGER.info(f"🔄 Sync started: {reason}")
 
 def _poll_background_sync():
-    """When sync finishes, clear caches + mark warmup flag."""
     fut = st.session_state.get("sync_future")
     if fut is None or not fut.done():
         return
@@ -131,18 +158,18 @@ def _poll_background_sync():
     try:
         updated = fut.result()
 
-        # Mark warmup complete ONLY after a successful sync
         if not WARMUP_FLAG.exists():
             WARMUP_FLAG.touch()
 
+<<<<<<< Updated upstream
         # Important: pages use both st.cache_data and st.cache_resource.
         # Clear both so freshly-synced parquet is reflected immediately.
+=======
+>>>>>>> Stashed changes
         st.cache_data.clear()
         st.cache_resource.clear()
         st.session_state["_parquet_sync_token"] = int(st.session_state.get("_parquet_sync_token", 0)) + 1
         APP_LOGGER.info(f"✅ Sync finished ({updated} logs updated)")
-
-        # refresh UI immediately to reflect new parquet
         st.rerun()
 
     except Exception as e:
@@ -154,8 +181,6 @@ def _poll_background_sync():
 # =====================================================
 # Non-blocking warmup + polling
 # =====================================================
-
-# REMOVED: status_placeholder = st.empty() (unused)
 
 _drain_sync_toasts()
 _poll_background_sync()
@@ -177,12 +202,10 @@ else:
 
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
 
-# schedule auto-sync in background; do NOT block page render
 if "data_synced" not in st.session_state:
     _start_background_sync("auto session sync")
     st.session_state.data_synced = True
 
-# make default match render_current_page() routing
 if "initialized" not in st.session_state:
     st.session_state.current_page = "Device Inspection"
     st.session_state.initialized = True
@@ -218,117 +241,34 @@ else:
         "bell",
     ]
 
+# ✅ Logout in option_menu (last)
+if "Logout" not in menu_options:
+    menu_options.append("Logout")
+    menu_icons.append("box-arrow-right")
+
+# Prevent "Logout" from sticking as a page
+if st.session_state.get("current_page") == "Logout":
+    st.session_state.current_page = menu_options[0]
+
 if st.session_state.current_page not in menu_options:
     st.session_state.current_page = menu_options[0]
 
-# render sidebar ONCE and persist selection (fixes DuplicateElementId)
+# Render sidebar ONCE
 selected_page = render_sidebar(
     auto_refresh_interval=AUTO_REFRESH_INTERVAL,
     menu_options=menu_options,
     menu_icons=menu_icons,
 )
+
+# ✅ Logout action: go back to login page immediately
+if selected_page == "Logout":
+    perform_logout()
+
 st.session_state.current_page = selected_page
-
-with st.sidebar:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] .block-container {
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-
-        [data-testid="stSidebar"] .block-container > div {
-            min-height: 100%;
-            display: flex;
-            flex-direction: column;
-        }
-
-        [data-testid="stSidebar"] [data-testid="stVerticalBlock"]:has(.sidebar-account-marker) {
-            margin-top: auto;
-            padding-top: 1rem;
-            border-top: 1px solid #334255;
-        }
-
-        .sidebar-user-card {
-            margin-top: 0.8rem;
-            margin-bottom: 0.55rem;
-            padding: 0.65rem 0.75rem;
-            border: 1px solid #2f3f57;
-            border-radius: 12px;
-            background: linear-gradient(160deg, #1f2d3f 0%, #182233 100%);
-        }
-
-        .sidebar-user-label {
-            color: #90a2ba;
-            font-size: 0.69rem;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            margin-bottom: 0.25rem;
-        }
-
-        .sidebar-user-name {
-            color: #eef5ff;
-            font-size: 0.95rem;
-            font-weight: 700;
-            line-height: 1.2;
-        }
-
-        .sidebar-user-role {
-            color: #9ec8ff;
-            font-size: 0.78rem;
-            font-weight: 600;
-            margin-top: 0.15rem;
-        }
-
-        [data-testid="stSidebar"] .stButton {
-            margin-top: 0.35rem;
-        }
-
-        [data-testid="stSidebar"] .stButton > button {
-            border-radius: 14px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    account_actions = st.container()
-    with account_actions:
-        st.markdown("<div class='sidebar-account-marker'></div>", unsafe_allow_html=True)
-        st.markdown(
-            f"""
-            <div class="sidebar-user-card">
-                <div class="sidebar-user-label">Signed in</div>
-                <div class="sidebar-user-name">{auth_user["username"]}</div>
-                <div class="sidebar-user-role">{auth_user["role"].title()}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Logout", use_container_width=True):
-            clear_persistent_auth_session()
-            # Reset all transient UI/session state so the login page always
-            # renders with a clean layout after logout.
-            preserve_keys = {"auth_schema_initialized"}
-            for key in list(st.session_state.keys()):
-                if key not in preserve_keys:
-                    st.session_state.pop(key, None)
-            st.rerun()
-        # force refresh schedules background sync + keeps dashboard visible
-        if st.button("🔄 Force Refresh Data", use_container_width=True):
-            st.session_state.pop("data_synced", None)
-            _start_background_sync("manual refresh")
-            st.rerun()
 
 
 def render_current_page():
     page = st.session_state.current_page
-
-    # NOTE: Ensure your page modules (devices, tables, etc.)
-    # are updated to accept PARQUET_DIR (Path object)
-    # and use load_single_log() internally.
 
     if page == "Device Inspection":
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
@@ -355,7 +295,6 @@ def render_current_page():
         user_management.render(current_username=auth_user["username"])
 
 
-# Keep header vertical position consistent across pages.
 def inject_global_header_alignment_css():
     st.markdown(
         """
@@ -384,4 +323,3 @@ def inject_global_header_alignment_css():
 
 render_current_page()
 inject_global_header_alignment_css()
-
