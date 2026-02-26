@@ -624,6 +624,11 @@ def _discover_date_dirs(parquet_root_str: str) -> Dict[str, List[str]]:
     by_date: Dict[str, List[str]] = {}
 
     def _is_cache_like(name_l: str) -> bool:
+        # Mirror other pages: never treat cache/hidden folders as source date dirs.
+        if name_l.startswith("_"):
+            return True
+        if "cache" in name_l:
+            return True
         if name_l == CACHE_DIRNAME.lower():
             return True
         if name_l.startswith("_shadow_cache"):

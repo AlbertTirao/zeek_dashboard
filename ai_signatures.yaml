@@ -1,147 +1,161 @@
-﻿ai_signatures:
-  "OpenAI / ChatGPT":
-    [
-      'openai\.com',
-      'chatgpt\.com',
-      'api\.openai\.com',
-      'chat\.openai\.com',
-      'oaistatic\.com',
-      'oaiusercontent\.com',
-    ]
-
-  "Claude (Anthropic)":
-    ['anthropic\.com', 'claude\.ai', 'cdn\.anthropic\.com']
-
-  "Google Gemini / AI Studio":
-    [
-      'gemini\.google\.com',
-      'aistudio\.google\.com',
-      'generativelanguage\.googleapis\.com',
-      'ai\.google\.dev',
-    ]
-
-  "Grok (xAI)": ['x\.ai', 'grok\.x\.com', 'grok\.com']
-
-  "DeepSeek": ['deepseek\.com', 'api\.deepseek\.com']
-
-  "Perplexity": ['perplexity\.ai', 'pplx\.ai']
-
-  "Meta AI": ['meta\.ai', 'llama\.meta\.com']
-
-  "Pi (Inflection)": ['pi\.ai', 'inflection\.ai']
-
-  "YouChat": ['youchat\.com', 'you\.com']
-
-  "Character AI": ['character\.ai', 'c\.ai']
-
-  "Lumo (Proton)": ['lumo\.proton\.me']
-
-  "Microsoft Copilot":
-    [
-      'copilot\.microsoft\.com',
-      'copilot\.github\.com',
-      'githubcopilot\.com',
-      'edgeservices\.bing\.com',
-      'bing\.com/chat',
-    ]
-
-  "Notion AI": ['notion\.so/ai', 'api\.notion\.com/ai']
-
-  "Jasper AI": ['jasper\.ai']
-
-  "Writesonic": ['writesonic\.com']
-
-  "QuillBot": ['quillbot\.com']
-
-  "Grammarly / Superhuman AI": ['grammarly\.com', 'superhuman\.com']
-
-  "Zapier AI": ['zapier\.com/ai']
-
-  "Taskade": ['taskade\.com/ai']
-
-  "Surfer AI": ['surferseo\.com/ai', 'surfer\.com/ai']
-
-  "Elicit": ['app\.elicit\.com']
-
-  "Google Cloud AI / Vertex AI":
-    ['vertexai\.googleapis\.com', 'aiplatform\.googleapis\.com']
-
-  "Amazon SageMaker / AWS AI":
-    [
-      'sagemaker\.',
-      'bedrock-runtime\.',
-      'bedrock\.',
-      'comprehend\.',
-      'rekognition\.',
-    ]
-
-  "Azure AI Services":
-    [
-      'openai\.azure\.com',
-      'api\.cognitive\.microsoft\.com',
-      'cognitiveservices\.azure\.com',
-    ]
-
-  "IBM Watson": ['watson\.ibm\.com']
-
-  "DataRobot": ['datarobot\.com']
-
-  "H2O.ai / MLflow / Weights & Biases":
-    ['h2o\.ai', 'mlflow\.', 'wandb\.ai']
-
-  "Dialogflow / Wit.ai": ['dialogflow\.cloud\.google\.com', 'wit\.ai']
-
-  "MindsDB / Dify": ['mindsdb\.com', 'dify\.ai']
-
-  "DALL-E / Midjourney": ['dall-e', 'midjourney\.com']
-
-  "Runway ML": ['runwayml\.com']
-
-  "Descript": ['descript\.com']
-
-  "ElevenLabs": ['elevenlabs\.io']
-
-  "Canva AI": ['canva\.com/(?:ai|magic)']
-
-  "GitHub Copilot": ['githubcopilot\.com', 'copilot\.github\.com']
-
-  "Amazon CodeWhisperer": ['codewhisperer\.', 'qdeveloper\.', 'codewhisperer\.aws\.amazon\.com']
-
-  "Scholarcy": ['scholarcy\.com']
-
-  "NotebookLM": ['notebooklm\.google\.com']
-
-  "AISEO / Novelcrafter / Sudowrite": ['aiseo\.ai', 'novelcrafter\.com', 'sudowrite\.com']
-
-  "Moises / Brain.fm / Aiva": ['moises\.ai', 'brain\.fm', 'aiva\.ai']
-
-  "Siri / Apple Intelligence": ['siri\.apple\.com']
-
-  "Google Assistant": ['assistant\.google\.com']
-
-  "Alexa": ['alexa\.amazon\.com']
-
-  "Celia (Huawei)": ['celia\.huawei\.com']
-
-  "ChatGPT Connectors / Apps":
-    [
-      'photoshop\.adobe\.com',
-      'express\.adobe\.com',
-      'canva\.com/(?:ai|magic)',
-    ]
-
-  "Manus": ['manus\.im', 'manus\.ai']
-
-  "n8n": ['n8n\.io', 'n8n\.cloud']
-
-  "Ollama (Local/Cloud)":
-    ['ollama\.ai', 'localhost:11434', '127\.0\.0\.1:11434']
-
-  "LM Studio": ['lmstudio\.ai', 'localhost:1234']
-
-  "Generic AI API":
-    ['api\.[\w-]+\.ai', 'v1/chat/completions', 'v1/embeddings', 'v1/responses']
-
+ai_signatures:
+  OpenAI / ChatGPT:
+  - openai\.com
+  - chatgpt\.com
+  - api\.openai\.com
+  - chat\.openai\.com
+  - oaistatic\.com
+  - oaiusercontent\.com
+  Claude (Anthropic):
+  - anthropic\.com
+  - claude\.ai
+  - cdn\.anthropic\.com
+  - claudeusercontent\.com
+  Google Gemini / AI Studio:
+  - gemini\.google\.com
+  - aistudio\.google\.com
+  - generativelanguage\.googleapis\.com
+  - ai\.google\.dev
+  Grok (xAI):
+  - x\.ai
+  - grok\.x\.com
+  - grok\.com
+  - grokusercontent\.com
+  - grokipedia\.com
+  DeepSeek:
+  - deepseek\.com
+  - api\.deepseek\.com
+  Perplexity:
+  - perplexity\.ai
+  - pplx\.ai
+  Meta AI:
+  - meta\.ai
+  - llama\.meta\.com
+  Pi (Inflection):
+  - pi\.ai
+  - inflection\.ai
+  YouChat:
+  - youchat\.com
+  - you\.com
+  Character AI:
+  - character\.ai
+  - c\.ai
+  Lumo (Proton):
+  - lumo\.proton\.me
+  Microsoft Copilot:
+  - copilot\.microsoft\.com
+  - copilot\.github\.com
+  - githubcopilot\.com
+  - edgeservices\.bing\.com
+  - bing\.com/chat
+  Notion AI:
+  - notion\.so/ai
+  - api\.notion\.com/ai
+  Jasper AI:
+  - jasper\.ai
+  Writesonic:
+  - writesonic\.com
+  QuillBot:
+  - quillbot\.com
+  Grammarly / Superhuman AI:
+  - grammarly\.com
+  - superhuman\.com
+  Zapier AI:
+  - zapier\.com/ai
+  Taskade:
+  - taskade\.com/ai
+  Surfer AI:
+  - surferseo\.com/ai
+  - surfer\.com/ai
+  Elicit:
+  - app\.elicit\.com
+  Google Cloud AI / Vertex AI:
+  - vertexai\.googleapis\.com
+  - aiplatform\.googleapis\.com
+  Amazon SageMaker / AWS AI:
+  - sagemaker\.
+  - bedrock-runtime\.
+  - bedrock\.
+  - comprehend\.
+  - rekognition\.
+  Azure AI Services:
+  - openai\.azure\.com
+  - api\.cognitive\.microsoft\.com
+  - cognitiveservices\.azure\.com
+  IBM Watson:
+  - watson\.ibm\.com
+  DataRobot:
+  - datarobot\.com
+  H2O.ai / MLflow / Weights & Biases:
+  - h2o\.ai
+  - mlflow\.
+  - wandb\.ai
+  Dialogflow / Wit.ai:
+  - dialogflow\.cloud\.google\.com
+  - wit\.ai
+  MindsDB / Dify:
+  - mindsdb\.com
+  - dify\.ai
+  DALL-E / Midjourney:
+  - dall-e
+  - midjourney\.com
+  Runway ML:
+  - runwayml\.com
+  Descript:
+  - descript\.com
+  ElevenLabs:
+  - elevenlabs\.io
+  Canva AI:
+  - canva\.com/(?:ai|magic)
+  GitHub Copilot:
+  - githubcopilot\.com
+  - copilot\.github\.com
+  Amazon CodeWhisperer:
+  - codewhisperer\.
+  - qdeveloper\.
+  - codewhisperer\.aws\.amazon\.com
+  Scholarcy:
+  - scholarcy\.com
+  NotebookLM:
+  - notebooklm\.google\.com
+  AISEO / Novelcrafter / Sudowrite:
+  - aiseo\.ai
+  - novelcrafter\.com
+  - sudowrite\.com
+  Moises / Brain.fm / Aiva:
+  - moises\.ai
+  - brain\.fm
+  - aiva\.ai
+  Siri / Apple Intelligence:
+  - siri\.apple\.com
+  Google Assistant:
+  - assistant\.google\.com
+  Alexa:
+  - alexa\.amazon\.com
+  Celia (Huawei):
+  - celia\.huawei\.com
+  ChatGPT Connectors / Apps:
+  - photoshop\.adobe\.com
+  - express\.adobe\.com
+  - canva\.com/(?:ai|magic)
+  Manus:
+  - manus\.im
+  - manus\.ai
+  n8n:
+  - n8n\.io
+  - n8n\.cloud
+  Ollama (Local/Cloud):
+  - ollama\.ai
+  - localhost:11434
+  - 127\.0\.0\.1:11434
+  LM Studio:
+  - lmstudio\.ai
+  - localhost:1234
+  Generic AI API:
+  - api\.[\w-]+\.ai
+  - v1/chat/completions
+  - v1/embeddings
+  - v1/responses
 local_ai_ports:
   11434: Ollama
   1234: LM Studio
@@ -151,20 +165,17 @@ local_ai_ports:
   8080: Open WebUI
   3000: Local AI Web App
   5678: n8n
-
-authorized_providers: []
-
+authorized_providers:
+- OpenAI / ChatGPT
 generic_name_patterns:
-  - '\bgpt\b'
-  - '\bcopilot\b'
-  - '\bagent\b'
-  - '\bllm\b'
-  - '\bgenai\b'
-  - '\bai\b'
-  - 'openai|anthropic|gemini|perplexity|manus|deepseek|copilot'
-
+- \bgpt\b
+- \bcopilot\b
+- \bagent\b
+- \bllm\b
+- \bgenai\b
+- \bai\b
+- openai|anthropic|gemini|perplexity|manus|deepseek|copilot
 saas_allowlist_domains: []
-
 detection_settings:
   baseline_days: 30
   large_https_post_threshold_mb: 5
@@ -173,11 +184,10 @@ detection_settings:
   json_post_calls_per_hour: 20
   small_request_max_kb: 64
   smb_window_minutes: 5
-
 file_upload_extensions:
-  - csv
-  - xlsx
-  - xls
-  - pdf
-  - zip
-  - json
+- csv
+- xlsx
+- xls
+- pdf
+- zip
+- json

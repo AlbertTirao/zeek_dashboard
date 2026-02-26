@@ -6,6 +6,7 @@
 INVALID_DEST_STRINGS = {"", "unknown", "nan", "none", "(empty)", "*"}
 INVALID_DEST_SET = set(INVALID_DEST_STRINGS)
 # ui/pages/shadow_sharings.py
+import hashlib
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -21,8 +22,7 @@ try:
         _add_domain_to_whitelist,
         _remove_domain_from_whitelist,
         get_available_dates,
-        load_shadow_sharing_data,
-        load_shadow_sharing_incidents_data,
+        load_shadow_sharing_bundle,
         build_shadow_sharing_incidents,
         refresh_shadow_sharing_runtime_state,
     )
@@ -32,8 +32,7 @@ except ImportError:
         _add_domain_to_whitelist,
         _remove_domain_from_whitelist,
         get_available_dates,
-        load_shadow_sharing_data,
-        load_shadow_sharing_incidents_data,
+        load_shadow_sharing_bundle,
         build_shadow_sharing_incidents,
         refresh_shadow_sharing_runtime_state,
     )
@@ -50,6 +49,76 @@ CONFIDENCE_COLORS = {
     "PROBABLE": "#f59e0b",
     "WEAK": "#38bdf8",
 }
+
+
+def _shadow_sharing_policy_stamp() -> tuple:
+    project_root = Path(__file__).resolve().parents[2]
+    out: List[int] = []
+    for policy_name in ("whitelist_domains.yaml", "shadow_sharing_signatures.yaml"):
+        policy_path = project_root / policy_name
+        try:
+            out.append(int(policy_path.stat().st_mtime_ns))
+        except Exception:
+            out.append(0)
+    return tuple(out)
+
+
+def _grid_data_signature(df: pd.DataFrame) -> tuple:
+    if not isinstance(df, pd.DataFrame):
+        return ("invalid",)
+
+    n_rows = int(len(df))
+    cols = tuple(str(c) for c in df.columns)
+    if n_rows <= 0:
+        return (n_rows, cols, "empty")
+
+    sig_cols = [
+        c
+        for c in ["event_id", "incident_id", "uid", "ts", "destination", "domain", "mac", "id.orig_h", "bytes", "Allowed", "allowed"]
+        if c in df.columns
+    ]
+    if not sig_cols:
+        sig_cols = list(df.columns[: min(4, len(df.columns))])
+
+    sample = pd.concat([df.head(3), df.tail(3)], ignore_index=True)[sig_cols].copy()
+    for c in sig_cols:
+        sample[c] = sample[c].astype(str)
+    sample_blob = sample.to_csv(index=False)
+    digest = hashlib.sha1(sample_blob.encode("utf-8")).hexdigest()
+    return (n_rows, cols, digest)
+
+
+def _shadow_sharing_data_stamp(df: pd.DataFrame) -> tuple:
+    if df is None or df.empty:
+        return (0, "", "")
+    ts_raw = df.get("ts", pd.Series([], dtype="datetime64[ns]"))
+    ts = ts_raw if pd.api.types.is_datetime64_any_dtype(ts_raw) else pd.to_datetime(ts_raw, errors="coerce")
+    tmax = ts.max()
+    tmin = ts.min()
+    return (
+        int(len(df)),
+        str(tmax) if pd.notna(tmax) else "",
+        str(tmin) if pd.notna(tmin) else "",
+    )
+
+
+def _shadow_sharing_filter_cache_key(
+    selected_scope_key: str,
+    selected_sources: List[str],
+    selected_risk_levels: List[str],
+    min_bytes_mb: float,
+    search_q: str,
+    data_stamp: tuple,
+) -> tuple:
+    return (
+        str(selected_scope_key),
+        tuple(sorted([str(x) for x in (selected_sources or [])])),
+        tuple(sorted([str(x) for x in (selected_risk_levels or [])])),
+        float(min_bytes_mb or 0),
+        str(search_q or "").strip().lower(),
+        data_stamp,
+    )
+
 
 def _is_dark_theme() -> bool:
     try:
@@ -180,6 +249,7 @@ def render_shadow_aggrid(
     hide_scrollbar_buttons: bool = False,
 ):
     grid_options = gb.build()
+    row_count = int(len(df)) if isinstance(df, pd.DataFrame) else 0
     default_col_def = dict(grid_options.get("defaultColDef") or {})
     # Keep sorting available via column menu (three-dot menu).
     default_col_def["sortable"] = True
@@ -199,7 +269,8 @@ def render_shadow_aggrid(
     grid_options["enableCellTextSelection"] = True
     grid_options["ensureDomOrder"] = True
     grid_options["enableRtl"] = False
-    grid_options["suppressColumnVirtualisation"] = True
+    # Large grids render much faster with column virtualization enabled.
+    grid_options["suppressColumnVirtualisation"] = bool(row_count <= 2000)
     if force_scrollbars:
         grid_options["domLayout"] = "normal"
         grid_options["alwaysShowVerticalScroll"] = True
@@ -222,8 +293,13 @@ def render_shadow_aggrid(
         }
         """
     )
-    grid_options["onFirstDataRendered"] = autofit_js
-    grid_options["onGridSizeChanged"] = autofit_js
+    # Auto-size is expensive on large tables; keep it only for smaller grids.
+    if row_count <= 2000:
+        grid_options["onFirstDataRendered"] = autofit_js
+        grid_options["onGridSizeChanged"] = autofit_js
+    else:
+        grid_options.pop("onFirstDataRendered", None)
+        grid_options.pop("onGridSizeChanged", None)
 
     ag_theme, ag_css = get_aggrid_theme_and_css()
     table_css = dict(ag_css)
@@ -270,6 +346,10 @@ def render_shadow_aggrid(
 
     if wrap_shell:
         st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
+    data_sig = _grid_data_signature(df)
+    sig_key = f"_shadow_sharing_grid_sig::{key}"
+    reload_data = st.session_state.get(sig_key) != data_sig
+    st.session_state[sig_key] = data_sig
     grid_response = AgGrid(
         df,
         gridOptions=grid_options,
@@ -281,7 +361,7 @@ def render_shadow_aggrid(
         allow_unsafe_jscode=True,
         enable_enterprise_modules=True,
         fit_columns_on_grid_load=False,
-        reload_data=True,
+        reload_data=reload_data,
         key=key,
     )
     if wrap_shell:
@@ -1038,6 +1118,9 @@ def render_shadow_sharing(parquet_root: Path):
     st.session_state.setdefault("shadow_sharing_dialog_base_key", None)
     st.session_state.setdefault("shadow_sharing_dialog_incidents_df", None)
     st.session_state.setdefault("shadow_sharing_grid_nonce", 0)
+    st.session_state.setdefault("_shadow_sharing_scope_cache_key_v1", None)
+    st.session_state.setdefault("_shadow_sharing_scope_df_v1", None)
+    st.session_state.setdefault("_shadow_sharing_scope_incidents_v1", None)
 
     feedback = st.session_state.pop("shadow_sharing_whitelist_feedback", None)
     if isinstance(feedback, dict):
@@ -1052,7 +1135,28 @@ def render_shadow_sharing(parquet_root: Path):
 
     # Date scope
     target_dates = [selected_date] if selected_date else []
-    df = load_shadow_sharing_data(parquet_root, target_dates)
+    policy_stamp = _shadow_sharing_policy_stamp()
+    sync_token = int(st.session_state.get("_parquet_sync_token", 0))
+    scope_cache_key = (
+        int(sync_token),
+        str(parquet_root.resolve()),
+        tuple(target_dates),
+        tuple(policy_stamp),
+    )
+
+    cached_key = st.session_state.get("_shadow_sharing_scope_cache_key_v1")
+    cached_df = st.session_state.get("_shadow_sharing_scope_df_v1")
+    cached_incidents = st.session_state.get("_shadow_sharing_scope_incidents_v1")
+    if cached_key == scope_cache_key and isinstance(cached_df, pd.DataFrame):
+        df = cached_df
+        incidents = cached_incidents if isinstance(cached_incidents, pd.DataFrame) else pd.DataFrame()
+    else:
+        df, incidents = load_shadow_sharing_bundle(parquet_root, target_dates)
+        st.session_state["_shadow_sharing_scope_cache_key_v1"] = scope_cache_key
+        st.session_state["_shadow_sharing_scope_df_v1"] = df
+        st.session_state["_shadow_sharing_scope_incidents_v1"] = incidents
+        st.session_state.pop("_shadow_sharing_filtered_cache_v1", None)
+        st.session_state.pop("_shadow_sharing_source_masks_cache_v1", None)
 
     if df.empty:
         st.info("No data detected for the selected timeframe.")
@@ -1061,7 +1165,6 @@ def render_shadow_sharing(parquet_root: Path):
     # -------------------------------------------------------------------------
     # Incident Rollup (Algorithms #2/#4/#5/#6)
     # -------------------------------------------------------------------------
-    incidents = load_shadow_sharing_incidents_data(parquet_root, target_dates)
     incidents = _filter_incidents_nonzero_outbound(incidents)
 
     st.markdown("### Shadow Sharing Incidents")
@@ -1129,11 +1232,23 @@ def render_shadow_sharing(parquet_root: Path):
             "files": files_mask,
         }
 
-    source_masks = _build_real_source_masks(df)
-    ordered_sources = ["conn", "http", "ssl", "dns", "files"]
-    source_options = [s for s in ordered_sources if bool(source_masks[s].any())]
-    if not source_options:
-        source_options = ordered_sources
+    source_data_stamp = _shadow_sharing_data_stamp(df)
+    source_mask_key = (str(selected_scope_key), source_data_stamp)
+    source_mask_cache = st.session_state.get("_shadow_sharing_source_masks_cache_v1", {})
+    if isinstance(source_mask_cache, dict) and source_mask_cache.get("key") == source_mask_key:
+        source_masks = source_mask_cache.get("masks", {})
+        source_options = source_mask_cache.get("options", [])
+    else:
+        source_masks = _build_real_source_masks(df)
+        ordered_sources = ["conn", "http", "ssl", "dns", "files"]
+        source_options = [s for s in ordered_sources if bool(source_masks.get(s, pd.Series([], dtype=bool)).any())]
+        if not source_options:
+            source_options = ordered_sources
+        st.session_state["_shadow_sharing_source_masks_cache_v1"] = {
+            "key": source_mask_key,
+            "masks": source_masks,
+            "options": source_options,
+        }
 
     search_q = st.text_input("Search (MAC, Host, IP, Destination, Basis)", placeholder="e.g., 192.168.1.14",)
 
@@ -1147,59 +1262,79 @@ def render_shadow_sharing(parquet_root: Path):
     with c3:
         selected_sources = st.multiselect("Source Logs", source_options, default=source_options)
 
-    # Apply filters
-    filtered = df.copy()
-
-    if selected_sources:
-        source_keep = pd.Series(False, index=filtered.index)
-        filtered_masks = _build_real_source_masks(filtered)
-        for src_name in selected_sources:
-            mask = filtered_masks.get(str(src_name).strip().lower())
-            if mask is not None:
-                source_keep = source_keep | mask
-        filtered = filtered[source_keep]
-
-    if selected_risk_levels:
-        filtered = filtered[filtered["Severity"].isin(selected_risk_levels)]
-
-    if min_bytes_mb > 0:
-        filtered = filtered[filtered["bytes"] >= float(min_bytes_mb) * 1024 * 1024]
-
-    if search_q:
-        q = search_q.lower().strip()
-        if q:
-            filtered = filtered[
-                filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                | filtered["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                | filtered["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                | filtered["Action_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                | filtered["Allow_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-            ]
-
-    # Hard filter: hide Unknown/placeholder destinations in tables and Top Dest computations
-    if "destination" in filtered.columns:
-        dest_norm = filtered["destination"].astype(str).str.strip().str.lower()
-        filtered = filtered[~dest_norm.isin(INVALID_DEST_SET)].copy()
-    filtered["bytes"] = pd.to_numeric(filtered["bytes"], errors="coerce").fillna(0)
-    filtered = filtered[filtered["bytes"] > 0].copy()
-
-    if "event_id" in filtered.columns:
-        filtered = filtered.drop_duplicates(subset=["event_id"], keep="last")
+    filter_cache_key = _shadow_sharing_filter_cache_key(
+        selected_scope_key=selected_scope_key,
+        selected_sources=selected_sources,
+        selected_risk_levels=selected_risk_levels,
+        min_bytes_mb=float(min_bytes_mb or 0),
+        search_q=search_q,
+        data_stamp=source_data_stamp,
+    )
+    filter_cache_state = st.session_state.get("_shadow_sharing_filtered_cache_v1", {})
+    if isinstance(filter_cache_state, dict) and filter_cache_state.get("key") == filter_cache_key:
+        filtered = filter_cache_state.get("filtered", pd.DataFrame())
+        filtered_incidents = filter_cache_state.get("filtered_incidents", pd.DataFrame())
+        dev_grid_cached = filter_cache_state.get("dev_grid", pd.DataFrame())
     else:
-        dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes"] if c in filtered.columns]
-        if dedupe_cols:
-            filtered = filtered.drop_duplicates(subset=dedupe_cols, keep="last")
+        # Apply filters
+        filtered = df.copy()
+
+        if selected_sources:
+            source_keep = pd.Series(False, index=filtered.index)
+            for src_name in selected_sources:
+                mask = source_masks.get(str(src_name).strip().lower())
+                if mask is not None:
+                    source_keep = source_keep | mask
+            filtered = filtered[source_keep]
+
+        if selected_risk_levels:
+            filtered = filtered[filtered["Severity"].isin(selected_risk_levels)]
+
+        if min_bytes_mb > 0:
+            filtered = filtered[filtered["bytes"] >= float(min_bytes_mb) * 1024 * 1024]
+
+        if search_q:
+            q = search_q.lower().strip()
+            if q:
+                filtered = filtered[
+                    filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    | filtered["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    | filtered["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    | filtered["Action_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    | filtered["Allow_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                ]
+
+        # Hard filter: hide Unknown/placeholder destinations in tables and Top Dest computations
+        if "destination" in filtered.columns:
+            dest_norm = filtered["destination"].astype(str).str.strip().str.lower()
+            filtered = filtered[~dest_norm.isin(INVALID_DEST_SET)].copy()
+        filtered["bytes"] = pd.to_numeric(filtered["bytes"], errors="coerce").fillna(0)
+        filtered = filtered[filtered["bytes"] > 0].copy()
+
+        if "event_id" in filtered.columns:
+            filtered = filtered.drop_duplicates(subset=["event_id"], keep="last")
         else:
-            filtered = filtered.drop_duplicates()
+            dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes"] if c in filtered.columns]
+            if dedupe_cols:
+                filtered = filtered.drop_duplicates(subset=dedupe_cols, keep="last")
+            else:
+                filtered = filtered.drop_duplicates()
+
+        filtered_incidents = build_shadow_sharing_incidents(filtered)
+        filtered_incidents = _filter_incidents_nonzero_outbound(filtered_incidents)
+        dev_grid_cached = _build_incident_grid_frame(filtered_incidents)
+        st.session_state["_shadow_sharing_filtered_cache_v1"] = {
+            "key": filter_cache_key,
+            "filtered": filtered,
+            "filtered_incidents": filtered_incidents,
+            "dev_grid": dev_grid_cached,
+        }
 
     if filtered.empty:
         st.warning("No rows above 0 MB match your filters.")
         return
-
-    filtered_incidents = build_shadow_sharing_incidents(filtered)
-    filtered_incidents = _filter_incidents_nonzero_outbound(filtered_incidents)
 
     # Metrics
     st.divider()
@@ -1377,7 +1512,7 @@ def render_shadow_sharing(parquet_root: Path):
         st.markdown("#### Shadow Sharing Incidents")
         st.caption("Rows mirror Shadow Sharing Incidents in this filtered scope. Click any MAC to open all matching rows for that MAC.")
 
-        dev_grid = _build_incident_grid_frame(filtered_incidents)
+        dev_grid = dev_grid_cached if isinstance(dev_grid_cached, pd.DataFrame) else _build_incident_grid_frame(filtered_incidents)
         if dev_grid.empty:
             st.info("No incident rows are available with the current filters.")
             st.session_state["shadow_sharing_last_selected_mac"] = None

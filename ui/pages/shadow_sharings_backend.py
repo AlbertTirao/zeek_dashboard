@@ -470,6 +470,7 @@ def refresh_shadow_sharing_runtime_state() -> None:
 
     for fn_name in [
         "_load_shadow_sharing_data_cached",
+        "_load_shadow_sharing_bundle_cached",
         "load_shadow_sharing_incidents_data",
     ]:
         try:
@@ -1930,14 +1931,18 @@ def _load_shadow_sharing_data_cached(
     return out.sort_values("ts", ascending=False)
 
 
-def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
-    parquet_root = Path(parquet_root).resolve()
-    dates_key = tuple(
+def _normalize_target_dates_key(target_dates: List[str]) -> Tuple[str, ...]:
+    return tuple(
         sorted(
             {str(d) for d in (target_dates or []) if d and DATE_DIR_RE.match(str(d))},
             reverse=True,
         )
     )
+
+
+def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
+    parquet_root = Path(parquet_root).resolve()
+    dates_key = _normalize_target_dates_key(target_dates)
     return _load_shadow_sharing_data_cached(
         str(parquet_root),
         dates_key,
@@ -1965,7 +1970,7 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
 
     df = events_df.copy()
     df = _ensure_ts_datetime(df)
-    log_src = df.get("log_source", "").astype(str).str.strip().str.lower()
+    log_src = df.get("log_source", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
     df = df[log_src.eq("flow")].copy()
     if df.empty:
         return pd.DataFrame()
@@ -1979,142 +1984,188 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         else:
             df = df.drop_duplicates()
 
-    mac = df.get("orig_l2_addr", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
-    ip = df.get("id.orig_h", pd.Series("", index=df.index)).astype(str).str.strip()
-    df["device_id"] = mac.where(mac.replace({"nan": "", "none": "", "-": ""}).ne(""), "ip:" + ip)
+    def _clean_text(col_name: str, *, lower: bool = False) -> pd.Series:
+        raw = df.get(col_name, pd.Series("", index=df.index))
+        s = raw.astype(str).str.strip()
+        if lower:
+            s = s.str.lower()
+        s = s.replace({"nan": "", "none": "", "None": "", "-": "", "(empty)": "", "unknown": ""})
+        return s.mask(s.eq(""), pd.NA)
 
-    df["domain"] = df.get("dest_domain", df.get("destination", "")).astype(str).str.strip().str.lower()
-    df.loc[df["domain"].isin(["", "nan", "none", "unknown", "-", "*"]), "domain"] = df.get("destination", "").astype(str).str.strip().str.lower()
+    def _coerce_bool_series(raw_series: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(raw_series):
+            return raw_series.fillna(False).astype(bool)
+        t = raw_series.astype(str).str.strip().str.lower()
+        return t.isin(["1", "true", "t", "yes", "y"])
 
-    if "source_types" not in df.columns:
-        src = pd.Series("conn", index=df.index, dtype="object")
+    mac = _clean_text("orig_l2_addr", lower=True).fillna("")
+    ip = _clean_text("id.orig_h").fillna("")
+    df["device_id"] = mac.where(mac.ne(""), "ip:" + ip)
 
-        http_mask = pd.Series(False, index=df.index)
-        for col in ["method", "uri", "user_agent", "content_type", "host"]:
-            if col in df.columns:
-                t = df[col].astype(str).str.strip().str.lower()
-                http_mask = http_mask | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
-        for col in ["request_body_len", "response_body_len"]:
-            if col in df.columns:
-                v = pd.to_numeric(df[col], errors="coerce").fillna(0)
-                http_mask = http_mask | (v > 0)
-        for col in ["http_any_upload", "http_any_share"]:
-            if col in df.columns:
-                b = df[col]
-                if pd.api.types.is_bool_dtype(b):
-                    http_mask = http_mask | b.fillna(False).astype(bool)
-                else:
-                    http_mask = http_mask | b.astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
-        src = src.where(~http_mask, src + ", http")
+    dom = _clean_text("dest_domain", lower=True)
+    dest_for_dom = _clean_text("destination", lower=True)
+    df["domain"] = dom.fillna(dest_for_dom).fillna("")
 
-        ssl_mask = pd.Series(False, index=df.index)
-        for col in ["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"]:
-            if col in df.columns:
-                t = df[col].astype(str).str.strip().str.lower()
-                ssl_mask = ssl_mask | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
-        src = src.where(~ssl_mask, src + ", ssl")
+    if "source_types" in df.columns:
+        src_text = df["source_types"].astype(str).str.lower()
+    else:
+        src_text = pd.Series("conn", index=df.index, dtype="object")
 
-        files_mask = pd.Series(False, index=df.index)
-        for col in ["file_total_bytes", "file_seen_bytes"]:
-            if col in df.columns:
-                v = pd.to_numeric(df[col], errors="coerce").fillna(0)
-                files_mask = files_mask | (v > 0)
-        for col in ["file_mime_types", "file_names", "file_sources"]:
-            if col in df.columns:
-                t = df[col].astype(str).str.strip().str.lower()
-                files_mask = files_mask | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
-        src = src.where(~files_mask, src + ", files")
+    def _has_text_columns(cols: List[str]) -> pd.Series:
+        m = pd.Series(False, index=df.index)
+        for c in cols:
+            if c in df.columns:
+                t = df[c].astype(str).str.strip().str.lower()
+                m = m | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
+        return m
 
-        df["source_types"] = src
+    df["_src_conn"] = True
+    src_http = src_text.str.contains(r"\bhttp\b", regex=True, na=False)
+    src_ssl = src_text.str.contains(r"\bssl\b", regex=True, na=False)
+    src_dns = src_text.str.contains(r"\bdns\b", regex=True, na=False)
+    src_files = src_text.str.contains(r"\bfiles\b", regex=True, na=False)
+
+    http_infer = _has_text_columns(["method", "uri", "user_agent", "content_type", "host"])
+    for c in ["request_body_len", "response_body_len"]:
+        if c in df.columns:
+            http_infer = http_infer | (pd.to_numeric(df[c], errors="coerce").fillna(0) > 0)
+    for c in ["http_any_upload", "http_any_share"]:
+        if c in df.columns:
+            http_infer = http_infer | _coerce_bool_series(pd.Series(df[c], index=df.index))
+
+    ssl_infer = _has_text_columns(["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"])
+
+    files_infer = pd.Series(False, index=df.index)
+    for c in ["file_total_bytes", "file_seen_bytes"]:
+        if c in df.columns:
+            files_infer = files_infer | (pd.to_numeric(df[c], errors="coerce").fillna(0) > 0)
+    files_infer = files_infer | _has_text_columns(["file_mime_types", "file_names", "file_sources"])
+
+    df["_src_http"] = src_http | http_infer
+    df["_src_ssl"] = src_ssl | ssl_infer
+    df["_src_dns"] = src_dns
+    df["_src_files"] = src_files | files_infer
 
     df["bytes_out"] = pd.to_numeric(df.get("bytes_out", 0), errors="coerce").fillna(0)
     df["bytes_in"] = pd.to_numeric(df.get("bytes_in", 0), errors="coerce").fillna(0)
     df["duration"] = pd.to_numeric(df.get("duration", 0), errors="coerce").fillna(0)
-
-    df["out_in_ratio"] = (df["bytes_out"] / df["bytes_in"].clip(lower=1)).replace([math.inf, -math.inf], 0).fillna(0)
     df["is_long"] = df["duration"] >= LONG_DURATION_SEC
     df["is_big_out"] = df["bytes_out"] >= BIG_OUT_BYTES
-
-    http_any_share = df.get("http_any_share", False)
-    df["http_share_evidence"] = pd.Series(http_any_share, index=df.index).fillna(False).astype(bool)
+    df["http_share_evidence"] = _coerce_bool_series(pd.Series(df.get("http_any_share", False), index=df.index))
+    df["sig_match_b"] = _coerce_bool_series(pd.Series(df.get("Signature_Match", False), index=df.index))
+    df["allowed_b"] = _coerce_bool_series(pd.Series(df.get("Allowed", False), index=df.index))
 
     df["day"] = df["ts"].dt.date
-    rep = df.groupby(["device_id", "domain"], dropna=False)["day"].nunique().reset_index().rename(columns={"day": "active_days"})
+    rep = (
+        df.groupby(["device_id", "domain"], dropna=False)["day"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"day": "active_days"})
+    )
     df = df.merge(rep, on=["device_id", "domain"], how="left")
 
     w = max(1, int(window_minutes))
     df["time_window"] = df["ts"].dt.floor(f"{w}min")
 
-    def _mode(series: pd.Series) -> str:
-        try:
-            return series.astype(str).value_counts().index[0] if len(series) else ""
-        except Exception:
-            return ""
+    # Clean text fields once, then use groupby.last (fast + stable).
+    text_map = {
+        "mac": _clean_text("orig_l2_addr", lower=True),
+        "orig_ip": _clean_text("id.orig_h"),
+        "destination": _clean_text("destination"),
+        "sig_service": _clean_text("Signature_Service"),
+        "allow_basis": _clean_text("Allow_Basis"),
+        "action": _clean_text("Action"),
+        "action_basis": _clean_text("Action_Basis"),
+        "category": _clean_text("Category"),
+        "method": _clean_text("method"),
+        "uri": _clean_text("uri"),
+        "user_agent": _clean_text("user_agent"),
+        "file_names": _clean_text("file_names"),
+        "file_mime_types": _clean_text("file_mime_types"),
+        "uid_clean": _clean_text("uid"),
+    }
+    for k, s in text_map.items():
+        df[f"__{k}"] = s
 
-    def _mode_nonempty(series: pd.Series) -> str:
-        try:
-            vals = (
-                series.astype(str)
-                .str.strip()
-                .replace({"nan": "", "none": "", "None": "", "-": "", "(empty)": ""})
-            )
-            vals = vals[vals != ""]
-            return vals.value_counts().index[0] if len(vals) else ""
-        except Exception:
-            return ""
+    group_keys = ["device_id", "domain", "time_window"]
+    gb = df.groupby(group_keys, dropna=False)
 
-    def _first_nonempty(series: pd.Series) -> str:
-        for raw in series.astype(str):
-            v = raw.strip()
-            if v and v.lower() not in {"nan", "none", "-", "(empty)"}:
-                return v
-        return ""
-
-    def _merge_source_types(series: pd.Series) -> str:
-        order = ["conn", "http", "ssl", "dns", "files"]
-        seen = set()
-        out: List[str] = []
-        for raw in series.astype(str):
-            parts = [p.strip().lower() for p in str(raw or "").split(",") if p.strip()]
-            for p in parts:
-                if p not in seen:
-                    seen.add(p)
-                    out.append(p)
-        if not out:
-            return "conn"
-        out_sorted = [p for p in order if p in seen]
-        out_sorted.extend([p for p in out if p not in set(order)])
-        return ", ".join(out_sorted)
-
-    gb = df.groupby(["device_id", "domain", "time_window"], dropna=False)
-    agg = gb.agg(
+    agg_num = gb.agg(
         first_ts=("ts", "min"),
         last_ts=("ts", "max"),
-        mac=("orig_l2_addr", _first_nonempty),
-        orig_ip=("id.orig_h", _first_nonempty),
-        destination=("destination", _mode_nonempty),
-        source_types=("source_types", _merge_source_types),
-        sig_match=("Signature_Match", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        sig_service=("Signature_Service", _mode_nonempty),
-        allowed=("Allowed", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        allow_basis=("Allow_Basis", _mode_nonempty),
         bytes_out_total=("bytes_out", "sum"),
         bytes_in_total=("bytes_in", "sum"),
-        conn_count=("uid", pd.Series.nunique),
         total_duration=("duration", "sum"),
-        http_share=("http_share_evidence", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        action=("Action", _mode_nonempty),
-        action_basis=("Action_Basis", _mode_nonempty),
-        category=("Category", _mode_nonempty),
-        method=("method", _mode_nonempty),
-        uri=("uri", _first_nonempty),
-        user_agent=("user_agent", _mode_nonempty),
-        file_names=("file_names", _first_nonempty),
-        file_mime_types=("file_mime_types", _mode_nonempty),
-        any_long=("is_long", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
-        any_big_out=("is_big_out", lambda s: bool(pd.Series(s).fillna(False).astype(bool).any())),
+        conn_count=("__uid_clean", "nunique"),
+        sig_match=("sig_match_b", "max"),
+        allowed=("allowed_b", "max"),
+        http_share=("http_share_evidence", "max"),
+        any_long=("is_long", "max"),
+        any_big_out=("is_big_out", "max"),
         active_days=("active_days", "max"),
+        src_conn=("_src_conn", "max"),
+        src_http=("_src_http", "max"),
+        src_ssl=("_src_ssl", "max"),
+        src_dns=("_src_dns", "max"),
+        src_files=("_src_files", "max"),
     ).reset_index()
+
+    # Fallback when uid is unavailable.
+    event_counts = gb.size().reset_index(name="event_count")
+    agg = agg_num.merge(event_counts, on=group_keys, how="left")
+    agg["conn_count"] = pd.to_numeric(agg.get("conn_count", 0), errors="coerce").fillna(0)
+    agg["event_count"] = pd.to_numeric(agg.get("event_count", 0), errors="coerce").fillna(0)
+    agg.loc[agg["conn_count"] <= 0, "conn_count"] = agg.loc[agg["conn_count"] <= 0, "event_count"]
+    agg["conn_count"] = agg["conn_count"].astype(int)
+    agg = agg.drop(columns=["event_count"], errors="ignore")
+
+    text_cols = [
+        "__mac",
+        "__orig_ip",
+        "__destination",
+        "__sig_service",
+        "__allow_basis",
+        "__action",
+        "__action_basis",
+        "__category",
+        "__method",
+        "__uri",
+        "__user_agent",
+        "__file_names",
+        "__file_mime_types",
+    ]
+    last_txt = gb[text_cols].last().reset_index()
+    agg = agg.merge(last_txt, on=group_keys, how="left")
+    agg = agg.rename(
+        columns={
+            "__mac": "mac",
+            "__orig_ip": "orig_ip",
+            "__destination": "destination",
+            "__sig_service": "sig_service",
+            "__allow_basis": "allow_basis",
+            "__action": "action",
+            "__action_basis": "action_basis",
+            "__category": "category",
+            "__method": "method",
+            "__uri": "uri",
+            "__user_agent": "user_agent",
+            "__file_names": "file_names",
+            "__file_mime_types": "file_mime_types",
+        }
+    )
+
+    src_cols = ["conn", "http", "ssl", "dns", "files"]
+    src_flags = ["src_conn", "src_http", "src_ssl", "src_dns", "src_files"]
+
+    def _compose_sources(row) -> str:
+        out: List[str] = []
+        for c_name, f_name in zip(src_cols, src_flags):
+            if bool(row.get(f_name, False)):
+                out.append(c_name)
+        return ", ".join(out) if out else "conn"
+
+    agg["source_types"] = agg.apply(_compose_sources, axis=1)
+    agg = agg.drop(columns=src_flags, errors="ignore")
 
     agg["bytes_out_total"] = pd.to_numeric(agg.get("bytes_out_total", 0), errors="coerce").fillna(0)
     agg["bytes_in_total"] = pd.to_numeric(agg.get("bytes_in_total", 0), errors="coerce").fillna(0)
@@ -2123,37 +2174,30 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         return pd.DataFrame()
 
     agg["out_in_ratio_total"] = (agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)).replace([math.inf, -math.inf], 0).fillna(0)
+    cond_sig = agg["sig_match"].fillna(False).astype(bool)
+    cond_not_allowed = ~agg["allowed"].fillna(False).astype(bool)
+    cond_upload = (agg["bytes_out_total"] >= BIG_OUT_BYTES) & (agg["out_in_ratio_total"] >= RATIO_HIGH)
+    cond_chunking = agg["conn_count"] >= CHUNK_CONN_COUNT
+    cond_share = agg["http_share"].fillna(False).astype(bool)
+    cond_repeat = (pd.to_numeric(agg.get("active_days", 0), errors="coerce").fillna(0) >= 2) & cond_not_allowed
 
-    scores: List[int] = []
-    reasons: List[str] = []
-    for _, r in agg.iterrows():
-        score = 0
-        why: List[str] = []
-        if bool(r.get("sig_match", False)):
-            score += 40
-            why.append("signature: known sharing service")
-        if not bool(r.get("allowed", False)):
-            score += 30
-            why.append("policy: not allowlisted")
-        if float(r.get("bytes_out_total", 0)) >= BIG_OUT_BYTES and float(r.get("out_in_ratio_total", 0)) >= RATIO_HIGH:
-            score += 30
-            why.append("upload: >=10MB and high out/in ratio")
-        if int(r.get("conn_count", 0) or 0) >= CHUNK_CONN_COUNT:
-            score += 15
-            why.append("chunking: many conns in window")
-        if bool(r.get("http_share", False)):
-            score += 40
-            why.append("sharing: HTTP share-link evidence")
-        if (int(r.get("active_days", 0) or 0) >= 2) and (not bool(r.get("allowed", False))):
-            score += 20
-            why.append("repeat: seen across >=2 days")
-        score = min(100, int(score))
-        scores.append(score)
-        reasons.append("; ".join(why))
-
-    agg["confidence_score"] = scores
+    agg["confidence_score"] = (
+        cond_sig.astype(int) * 40
+        + cond_not_allowed.astype(int) * 30
+        + cond_upload.astype(int) * 30
+        + cond_chunking.astype(int) * 15
+        + cond_share.astype(int) * 40
+        + cond_repeat.astype(int) * 20
+    ).clip(upper=100).astype(int)
     agg["confidence"] = agg["confidence_score"].apply(_confidence_label)
-    agg["confidence_reasons"] = reasons
+    reason_chunks: List[pd.Series] = []
+    reason_chunks.append(pd.Series("signature: known sharing service; ", index=agg.index).where(cond_sig, ""))
+    reason_chunks.append(pd.Series("policy: not allowlisted; ", index=agg.index).where(cond_not_allowed, ""))
+    reason_chunks.append(pd.Series("upload: >=10MB and high out/in ratio; ", index=agg.index).where(cond_upload, ""))
+    reason_chunks.append(pd.Series("chunking: many conns in window; ", index=agg.index).where(cond_chunking, ""))
+    reason_chunks.append(pd.Series("sharing: HTTP share-link evidence; ", index=agg.index).where(cond_share, ""))
+    reason_chunks.append(pd.Series("repeat: seen across >=2 days; ", index=agg.index).where(cond_repeat, ""))
+    agg["confidence_reasons"] = pd.concat(reason_chunks, axis=1).sum(axis=1).str.rstrip("; ").str.strip()
     agg["is_shadow_sharing"] = (agg["sig_match"] == True) & (agg["allowed"] == False) & (agg["confidence_score"] >= 50)  # noqa: E712
     agg["incident_id"] = agg["device_id"].astype(str) + "|" + agg["domain"].astype(str) + "|" + agg["time_window"].astype(str)
     agg["category"] = agg["category"].where(agg["category"].astype(str).str.strip() != "", "file_sharing")
@@ -2182,6 +2226,46 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     return out.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
 
 @st.cache_resource(show_spinner=False)
+def _load_shadow_sharing_bundle_cached(
+    parquet_root_str: str,
+    target_dates: Tuple[str, ...],
+    cache_version: str,
+    whitelist_mtime_ns: int,
+    signatures_mtime_ns: int,
+    incident_window_minutes: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # Keep these in the cache key for safe invalidation.
+    _ = cache_version
+    _ = whitelist_mtime_ns
+    _ = signatures_mtime_ns
+
+    events = _load_shadow_sharing_data_cached(
+        parquet_root_str,
+        target_dates,
+        cache_version,
+        whitelist_mtime_ns,
+        signatures_mtime_ns,
+    )
+    if events is None or events.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    incidents = build_shadow_sharing_incidents(events, max(1, int(incident_window_minutes or INCIDENT_WINDOW_MINUTES)))
+    return events, incidents
+
+
+def load_shadow_sharing_bundle(parquet_root: Path, target_dates: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    root = Path(parquet_root).resolve()
+    dates_key = _normalize_target_dates_key(target_dates)
+    return _load_shadow_sharing_bundle_cached(
+        str(root),
+        dates_key,
+        CACHE_VERSION,
+        int(WHITELIST_MTIME_NS),
+        int(SIGNATURES_MTIME_NS),
+        int(INCIDENT_WINDOW_MINUTES),
+    )
+
+
+@st.cache_resource(show_spinner=False)
 def load_shadow_sharing_incidents_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
-    df = load_shadow_sharing_data(parquet_root, target_dates)
-    return build_shadow_sharing_incidents(df, INCIDENT_WINDOW_MINUTES)
+    _, incidents = load_shadow_sharing_bundle(parquet_root, target_dates)
+    return incidents

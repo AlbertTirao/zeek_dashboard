@@ -139,6 +139,7 @@ def _poll_background_sync():
         # Clear both so freshly-synced parquet is reflected immediately.
         st.cache_data.clear()
         st.cache_resource.clear()
+        st.session_state["_parquet_sync_token"] = int(st.session_state.get("_parquet_sync_token", 0)) + 1
         APP_LOGGER.info(f"✅ Sync finished ({updated} logs updated)")
 
         # refresh UI immediately to reflect new parquet

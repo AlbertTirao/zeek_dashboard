@@ -19,7 +19,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # =============================================================================
 
 # Bump version so old cached parquet gets rebuilt automatically when ingestion logic changes.
-CACHE_VERSION = "shadow-cache-v13-unidentified-identity-normalization"
+CACHE_VERSION = "shadow-cache-v14-risk-engine-escalation"
 
 # -----------------------------
 # Config
@@ -44,6 +44,23 @@ RISK_OPTIONS = ["Critical", "High", "Medium", "Low", "Safe"]
 EXFIL_BYTES_SENT_THRESHOLD = 10_000_000
 HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD = 100_000_000
 PROTOCOL_ANOMALY_SOURCE_LOG = "WEIRD"
+UPLOAD_SPIKE_BYTES_SENT_THRESHOLD = 2_500_000
+UPLOAD_SPIKE_BYTES_RECEIVED_MAX = 250_000
+MULTI_SIGNAL_ESCALATION_MIN_INDICATORS = 2
+_UNIDENTIFIED_DEST_VALUES = {
+    "",
+    "unknown",
+    "unidentified_activity",
+    "-",
+    "*",
+    "nan",
+    "none",
+    "null",
+    "n/a",
+    "(empty)",
+    "[]",
+    "unresolved_destination",
+}
 
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
@@ -56,6 +73,8 @@ _DOMAIN_LOG_SOURCES = {"HTTP", "SSL", "DNS"}
 _DOMAIN_INFER_EXCLUDED_SOURCES = {"NOTICE"}
 _DOMAIN_INFER_IP_UNKNOWN = {"", "unknown", "0.0.0.0", "nan", "none", "null"}
 _DOMAIN_INFER_TOLERANCE_SECONDS = 2
+_APP_IDENTITY_INFER_TOLERANCE_SECONDS = 2
+_SHADOW_SHARINGS_EMPTY_REPLACEMENTS = {"nan": "", "None": "", "none": "", "*": ""}
 
 
 def normalize_mac(x) -> str:
@@ -93,6 +112,105 @@ def _fmt_mb_threshold(num_bytes: int) -> str:
 def normalize_source_log_value(value) -> str:
     s = "" if value is None else str(value).strip().upper()
     return s if s else "UNKNOWN"
+
+
+def _is_real_destination_series(values: pd.Series) -> pd.Series:
+    s = _normalize_destination_display_series(values)
+    low = s.str.lower().str.strip(".")
+    invalid = _UNIDENTIFIED_DEST_VALUES | {"unresolved_destination", "unknown host"}
+    strict_domain = low.apply(extract_domain_strict)
+    com_domain = strict_domain.str.endswith(".com")
+    return (
+        s.ne("")
+        & ~low.isin(invalid)
+        & ~s.str.match(_IPV4_RE, na=False)
+        & ~low.str.match(r"^port/\d+$", na=False)
+        & ~low.str.contains(r"\s|/|\\", regex=True)
+        & com_domain
+    )
+
+
+def _is_real_identifier_series(values: pd.Series) -> pd.Series:
+    s = _normalize_application_display_series(values)
+    low = s.str.lower()
+    invalid = _UNIDENTIFIED_DEST_VALUES | {"conn telemetry", "unmapped"}
+    com_domain = low.apply(_to_com_root_domain).ne("")
+    human_readable_app = (
+        low.str.match(r"^[a-z0-9][a-z0-9 ._:+()&-]{1,119}$", na=False)
+        & low.str.contains(r"[a-z]", na=False)
+        & ~low.str.contains(r"://|/|\\|\\?|#", regex=True)
+        & s.str.split().str.len().fillna(0).le(8)
+    )
+    return (
+        s.ne("")
+        & ~low.isin(invalid)
+        & ~low.str.match(_IPV4_RE, na=False)
+        & ~low.str.match(r"^conn port\s+\d+$", na=False)
+        & ~low.str.match(r"^port/\d+$", na=False)
+        & (com_domain | human_readable_app)
+    )
+
+
+def _format_duration_seconds(value) -> str:
+    try:
+        sec = float(value)
+    except Exception:
+        return "0s"
+    if pd.isna(sec) or sec < 0:
+        sec = 0.0
+    total = int(round(sec))
+    hours, rem = divmod(total, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {mins}m {secs}s"
+    if mins > 0:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _normalize_destination_display_series(values: pd.Series) -> pd.Series:
+    s = values.fillna("").astype(str).str.strip().replace(_SHADOW_SHARINGS_EMPTY_REPLACEMENTS)
+    s = s.str.strip().str.strip(".")
+    domain_norm = s.str.lower().apply(extract_domain_strict)
+    m_domain = domain_norm.ne("")
+    if m_domain.any():
+        s.loc[m_domain] = domain_norm.loc[m_domain]
+    return s
+
+
+def _to_com_root_domain(value) -> str:
+    d = extract_domain_strict(value)
+    if not d or not d.endswith(".com"):
+        return ""
+    parts = d.split(".")
+    if len(parts) < 2:
+        return d
+    return ".".join(parts[-2:])
+
+
+def _normalize_application_display_series(values: pd.Series, destination_values: pd.Series | None = None) -> pd.Series:
+    s = values.fillna("").astype(str).str.strip().replace(_SHADOW_SHARINGS_EMPTY_REPLACEMENTS)
+    s = s.str.strip().str.strip(".")
+
+    # For domain-like identifiers, mirror Shadow Sharings Domain style (root .com).
+    domain_norm = s.str.lower().apply(_to_com_root_domain)
+    m_domain = domain_norm.ne("")
+    if m_domain.any():
+        s.loc[m_domain] = domain_norm.loc[m_domain]
+
+    # When app/software is missing, derive root .com domain from destination.
+    if destination_values is not None:
+        dest_norm = _normalize_destination_display_series(destination_values).str.lower().apply(_to_com_root_domain)
+        m_empty = s.eq("")
+        if m_empty.any():
+            s.loc[m_empty] = dest_norm.loc[m_empty]
+    if destination_values is not None:
+        dest_domain = _normalize_destination_display_series(destination_values).str.lower().apply(_to_com_root_domain)
+        app_domain = s.str.lower().apply(_to_com_root_domain)
+        m_same_as_dest = app_domain.eq(dest_domain) & dest_domain.ne("")
+        if m_same_as_dest.any():
+            s.loc[m_same_as_dest] = dest_domain.loc[m_same_as_dest]
+    return s
 
 
 def _policy_section(policy: dict, level: str) -> dict:
@@ -152,6 +270,16 @@ def build_risk_policy_reference(policy: dict) -> pd.DataFrame:
         },
         {
             "Order": 3,
+            "Risk Level": "High",
+            "Rule Source": "Behavior",
+            "Trigger": (
+                "Asymmetric Upload Spike: Unauthorized traffic with bytes_sent > "
+                f"{UPLOAD_SPIKE_BYTES_SENT_THRESHOLD:,} ({_fmt_mb_threshold(UPLOAD_SPIKE_BYTES_SENT_THRESHOLD)}) and "
+                f"bytes_received <= {UPLOAD_SPIKE_BYTES_RECEIVED_MAX:,} ({_fmt_mb_threshold(UPLOAD_SPIKE_BYTES_RECEIVED_MAX)})."
+            ),
+        },
+        {
+            "Order": 4,
             "Risk Level": "Medium",
             "Rule Source": "Behavior",
             "Trigger": (
@@ -159,9 +287,15 @@ def build_risk_policy_reference(policy: dict) -> pd.DataFrame:
                 f"{HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD:,} ({_fmt_mb_threshold(HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD)})"
             ),
         },
+        {
+            "Order": 5,
+            "Risk Level": "Medium",
+            "Rule Source": "Heuristic",
+            "Trigger": "Unauthorized traffic with unresolved destination/domain context (unidentified_activity).",
+        },
     ]
 
-    order = 4
+    order = 6
     for lvl_key, lvl_name in (("critical", "Critical"), ("high", "High"), ("medium", "Medium")):
         logs = sorted(_policy_logs(policy, lvl_key))
         ports = sorted(_policy_ports(policy, lvl_key))
@@ -197,6 +331,19 @@ def build_risk_policy_reference(policy: dict) -> pd.DataFrame:
             }
         )
         order += 1
+
+    rows.append(
+        {
+            "Order": order,
+            "Risk Level": "Escalation",
+            "Rule Source": "Heuristic",
+            "Trigger": (
+                "Unauthorized events with >= "
+                f"{MULTI_SIGNAL_ESCALATION_MIN_INDICATORS} medium/high indicators are elevated by +1 risk level (max Critical)."
+            ),
+        }
+    )
+    order += 1
 
     default_raw = str(policy.get("default", "Safe")) if isinstance(policy, dict) and policy else "Safe"
     default_risk = score_to_risk(risk_score(default_raw))
@@ -411,10 +558,16 @@ def _apply_shadow_grid_filter_sort(grid_options: dict) -> dict:
                 try {
                     params.columnApi.autoSizeColumns(colIds, false);
                 } catch (e) {}
+                try {
+                    if (params.api && params.api.sizeColumnsToFit) {
+                        params.api.sizeColumnsToFit();
+                    }
+                } catch (e) {}
             }, 0);
         }
         """
     )
+    opts["autoSizeStrategy"] = {"type": "fitCellContents"}
     opts["onFirstDataRendered"] = autosize_js
     opts["onGridSizeChanged"] = autosize_js
     return opts
@@ -863,6 +1016,25 @@ def _asof_domain_match(
     return matched[["row_idx", "matched_domain"]]
 
 
+def _asof_identity_match(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    by_cols: list[str],
+    tolerance_seconds: int,
+) -> pd.DataFrame:
+    matched = _asof_grouped_match(
+        left_df=left_df,
+        right_df=right_df,
+        by_cols=by_cols,
+        right_value_cols=["app_identity"],
+        tolerance_seconds=tolerance_seconds,
+    )
+    if matched.empty:
+        return pd.DataFrame(columns=["row_idx", "matched_identity"])
+    matched["matched_identity"] = matched["app_identity"].fillna("").astype(str).str.strip()
+    return matched[["row_idx", "matched_identity"]]
+
+
 def infer_missing_domains(df: pd.DataFrame) -> pd.Series:
     """
     Infer missing domains for CONN/SOFTWARE/FILES rows using nearest domain-bearing
@@ -970,6 +1142,150 @@ def infer_missing_domains(df: pd.DataFrame) -> pd.Series:
             stage3_right,
             ["mac"],
             _DOMAIN_INFER_TOLERANCE_SECONDS,
+        )
+    )
+    return inferred
+
+
+def infer_missing_app_identities(df: pd.DataFrame) -> pd.Series:
+    """
+    Infer missing app identities (including WEIRD rows) from nearest events with
+    known identities on the same MAC/IP/port and close timestamp.
+    """
+    inferred = pd.Series("", index=df.index, dtype="object")
+    if df is None or df.empty:
+        return inferred
+
+    base = pd.DataFrame(index=df.index)
+    base["datetime"] = pd.to_datetime(df.get("datetime"), errors="coerce")
+    base["mac"] = df.get("mac", pd.Series("unknown", index=df.index)).fillna("unknown").astype(str).str.lower().str.strip()
+    base["ip"] = df.get("ip", pd.Series("Unknown", index=df.index)).fillna("Unknown").astype(str).str.strip()
+    base["dst_port"] = pd.to_numeric(
+        df.get("dst_port", pd.Series(0, index=df.index)),
+        errors="coerce",
+    ).fillna(0).astype("int64")
+    base["source_log"] = (
+        df.get("source_log", pd.Series("", index=df.index)).fillna("").astype(str).str.upper().str.strip()
+    )
+    base["app_identity"] = (
+        df.get("app_identity", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
+    )
+    base["app_identity_low"] = base["app_identity"].str.lower()
+
+    invalid_identity_values = _UNIDENTIFIED_DEST_VALUES | {"conn telemetry", "unmapped", "unknown host"}
+    known_identity_mask = (
+        base["datetime"].notna()
+        & base["app_identity"].ne("")
+        & ~base["app_identity_low"].isin(invalid_identity_values)
+        & ~base["app_identity_low"].str.match(r"^conn port\s+\d+$", na=False)
+        & ~base["app_identity_low"].str.match(r"^port/\d+$", na=False)
+    )
+    anchors = base.loc[known_identity_mask, ["datetime", "mac", "ip", "dst_port", "app_identity"]].copy()
+    if anchors.empty:
+        return inferred
+
+    missing_identity_mask = (
+        base["datetime"].notna()
+        & (
+            base["app_identity"].eq("")
+            | base["app_identity_low"].isin(invalid_identity_values)
+            | base["app_identity_low"].str.match(r"^conn port\s+\d+$", na=False)
+            | base["app_identity_low"].str.match(r"^port/\d+$", na=False)
+        )
+    )
+    if not missing_identity_mask.any():
+        return inferred
+
+    targets = base.loc[missing_identity_mask, ["datetime", "mac", "ip", "dst_port", "source_log"]].copy()
+    targets["row_idx"] = targets.index
+    unknown_ip_mask = targets["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN)
+
+    def apply_matches(matches_df: pd.DataFrame):
+        if matches_df.empty:
+            return
+        matched = matches_df.copy()
+        matched["matched_identity"] = matched["matched_identity"].fillna("").astype(str).str.strip()
+        matched = matched[matched["matched_identity"].ne("")]
+        if matched.empty:
+            return
+        inferred.loc[matched["row_idx"].tolist()] = matched["matched_identity"].tolist()
+
+    # Stage 1: strictest match on MAC + IP + port.
+    stage1_left = targets.loc[
+        targets["dst_port"].gt(0) & ~unknown_ip_mask,
+        ["row_idx", "datetime", "mac", "ip", "dst_port"],
+    ].copy()
+    stage1_right = anchors.loc[
+        anchors["dst_port"].gt(0) & ~anchors["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN),
+        ["datetime", "mac", "ip", "dst_port", "app_identity"],
+    ].copy()
+    apply_matches(
+        _asof_identity_match(
+            stage1_left,
+            stage1_right,
+            ["mac", "ip", "dst_port"],
+            _APP_IDENTITY_INFER_TOLERANCE_SECONDS,
+        )
+    )
+
+    pending = targets.loc[inferred.loc[targets["row_idx"]].eq("").values].copy()
+    if pending.empty:
+        return inferred
+    pending_unknown_ip = pending["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN)
+
+    # Stage 2: MAC + IP match.
+    stage2_left = pending.loc[
+        ~pending_unknown_ip,
+        ["row_idx", "datetime", "mac", "ip"],
+    ].copy()
+    stage2_right = anchors.loc[
+        ~anchors["ip"].str.lower().isin(_DOMAIN_INFER_IP_UNKNOWN),
+        ["datetime", "mac", "ip", "app_identity"],
+    ].copy()
+    apply_matches(
+        _asof_identity_match(
+            stage2_left,
+            stage2_right,
+            ["mac", "ip"],
+            _APP_IDENTITY_INFER_TOLERANCE_SECONDS,
+        )
+    )
+
+    pending = targets.loc[inferred.loc[targets["row_idx"]].eq("").values].copy()
+    if pending.empty:
+        return inferred
+
+    # Stage 3: MAC + port fallback when IP is noisy/missing.
+    stage3_left = pending.loc[
+        pending["dst_port"].gt(0),
+        ["row_idx", "datetime", "mac", "dst_port"],
+    ].copy()
+    stage3_right = anchors.loc[
+        anchors["dst_port"].gt(0),
+        ["datetime", "mac", "dst_port", "app_identity"],
+    ].copy()
+    apply_matches(
+        _asof_identity_match(
+            stage3_left,
+            stage3_right,
+            ["mac", "dst_port"],
+            _APP_IDENTITY_INFER_TOLERANCE_SECONDS,
+        )
+    )
+
+    pending = targets.loc[inferred.loc[targets["row_idx"]].eq("").values].copy()
+    if pending.empty:
+        return inferred
+
+    # Stage 4: last-resort MAC-level nearest event.
+    stage4_left = pending.loc[:, ["row_idx", "datetime", "mac"]].copy()
+    stage4_right = anchors.loc[:, ["datetime", "mac", "app_identity"]].copy()
+    apply_matches(
+        _asof_identity_match(
+            stage4_left,
+            stage4_right,
+            ["mac"],
+            _APP_IDENTITY_INFER_TOLERANCE_SECONDS,
         )
     )
     return inferred
@@ -1457,40 +1773,98 @@ def vectorized_behavior(df: pd.DataFrame) -> pd.Series:
     sent = pd.to_numeric(df["bytes_sent"], errors="coerce").fillna(0).astype("int64")
     recv = pd.to_numeric(df["bytes_received"], errors="coerce").fillna(0).astype("int64")
     slog = df["source_log"].astype(str).str.upper()
+    status_norm = (
+        df.get("App Status", pd.Series("", index=df.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    unauthorized = status_norm.eq("unauthorized")
     conds = [
         sent > EXFIL_BYTES_SENT_THRESHOLD,
-        recv > HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD,
         slog.eq(PROTOCOL_ANOMALY_SOURCE_LOG),
+        unauthorized & sent.gt(UPLOAD_SPIKE_BYTES_SENT_THRESHOLD) & recv.le(UPLOAD_SPIKE_BYTES_RECEIVED_MAX),
+        recv > HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD,
     ]
-    choices = ["Potential Exfiltration", "Heavy Download", "Protocol Anomaly"]
+    choices = ["Potential Exfiltration", "Protocol Anomaly", "Asymmetric Upload Spike", "Heavy Download"]
     return pd.Series(np.select(conds, choices, default="Standard Traffic"), index=df.index)
 
 
 def vectorized_risk(df: pd.DataFrame, policy: dict):
-    score = pd.Series(-1, index=df.index, dtype="int16")
-    basis = pd.Series("", index=df.index, dtype="object")
+    idx = df.index
+    score = pd.Series(-1, index=idx, dtype="int16")
+    basis = pd.Series("", index=idx, dtype="object")
+    strong_signal_hits = pd.Series(0, index=idx, dtype="int16")
 
     port = pd.to_numeric(df["dst_port"], errors="coerce").fillna(0).astype("int64")
     slog = df["source_log"].astype(str).str.upper()
     status = df["App Status"].astype(str)
+    status_norm = status.str.strip().str.lower()
     behavior = df["Behavior"].astype(str)
-
-    m = behavior.eq("Potential Exfiltration") & score.eq(-1)
-    score[m] = 4
-    basis[m] = (
-        "Critical: Potential Exfiltration because bytes_sent exceeded "
-        f"{EXFIL_BYTES_SENT_THRESHOLD:,} ({_fmt_mb_threshold(EXFIL_BYTES_SENT_THRESHOLD)})."
+    domain_clean = (
+        df.get("domain_clean", pd.Series("", index=idx))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
     )
 
-    m = behavior.eq("Protocol Anomaly") & score.eq(-1)
-    score[m] = 3
-    basis[m] = f"High: Protocol Anomaly detected from source_log={PROTOCOL_ANOMALY_SOURCE_LOG}."
+    unauthorized = status_norm.eq("unauthorized")
+    unresolved_destination = domain_clean.isin(_UNIDENTIFIED_DEST_VALUES) | domain_clean.str.match(_IPV4_RE, na=False)
 
-    m = behavior.eq("Heavy Download") & score.eq(-1)
-    score[m] = 2
-    basis[m] = (
-        "Medium: Heavy Download because bytes_received exceeded "
-        f"{HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD:,} ({_fmt_mb_threshold(HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD)})."
+    def apply_rule(mask: pd.Series, new_score: int, reason, *, strong_signal: bool = False):
+        m = mask.fillna(False)
+        if not m.any():
+            return
+        if strong_signal:
+            strong_signal_hits.loc[m] = strong_signal_hits.loc[m] + 1
+
+        promote = m & score.lt(int(new_score))
+        if not promote.any():
+            return
+
+        score.loc[promote] = int(new_score)
+        if isinstance(reason, pd.Series):
+            reason_series = reason.reindex(idx).fillna("").astype(str)
+            basis.loc[promote] = reason_series.loc[promote]
+        else:
+            basis.loc[promote] = str(reason)
+
+    apply_rule(
+        behavior.eq("Potential Exfiltration"),
+        4,
+        (
+            "Critical: Potential Exfiltration because bytes_sent exceeded "
+            f"{EXFIL_BYTES_SENT_THRESHOLD:,} ({_fmt_mb_threshold(EXFIL_BYTES_SENT_THRESHOLD)})."
+        ),
+        strong_signal=True,
+    )
+    apply_rule(
+        behavior.eq("Protocol Anomaly"),
+        3,
+        f"High: Protocol Anomaly detected from source_log={PROTOCOL_ANOMALY_SOURCE_LOG}.",
+        strong_signal=True,
+    )
+    apply_rule(
+        behavior.eq("Asymmetric Upload Spike"),
+        3,
+        (
+            "High: Unauthorized upload spike because bytes_sent exceeded "
+            f"{UPLOAD_SPIKE_BYTES_SENT_THRESHOLD:,} ({_fmt_mb_threshold(UPLOAD_SPIKE_BYTES_SENT_THRESHOLD)}) and "
+            f"bytes_received stayed at or below {UPLOAD_SPIKE_BYTES_RECEIVED_MAX:,} "
+            f"({_fmt_mb_threshold(UPLOAD_SPIKE_BYTES_RECEIVED_MAX)})."
+        ),
+        strong_signal=True,
+    )
+    apply_rule(
+        behavior.eq("Heavy Download"),
+        2,
+        (
+            "Medium: Heavy Download because bytes_received exceeded "
+            f"{HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD:,} ({_fmt_mb_threshold(HEAVY_DOWNLOAD_BYTES_RECEIVED_THRESHOLD)})."
+        ),
+        strong_signal=True,
     )
 
     crit_logs, crit_ports = _policy_logs(policy, "critical"), _policy_ports(policy, "critical")
@@ -1498,56 +1872,94 @@ def vectorized_risk(df: pd.DataFrame, policy: dict):
     med_logs, med_ports = _policy_logs(policy, "medium"), _policy_ports(policy, "medium")
 
     if crit_logs:
-        m = slog.isin(crit_logs) & score.eq(-1)
-        score[m] = 4
-        basis.loc[m] = (
-            "Critical: source_log matched risk_policy.critical.source_logs ("
-            + slog.loc[m].astype(str)
-            + ")."
+        apply_rule(
+            slog.isin(crit_logs),
+            4,
+            "Critical: source_log matched risk_policy.critical.source_logs (" + slog.astype(str) + ").",
+            strong_signal=True,
         )
     if crit_ports:
-        m = port.isin(crit_ports) & score.eq(-1)
-        score[m] = 4
-        basis.loc[m] = (
-            "Critical: destination port matched risk_policy.critical.ports ("
-            + port.loc[m].astype(str)
-            + ")."
+        apply_rule(
+            port.isin(crit_ports),
+            4,
+            "Critical: destination port matched risk_policy.critical.ports (" + port.astype(str) + ").",
+            strong_signal=True,
         )
 
     if high_logs:
-        m = slog.isin(high_logs) & score.eq(-1)
-        score[m] = 3
-        basis[m] = "High: source_log matched risk_policy.high.source_logs (" + slog[m] + ")."
+        apply_rule(
+            slog.isin(high_logs),
+            3,
+            "High: source_log matched risk_policy.high.source_logs (" + slog.astype(str) + ").",
+            strong_signal=True,
+        )
     if high_ports:
-        m = port.isin(high_ports) & score.eq(-1)
-        score[m] = 3
-        basis[m] = "High: destination port matched risk_policy.high.ports (" + port[m].astype(str) + ")."
+        apply_rule(
+            port.isin(high_ports),
+            3,
+            "High: destination port matched risk_policy.high.ports (" + port.astype(str) + ").",
+            strong_signal=True,
+        )
 
     if med_logs:
-        m = slog.isin(med_logs) & score.eq(-1)
-        score[m] = 2
-        basis[m] = "Medium: source_log matched risk_policy.medium.source_logs (" + slog[m] + ")."
+        apply_rule(
+            slog.isin(med_logs),
+            2,
+            "Medium: source_log matched risk_policy.medium.source_logs (" + slog.astype(str) + ").",
+            strong_signal=True,
+        )
     if med_ports:
-        m = port.isin(med_ports) & score.eq(-1)
-        score[m] = 2
-        basis[m] = "Medium: destination port matched risk_policy.medium.ports (" + port[m].astype(str) + ")."
+        apply_rule(
+            port.isin(med_ports),
+            2,
+            "Medium: destination port matched risk_policy.medium.ports (" + port.astype(str) + ").",
+            strong_signal=True,
+        )
+
+    apply_rule(
+        unauthorized & unresolved_destination,
+        2,
+        "Medium: Unauthorized traffic with unresolved destination/domain context (unidentified_activity).",
+        strong_signal=True,
+    )
 
     low_statuses = _policy_statuses(policy, "low")
     if low_statuses:
-        m = status.isin(low_statuses) & score.eq(-1)
-        score[m] = 1
-        basis[m] = "Low: App Status matched risk_policy.low.app_status (" + status[m].astype(str) + ")."
+        apply_rule(
+            status.isin(low_statuses),
+            1,
+            "Low: App Status matched risk_policy.low.app_status (" + status.astype(str) + ").",
+        )
 
     default_str = str(policy.get("default", "Safe")) if isinstance(policy, dict) and policy else "Safe"
     default_score = int(RISK_SCORE.get(default_str, 0))
     default_risk = score_to_risk(default_score)
-    m = score.eq(-1)
-    score[m] = default_score
-    basis[m] = (
-        f"{default_risk}: No higher-priority rule matched; fallback to risk_policy.default ('{default_str}')."
+    m_default = score.eq(-1)
+    score.loc[m_default] = default_score
+    basis.loc[m_default] = (
+        f"{default_risk}: No explicit risk signal matched; fallback to risk_policy.default ('{default_str}')."
         if policy
         else "Safe: No risk_policy.yaml loaded; fallback default applied."
     )
+
+    escalate_mask = (
+        unauthorized
+        & strong_signal_hits.ge(MULTI_SIGNAL_ESCALATION_MIN_INDICATORS)
+        & score.ge(2)
+        & score.lt(4)
+    )
+    if escalate_mask.any():
+        prev_labels = score.loc[escalate_mask].map(lambda s: SCORE_TO_RISK.get(int(s), "Safe")).astype(str)
+        score.loc[escalate_mask] = (score.loc[escalate_mask] + 1).clip(upper=4).astype("int16")
+        new_labels = score.loc[escalate_mask].map(lambda s: SCORE_TO_RISK.get(int(s), "Safe")).astype(str)
+        basis.loc[escalate_mask] = (
+            new_labels
+            + ": Escalated from "
+            + prev_labels
+            + " due to "
+            + strong_signal_hits.loc[escalate_mask].astype(str)
+            + " corroborating medium/high indicators on unauthorized traffic."
+        )
 
     risk_level = score.map(lambda s: SCORE_TO_RISK.get(int(s), "Safe")).astype(str)
     return risk_level, basis, score.astype("int16")
@@ -1634,11 +2046,16 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     ]
     df["app_identity"] = df["app_software"].fillna("").astype(str).str.strip()
     app_identifier_hint = df["app_identifier"].apply(normalize_identifier_hint)
-    m_identifier_identity = df["app_identity"].eq("") & app_identifier_hint.ne("")
+    m_hint_eligible_source = ~df["source_log"].astype(str).str.upper().eq("WEIRD")
+    m_identifier_identity = df["app_identity"].eq("") & app_identifier_hint.ne("") & m_hint_eligible_source
     if m_identifier_identity.any():
         df.loc[m_identifier_identity, "app_identity"] = app_identifier_hint.loc[m_identifier_identity].astype(str)
     m_domain_identity = df["app_identity"].eq("") & df["domain_clean"].ne("unidentified_activity")
     df.loc[m_domain_identity, "app_identity"] = df.loc[m_domain_identity, "domain_clean"].astype(str)
+    inferred_identities = infer_missing_app_identities(df)
+    m_inferred_identity = df["app_identity"].eq("") & inferred_identities.reindex(df.index).fillna("").ne("")
+    if m_inferred_identity.any():
+        df.loc[m_inferred_identity, "app_identity"] = inferred_identities.loc[m_inferred_identity].astype(str)
 
     # Keep unresolved CONN identities empty here; UI/query layers will render
     # unresolved entries as 'unidentified_activity' instead of synthetic labels.
@@ -1870,6 +2287,26 @@ def show_inventory_app_dialog(conn):
     with top[1]:
         st.caption(f"Application usage scope: {sel_app or '-'}")
 
+    # Make app-detail metrics a bit more compact for readability.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] [data-testid="stMetricLabel"] p {
+            font-size: 0.78rem !important;
+            line-height: 1.05 !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stMetricValue"] {
+            font-size: 1.38rem !important;
+            line-height: 1.08 !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stMetricDelta"] {
+            font-size: 0.72rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     if not target_mac or not sel_dest_lookup or not sel_app:
         st.warning("Missing application context. Please select an Application / Identifier row again.")
         return
@@ -1988,11 +2425,26 @@ def show_inventory_app_dialog(conn):
     if invalid_ts > 0:
         st.warning(f"{invalid_ts:,} events were excluded from trend charts due to invalid timestamps.")
 
-    app_metrics = st.columns(4)
+    valid_time = app_df["datetime"].dropna()
+    if not valid_time.empty:
+        first_seen_ts = valid_time.min()
+        last_seen_ts = valid_time.max()
+        duration_seconds = max(float((last_seen_ts - first_seen_ts).total_seconds()), 0.0)
+        first_seen_txt = first_seen_ts.strftime("%Y-%m-%d %H:%M:%S")
+        last_seen_txt = last_seen_ts.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        duration_seconds = 0.0
+        first_seen_txt = "-"
+        last_seen_txt = "-"
+
+    app_metrics = st.columns(5)
     app_metrics[0].metric("Events", f"{len(app_df):,}")
     app_metrics[1].metric("Unauthorized", f"{int((app_df['App Status'] == 'Unauthorized').sum()):,}")
     app_metrics[2].metric("Critical / High", f"{int(app_df['Risk Level'].isin(['Critical', 'High']).sum()):,}")
     app_metrics[3].metric("Distinct Source Logs", f"{int(app_df['source_log'].nunique(dropna=True)):,}")
+    app_metrics[4].metric("Duration", _format_duration_seconds(duration_seconds))
+    st.caption(f"First Seen: {first_seen_txt}")
+    st.caption(f"Last Seen: {last_seen_txt}")
 
     trend = app_df.dropna(subset=["datetime"]).copy()
     trend = trend.set_index("datetime").resample("1H").size().reset_index(name="events")
@@ -2203,7 +2655,8 @@ def show_forensics_dialog(conn):
         return
 
     forensic_total = int(len(forensic_df))
-    forensic_domains = int(forensic_df["domain_clean"].nunique(dropna=True))
+    forensic_domain_series = _normalize_destination_display_series(forensic_df["domain_clean"])
+    forensic_domains = int(forensic_domain_series[_is_real_destination_series(forensic_domain_series)].nunique(dropna=True))
     forensic_unauthorized = int((forensic_df["App Status"] == "Unauthorized").sum())
     forensic_critical_high = int(forensic_df["Risk Level"].isin(["Critical", "High"]).sum())
 
@@ -2296,14 +2749,12 @@ def show_forensics_dialog(conn):
         st.warning("No timeline events match the selected status/bucket filters.")
 
     st.markdown("#### Top Destinations")
+    top_dest_src = forensic_df.assign(
+        domain_clean=_normalize_destination_display_series(forensic_df["domain_clean"])
+    )
+    top_dest_src = top_dest_src[_is_real_destination_series(top_dest_src["domain_clean"])].copy()
     top_dest = (
-        forensic_df.assign(
-            domain_clean=forensic_df["domain_clean"]
-            .fillna("Unknown")
-            .astype(str)
-            .str.strip()
-            .replace("", "Unknown")
-        )
+        top_dest_src
         .groupby("domain_clean", as_index=False)
         .size()
         .rename(columns={"size": "Hits", "domain_clean": "Destination"})
@@ -2876,6 +3327,18 @@ def show_forensics_dialog(conn):
             inventory_df["application_or_identifier"].fillna("").astype(str).str.strip()
         )
         inventory_df["lookup_destination"] = inventory_df["destination"]
+        inventory_df["destination"] = (
+            inventory_df["destination"]
+            .str.replace("*", "", regex=False)
+            .str.strip()
+            .str.strip(".")
+        )
+        inventory_df["application_or_identifier"] = (
+            inventory_df["application_or_identifier"]
+            .str.replace("*", "", regex=False)
+            .str.strip()
+            .str.strip(".")
+        )
         m_conn_placeholder_display = (
             inventory_df["application_or_identifier"].str.match(r"(?i)^conn port\s+\d+$", na=False)
             | inventory_df["application_or_identifier"].str.lower().eq("conn telemetry")
@@ -2883,8 +3346,22 @@ def show_forensics_dialog(conn):
         if m_conn_placeholder_display.any():
             inventory_df.loc[m_conn_placeholder_display, "application_or_identifier"] = "unidentified_activity"
 
-        unknown_tokens = {"", "unidentified_activity", "unknown", "-"}
-        m_unknown_dest = inventory_df["destination"].str.lower().isin(unknown_tokens)
+        unknown_tokens = {
+            "",
+            "unidentified_activity",
+            "unknown",
+            "-",
+            "*",
+            "nan",
+            "none",
+            "null",
+            "n/a",
+            "(empty)",
+            "[]",
+            "unresolved_destination",
+        }
+        m_dest_is_ip = inventory_df["destination"].str.match(_IPV4_RE, na=False)
+        m_unknown_dest = inventory_df["destination"].str.lower().isin(unknown_tokens) | m_dest_is_ip
         m_unknown_app = inventory_df["application_or_identifier"].str.lower().isin(unknown_tokens)
 
         # If a real identifier exists but destination is unresolved, display that identifier as destination.
@@ -2894,7 +3371,8 @@ def show_forensics_dialog(conn):
                 inventory_df.loc[m_display_fallback, "application_or_identifier"]
             )
 
-        m_unknown_dest = inventory_df["destination"].str.lower().isin(unknown_tokens)
+        m_dest_is_ip = inventory_df["destination"].str.match(_IPV4_RE, na=False)
+        m_unknown_dest = inventory_df["destination"].str.lower().isin(unknown_tokens) | m_dest_is_ip
         m_unknown_app = inventory_df["application_or_identifier"].str.lower().isin(unknown_tokens)
         if m_unknown_dest.any():
             inventory_df.loc[m_unknown_dest, "destination"] = "unidentified_activity"
@@ -2995,6 +3473,34 @@ def show_forensics_dialog(conn):
                 ]
             )
 
+    if not inventory_df.empty:
+        raw_destination = inventory_df.get("destination", pd.Series("", index=inventory_df.index))
+        raw_application = inventory_df.get("application_or_identifier", pd.Series("", index=inventory_df.index))
+        inventory_df["destination"] = _normalize_destination_display_series(raw_destination)
+        inventory_df["application_or_identifier"] = _normalize_application_display_series(
+            raw_application,
+            inventory_df["destination"],
+        )
+        if "lookup_destination" not in inventory_df.columns:
+            inventory_df["lookup_destination"] = inventory_df["destination"]
+        inventory_df["lookup_destination"] = inventory_df["lookup_destination"].fillna("").astype(str).str.strip()
+
+        first_seen_ts = pd.to_datetime(
+            inventory_df.get("first_seen", pd.Series(pd.NaT, index=inventory_df.index)),
+            errors="coerce",
+        )
+        last_seen_ts = pd.to_datetime(
+            inventory_df.get("last_seen", pd.Series(pd.NaT, index=inventory_df.index)),
+            errors="coerce",
+        )
+        inventory_df["duration_sec"] = (
+            (last_seen_ts - first_seen_ts).dt.total_seconds().clip(lower=0).fillna(0).round(1)
+        )
+
+        real_dest_mask = _is_real_destination_series(inventory_df["destination"])
+        real_identifier_mask = _is_real_identifier_series(inventory_df["application_or_identifier"])
+        inventory_df = inventory_df[real_dest_mask & real_identifier_mask].copy()
+
     if inventory_df.empty:
         st.info("No valid application/software/domain identifiers were detected for this MAC with the current filters.")
     else:
@@ -3009,10 +3515,39 @@ def show_forensics_dialog(conn):
         inv_original_allowed = {
             str(k): _coerce_bool(v) for k, v in zip(inv_grid["_allow_key"].tolist(), inv_grid["Allowed"].tolist())
         }
-        inv_grid["first_seen"] = pd.to_datetime(inv_grid["first_seen"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-        inv_grid["last_seen"] = pd.to_datetime(inv_grid["last_seen"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        inv_grid["first_seen_ts"] = pd.to_datetime(inv_grid["first_seen"], errors="coerce")
+        inv_grid["last_seen_ts"] = pd.to_datetime(inv_grid["last_seen"], errors="coerce")
+        inv_grid["duration_sec"] = (
+            (inv_grid["last_seen_ts"] - inv_grid["first_seen_ts"]).dt.total_seconds().clip(lower=0).fillna(0).round(1)
+        )
+        inv_grid["duration"] = inv_grid["duration_sec"].apply(_format_duration_seconds)
+        inv_grid["first_seen"] = inv_grid["first_seen_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        inv_grid["last_seen"] = inv_grid["last_seen_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
         inv_grid["first_seen"] = inv_grid["first_seen"].fillna("")
         inv_grid["last_seen"] = inv_grid["last_seen"].fillna("")
+        preferred_col_order = [
+            "#",
+            "destination",
+            "application_or_identifier",
+            "Allowed",
+            "sources",
+            "identity_type",
+            "conn_ports",
+            "status",
+            "first_seen",
+            "last_seen",
+            "duration",
+            "hits",
+            "max_risk",
+            "lookup_destination",
+            "_allow_key",
+            "first_seen_ts",
+            "last_seen_ts",
+            "duration_sec",
+        ]
+        ordered_cols = [c for c in preferred_col_order if c in inv_grid.columns]
+        remaining_cols = [c for c in inv_grid.columns if c not in ordered_cols]
+        inv_grid = inv_grid[ordered_cols + remaining_cols].copy()
 
         inv_risk_style = JsCode(
             """
@@ -3081,22 +3616,29 @@ def show_forensics_dialog(conn):
         )
         gb_inv.configure_selection(selection_mode="single", use_checkbox=False)
         gb_inv.configure_column("#", header_name="#", width=52, pinned="left", suppressMovable=True)
-        gb_inv.configure_column(
-            "destination",
-            header_name="Destination",
-            minWidth=155,
-            flex=1.15,
-            tooltipField="destination",
-        )
+        gb_inv.configure_column("destination", header_name="Destination", minWidth=200, flex=1.2, suppressMovable=True)
         gb_inv.configure_column(
             "application_or_identifier",
-            header_name="Application / Identifier",
+            header_name="Application / Software / Domain",
             minWidth=185,
             flex=1.35,
             wrapText=True,
             autoHeight=True,
             tooltipField="application_or_identifier",
             cellStyle=inv_app_click_style,
+            suppressMovable=True,
+        )
+        gb_inv.configure_column(
+            "Allowed",
+            header_name="Allowed",
+            width=96,
+            editable=inv_allow_editable,
+            cellRenderer="agCheckboxCellRenderer",
+            cellEditor="agCheckboxCellEditor",
+            singleClickEdit=True,
+            filter=False,
+            sortable=False,
+            suppressMovable=True,
         )
         gb_inv.configure_column(
             "sources",
@@ -3109,22 +3651,15 @@ def show_forensics_dialog(conn):
         )
         gb_inv.configure_column("identity_type", header_name="Identifier Type", width=128)
         gb_inv.configure_column("conn_ports", header_name="Port(s)", width=108)
-        gb_inv.configure_column(
-            "Allowed",
-            header_name="Allowed",
-            width=96,
-            editable=inv_allow_editable,
-            cellRenderer="agCheckboxCellRenderer",
-            cellEditor="agCheckboxCellEditor",
-            singleClickEdit=True,
-            filter=False,
-            sortable=False,
-        )
         gb_inv.configure_column("status", header_name="Status", width=104, cellStyle=inv_status_style)
         gb_inv.configure_column("first_seen", header_name="First Seen", width=152)
         gb_inv.configure_column("last_seen", header_name="Last Seen", width=152)
+        gb_inv.configure_column("duration", header_name="Duration", width=118)
         gb_inv.configure_column("hits", header_name="Hits", width=72)
         gb_inv.configure_column("max_risk", header_name="Max Risk", width=94, cellStyle=inv_risk_style)
+        gb_inv.configure_column("first_seen_ts", hide=True)
+        gb_inv.configure_column("last_seen_ts", hide=True)
+        gb_inv.configure_column("duration_sec", hide=True)
         gb_inv.configure_column("lookup_destination", hide=True)
         gb_inv.configure_column("_allow_key", hide=True)
 
@@ -3137,6 +3672,8 @@ def show_forensics_dialog(conn):
         inv_grid_options["tooltipShowDelay"] = 0
         inv_grid_options["suppressRowClickSelection"] = True
         inv_grid_options["onCellClicked"] = inv_app_only_click_js
+        inv_grid_options["maintainColumnOrder"] = True
+        inv_grid_options["suppressMovableColumns"] = True
 
         inv_grid_response = AgGrid(
             inv_grid,
@@ -3148,22 +3685,25 @@ def show_forensics_dialog(conn):
             custom_css=ag_css,
             allow_unsafe_jscode=True,
             enable_enterprise_modules=True,
-            fit_columns_on_grid_load=True,
+            fit_columns_on_grid_load=False,
             reload_data=False,
             key=f"dlg_inventory_grid_{target_mac}_{int(st.session_state.get('shadow_inv_grid_nonce', 0))}",
         )
         st.caption(
-            f"{len(inv_grid):,} rows shown. Each row is a Destination + Application/Identifier for this MAC with current filters."
+            f"{len(inv_grid):,} rows shown. Each row is an application/software/domain identifier for this MAC with current filters."
         )
         st.caption(
-            "Rows are grouped by Destination + Application/Identifier. Sources are merged, First Seen/Last Seen/Hits "
-            "are aggregated, and Unauthorized/Max Risk show highest severity seen. A 'unidentified_activity' row may appear so "
-            "table Hits reconcile to Events. Click Application/Identifier for details or toggle Allowed on unauthorized "
-            "rows to start allowlisting."
+            "Rows are grouped by Destination + Application/Software/Domain. Sources, first/last seen, duration, and hits "
+            "are aggregated per MAC while Status and Max Risk keep the highest-severity state."
         )
+        st.caption("Only rows with real `.com` destinations and real application/software/domain identifiers are shown.")
         st.caption(
-            "Software/CONN rows may use inferred Destination from nearest non-software events for this MAC (\u00b12s). "
+            "Software/CONN rows may use inferred domain context from nearest non-software events for this MAC (\u00b12s). "
             "Port(s) inferred are labeled '(inferred)'."
+        )
+        st.caption(
+            "WEIRD and other logs without native application identity are matched to nearby events when possible; "
+            "rows with no real destination+application after inference are excluded from this table."
         )
 
         edited_inv = inv_grid_response.get("data", None)
@@ -3190,7 +3730,12 @@ def show_forensics_dialog(conn):
                 _open_inventory_allow_dialog(
                     {
                         "mac": target_mac,
-                        "destination": str(pick.get("destination", "")),
+                        "destination": str(
+                            pick.get("lookup_destination")
+                            or pick.get("destination")
+                            or pick.get("application_or_identifier")
+                            or ""
+                        ),
                         "application_or_identifier": str(pick.get("application_or_identifier", "")),
                     }
                 )
@@ -3210,7 +3755,12 @@ def show_forensics_dialog(conn):
             and not st.session_state.get("shadow_allow_dialog_open")
             and not st.session_state.get("shadow_app_detail_dialog_open")
         ):
-            sel_dest = str(selected_inv.get("destination", "") or "").strip()
+            sel_dest = str(
+                selected_inv.get("destination")
+                or selected_inv.get("lookup_destination")
+                or selected_inv.get("application_or_identifier")
+                or ""
+            ).strip()
             sel_dest_lookup = str(selected_inv.get("lookup_destination", sel_dest) or "").strip()
             sel_app = str(selected_inv.get("application_or_identifier", "") or "").strip()
             if sel_dest and sel_app and sel_app.lower() not in {"unmapped", "unidentified_activity"}:
@@ -3409,7 +3959,7 @@ def render_shadow_apps(parquet_root: Path):
 
         st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         search_query_audit = st.text_input(
-            "Search (MAC, Hostname, IP, Domain)",
+            "Search (MAC, Hostname, IP, Destination, App/Software)",
             placeholder="e.g., 192.168.1.14",
             key="audit_search",
         ).strip()
@@ -3561,6 +4111,17 @@ def render_shadow_apps(parquet_root: Path):
                         THEN trim(hp.pref_hostname)
                     ELSE 'unresolved_destination'
                 END AS domain_clean,
+                CASE
+                    WHEN r.app_identity IS NOT NULL
+                     AND trim(r.app_identity) <> ''
+                     AND lower(trim(r.app_identity)) NOT IN ('unknown', 'nan', 'none', 'null', 'n/a', '-', 'unidentified_activity')
+                     AND lower(trim(r.app_identity)) <> 'conn telemetry'
+                     AND lower(trim(r.app_identity)) NOT LIKE 'conn port %'
+                        THEN trim(r.app_identity)
+                    WHEN try_cast(r.dst_port AS INT) > 0
+                        THEN 'port/' || CAST(try_cast(r.dst_port AS INT) AS VARCHAR)
+                    ELSE 'unidentified_activity'
+                END AS application_or_identifier,
                 COALESCE(NULLIF(trim(r.mac), ''), 'unknown') AS mac,
                 CASE
                     WHEN r.hostname IS NOT NULL
@@ -3586,6 +4147,7 @@ def render_shadow_apps(parquet_root: Path):
         agg AS (
             SELECT
                 domain_clean,
+                application_or_identifier,
                 mac,
                 hostname,
                 ip,
@@ -3595,24 +4157,26 @@ def render_shadow_apps(parquet_root: Path):
                 COUNT(*) AS Hits,
                 MAX(_risk_score) AS Max_Risk_Score
             FROM base
-            GROUP BY 1,2,3,4,5
+            GROUP BY 1,2,3,4,5,6
         ),
         pick_basis AS (
             SELECT
                 domain_clean,
+                application_or_identifier,
                 mac,
                 hostname,
                 ip,
                 source_log,
                 COALESCE(NULLIF(trim(risk_basis), ''), 'No explicit reason captured') AS Max_Risk_Reason,
                 ROW_NUMBER() OVER (
-                    PARTITION BY domain_clean, mac, hostname, ip, source_log
+                    PARTITION BY domain_clean, application_or_identifier, mac, hostname, ip, source_log
                     ORDER BY _risk_score DESC, datetime DESC
                 ) AS rn
             FROM base
         )
         SELECT
             a.domain_clean,
+            a.application_or_identifier,
             a.mac,
             a.hostname,
             a.ip,
@@ -3631,6 +4195,7 @@ def render_shadow_apps(parquet_root: Path):
         FROM agg a
         LEFT JOIN (SELECT * FROM pick_basis WHERE rn = 1) b
             ON a.domain_clean IS NOT DISTINCT FROM b.domain_clean
+           AND a.application_or_identifier IS NOT DISTINCT FROM b.application_or_identifier
            AND a.mac IS NOT DISTINCT FROM b.mac
            AND a.hostname IS NOT DISTINCT FROM b.hostname
            AND a.ip IS NOT DISTINCT FROM b.ip
@@ -3640,6 +4205,30 @@ def render_shadow_apps(parquet_root: Path):
         """
 
         display_df = _sql_fetch_df(conn, audit_sql, params)
+        if not display_df.empty:
+            display_df["domain_clean"] = _normalize_destination_display_series(display_df["domain_clean"])
+            display_df["application_or_identifier"] = _normalize_application_display_series(
+                display_df["application_or_identifier"],
+                display_df["domain_clean"],
+            )
+            display_df["mac"] = display_df["mac"].fillna("").astype(str).str.strip().str.lower()
+            display_df["hostname"] = display_df["hostname"].fillna("").astype(str).str.strip()
+            display_df["First_Seen"] = pd.to_datetime(display_df["First_Seen"], errors="coerce")
+            display_df["Last_Seen"] = pd.to_datetime(display_df["Last_Seen"], errors="coerce")
+            display_df["Duration_sec"] = (
+                (display_df["Last_Seen"] - display_df["First_Seen"]).dt.total_seconds().clip(lower=0).fillna(0).round(1)
+            )
+            display_df["Duration"] = display_df["Duration_sec"].apply(_format_duration_seconds)
+
+            mac_unknowns = _MAC_UNKNOWNS | {"ff:ff:ff:ff:ff:ff"}
+
+            m_known_mac = ~display_df["mac"].str.lower().isin(mac_unknowns)
+            m_known_domain = _is_real_destination_series(display_df["domain_clean"])
+            m_known_identifier = _is_real_identifier_series(display_df["application_or_identifier"])
+
+            display_df = display_df[m_known_mac & m_known_domain & m_known_identifier].copy()
+            display_df["First_Seen"] = display_df["First_Seen"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+            display_df["Last_Seen"] = display_df["Last_Seen"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
 
         if not display_df.empty:
             # Add row index column for easier navigation.
@@ -3709,13 +4298,24 @@ def render_shadow_apps(parquet_root: Path):
             )
 
             # Optional: tighten these widths (feel more like a fixed enterprise table)
-            gb.configure_column("domain_clean", header_name="Domain", minWidth=220)
+            gb.configure_column("domain_clean", header_name="Destination", minWidth=220)
+            gb.configure_column(
+                "application_or_identifier",
+                header_name="Application / Software / Domain",
+                minWidth=220,
+                flex=1.25,
+                wrapText=True,
+                autoHeight=True,
+                tooltipField="application_or_identifier",
+            )
             gb.configure_column("hostname", header_name="Hostname", minWidth=160)
             gb.configure_column("ip", header_name="IP", minWidth=130)
             gb.configure_column("source_log", header_name="Source", width=110)
             gb.configure_column("Hits", header_name="Hits", width=90)
             gb.configure_column("First_Seen", header_name="First Seen", width=170)
             gb.configure_column("Last_Seen", header_name="Last Seen", width=170)
+            gb.configure_column("Duration", width=110)
+            gb.configure_column("Duration_sec", hide=True)
 
             grid_options = _apply_shadow_grid_filter_sort(gb.build())
             grid_options["rowSelection"] = "single"
@@ -3759,15 +4359,16 @@ def render_shadow_apps(parquet_root: Path):
                 custom_css=audit_ag_css,
                 allow_unsafe_jscode=True,
                 enable_enterprise_modules=True,
-                fit_columns_on_grid_load=True,
+                fit_columns_on_grid_load=False,
                 reload_data=False,
                 key=grid_key,
             )
             st.caption(
                 f"{len(df_grid):,} grouped rows shown. Rows are built by grouping filtered events on "
-                "Domain + MAC + Hostname + IP + Source, then computing First Seen, Last Seen, Hits, and "
-                "the max risk; groups are sorted by max risk score and hit count, and only the top 1,000 are displayed."
+                "Destination + Application + MAC + Hostname + IP + Source, then computing First Seen, Last Seen, Duration, "
+                "Hits, and max risk; groups are sorted by max risk score and hit count, and only the top 1,000 are displayed."
             )
+            st.caption("Table excludes unresolved placeholders and keeps only real `.com` destinations with real app identifiers.")
 
             # selection -> open dialog
             selected_rows = grid_response.get("selected_rows", None)
@@ -3795,7 +4396,7 @@ def render_shadow_apps(parquet_root: Path):
 
         with st.expander("How Risk Is Calculated", expanded=False):
             st.markdown(
-                "<div class='shadow-callout'>Rules are evaluated top-to-bottom per event. The first match sets the Risk Level.</div>",
+                "<div class='shadow-callout'>Risk uses highest-severity matching rules per event, plus multi-signal escalation for unauthorized traffic.</div>",
                 unsafe_allow_html=True,
             )
             ref_df = build_risk_policy_reference(risk_policy)

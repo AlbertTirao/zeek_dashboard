@@ -377,7 +377,7 @@ def render(parquet_root: Path):
     available_dates = get_available_dates(parquet_root)
     if not available_dates:
         st.warning(f"No parquet data found in `{parquet_root}`")
-        st.info("Try running 'Update Data from Drive' in the sidebar.")
+        st.info("Try running 'Force Refresh Data' in the sidebar.")
         return
 
     day_col, day_hint_col = st.columns([1.2, 2])
