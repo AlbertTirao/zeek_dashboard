@@ -46,6 +46,11 @@ SRC_DEFS = [
     ("conn", ["conn"]),
 ]
 KNOWN_HOSTS_KEYWORDS = ["known_hosts", "knownhost", "known-hosts"]
+ROLLING_TIME_WINDOWS_DAYS = {
+    "Last 7 Days": 7,
+    "Last 30 Days": 30,
+}
+ALERT_TIME_RANGE_OPTIONS = ["Last 7 Days", "Last 30 Days", "Specific Date"]
 
 
 # =============================================================================
@@ -1013,16 +1018,23 @@ def _load_cached_for_date_dirs_cached(
 # BUSINESS LOGIC
 # =============================================================================
 def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[str]) -> Tuple[pd.DataFrame, str]:
+    def _rolling_days(selected_mode: str) -> int:
+        return ROLLING_TIME_WINDOWS_DAYS.get(selected_mode, ROLLING_TIME_WINDOWS_DAYS["Last 7 Days"])
+
+    def _rolling_label(selected_mode: str, cutoff_ts: pd.Timestamp) -> str:
+        label = selected_mode if selected_mode in ROLLING_TIME_WINDOWS_DAYS else "Last 7 Days"
+        return f"{label} (since {cutoff_ts.strftime('%Y-%m-%d %H:%M')})"
+
     if events is None or events.empty:
         if mode == "Specific Date" and selected_date:
             return (
                 pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]),
                 f"Specific Date ({selected_date})",
             )
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=7)
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=_rolling_days(mode))
         return (
             pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]),
-            f"Last 7 Days (since {cutoff.strftime('%Y-%m-%d %H:%M')})",
+            _rolling_label(mode, cutoff),
         )
 
     tmp = events.copy()
@@ -1034,10 +1046,10 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
 
     tmp = tmp.dropna(subset=["ts_dt", "mac_norm"])
 
-    if mode == "Last 7 Days":
-        cutoff = now - pd.Timedelta(days=7)
+    if mode in ROLLING_TIME_WINDOWS_DAYS:
+        cutoff = now - pd.Timedelta(days=_rolling_days(mode))
         tmp = tmp[tmp["ts_dt"] >= cutoff]
-        return tmp, f"Last 7 Days (since {cutoff.strftime('%Y-%m-%d %H:%M')})"
+        return tmp, _rolling_label(mode, cutoff)
 
     if mode == "Specific Date" and selected_date:
         start_naive = datetime.strptime(selected_date, "%Y-%m-%d")
@@ -1053,7 +1065,7 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
     # No legacy removed mode: default to Last 7 Days semantics if an unexpected mode is passed.
     cutoff = now - pd.Timedelta(days=7)
     tmp = tmp[tmp["ts_dt"] >= cutoff]
-    return tmp, f"Last 7 Days (since {cutoff.strftime('%Y-%m-%d %H:%M')})"
+    return tmp, _rolling_label("Last 7 Days", cutoff)
 
 
 def build_known_maps(known_hosts_df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -1494,7 +1506,7 @@ def render(parquet_root: str, authorized_macs_file: str):
     st.session_state.setdefault("alerts_time_date", available_dates[0])
 
     # Ensure legacy saved values (e.g., a removed mode) do not break the UI after removing options.
-    if st.session_state.get("alerts_time_mode") not in ["Last 7 Days", "Specific Date"]:
+    if st.session_state.get("alerts_time_mode") not in ALERT_TIME_RANGE_OPTIONS:
         st.session_state["alerts_time_mode"] = "Last 7 Days"
 
     inject_alerts_page_css()
@@ -1519,9 +1531,9 @@ def render(parquet_root: str, authorized_macs_file: str):
     with tr_col1:
         time_mode = st.selectbox(
             "Time Range:",
-            ["Last 7 Days", "Specific Date"],
-            index=["Last 7 Days", "Specific Date"].index(st.session_state["alerts_time_mode"])
-            if st.session_state["alerts_time_mode"] in ["Last 7 Days", "Specific Date"]
+            ALERT_TIME_RANGE_OPTIONS,
+            index=ALERT_TIME_RANGE_OPTIONS.index(st.session_state["alerts_time_mode"])
+            if st.session_state["alerts_time_mode"] in ALERT_TIME_RANGE_OPTIONS
             else 0,
             key="alerts_time_mode",
         )
@@ -1577,7 +1589,8 @@ def render(parquet_root: str, authorized_macs_file: str):
         for p in by_date.get(selected_date, []):
             selected_date_dirs.append((selected_date, p))
     else:
-        cutoff_date = datetime.now().date() - timedelta(days=7)
+        rolling_days = ROLLING_TIME_WINDOWS_DAYS.get(time_mode, ROLLING_TIME_WINDOWS_DAYS["Last 7 Days"])
+        cutoff_date = datetime.now().date() - timedelta(days=rolling_days)
         for d in available_dates:
             try:
                 dd = datetime.strptime(d, "%Y-%m-%d").date()

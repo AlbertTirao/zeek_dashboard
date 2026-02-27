@@ -593,6 +593,7 @@ def create_user(name: str, username: str, password: str, role: str, created_by: 
     clean_role = (role or "").strip().lower()
     if clean_role not in {"admin", "staff"}:
         raise ValueError("Role must be admin or staff.")
+    clean_created_by = normalize_username(created_by) or "system"
 
     now = datetime.now(timezone.utc)
     try:
@@ -606,11 +607,13 @@ def create_user(name: str, username: str, password: str, role: str, created_by: 
                 "created_at": now,
                 "updated_at": now,
                 "last_login_at": None,
-                "created_by": (created_by or "").strip().lower(),
+                "created_by": clean_created_by,
             }
         )
     except DuplicateKeyError as exc:
         raise ValueError("Username already exists.") from exc
+    except PyMongoError as exc:
+        raise RuntimeError("Database error while creating user.") from exc
 
 
 def set_user_status(username: str, is_active: bool) -> None:

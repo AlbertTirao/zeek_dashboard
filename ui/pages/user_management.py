@@ -253,12 +253,34 @@ def _aggrid_payload_to_df(payload) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _users_signature(users: list[dict]) -> str:
+    parts = []
+    for row in users or []:
+        parts.append(
+            "|".join(
+                [
+                    str(row.get("username", "")).strip().lower(),
+                    str(row.get("name", "")).strip(),
+                    str(row.get("role", "")).strip().lower(),
+                    str(row.get("created_at", "")).strip(),
+                    str(row.get("last_login_at", "")).strip(),
+                ]
+            )
+        )
+    return "||".join(parts)
+
+
 def _user_table_aggrid_theme_and_css() -> tuple[str, dict]:
     custom_css = {
         ".ag-root-wrapper": {
             "background-color": "#061120",
             "color": "#EAF2FF",
             "border": "1px solid #2A466E",
+            "border-radius": "10px",
+            "overflow": "hidden",
+        },
+        ".ag-root, .ag-body, .ag-body-viewport, .ag-body-clipper, .ag-center-cols-clipper, .ag-center-cols-viewport, .ag-center-cols-container": {
+            "background-color": "#050B16",
         },
         ".ag-header": {
             "background-color": "#0A1730",
@@ -305,6 +327,25 @@ def _user_table_aggrid_theme_and_css() -> tuple[str, dict]:
         },
         ".ag-center-cols-viewport": {
             "overflow-x": "hidden !important",
+        },
+        ".ag-body-horizontal-scroll": {
+            "display": "none !important",
+            "height": "0 !important",
+            "min-height": "0 !important",
+            "max-height": "0 !important",
+            "overflow": "hidden !important",
+        },
+        ".ag-horizontal-left-spacer, .ag-horizontal-right-spacer": {
+            "display": "none !important",
+            "width": "0 !important",
+            "min-width": "0 !important",
+        },
+        ".ag-body-vertical-scroll": {
+            "display": "none !important",
+            "width": "0 !important",
+            "min-width": "0 !important",
+            "max-width": "0 !important",
+            "overflow": "hidden !important",
         },
     }
     return "alpine-dark", custom_css
@@ -364,6 +405,26 @@ _UM_ACTION_CLICK_JS = (
             } else if (params.setValue) {
                 params.setValue(token);
             }
+        }
+        """
+    )
+    if JsCode
+    else None
+)
+
+_UM_GRID_SIZE_CHANGED_JS = (
+    JsCode(
+        """
+        function(params) {
+            if (!params || !params.api || !params.columnApi) return;
+            const fit = () => {
+                try {
+                    params.api.sizeColumnsToFit();
+                } catch (e) {}
+            };
+            fit();
+            setTimeout(fit, 0);
+            setTimeout(fit, 60);
         }
         """
     )
@@ -491,6 +552,7 @@ def render(current_username: str):
         return
 
     users = auth_service.list_users()
+
     total_users = len(users)
     admin_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
     staff_count = sum(1 for u in users if str(u.get("role", "")).lower() == "staff")
@@ -521,29 +583,36 @@ def render(current_username: str):
     )
 
     with st.form("create_user_form", clear_on_submit=True):
-        name = st.text_input("Name", placeholder="Full name")
-        username = st.text_input("E-mail", placeholder="name@gmail.com")
+        name = st.text_input("Name", placeholder="Full name", key="um_create_name")
+        username = st.text_input("E-mail", placeholder="name@gmail.com", key="um_create_username")
         password = st.text_input(
             "Password",
             type="password",
             placeholder="At least 8 characters and 1 special character",
+            key="um_create_password",
         )
         st.caption("Name is required. Only @gmail.com e-mail accounts are allowed.")
-        role = st.selectbox("Role", options=["staff", "admin"], index=0)
-        submit_create = st.form_submit_button("Create User", use_container_width=True)
+        role_options = ["staff", "admin"]
+        current_role = str(st.session_state.get("um_create_role", "staff") or "staff").strip().lower()
+        role_index = role_options.index(current_role) if current_role in role_options else 0
+        role = st.selectbox("Role", options=role_options, index=role_index, key="um_create_role")
+        submit_create = st.form_submit_button("Create User", use_container_width=True, type="primary")
 
     if submit_create:
         try:
+            clean_name = auth_service.validate_display_name_policy(name)
+            clean_username = auth_service.validate_username_policy(username)
+            auth_service.validate_password_policy(password)
+            clean_role = str(role or "").strip().lower()
             auth_service.create_user(
-                name=name,
-                username=username,
+                name=clean_name,
+                username=clean_username,
                 password=password,
-                role=role,
+                role=clean_role,
                 created_by=current_username,
             )
-            created_name = " ".join(str(name or "").strip().split())
-            st.success(f"User '{created_name or username.strip().lower()}' created.")
-            st.rerun()
+            st.success(f"User '{clean_name or clean_username}' created.")
+            users = auth_service.list_users()
         except Exception as e:
             st.error(str(e))
 
@@ -557,6 +626,12 @@ def render(current_username: str):
     )
 
     if users:
+        current_users_signature = _users_signature(users)
+        if st.session_state.get("um_users_signature") != current_users_signature:
+            st.session_state["um_users_signature"] = current_users_signature
+            st.session_state["um_user_editor_version"] = int(st.session_state.get("um_user_editor_version", 0)) + 1
+        grid_component_key = f"um_user_editor_v7_{int(st.session_state.get('um_user_editor_version', 0))}"
+
         table_rows = []
         for row in users:
             display_name = str(row.get("name", "") or "").strip()
@@ -576,8 +651,6 @@ def render(current_username: str):
         editor_df = _with_row_numbers(df[["Name", "Username", "Role", "Created By", "Created At", "Last Login"]].copy())
         editor_df["Action"] = "✎  🗑"
         editor_df["_ActionToken"] = ""
-        # Fit the table to actual rows so empty visual rows are not shown.
-        table_height = min(520, max(170, 52 * (len(editor_df) + 1)))
 
         st.markdown("<div class='um-table-shell'>", unsafe_allow_html=True)
         gb = GridOptionsBuilder.from_dataframe(editor_df)
@@ -589,22 +662,22 @@ def render(current_username: str):
             editable=False,
         )
         gb.configure_column("#", header_name="#", width=56, pinned="left", suppressMovable=True)
-        gb.configure_column("Name", minWidth=180, flex=1.2, editable=False, tooltipField="Name")
-        gb.configure_column("Username", minWidth=220, flex=1.4, editable=False, tooltipField="Username")
+        gb.configure_column("Name", minWidth=140, flex=1.2, editable=False, tooltipField="Name")
+        gb.configure_column("Username", minWidth=170, flex=1.35, editable=False, tooltipField="Username")
         gb.configure_column(
             "Role",
-            width=110,
+            width=96,
             editable=True,
             cellEditor="agSelectCellEditor",
             cellEditorParams={"values": ["staff", "admin"]},
             singleClickEdit=True,
         )
-        gb.configure_column("Created By", minWidth=150, flex=1.05, editable=False, tooltipField="Created By")
-        gb.configure_column("Created At", minWidth=175, flex=1.1, editable=False, tooltipField="Created At")
-        gb.configure_column("Last Login", minWidth=175, flex=1.1, editable=False, tooltipField="Last Login")
+        gb.configure_column("Created By", minWidth=125, flex=1.0, editable=False, tooltipField="Created By")
+        gb.configure_column("Created At", minWidth=140, flex=1.0, editable=False, tooltipField="Created At")
+        gb.configure_column("Last Login", minWidth=140, flex=1.0, editable=False, tooltipField="Last Login")
         gb.configure_column(
             "Action",
-            width=128,
+            width=104,
             editable=False,
             sortable=False,
             filter=False,
@@ -623,7 +696,13 @@ def render(current_username: str):
         grid_options["ensureDomOrder"] = True
         grid_options["rowHeight"] = 54
         grid_options["headerHeight"] = 50
+        grid_options["suppressHorizontalScroll"] = True
+        grid_options["alwaysShowHorizontalScroll"] = False
+        grid_options["alwaysShowVerticalScroll"] = False
+        grid_options["domLayout"] = "autoHeight"
         grid_options["onCellClicked"] = _UM_ACTION_CLICK_JS
+        grid_options["onGridSizeChanged"] = _UM_GRID_SIZE_CHANGED_JS
+        grid_options["onFirstDataRendered"] = _UM_GRID_SIZE_CHANGED_JS
 
         ag_theme, ag_css = _user_table_aggrid_theme_and_css()
         grid_response = AgGrid(
@@ -632,19 +711,17 @@ def render(current_username: str):
             update_mode=GridUpdateMode.MODEL_CHANGED,
             data_return_mode=DataReturnMode.AS_INPUT,
             server_sync_strategy="server_wins",
-            height=table_height,
             theme=ag_theme,
             custom_css=ag_css,
+            reload_data=True,
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=True,
-            key="um_user_editor_v5",
+            key=grid_component_key,
         )
         edited_df = _aggrid_payload_to_df(grid_response.get("data", None))
         if edited_df.empty:
             edited_df = editor_df.copy()
         st.markdown("</div>", unsafe_allow_html=True)
-
-        st.caption("Tip: Use Action icons to edit/delete users. Update roles in the Role column, then click Save Changes.")
 
         for row in edited_df.to_dict("records"):
             raw_action = str(row.get("_ActionToken", "") or "").strip()
@@ -667,56 +744,58 @@ def render(current_username: str):
                 st.session_state["um_delete_target"] = action_user
             st.rerun()
 
-        if st.button("Save Changes", use_container_width=True, key="save_user_table_changes"):
-            try:
-                clean_df = edited_df.drop(columns=["#", "Action", "_ActionToken"], errors="ignore")
+        try:
+            clean_df = edited_df.drop(columns=["#", "Action", "_ActionToken"], errors="ignore")
 
-                updated_rows = {}
-                for row in clean_df.to_dict("records"):
-                    username = str(row.get("Username", "")).strip().lower()
-                    if not username:
-                        continue
+            updated_rows = {}
+            for row in clean_df.to_dict("records"):
+                username = str(row.get("Username", "")).strip().lower()
+                if not username:
+                    continue
 
-                    role_value = str(row.get("Role", "staff")).strip().lower()
-                    if role_value not in {"admin", "staff"}:
-                        raise ValueError(f"Invalid role for '{username}'.")
+                role_value = str(row.get("Role", "staff")).strip().lower()
+                if role_value not in {"admin", "staff"}:
+                    raise ValueError(f"Invalid role for '{username}'.")
 
-                    updated_rows[username] = {
-                        "role": role_value,
-                    }
-
-                before_map = {
-                    str(u.get("username", "")).strip().lower(): {
-                        "role": str(u.get("role", "staff")).strip().lower(),
-                    }
-                    for u in users
+                updated_rows[username] = {
+                    "role": role_value,
                 }
 
-                before_usernames = set(before_map.keys())
-                after_usernames = set(updated_rows.keys())
-                common_usernames = before_usernames & after_usernames
+            before_map = {
+                str(u.get("username", "")).strip().lower(): {
+                    "role": str(u.get("role", "staff")).strip().lower(),
+                }
+                for u in users
+            }
 
-                final_admin_count = 0
-                for username in after_usernames:
-                    role_value = updated_rows[username]["role"]
-                    if role_value == "admin":
-                        final_admin_count += 1
-                if final_admin_count == 0:
-                    raise ValueError("At least one admin account must remain.")
+            before_usernames = set(before_map.keys())
+            after_usernames = set(updated_rows.keys())
+            common_usernames = before_usernames & after_usernames
 
-                for username in sorted(common_usernames):
-                    before = before_map[username]
-                    after = updated_rows[username]
-                    if before["role"] != after["role"]:
-                        auth_service.update_user(
-                            username=username,
-                            role=after["role"],
-                        )
+            final_admin_count = 0
+            for username in after_usernames:
+                role_value = updated_rows[username]["role"]
+                if role_value == "admin":
+                    final_admin_count += 1
+            if final_admin_count == 0:
+                raise ValueError("At least one admin account must remain.")
 
-                st.success("User table updated successfully.")
+            role_changes = []
+            for username in sorted(common_usernames):
+                before = before_map[username]
+                after = updated_rows[username]
+                if before["role"] != after["role"]:
+                    role_changes.append((username, after["role"]))
+
+            if role_changes:
+                for username, new_role in role_changes:
+                    auth_service.update_user(
+                        username=username,
+                        role=new_role,
+                    )
                 st.rerun()
-            except Exception as e:
-                st.error(str(e))
+        except Exception as e:
+            st.error(str(e))
 
         delete_target = str(st.session_state.get("um_delete_target", "") or "").strip().lower()
         if delete_target:
