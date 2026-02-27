@@ -81,6 +81,7 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
 
     sidebar_width_px = SIDEBAR_COLLAPSED_WIDTH_PX if collapsed else SIDEBAR_EXPANDED_WIDTH_PX
     sidebar_block_padding = "0.78rem 0.56rem 0.68rem 0.56rem"
+    toggle_justify = "center" if collapsed else "flex-end"
     st.markdown(
         f"""
         <style>
@@ -111,16 +112,21 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
         }}
         .st-key-sb_toggle {{
             display: flex;
-            justify-content: flex-end;
+            justify-content: {toggle_justify};
             align-items: center;
             width: 100%;
             margin: 0 0 0.55rem 0;
             padding: 0;
         }}
         .st-key-sb_toggle > div,
-        .st-key-sb_toggle .stButton {{
-            width: auto !important;
-            margin-left: auto !important;
+        .st-key-sb_toggle .stButton,
+        .st-key-sb_toggle .st-key-sidebar_toggle_btn {{
+            width: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: {toggle_justify} !important;
         }}
         .st-key-sb_toggle .stButton > button,
         .st-key-sb_toggle button {{
@@ -136,10 +142,23 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             font-size: 18px !important;
             line-height: 1 !important;
             box-shadow: none !important;
-            display: inline-flex !important;
+            display: flex !important;
             align-items: center !important;
             justify-content: center !important;
             vertical-align: middle !important;
+        }}
+        .st-key-sb_toggle .stButton > button > div,
+        .st-key-sb_toggle .stButton > button > div > p,
+        .st-key-sb_toggle button > div,
+        .st-key-sb_toggle button > div > p {{
+            width: 100% !important;
+            height: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            line-height: 1 !important;
         }}
         .st-key-sb_toggle .stButton > button:hover,
         .st-key-sb_toggle button:hover {{
