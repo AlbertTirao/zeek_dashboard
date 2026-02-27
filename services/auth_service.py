@@ -624,6 +624,7 @@ def set_user_status(username: str, is_active: bool) -> None:
 def update_user(
     username: str,
     *,
+    name: Optional[str] = None,
     new_username: Optional[str] = None,
     role: Optional[str] = None,
     is_active: Optional[bool] = None,
@@ -634,6 +635,8 @@ def update_user(
         raise ValueError("E-mail is required.")
 
     updates = {}
+    if name is not None:
+        updates["name"] = validate_display_name_policy(name)
     if new_username is not None:
         clean_new_username = validate_username_policy(new_username)
         if clean_new_username != clean_user:

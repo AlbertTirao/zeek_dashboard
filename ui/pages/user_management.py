@@ -444,7 +444,10 @@ def _render_edit_user_dialog(
             st.rerun()
         return
 
+    current_name = str(user_map[target].get("name", "") or "").strip()
+
     with st.form("um_edit_user_modal_form", clear_on_submit=False):
+        new_name = st.text_input("Name", value=current_name, placeholder="Full name")
         new_username = st.text_input("E-mail", value=target, placeholder="name@gmail.com")
         new_password = st.text_input(
             "New Password",
@@ -456,15 +459,18 @@ def _render_edit_user_dialog(
 
     if submit:
         try:
+            clean_new_name = " ".join(str(new_name or "").strip().split())
             clean_new_username = (new_username or "").strip().lower()
             auth_service.update_user(
                 username=target,
+                name=clean_new_name,
                 new_username=clean_new_username,
                 password=(new_password.strip() if new_password.strip() else None),
             )
 
-            if target == current and clean_new_username != current:
+            if target == current:
                 if "auth_user" in st.session_state and isinstance(st.session_state["auth_user"], dict):
+                    st.session_state["auth_user"]["name"] = clean_new_name
                     st.session_state["auth_user"]["username"] = clean_new_username
 
             st.success("User updated successfully.")
