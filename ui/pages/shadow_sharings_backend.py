@@ -1227,7 +1227,7 @@ def _build_correlated_flows(
         rb = pd.to_numeric(c["resp_ip_bytes"], errors="coerce")
     c["bytes_out"] = ob.fillna(0)
     c["bytes_in"] = rb.fillna(0)
-    c["out_in_ratio"] = c["bytes_out"] / (c["bytes_in"].clip(lower=1))
+    c["out_in_ratio"] = (c["bytes_out"] / (c["bytes_in"].clip(lower=1))).round(3)
 
     # Focus on internal -> external. If orig_h isn't parseable, keep it.
     try:
@@ -2097,7 +2097,9 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     if agg.empty:
         return pd.DataFrame()
 
-    agg["out_in_ratio_total"] = (agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)).replace([math.inf, -math.inf], 0).fillna(0)
+    agg["out_in_ratio_total"] = (
+        agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)
+    ).replace([math.inf, -math.inf], 0).fillna(0).round(3)
     cond_sig = agg["sig_match"].fillna(False).astype(bool)
     cond_not_allowed = ~agg["allowed"].fillna(False).astype(bool)
     cond_upload = (agg["bytes_out_total"] >= BIG_OUT_BYTES) & (agg["out_in_ratio_total"] >= RATIO_HIGH)

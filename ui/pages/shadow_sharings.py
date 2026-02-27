@@ -6,6 +6,7 @@
 INVALID_DEST_STRINGS = {"", "unknown", "nan", "none", "(empty)", "*"}
 INVALID_DEST_SET = set(INVALID_DEST_STRINGS)
 AUTO_UNIQUE_ID_COL = "::auto_unique_id::"
+FILTER_CACHE_VERSION = "ratio-precision-3dp-v2"
 # ui/pages/shadow_sharings.py
 import hashlib
 import re
@@ -109,6 +110,7 @@ def _shadow_sharing_filter_cache_key(
     data_stamp: tuple,
 ) -> tuple:
     return (
+        FILTER_CACHE_VERSION,
         str(selected_scope_key),
         tuple(sorted([str(x) for x in (selected_sources or [])])),
         tuple(sorted([str(x) for x in (selected_risk_levels or [])])),
@@ -229,6 +231,18 @@ def _confidence_cellstyle() -> JsCode:
             if (v === 'PROBABLE') return { 'color': '#f59e0b', 'fontWeight': '800' };
             if (v === 'WEAK') return { 'color': '#38bdf8', 'fontWeight': '700' };
             return {};
+        }
+        """
+    )
+
+
+def _fixed_3dp_formatter() -> JsCode:
+    return JsCode(
+        """
+        function(params) {
+            const v = Number(params.value);
+            if (!isFinite(v)) return '0.000';
+            return v.toFixed(3);
         }
         """
     )
@@ -803,9 +817,12 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
     inc_src["Confidence"] = inc_src["confidence"].astype(str).str.upper()
     inc_src["Confidence"] = inc_src["Confidence"].where(inc_src["Confidence"].isin(["HIGH", "PROBABLE", "WEAK"]), "WEAK")
     inc_src["Score"] = pd.to_numeric(inc_src["confidence_score"], errors="coerce").fillna(0).astype(int)
-    inc_src["Outbound_MB"] = (pd.to_numeric(inc_src["bytes_out_total"], errors="coerce").fillna(0) / 1024 / 1024).round(2)
-    inc_src["Inbound_MB"] = (pd.to_numeric(inc_src["bytes_in_total"], errors="coerce").fillna(0) / 1024 / 1024).round(2)
-    inc_src["Ratio"] = pd.to_numeric(inc_src["out_in_ratio_total"], errors="coerce").fillna(0).round(2)
+    out_mb = (pd.to_numeric(inc_src["bytes_out_total"], errors="coerce").fillna(0) / 1024 / 1024).round(3)
+    in_mb = (pd.to_numeric(inc_src["bytes_in_total"], errors="coerce").fillna(0) / 1024 / 1024).round(3)
+    inc_src["Outbound_MB"] = out_mb
+    inc_src["Inbound_MB"] = in_mb
+    # Keep displayed Ratio consistent with displayed MB values.
+    inc_src["Ratio"] = (out_mb / in_mb.where(in_mb > 0, pd.NA)).fillna(0).round(3)
     inc_src["Conns"] = pd.to_numeric(inc_src["conn_count"], errors="coerce").fillna(0).astype(int)
     inc_src["Duration"] = pd.to_numeric(inc_src["total_duration"], errors="coerce").fillna(0).apply(_format_duration_minutes_seconds)
     base_reasons = inc_src["confidence_reasons"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
@@ -931,9 +948,10 @@ def _configure_incident_grid_columns(
     )
 
     gb.configure_column("allow_basis", header_name="Allow Basis", minWidth=190)
-    gb.configure_column("Outbound_MB", header_name="Out MB", width=104)
-    gb.configure_column("Inbound_MB", header_name="In MB", width=98)
-    gb.configure_column("Ratio", width=90)
+    num_fmt = _fixed_3dp_formatter()
+    gb.configure_column("Outbound_MB", header_name="Out MB", width=110, valueFormatter=num_fmt)
+    gb.configure_column("Inbound_MB", header_name="In MB", width=110, valueFormatter=num_fmt)
+    gb.configure_column("Ratio", width=100, valueFormatter=num_fmt)
     gb.configure_column("Conns", width=86)
     gb.configure_column("Duration", header_name="Duration (m/s)", width=128)
     gb.configure_column("Confidence", width=110, cellStyle=_confidence_cellstyle())
