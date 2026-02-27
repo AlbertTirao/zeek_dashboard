@@ -15,7 +15,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v15-duckdb-cache-tuning"
+CACHE_VERSION = "shadow-sharing-cache-v16-category-yaml-no-exfil"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -25,6 +25,7 @@ WHITELIST_FILE = PROJECT_ROOT / "whitelist_domains.yaml"
 # Sharing/service signatures (algorithm #6)
 # Optional override file. If missing, built-in defaults are used.
 SIGNATURES_FILE = PROJECT_ROOT / "shadow_sharing_signatures.yaml"
+CATEGORY_RULES_FILE = PROJECT_ROOT / "shadow_sharing_categories.yaml"
 
 # Incident model (algorithm #2/#4/#5)
 INCIDENT_WINDOW_MINUTES = 5
@@ -83,11 +84,13 @@ def _meta_expected(
     files_sig: Dict[str, List[List[object]]],
     whitelist_mtime_ns: int,
     signatures_mtime_ns: int,
+    category_rules_mtime_ns: int,
 ) -> dict:
     return {
         "cache_version": CACHE_VERSION,
         "whitelist_mtime_ns": int(whitelist_mtime_ns),
         "signatures_mtime_ns": int(signatures_mtime_ns),
+        "category_rules_mtime_ns": int(category_rules_mtime_ns),
         "files_sig": files_sig,
     }
 
@@ -306,6 +309,52 @@ def load_sharing_signatures() -> Tuple[Dict[str, List[str]], int]:
 
 SIGNATURES_MAP, SIGNATURES_MTIME_NS = load_sharing_signatures()
 
+
+def _extract_category_rule_map(y: dict) -> Dict[str, List[str]]:
+    if not isinstance(y, dict):
+        return {}
+
+    raw = None
+    for k in ["categories", "category_rules", "rules"]:
+        v = y.get(k)
+        if isinstance(v, dict):
+            raw = v
+            break
+    if raw is None and all(isinstance(v, list) for v in y.values()):
+        raw = y
+    if not isinstance(raw, dict):
+        return {}
+
+    out: Dict[str, List[str]] = {}
+    for cat, vals in raw.items():
+        if not isinstance(vals, list):
+            continue
+        cat_name = str(cat or "").strip() or "Unknown"
+        rules: List[str] = []
+        for v in vals:
+            d = _normalize_host(str(v))
+            if d:
+                rules.append(d)
+        if rules:
+            out[cat_name] = sorted(set(rules))
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_category_rules() -> Tuple[List[Tuple[str, List[str]]], int]:
+    y = _safe_yaml_load(CATEGORY_RULES_FILE)
+    category_map = _extract_category_rule_map(y)
+    rules: List[Tuple[str, List[str]]] = []
+    for cat, doms in category_map.items():
+        if doms:
+            rules.append((cat, doms))
+    mtime_ns = int(CATEGORY_RULES_FILE.stat().st_mtime_ns) if CATEGORY_RULES_FILE.exists() else 0
+    return rules, mtime_ns
+
+
+CATEGORY_RULES, CATEGORY_RULES_MTIME_NS = load_category_rules()
+
+
 def _domain_in_signatures(dest: str, sig_map: Dict[str, List[str]]) -> Tuple[bool, str, str]:
     host = _normalize_host(dest)
     if not host:
@@ -444,11 +493,12 @@ def _remove_domain_from_whitelist(domain: str) -> Tuple[bool, str]:
 
 def refresh_shadow_sharing_runtime_state() -> None:
     """
-    Refresh in-memory whitelist/signature metadata and clear shadow-sharing caches.
+    Refresh in-memory whitelist/signature/category metadata and clear shadow-sharing caches.
     Call after mutating whitelist/signature files.
     """
     global WHITELIST_DOMAINS, WHITELIST_MTIME_NS
     global SIGNATURES_MAP, SIGNATURES_MTIME_NS
+    global CATEGORY_RULES, CATEGORY_RULES_MTIME_NS
 
     try:
         load_whitelist.clear()
@@ -467,6 +517,15 @@ def refresh_shadow_sharing_runtime_state() -> None:
         SIGNATURES_MAP, SIGNATURES_MTIME_NS = load_sharing_signatures()
     except Exception:
         SIGNATURES_MAP, SIGNATURES_MTIME_NS = ({}, 0)
+
+    try:
+        load_category_rules.clear()
+    except Exception:
+        pass
+    try:
+        CATEGORY_RULES, CATEGORY_RULES_MTIME_NS = load_category_rules()
+    except Exception:
+        CATEGORY_RULES, CATEGORY_RULES_MTIME_NS = ([], 0)
 
     for fn_name in [
         "_load_shadow_sharing_data_cached",
@@ -829,26 +888,6 @@ UPLOAD_URI_RE = re.compile(r"(^|/)(upload|uploads|file|files|attachments|drive|s
 PASTE_URI_RE = re.compile(r"(paste|bin|snippet|gist)", re.IGNORECASE)
 REMOTE_URI_RE = re.compile(r"(remote|rdp|vpn|tunnel|teamviewer|anydesk)", re.IGNORECASE)
 API_UPLOAD_RE = re.compile(r"(multipart/form-data|application/octet-stream)", re.IGNORECASE)
-
-# category patterns (domain based)
-CATEGORY_RULES: List[Tuple[str, List[str]]] = [
-    ("Cloud Storage", [
-        "drive.google.com", "docs.google.com", "storage.googleapis.com",
-        "onedrive.live.com", "sharepoint.com", "1drv.ms",
-        "dropbox.com", "dropboxusercontent.com",
-        "box.com",
-        "mega.nz",
-        "wetransfer.com",
-        "icloud.com",
-        "s3.amazonaws.com", "amazonaws.com",
-        "azureedge.net", "blob.core.windows.net"
-    ]),
-    ("Paste", ["pastebin.com", "dpaste.com", "hastebin.com", "gist.github.com", "ghostbin.com"]),
-    ("Messaging", ["slack.com", "discord.com", "telegram.org", "whatsapp.com", "messenger.com"]),
-    ("Code Repo", ["github.com", "gitlab.com", "bitbucket.org"]),
-    ("Remote Access", ["teamviewer.com", "anydesk.com", "ngrok.io", "ngrok.com", "tailscale.com", "zerotier.com"]),
-]
-
 
 # -----------------------------------------------------------------------------
 # Correlation / destination normalization helpers
@@ -1369,7 +1408,7 @@ def _detect_action(log_source: str, method: str, uri: str, user_agent: str, dest
     d = str(dest or "")
     ua = str(user_agent or "")
 
-    # DNS-based exfil is handled separately as "DNS Exfil Suspected"
+    # DNS handling is represented as lookup activity
     if ls == "dns":
         return ("DNS Lookup", "dns query")
 
@@ -1392,7 +1431,7 @@ def _detect_action(log_source: str, method: str, uri: str, user_agent: str, dest
             return ("Upload", f"http {m} uri contains upload/file/share keyword")
         if API_UPLOAD_RE.search(content_type or ""):
             return ("Upload", f"http {m} content-type suggests upload")
-        # generic: any POST could be exfil or chat etc.
+        # generic: any POST could be transfer or API/chat traffic.
         return ("Post Data", f"http {m}")
 
     # Share/paste indicators
@@ -1406,62 +1445,6 @@ def _detect_action(log_source: str, method: str, uri: str, user_agent: str, dest
         return ("Automated Access", "automation user-agent")
 
     return ("Browse", "http read access")
-
-# -----------------------------------------------------------------------------
-# DNS tunneling heuristics
-# -----------------------------------------------------------------------------
-
-_BASE32_64_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=_-")
-
-def _shannon_entropy(s: str) -> float:
-    if not s:
-        return 0.0
-    freq: Dict[str, int] = {}
-    for ch in s:
-        freq[ch] = freq.get(ch, 0) + 1
-    n = len(s)
-    ent = 0.0
-    for k, c in freq.items():
-        p = c / n
-        ent -= p * math.log2(p)
-    return ent
-
-
-def _dns_exfil_score(query: str) -> Tuple[int, str]:
-    """
-    Returns (score_add, reason)
-    Basic signals:
-      - long query
-      - high entropy
-      - many allowed chars (b64-ish)
-    """
-    q = str(query or "")
-    qn = q.replace(".", "")
-    if not q:
-        return 0, ""
-
-    score = 0
-    reasons: List[str] = []
-
-    if len(q) >= 120:
-        score += 25
-        reasons.append("dns query length >=120")
-    elif len(q) >= 80:
-        score += 15
-        reasons.append("dns query length >=80")
-
-    ent = _shannon_entropy(qn[:200])
-    if ent >= 4.2:
-        score += 20
-        reasons.append(f"high entropy ({ent:.2f})")
-
-    # proportion of base-ish chars
-    baseish = sum(1 for ch in qn if ch in _BASE32_64_CHARS)
-    if len(qn) >= 40 and (baseish / max(1, len(qn))) >= 0.95:
-        score += 10
-        reasons.append("b64-like charset")
-
-    return score, "; ".join(reasons)
 
 # -----------------------------------------------------------------------------
 # Risk scoring (SOC-style)
@@ -1548,60 +1531,10 @@ def _risk_score_row(row: pd.Series) -> Tuple[int, str]:
         score += 10
         basis.append("http request_body_len >=10MB")
 
-    # DNS exfil heuristics (dns rows)
-    dns_add = int(row.get("DNS_Exfil_Add", 0) or 0)
-    if dns_add > 0:
-        score += dns_add
-        r = str(row.get("DNS_Exfil_Reason", "") or "")
-        basis.append(f"dns exfil: {r}" if r else "dns exfil heuristic")
-
     score = int(min(100, score))
     if not basis:
         basis = ["baseline"]
     return score, "; ".join(basis)
-
-
-def _detect_exfil_signal_row(row: pd.Series) -> Tuple[bool, str]:
-    """
-    Returns (is_exfil_signal, detection_basis) using explicit/strong indicators.
-    """
-    reasons: List[str] = []
-
-    action = str(row.get("Action", "") or "")
-    log_source = str(row.get("log_source", "") or "").lower()
-    severity = str(row.get("Severity", "") or "").upper()
-    dns_reason = str(row.get("DNS_Exfil_Reason", "") or "").strip()
-    allowed = bool(row.get("Allowed", False))
-
-    dest_raw = str(row.get("destination", "") or "").strip().lower()
-    dest_unknown = dest_raw in {"", "unknown", "nan", "none", "(empty)", "*"}
-    unapproved = (not allowed) and (not dest_unknown)
-    bytes_out = float(row.get("bytes_out", row.get("bytes", 0)) or 0)
-    ratio = float(row.get("out_in_ratio", 0) or 0)
-    file_bytes = float(row.get("file_total_bytes", 0) or 0)
-
-    if action in {"Upload", "Upload (TLS)", "File Transfer (Upload)", "Share Link", "Paste/Share", "Post Data"}:
-        reasons.append(f"action={action}")
-
-    if dns_reason:
-        reasons.append("dns exfil heuristic")
-
-    if unapproved and bytes_out >= 10 * 1024 * 1024 and ratio >= 5:
-        reasons.append(">=10MB outbound with high ratio")
-
-    if unapproved and file_bytes >= 10 * 1024 * 1024:
-        reasons.append("files.log >=10MB on unapproved dest")
-
-    if unapproved and severity in {"CRITICAL", "HIGH"} and bytes_out >= 50 * 1024 * 1024:
-        reasons.append("high-risk large outbound transfer")
-
-    # TLS-only, still suspicious: large raw flow to unapproved destination
-    if unapproved and log_source == "flow" and bytes_out >= 100 * 1024 * 1024:
-        reasons.append("unapproved flow >=100MB outbound")
-
-    if not reasons:
-        return False, ""
-    return True, "; ".join(reasons)
 
 
 # -----------------------------------------------------------------------------
@@ -1693,7 +1626,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
       - Use conn.log as the primary table (one row per uid / flow)
       - Correlate ssl/http/files onto conn via uid (and files.conn_uids)
       - Destination naming uses http.host -> ssl.server_name -> conn.id.resp_h (no DNS answer fallback)
-      - Keep dns.log rows separately for DNS exfil heuristics (tunneling / b64-like labels)
+      - Keep dns.log rows separately for lookup visibility and context
     """
     date_dir = Path(parquet_root) / date_str
     buckets = _collect_date_files(date_dir)
@@ -1711,7 +1644,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     cpath = cache_events_path(parquet_root, date_str)
     mpath = cache_meta_path(parquet_root, date_str)
 
-    expected = _meta_expected(files_sig, WHITELIST_MTIME_NS, SIGNATURES_MTIME_NS)
+    expected = _meta_expected(files_sig, WHITELIST_MTIME_NS, SIGNATURES_MTIME_NS, CATEGORY_RULES_MTIME_NS)
     meta = read_yaml(mpath)
 
     if cpath.exists() and meta == expected:
@@ -1859,26 +1792,11 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         out.loc[missing_action, "Action"] = tmp.apply(lambda x: x[0])
         out.loc[missing_action, "Action_Basis"] = tmp.apply(lambda x: x[1])
 
-    # DNS exfil heuristics (only on dns rows)
-    out["DNS_Exfil_Add"] = 0
-    out["DNS_Exfil_Reason"] = ""
-    dns_mask = out["log_source"].astype(str).str.lower().eq("dns")
-    if dns_mask.any():
-        q_series = out.loc[dns_mask, "destination"].astype(str).fillna("")
-        scores_reasons = q_series.apply(_dns_exfil_score)
-        out.loc[dns_mask, "DNS_Exfil_Add"] = scores_reasons.apply(lambda x: int(x[0]))
-        out.loc[dns_mask, "DNS_Exfil_Reason"] = scores_reasons.apply(lambda x: str(x[1] or ""))
-
     # risk score + severity + basis
     rs = out.apply(_risk_score_row, axis=1)
     out["Risk_Score"] = rs.apply(lambda x: int(x[0]))
     out["Risk_Basis"] = rs.apply(lambda x: str(x[1]))
     out["Severity"] = out["Risk_Score"].apply(_severity_label)
-
-    # explicit exfil signal detector (for threat-oriented highlighting/metrics)
-    ex = out.apply(_detect_exfil_signal_row, axis=1)
-    out["Exfil_Indicator"] = ex.apply(lambda x: bool(x[0]))
-    out["Exfil_Detection_Basis"] = ex.apply(lambda x: str(x[1]))
 
     # VirusTotal link for domain-like destinations; best-effort.
     vt_target = out["destination"].astype(str).apply(_registrable_domain_best_effort)
@@ -1903,11 +1821,13 @@ def _load_shadow_sharing_data_cached(
     cache_version: str,
     whitelist_mtime_ns: int,
     signatures_mtime_ns: int,
+    category_rules_mtime_ns: int,
 ) -> pd.DataFrame:
     # cache_version + whitelist_mtime_ns are explicit cache-busters.
     _ = cache_version
     _ = whitelist_mtime_ns
     _ = signatures_mtime_ns
+    _ = category_rules_mtime_ns
 
     parquet_root = Path(parquet_root_str)
     if not parquet_root.exists():
@@ -1949,6 +1869,7 @@ def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.
         CACHE_VERSION,
         int(WHITELIST_MTIME_NS),
         int(SIGNATURES_MTIME_NS),
+        int(CATEGORY_RULES_MTIME_NS),
     )
 
 
@@ -2070,6 +1991,7 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     # Clean text fields once, then use groupby.last (fast + stable).
     text_map = {
         "mac": _clean_text("orig_l2_addr", lower=True),
+        "host_name": _clean_text("host_name"),
         "orig_ip": _clean_text("id.orig_h"),
         "destination": _clean_text("destination"),
         "sig_service": _clean_text("Signature_Service"),
@@ -2121,6 +2043,7 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
 
     text_cols = [
         "__mac",
+        "__host_name",
         "__orig_ip",
         "__destination",
         "__sig_service",
@@ -2139,6 +2062,7 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     agg = agg.rename(
         columns={
             "__mac": "mac",
+            "__host_name": "host_name",
             "__orig_ip": "orig_ip",
             "__destination": "destination",
             "__sig_service": "sig_service",
@@ -2205,7 +2129,7 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     cols = [
         "incident_id",
         "first_ts", "last_ts",
-        "mac", "orig_ip",
+        "mac", "host_name", "orig_ip",
         "source_types",
         "destination", "domain",
         "category",
@@ -2232,12 +2156,14 @@ def _load_shadow_sharing_bundle_cached(
     cache_version: str,
     whitelist_mtime_ns: int,
     signatures_mtime_ns: int,
+    category_rules_mtime_ns: int,
     incident_window_minutes: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Keep these in the cache key for safe invalidation.
     _ = cache_version
     _ = whitelist_mtime_ns
     _ = signatures_mtime_ns
+    _ = category_rules_mtime_ns
 
     events = _load_shadow_sharing_data_cached(
         parquet_root_str,
@@ -2245,6 +2171,7 @@ def _load_shadow_sharing_bundle_cached(
         cache_version,
         whitelist_mtime_ns,
         signatures_mtime_ns,
+        category_rules_mtime_ns,
     )
     if events is None or events.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -2261,6 +2188,7 @@ def load_shadow_sharing_bundle(parquet_root: Path, target_dates: List[str]) -> T
         CACHE_VERSION,
         int(WHITELIST_MTIME_NS),
         int(SIGNATURES_MTIME_NS),
+        int(CATEGORY_RULES_MTIME_NS),
         int(INCIDENT_WINDOW_MINUTES),
     )
 

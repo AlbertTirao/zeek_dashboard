@@ -1,90 +1,86 @@
 trusted_domains:
-- acme-v02.api.letsencrypt.org
-- akamai
-- api.cloudflare
-- asana
-- atlassian.net
-- auth0
-- aws.amazon
-- azure.microsoft
-- bitbucket.org
-- box
-- clients2.google
-- cloud.google
-- cloudflare
-- confluence.example
-- connectivity-check.ubuntu
-- connectivitycheck.gstatic
-- datadoghq
-- device-api.palmplaystore
-- digicert
-- digitalocean
-- docker
-- docs.google
-- drive.google
-- dropbox
-- fastly
-- force
-- gcr.io
-- github
-- gitlab
-- google-analytics
-- google
-- grafana
-- hetzner
-- hub.docker
-- internal.example
-- intranetpany
-- jira.example
-- lazada
-- letsencrypt.org
-- linode
-- matomo.org
-- microsoft
-- newrelic
-- notion.so
-- npmjs
-- ocsp.globalsign
-- office
-- okta
-- onelogin
-- otyfastapi.dangsfly
-- ovh
-- pagerduty
-- pypi.org
-- quay.io
-- raw.githubusercontent
-- registry.npmjs.org
-- rubygems.org
-- s3.amazonaws
-- sadownload.mcafee
-- salesforce
-- sdx.microsoft
-- sectigo
-- sentry.io
-- settings-win.data.microsoft
-- sharepoint
-- slack
-- stackoverflow
-- statuspage.io
-- tas02.sls.update.microsoft
-- teams.microsoft
-- trello
-- ubuntu
-- us05das.zoom.us
-- us05web.zoom.us
-- v10.events.data.microsoft
-- vultr
-- web.vortex.data.microsoft
-- webex
-- wiki.example
-- googleapis.cn
-- msftconnecttest
-- msftncsi
-- zoom.us
-- play.google.com
-- _spotify-connect._tcp.local
-- google.com
-- connectivity-check.ubuntu.com
-- v16-cla.tiktokcdn.com
-- bing.com
+  - _spotify-connect._tcp.local
+  - acme-v02.api.letsencrypt.org
+  - akamai.com
+  - amazonaws.com
+  - api.cloudflare.com
+  - asana.com
+  - atlassian.net
+  - auth0.com
+  - azure.microsoft.com
+  - bing.com
+  - bitbucket.org
+  - box.com
+  - clients2.google.com
+  - cloud.google.com
+  - cloudflare.com
+  - confluence.example
+  - connectivity-check.ubuntu.com
+  - connectivitycheck.gstatic.com
+  - datadoghq.com
+  - digicert.com
+  - digitalocean.com
+  - docker.com
+  - docker.io
+  - docs.google.com
+  - drive.google.com
+  - dropbox.com
+  - fastly.com
+  - force.com
+  - gcr.io
+  - github.com
+  - gitlab.com
+  - google-analytics.com
+  - google.com
+  - googleapis.cn
+  - grafana.com
+  - hetzner.com
+  - hub.docker.com
+  - internal.example
+  - jira.example
+  - lazada.com
+  - letsencrypt.org
+  - linode.com
+  - matomo.org
+  - microsoft.com
+  - msftconnecttest.com
+  - msftncsi.com
+  - newrelic.com
+  - notion.so
+  - npmjs.com
+  - ocsp.globalsign.com
+  - office.com
+  - okta.com
+  - onelogin.com
+  - ovh.com
+  - pagerduty.com
+  - play.google.com
+  - pypi.org
+  - quay.io
+  - raw.githubusercontent.com
+  - registry.npmjs.org
+  - rubygems.org
+  - s3.amazonaws.com
+  - sadownload.mcafee.com
+  - salesforce.com
+  - sdx.microsoft.com
+  - sectigo.com
+  - sentry.io
+  - settings-win.data.microsoft.com
+  - sharepoint.com
+  - slack.com
+  - stackoverflow.com
+  - statuspage.io
+  - tas02.sls.update.microsoft.com
+  - teams.microsoft.com
+  - trello.com
+  - ubuntu.com
+  - us05das.zoom.us
+  - us05web.zoom.us
+  - v10.events.data.microsoft.com
+  - v16-cla.tiktokcdn.com
+  - vultr.com
+  - web.vortex.data.microsoft.com
+  - webex.com
+  - wiki.example
+  - zoom.us

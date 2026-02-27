@@ -5,6 +5,7 @@
 # ----------------------------------------------------------------------------
 INVALID_DEST_STRINGS = {"", "unknown", "nan", "none", "(empty)", "*"}
 INVALID_DEST_SET = set(INVALID_DEST_STRINGS)
+AUTO_UNIQUE_ID_COL = "::auto_unique_id::"
 # ui/pages/shadow_sharings.py
 import hashlib
 import re
@@ -18,7 +19,6 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 
 try:
     from .shadow_sharings_backend import (
-        _detect_exfil_signal_row,
         _add_domain_to_whitelist,
         _remove_domain_from_whitelist,
         get_available_dates,
@@ -28,7 +28,6 @@ try:
     )
 except ImportError:
     from shadow_sharings_backend import (  # type: ignore
-        _detect_exfil_signal_row,
         _add_domain_to_whitelist,
         _remove_domain_from_whitelist,
         get_available_dates,
@@ -54,7 +53,7 @@ CONFIDENCE_COLORS = {
 def _shadow_sharing_policy_stamp() -> tuple:
     project_root = Path(__file__).resolve().parents[2]
     out: List[int] = []
-    for policy_name in ("whitelist_domains.yaml", "shadow_sharing_signatures.yaml"):
+    for policy_name in ("whitelist_domains.yaml", "shadow_sharing_signatures.yaml", "shadow_sharing_categories.yaml"):
         policy_path = project_root / policy_name
         try:
             out.append(int(policy_path.stat().st_mtime_ns))
@@ -106,7 +105,6 @@ def _shadow_sharing_filter_cache_key(
     selected_scope_key: str,
     selected_sources: List[str],
     selected_risk_levels: List[str],
-    min_bytes_mb: float,
     search_q: str,
     data_stamp: tuple,
 ) -> tuple:
@@ -114,7 +112,6 @@ def _shadow_sharing_filter_cache_key(
         str(selected_scope_key),
         tuple(sorted([str(x) for x in (selected_sources or [])])),
         tuple(sorted([str(x) for x in (selected_risk_levels or [])])),
-        float(min_bytes_mb or 0),
         str(search_q or "").strip().lower(),
         data_stamp,
     )
@@ -248,8 +245,12 @@ def render_shadow_aggrid(
     force_scrollbars: bool = False,
     hide_scrollbar_buttons: bool = False,
 ):
+    grid_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if AUTO_UNIQUE_ID_COL in grid_df.columns:
+        grid_df = grid_df.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
+
     grid_options = gb.build()
-    row_count = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    row_count = int(len(grid_df))
     default_col_def = dict(grid_options.get("defaultColDef") or {})
     # Keep sorting available via column menu (three-dot menu).
     default_col_def["sortable"] = True
@@ -346,12 +347,12 @@ def render_shadow_aggrid(
 
     if wrap_shell:
         st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-    data_sig = _grid_data_signature(df)
+    data_sig = _grid_data_signature(grid_df)
     sig_key = f"_shadow_sharing_grid_sig::{key}"
     reload_data = st.session_state.get(sig_key) != data_sig
     st.session_state[sig_key] = data_sig
     grid_response = AgGrid(
-        df,
+        grid_df,
         gridOptions=grid_options,
         update_mode=update_mode,
         data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
@@ -617,7 +618,137 @@ def _filter_incidents_nonzero_outbound(incidents_df: pd.DataFrame) -> pd.DataFra
     return out
 
 
-def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
+def _strict_scope_by_selected_date(df: pd.DataFrame, selected_date: str, *, ts_col: str = "ts") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if not selected_date or ts_col not in df.columns:
+        return df.copy()
+    target_day = pd.to_datetime(selected_date, errors="coerce")
+    if pd.isna(target_day):
+        return df.copy()
+    out = df.copy()
+    ts = pd.to_datetime(out[ts_col], errors="coerce")
+    day_start = target_day.normalize()
+    day_end = day_start + pd.Timedelta(days=1)
+    mask = (ts >= day_start) & (ts < day_end)
+    return out.loc[mask].copy()
+
+
+def _format_duration_minutes_seconds(total_seconds: object) -> str:
+    sec_val = pd.to_numeric(pd.Series([total_seconds]), errors="coerce").fillna(0).iloc[0]
+    sec = float(max(0.0, float(sec_val)))
+    mins = int(sec // 60)
+    secs = int(round(sec - (mins * 60)))
+    if secs >= 60:
+        mins += 1
+        secs = 0
+    return f"{mins}m {secs:02d}s"
+
+
+def _table_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df is None or df.empty:
+        return b""
+    out = df.copy()
+    if AUTO_UNIQUE_ID_COL in out.columns:
+        out = out.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
+    if "#" not in out.columns:
+        out = out.reset_index(drop=True)
+        out.insert(0, "#", range(1, len(out) + 1))
+    return out.to_csv(index=False).encode("utf-8")
+
+
+def _confidence_score_explainer_text() -> str:
+    return (
+        "Incidents are 5-minute rollups grouped by `device + domain + time window`, then scored from 0-100.\n"
+        "- `+40` signature match (`Service`) when destination matches configured sharing signatures.\n"
+        "- `+30` when destination is not allowlisted (`Allowed (Domain)=False`).\n"
+        "- `+30` when upload volume is high (`>=10MB`) and out/in ratio is high (`>=5`).\n"
+        "- `+15` for chunking behavior (`Conns >= 5` in the same window).\n"
+        "- `+40` for share-link evidence (`http_any_share=True`, typically URI contains share/shared-link patterns).\n"
+        "- `+20` for repeat behavior (seen across `>=2` days while still unapproved).\n"
+        "- Confidence labels: `HIGH >= 80`, `PROBABLE >= 50`, `WEAK < 50`.\n\n"
+        
+        "- `Conns` = unique Zeek connection IDs (`uid`) in that incident window.\n"
+        "- `Duration` is the sum of Zeek `conn.duration` (seconds) for all connections in that incident window, shown as minutes and seconds.\n"
+        "- Chunking in plain terms: one transfer is split into many smaller connections in the same 5-minute window.\n"
+        "- Chunking example A: 6 connections x 2MB to the same domain in one window -> `Conns=6` and chunking points apply.\n"
+        "- Chunking example B: 1 connection x 12MB in one window -> large upload, but no chunking bonus because `Conns=1`.\n"
+        "- `Action` is inferred in priority order: `Share Link` -> `Upload` -> `File Transfer (Upload/Download)` -> `Upload (TLS)`/`Download` -> `Access`.\n"
+        "- `Share Link`/`Upload` come from HTTP markers (`http_any_share`/`http_any_upload`). `File Transfer` requires `files.log` bytes (`>=1MB`) plus conn direction (`bytes_out` vs `bytes_in`).\n"
+        "- TLS heuristics are fallback only: `Upload (TLS)` when `bytes_out>=10MB` and `out/in>=5`; `Download` when `bytes_in>=25MB` and inbound is at least 3x outbound.\n"
+        "- `Category` is matched from destination/domain against lists in `shadow_sharing_categories.yaml` (cloud storage, paste, messaging, code repo, remote access); unmatched destinations become `Unknown`.\n"
+        "- `Domain` is derived from destination (`dest_domain`) with fallback to destination text.\n"
+        "- `Allowed (Domain)` is a boundary-safe suffix match against `whitelist_domains.yaml` (`example.com` matches `a.b.example.com`, not `example.com.evil.tld`).\n"
+        "- `Allow Basis = no match` means no allowlist domain matched; improve it by adding the correct root domain (or wildcard entry) to the allowlist."
+    )
+
+
+def _render_incident_table_insights(grid_rows: pd.DataFrame) -> None:
+    if grid_rows is None or grid_rows.empty:
+        return
+
+    src = grid_rows.copy()
+    src["Outbound_MB"] = pd.to_numeric(src.get("Outbound_MB", 0), errors="coerce").fillna(0)
+    src["Confidence"] = src.get("Confidence", pd.Series("", index=src.index)).astype(str).str.upper()
+    src["Confidence"] = src["Confidence"].where(src["Confidence"].isin(["HIGH", "PROBABLE", "WEAK"]), "WEAK")
+
+    conf_order = ["HIGH", "PROBABLE", "WEAK"]
+    conf_counts = (
+        src.groupby("Confidence", dropna=False)
+        .size()
+        .reindex(conf_order, fill_value=0)
+        .reset_index(name="Incidents")
+    )
+    conf_counts = conf_counts[conf_counts["Incidents"] > 0].copy()
+
+    top_dest_col = "Domain" if "Domain" in src.columns else "Destination"
+    src[top_dest_col] = src.get(top_dest_col, "").astype(str).str.strip()
+    top_dest = (
+        src[src[top_dest_col] != ""]
+        .groupby(top_dest_col, dropna=False)["Outbound_MB"]
+        .sum()
+        .reset_index()
+        .sort_values("Outbound_MB", ascending=False)
+        .head(10)
+    )
+
+    ch1, ch2 = st.columns([1.0, 1.35])
+    with ch1:
+        if conf_counts.empty:
+            st.info("No confidence chart data in this scope.")
+        else:
+            fig_conf = px.bar(
+                conf_counts,
+                x="Confidence",
+                y="Incidents",
+                color="Confidence",
+                category_orders={"Confidence": conf_order},
+                color_discrete_map=CONFIDENCE_COLORS,
+                template=get_plotly_template(),
+            )
+            style_plotly_figure(fig_conf, height=300, show_legend=False)
+            fig_conf.update_xaxes(title="")
+            fig_conf.update_yaxes(title="Incident Count")
+            st.plotly_chart(fig_conf, use_container_width=True)
+
+    with ch2:
+        if top_dest.empty:
+            st.info("No destination chart data in this scope.")
+        else:
+            fig_dest = px.bar(
+                top_dest,
+                y=top_dest_col,
+                x="Outbound_MB",
+                orientation="h",
+                template=get_plotly_template(),
+            )
+            style_plotly_figure(fig_dest, height=300, show_legend=False)
+            fig_dest.update_xaxes(title="Outbound MB")
+            fig_dest.update_yaxes(title="Destination/Domain", categoryorder="total ascending")
+            st.plotly_chart(fig_dest, use_container_width=True)
+
+
+def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: bool = True) -> pd.DataFrame:
     if incidents_df is None or incidents_df.empty:
         return pd.DataFrame()
 
@@ -627,6 +758,7 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
         ("first_ts", pd.NaT),
         ("last_ts", pd.NaT),
         ("mac", ""),
+        ("host_name", ""),
         ("orig_ip", ""),
         ("destination", ""),
         ("domain", ""),
@@ -652,6 +784,8 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
     inc_src["first_ts"] = pd.to_datetime(inc_src["first_ts"], errors="coerce")
     inc_src["last_ts"] = pd.to_datetime(inc_src["last_ts"], errors="coerce")
     inc_src["mac"] = inc_src["mac"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
+    inc_src["Hostname"] = inc_src["host_name"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": "", "(empty)": ""})
+    inc_src.loc[inc_src["Hostname"] == "", "Hostname"] = "Unknown"
     inc_src["orig_ip"] = inc_src["orig_ip"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
     inc_src["Destination"] = inc_src["destination"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "*": ""})
     inc_src["Domain"] = inc_src["domain"].astype(str).str.strip().str.lower().replace({"nan": "", "None": "", "none": ""})
@@ -673,7 +807,7 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
     inc_src["Inbound_MB"] = (pd.to_numeric(inc_src["bytes_in_total"], errors="coerce").fillna(0) / 1024 / 1024).round(2)
     inc_src["Ratio"] = pd.to_numeric(inc_src["out_in_ratio_total"], errors="coerce").fillna(0).round(2)
     inc_src["Conns"] = pd.to_numeric(inc_src["conn_count"], errors="coerce").fillna(0).astype(int)
-    inc_src["Duration_sec"] = pd.to_numeric(inc_src["total_duration"], errors="coerce").fillna(0).round(1)
+    inc_src["Duration"] = pd.to_numeric(inc_src["total_duration"], errors="coerce").fillna(0).apply(_format_duration_minutes_seconds)
     base_reasons = inc_src["confidence_reasons"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
     inc_src["Reasons"] = [
         _compose_incident_reason(br, a, ab, c)
@@ -698,13 +832,15 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
 
     inc_src = inc_src.sort_values(["Score", "Outbound_MB", "Conns", "last_ts"], ascending=[False, False, False, False])
     dev_grid = inc_src.copy()
-    dev_grid["First_Seen"] = dev_grid["first_ts"].dt.strftime("%m-%d %H:%M").fillna("")
-    dev_grid["Last_Seen"] = dev_grid["last_ts"].dt.strftime("%m-%d %H:%M").fillna("")
+    dev_grid["First_Seen"] = dev_grid["first_ts"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+    dev_grid["Last_Seen"] = dev_grid["last_ts"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
 
     show_cols = [
+        "#",
         "First_Seen",
         "Last_Seen",
         "mac",
+        "Hostname",
         "orig_ip",
         "Destination",
         "Domain",
@@ -716,18 +852,22 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame) -> pd.DataFrame:
         "Inbound_MB",
         "Ratio",
         "Conns",
-        "Duration_sec",
+        "Duration",
         "Confidence",
         "Score",
         "Reasons",
         "incident_id",
     ]
+    if not include_hostname:
+        show_cols = [c for c in show_cols if c != "Hostname"]
     show_cols = [c for c in show_cols if c in dev_grid.columns]
     dev_grid = dev_grid[show_cols].copy()
     if "incident_id" in dev_grid.columns:
         dev_grid = dev_grid.drop_duplicates(subset=["incident_id"], keep="last").reset_index(drop=True)
     else:
         dev_grid = dev_grid.drop_duplicates().reset_index(drop=True)
+    if AUTO_UNIQUE_ID_COL in dev_grid.columns:
+        dev_grid = dev_grid.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
     dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
     return dev_grid
 
@@ -737,11 +877,13 @@ def _configure_incident_grid_columns(
     *,
     clickable_mac: bool,
     editable_allowed_domain: bool,
+    include_hostname: bool,
 ) -> None:
     gb.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
     if clickable_mac:
         gb.configure_selection(selection_mode="single", use_checkbox=False)
     gb.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
+    gb.configure_column(AUTO_UNIQUE_ID_COL, hide=True)
 
     if clickable_mac:
         clickable_mac_style = JsCode(
@@ -761,9 +903,11 @@ def _configure_incident_grid_columns(
         gb.configure_column("mac", header_name="MAC", minWidth=165, cellStyle=clickable_mac_style)
     else:
         gb.configure_column("mac", header_name="MAC", minWidth=165)
+    if include_hostname:
+        gb.configure_column("Hostname", minWidth=170)
 
-    gb.configure_column("First_Seen", width=115)
-    gb.configure_column("Last_Seen", width=115)
+    gb.configure_column("First_Seen", width=172)
+    gb.configure_column("Last_Seen", width=172)
     gb.configure_column("orig_ip", header_name="Orig IP", minWidth=140)
     gb.configure_column("Destination", minWidth=220)
     gb.configure_column("Domain", minWidth=210)
@@ -791,7 +935,7 @@ def _configure_incident_grid_columns(
     gb.configure_column("Inbound_MB", header_name="In MB", width=98)
     gb.configure_column("Ratio", width=90)
     gb.configure_column("Conns", width=86)
-    gb.configure_column("Duration_sec", header_name="Duration(sec)", width=125)
+    gb.configure_column("Duration", header_name="Duration (m/s)", width=128)
     gb.configure_column("Confidence", width=110, cellStyle=_confidence_cellstyle())
     gb.configure_column("Score", width=82)
     gb.configure_column("Reasons", minWidth=420)
@@ -895,6 +1039,7 @@ def show_shadow_sharing_device_dialog(
     filtered_incidents: pd.DataFrame,
     *,
     selected_scope_key: str,
+    selected_scope_label: str,
 ):
     target_mac = str(st.session_state.get("shadow_sharing_dialog_mac") or "").strip().lower()
     if not target_mac:
@@ -975,13 +1120,32 @@ def show_shadow_sharing_device_dialog(
         st.warning("No incident rows found for this MAC with current filters.")
         return
 
+    mac_hostname = ""
+    if "host_name" in scoped_incidents.columns:
+        h = scoped_incidents["host_name"].astype(str).str.strip()
+        h = h[~h.str.lower().isin(["", "nan", "none", "unknown", "-", "(empty)"])]
+        if not h.empty:
+            mac_hostname = str(h.value_counts(dropna=True).index[0]).strip()
+    if not mac_hostname and isinstance(filtered, pd.DataFrame) and "mac" in filtered.columns and "host_name" in filtered.columns:
+        f = filtered.copy()
+        mac_mask = f["mac"].astype(str).str.strip().str.lower().eq(target_mac)
+        h2 = f.loc[mac_mask, "host_name"].astype(str).str.strip()
+        h2 = h2[~h2.str.lower().isin(["", "nan", "none", "unknown", "-", "(empty)"])]
+        if not h2.empty:
+            mac_hostname = str(h2.value_counts(dropna=True).index[0]).strip()
+    mac_hostname = mac_hostname or "Unknown"
+
     top = st.columns([1.0, 5.0])
     with top[0]:
         if st.button("Close", use_container_width=True, type="primary", key=f"shadow_sharing_dlg_close_{selected_scope_key}_{mac_key}"):
             _close_shadow_sharing_dialog()
             st.rerun()
     with top[1]:
-        scope_label = f"MAC <code>{target_mac}</code>"
+        scope_label = (
+            f"MAC <code>{target_mac}</code> | "
+            f"Hostname <code>{mac_hostname}</code> | "
+            f"Date <code>{selected_scope_label}</code>"
+        )
         st.markdown(
             f"""
             <div class='shadow-dialog-hero'>
@@ -1031,10 +1195,15 @@ def show_shadow_sharing_device_dialog(
         st.info("No non-zero outbound incident rows match your dialog search.")
         return
 
-    grid_rows = _build_incident_grid_frame(scoped_incidents)
+    grid_rows = _build_incident_grid_frame(scoped_incidents, include_hostname=False)
     if grid_rows.empty:
         st.info("No incident rows above 0 MB are available for this MAC.")
         return
+    if AUTO_UNIQUE_ID_COL in grid_rows.columns:
+        grid_rows = grid_rows.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
+    if "#" not in grid_rows.columns:
+        grid_rows = grid_rows.reset_index(drop=True)
+        grid_rows.insert(0, "#", range(1, len(grid_rows) + 1))
 
     first_seen = pd.to_datetime(scoped_incidents.get("first_ts", pd.Series([], dtype="datetime64[ns]")), errors="coerce").min()
     last_seen = pd.to_datetime(scoped_incidents.get("last_ts", pd.Series([], dtype="datetime64[ns]")), errors="coerce").max()
@@ -1069,11 +1238,13 @@ def show_shadow_sharing_device_dialog(
 
     with st.container():
         st.markdown("#### Shadow Sharing Incidents (MAC Scope)")
+        _render_incident_table_insights(grid_rows)
         gb_rows = GridOptionsBuilder.from_dataframe(grid_rows)
         _configure_incident_grid_columns(
             gb_rows,
             clickable_mac=False,
             editable_allowed_domain=True,
+            include_hostname=False,
         )
         row_response = render_shadow_aggrid(
             grid_rows,
@@ -1086,6 +1257,19 @@ def show_shadow_sharing_device_dialog(
             hide_scrollbar_buttons=True,
         )
         _apply_allowed_domain_checkbox_changes(grid_rows, row_response)
+        export_rows = pd.DataFrame(row_response.get("data", [])) if isinstance(row_response, dict) else pd.DataFrame()
+        if export_rows.empty:
+            export_rows = grid_rows.copy()
+        st.download_button(
+            "Download CSV (MAC scope)",
+            data=_table_csv_bytes(export_rows),
+            file_name=f"shadow_sharing_mac_{mac_key}_{selected_scope_label}.csv",
+            mime="text/csv",
+            key=f"shadow_sharing_mac_csv_{selected_scope_key}_{mac_key}",
+        )
+
+    with st.expander("Confidence score computation", expanded=False):
+        st.markdown(_confidence_score_explainer_text())
 
 
 def render_shadow_sharing(parquet_root: Path):
@@ -1158,6 +1342,23 @@ def render_shadow_sharing(parquet_root: Path):
         st.session_state["_shadow_sharing_scope_incidents_v1"] = incidents
         st.session_state.pop("_shadow_sharing_filtered_cache_v1", None)
         st.session_state.pop("_shadow_sharing_source_masks_cache_v1", None)
+
+    # Keep date scope strict to selected day by event timestamp.
+    # Some date folders can still contain spillover rows around midnight.
+    total_scope_rows = int(len(df))
+    df = _strict_scope_by_selected_date(df, str(selected_date), ts_col="ts")
+    trimmed_rows = max(0, total_scope_rows - int(len(df)))
+    if trimmed_rows > 0:
+        st.caption(
+            f"Date scope note: excluded {trimmed_rows:,} rows because their timestamps were outside `{selected_date}`."
+        )
+    if isinstance(incidents, pd.DataFrame) and not incidents.empty:
+        incidents = _strict_scope_by_selected_date(incidents, str(selected_date), ts_col="first_ts")
+    elif not df.empty:
+        # Fallback if incident cache is unavailable.
+        incidents = build_shadow_sharing_incidents(df)
+    else:
+        incidents = pd.DataFrame()
 
     if df.empty:
         st.info("No data detected for the selected timeframe.")
@@ -1253,21 +1454,17 @@ def render_shadow_sharing(parquet_root: Path):
 
     search_q = st.text_input("Search (MAC, Host, IP, Destination, Basis)", placeholder="e.g., 192.168.1.14",)
 
-    c1, c2, c3 = st.columns([1.2, 1.4, 2.2])
+    c1, c2 = st.columns([1.4, 2.2])
     with c1:
-        min_bytes_mb = st.number_input("Min Bytes (MB)", min_value=0, value=0, step=10)
-
-    with c2:
         selected_risk_levels = st.multiselect("Risk Level", ["CRITICAL", "HIGH", "MEDIUM", "LOW"], default=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
 
-    with c3:
+    with c2:
         selected_sources = st.multiselect("Source Logs", source_options, default=source_options)
 
     filter_cache_key = _shadow_sharing_filter_cache_key(
         selected_scope_key=selected_scope_key,
         selected_sources=selected_sources,
         selected_risk_levels=selected_risk_levels,
-        min_bytes_mb=float(min_bytes_mb or 0),
         search_q=search_q,
         data_stamp=source_data_stamp,
     )
@@ -1290,9 +1487,6 @@ def render_shadow_sharing(parquet_root: Path):
 
         if selected_risk_levels:
             filtered = filtered[filtered["Severity"].isin(selected_risk_levels)]
-
-        if min_bytes_mb > 0:
-            filtered = filtered[filtered["bytes"] >= float(min_bytes_mb) * 1024 * 1024]
 
         if search_q:
             q = search_q.lower().strip()
@@ -1346,13 +1540,7 @@ def render_shadow_sharing(parquet_root: Path):
     unapproved = int((filtered["Allowed"] == False).sum())  # noqa: E712
     autom = int((filtered["Client_Type"] == "Automation / SDK").sum())
 
-    threat_metric_base = filtered.copy()
-    if "Exfil_Indicator" not in threat_metric_base.columns:
-        ex = threat_metric_base.apply(_detect_exfil_signal_row, axis=1)
-        threat_metric_base["Exfil_Indicator"] = ex.apply(lambda x: bool(x[0]))
-    threat_metric_base = threat_metric_base[
-        (threat_metric_base["Allowed"] == False) & (threat_metric_base["Exfil_Indicator"] == True)  # noqa: E712
-    ].copy()
+    threat_metric_base = filtered[filtered["Allowed"] == False].copy()  # noqa: E712
 
     top_offender = "Unknown"
     top_offender_type = "Unknown"
@@ -1518,11 +1706,20 @@ def render_shadow_sharing(parquet_root: Path):
             st.info("No incident rows are available with the current filters.")
             st.session_state["shadow_sharing_last_selected_mac"] = None
         else:
+            if "Hostname" not in dev_grid.columns:
+                dev_grid = _build_incident_grid_frame(filtered_incidents, include_hostname=True)
+            if AUTO_UNIQUE_ID_COL in dev_grid.columns:
+                dev_grid = dev_grid.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
+            if "#" not in dev_grid.columns:
+                dev_grid = dev_grid.reset_index(drop=True)
+                dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
+            _render_incident_table_insights(dev_grid)
             gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
             _configure_incident_grid_columns(
                 gb_dev,
                 clickable_mac=True,
                 editable_allowed_domain=True,
+                include_hostname=True,
             )
 
             dev_response = render_shadow_aggrid(
@@ -1555,25 +1752,27 @@ def render_shadow_sharing(parquet_root: Path):
             if not has_mac_rows:
                 st.info("MAC values are not available in this scope, so MAC drilldown dialog is disabled.")
 
+            export_dev = pd.DataFrame(dev_response.get("data", [])) if isinstance(dev_response, dict) else pd.DataFrame()
+            if export_dev.empty:
+                export_dev = dev_grid.copy()
+            st.download_button(
+                "Download CSV (current incident table)",
+                data=_table_csv_bytes(export_dev),
+                file_name=f"shadow_sharing_incidents_{selected_date}.csv",
+                mime="text/csv",
+                key=f"shadow_sharing_incidents_csv_{selected_scope_key}",
+            )
+
     with st.expander("Confidence score computation", expanded=False):
-        st.markdown(
-            "Incidents are 5-minute rollups grouped by `device + domain + time window`, then scored from 0-100.\n"
-            "- `+40` signature match (`Service`) when destination matches configured sharing signatures.\n"
-            "- `+30` when destination is not allowlisted (`Allowed (Domain)=False`).\n"
-            "- `+30` when upload volume is high (`>=10MB`) and out/in ratio is high (`>=5`).\n"
-            "- `+15` for chunking behavior (`Conns >= 5` in the same window).\n"
-            "- `+40` for share-link evidence (`http_any_share=True`, typically URI contains share/shared-link patterns).\n"
-            "- `+20` for repeat behavior (seen across `>=2` days while still unapproved).\n"
-            "- Confidence labels: `HIGH >= 80`, `PROBABLE >= 50`, `WEAK < 50`.\n"
-            "- `Conns` = unique Zeek connection IDs (`uid`) in that incident window.\n"
-            "- `Domain` is derived from destination (`dest_domain`) with fallback to destination text.\n"
-            "- `Allowed (Domain)` is a boundary-safe suffix match against `whitelist_domains.yaml` (`example.com` matches `a.b.example.com`, not `example.com.evil.tld`).\n"
-            "- `Allow Basis = no match` means no allowlist domain matched; improve it by adding the correct root domain (or wildcard entry) to the allowlist.\n"
-            "- Row-level `Exfil` is from `_detect_exfil_signal_row` and needs explicit suspicious evidence (upload indicators, large outbound with ratio, DNS exfil patterns, or unapproved risky transfer signals)."
-        )
+        st.markdown(_confidence_score_explainer_text())
 
     if st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac"):
-        show_shadow_sharing_device_dialog(filtered, filtered_incidents, selected_scope_key=selected_scope_key)
+        show_shadow_sharing_device_dialog(
+            filtered,
+            filtered_incidents,
+            selected_scope_key=selected_scope_key,
+            selected_scope_label=str(selected_date),
+        )
 
 
 # Backward compatibility if your app imports render_shadow_uploads
