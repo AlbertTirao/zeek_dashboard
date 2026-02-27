@@ -147,6 +147,23 @@ def is_broadcast_mac(mac: Optional[str]) -> bool:
     return mac == "ff:ff:ff:ff:ff:ff"
 
 
+def mac_spoofing_status(mac: Optional[str]) -> str:
+    """
+    Heuristic flag:
+    A locally administered MAC often has the second hex digit of the first byte
+    set to 2, 6, A, or E (e.g., 02:xx..., 06:xx..., 0A:xx..., 0E:xx...).
+    """
+    m = normalize_mac(mac)
+    if not m:
+        return "Unknown"
+
+    first_byte = m.split(":", 1)[0]
+    if len(first_byte) != 2:
+        return "Unknown"
+
+    return "MAC Randomization" if first_byte[1].lower() in {"2", "6", "a", "e"} else "No"
+
+
 # =============================================================================
 # IP HELPERS
 # =============================================================================
@@ -1166,12 +1183,21 @@ def resolve_vendor(mac_norm: Optional[str], mac_to_vendor: Dict[str, str], mac_l
 # =============================================================================
 # UI HELPERS
 # =============================================================================
-def build_display_table(df: pd.DataFrame) -> pd.DataFrame:
+def build_display_table(df: pd.DataFrame, include_mac_spoofing: bool = False) -> pd.DataFrame:
+    working = df.copy()
     cols = ["ts_dt", "ip", "mac_norm", "vendor", "host", "seen_in", "status"]
-    if "note" in df.columns:
+
+    if include_mac_spoofing:
+        if "mac_norm" in working.columns:
+            working["mac_spoofing"] = working["mac_norm"].map(mac_spoofing_status)
+        else:
+            working["mac_spoofing"] = "Unknown"
+        cols.append("mac_spoofing")
+
+    if "note" in working.columns:
         cols.append("note")
 
-    out = df[cols].rename(
+    out = working[cols].rename(
         columns={
             "ts_dt": "Last Seen",
             "ip": "IP Address",
@@ -1180,6 +1206,7 @@ def build_display_table(df: pd.DataFrame) -> pd.DataFrame:
             "host": "Host Name",
             "seen_in": "Source",
             "status": "Status",
+            "mac_spoofing": "Mac Spoofing",
             "note": "Note",
         }
     ).copy()
@@ -1849,7 +1876,7 @@ def _render_alerts_ui(
     if "ts_dt" in df_to_show.columns:
         df_to_show["ts_dt"] = pd.to_datetime(df_to_show["ts_dt"], errors="coerce")
 
-    table = build_display_table(df_to_show)
+    table = build_display_table(df_to_show, include_mac_spoofing=(view == "Unauthorized"))
 
     if "Last Seen" in table.columns:
         table = table.sort_values("Last Seen", ascending=False, na_position="last")
@@ -1887,7 +1914,11 @@ def _render_alerts_ui(
 
     if search_query:
         q = search_query.lower()
-        search_cols = [c for c in ["MAC Address", "IP Address", "Vendor", "Host Name", "Source", "Status", "Note"] if c in filtered_table.columns]
+        search_cols = [
+            c
+            for c in ["MAC Address", "IP Address", "Vendor", "Host Name", "Source", "Status", "mac spoofing", "Note"]
+            if c in filtered_table.columns
+        ]
         if search_cols:
             mask = (
                 filtered_table[search_cols]

@@ -57,6 +57,23 @@ def is_broadcast_mac(mac):
     return mac == "ff:ff:ff:ff:ff:ff"
 
 
+def mac_spoofing_status(mac) -> str:
+    """
+    Heuristic flag:
+    A locally administered MAC often has first-byte second hex digit
+    2, 6, A, or E (e.g., 02:xx..., 06:xx..., 0A:xx..., 0E:xx...).
+    """
+    m = normalize_mac(mac)
+    if not m:
+        return "Unknown"
+
+    first_byte = m.split(":", 1)[0]
+    if len(first_byte) != 2:
+        return "Unknown"
+
+    return "MAC Randomization" if first_byte[1].lower() in {"2", "6", "a", "e"} else "No"
+
+
 # =============================================================================
 # Date-folder discovery (avoid scanning cache dirs; match Alerts page)
 # =============================================================================
@@ -1814,12 +1831,14 @@ def device_list_popup(
 
     inventory["vendor"] = inventory["mac"].map(get_mac_vendor)
     inventory["vendor"] = inventory["vendor"].fillna("Unknown").astype(str)
+    if status_type != "Authorized":
+        inventory["mac_spoofing"] = inventory["mac"].map(mac_spoofing_status)
 
     # Filter columns for view
     if status_type == "Authorized":
         inventory = inventory[["mac", "ip", "host_name", "vendor", "Authorized Date", "Last Seen", "sort_dt"]].copy()
     else:
-        inventory = inventory[["mac", "ip", "host_name", "vendor", "Last Seen", "sort_dt"]].copy()
+        inventory = inventory[["mac", "ip", "host_name", "vendor", "mac_spoofing", "Last Seen", "sort_dt"]].copy()
 
     inventory = inventory.reset_index(drop=True)
     inventory.insert(0, "#", pd.RangeIndex(start=1, stop=len(inventory) + 1, step=1))
@@ -1932,6 +1951,8 @@ def device_list_popup(
     gb.configure_column("ip", header_name="IP Address", width=130)
     gb.configure_column("host_name", header_name="Host Name", width=180)
     gb.configure_column("vendor", header_name="Vendor", width=180)
+    if status_type != "Authorized" and "mac_spoofing" in inventory.columns:
+        gb.configure_column("mac_spoofing", header_name="Mac Spoofing", width=145)
     
     # Render two distinct date columns
     if status_type == "Authorized":

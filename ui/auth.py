@@ -30,6 +30,11 @@ DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 GOOGLE_OAUTH_STATE_SESSION_KEY = "google_oauth_state"
 GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY = "google_oauth_expected_email"
 GOOGLE_OAUTH_STATE_TTL_SECONDS = 10 * 60
+LOGIN_CAPTCHA_A_SESSION_KEY = "login_captcha_a"
+LOGIN_CAPTCHA_B_SESSION_KEY = "login_captcha_b"
+LOGIN_CAPTCHA_ANSWER_SESSION_KEY = "login_captcha_answer"
+LOGIN_CAPTCHA_INPUT_SESSION_KEY = "login_captcha_input"
+LOGIN_CAPTCHA_CLEAR_INPUT_FLAG_SESSION_KEY = "login_captcha_clear_input_flag"
 GOOGLE_OAUTH_QUERY_KEYS = (
     "code",
     "state",
@@ -97,6 +102,38 @@ def _session_ttl_seconds() -> int:
     except Exception:
         pass
     return DEFAULT_SESSION_TTL_SECONDS
+
+
+def _reset_login_captcha() -> None:
+    # Keep numbers compact so humans solve quickly while still blocking scripted noise.
+    a = 10 + py_secrets.randbelow(41)  # 10..50
+    b = 10 + py_secrets.randbelow(41)  # 10..50
+    st.session_state[LOGIN_CAPTCHA_A_SESSION_KEY] = int(a)
+    st.session_state[LOGIN_CAPTCHA_B_SESSION_KEY] = int(b)
+    st.session_state[LOGIN_CAPTCHA_ANSWER_SESSION_KEY] = int(a + b)
+    # Do not mutate widget-bound session keys in the same run after render.
+    # Mark input for clearing on next run before widget instantiation.
+    st.session_state[LOGIN_CAPTCHA_CLEAR_INPUT_FLAG_SESSION_KEY] = True
+
+
+def _ensure_login_captcha() -> None:
+    a = st.session_state.get(LOGIN_CAPTCHA_A_SESSION_KEY)
+    b = st.session_state.get(LOGIN_CAPTCHA_B_SESSION_KEY)
+    expected = st.session_state.get(LOGIN_CAPTCHA_ANSWER_SESSION_KEY)
+    if not isinstance(a, int) or not isinstance(b, int) or expected != (a + b):
+        _reset_login_captcha()
+
+
+def _parse_captcha_answer(raw_value: str) -> Optional[int]:
+    cleaned = str(raw_value or "").strip()
+    if not cleaned:
+        return None
+    if not cleaned.isdigit():
+        return None
+    try:
+        return int(cleaned)
+    except Exception:
+        return None
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -442,6 +479,11 @@ def require_authentication() -> None:
             f"background-image: linear-gradient(0deg, rgba(3, 10, 28, 0.34), "
             f"rgba(3, 10, 28, 0.20)), url('data:image/png;base64,{bg_image_data}');"
         )
+    _ensure_login_captcha()
+    if st.session_state.pop(LOGIN_CAPTCHA_CLEAR_INPUT_FLAG_SESSION_KEY, False):
+        st.session_state.pop(LOGIN_CAPTCHA_INPUT_SESSION_KEY, None)
+    captcha_a = int(st.session_state.get(LOGIN_CAPTCHA_A_SESSION_KEY, 15))
+    captcha_b = int(st.session_state.get(LOGIN_CAPTCHA_B_SESSION_KEY, 15))
 
     st.markdown(
         f"""
@@ -470,21 +512,27 @@ def require_authentication() -> None:
             [data-testid="collapsedControl"] {{
                 display: none !important;
             }}
+            header[data-testid="stHeader"],
+            [data-testid="stToolbar"],
+            #MainMenu,
+            footer {{
+                display: none !important;
+            }}
             section.main > div {{
-                max-width: 1240px;
-                padding-top: 1.3rem;
-                padding-bottom: 1.3rem;
+                max-width: 1120px;
+                padding-top: 0.8rem;
+                padding-bottom: 0.8rem;
                 margin-left: auto;
                 margin-right: auto;
             }}
             [data-testid="stMainBlockContainer"] {{
-                max-width: 1240px !important;
-                padding-top: 1.3rem !important;
-                padding-bottom: 1.3rem !important;
+                max-width: 1120px !important;
+                padding-top: 0.8rem !important;
+                padding-bottom: 0.8rem !important;
                 width: 100% !important;
                 margin-left: auto !important;
                 margin-right: auto !important;
-                min-height: calc(100vh - 5.8rem) !important;
+                min-height: calc(100vh - 1.6rem) !important;
                 display: flex !important;
                 align-items: center !important;
                 justify-content: center !important;
@@ -492,18 +540,29 @@ def require_authentication() -> None:
             .st-key-login_shell {{
                 position: relative;
                 isolation: isolate;
-                border: 1px solid var(--auth-border-soft);
-                border-radius: 24px;
+                border: 1px solid rgba(128, 165, 220, 0.30);
+                border-radius: 20px;
                 overflow: hidden;
-                background: linear-gradient(160deg, rgba(4, 16, 39, 0.95), rgba(3, 12, 30, 0.97));
+                background: linear-gradient(152deg, rgba(4, 16, 39, 0.95), rgba(3, 11, 28, 0.97));
                 box-shadow:
-                    0 28px 78px rgba(0, 0, 0, 0.45),
-                    inset 0 1px 0 rgba(221, 237, 255, 0.06);
-                padding: 0.5rem;
+                    0 24px 56px rgba(0, 0, 0, 0.36),
+                    inset 0 1px 0 rgba(221, 237, 255, 0.04);
+                padding: 0.28rem;
                 width: 100%;
-                max-width: 1120px;
+                max-width: 1020px;
                 margin: 0 auto;
                 animation: auth-fade-up 420ms ease-out;
+            }}
+            .st-key-login_shell > div[data-testid="stHorizontalBlock"] {{
+                align-items: stretch !important;
+            }}
+            .st-key-login_shell > div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {{
+                display: flex;
+            }}
+            .st-key-login_shell > div[data-testid="stHorizontalBlock"] > div[data-testid="column"] > div {{
+                width: 100%;
+                display: flex;
+                height: 100%;
             }}
             .st-key-login_shell::before {{
                 content: "";
@@ -517,37 +576,39 @@ def require_authentication() -> None:
                 z-index: -1;
             }}
             .st-key-login_form_panel {{
-                min-height: 560px;
-                max-width: 460px;
+                min-height: auto;
+                max-width: 400px;
                 margin: 0 auto;
-                border: 1px solid rgba(126, 160, 214, 0.38);
-                border-radius: 18px;
-                padding: 1.45rem 1.45rem 1.55rem 1.45rem;
+                border: 1px solid rgba(126, 160, 214, 0.30);
+                border-radius: 14px;
+                padding: 0.95rem 1rem 1.02rem 1rem;
                 background:
-                    radial-gradient(circle at 14% 12%, rgba(112, 174, 255, 0.12) 0%, rgba(112, 174, 255, 0) 42%),
-                    linear-gradient(180deg, rgba(11, 23, 47, 0.84), rgba(6, 14, 31, 0.84));
+                    radial-gradient(circle at 14% 12%, rgba(112, 174, 255, 0.10) 0%, rgba(112, 174, 255, 0) 40%),
+                    linear-gradient(180deg, rgba(10, 22, 44, 0.82), rgba(6, 14, 31, 0.82));
                 backdrop-filter: blur(4px);
                 animation: auth-fade-up 520ms ease-out;
             }}
             .st-key-login_image_panel {{
                 min-height: 560px;
-                background-color: #071326;
+                height: 100%;
+                flex: 1 1 auto;
+                background-color: #041022;
                 background-repeat: no-repeat;
                 background-size: cover;
-                background-position: center center;
-                border-radius: 18px;
-                border: 1px solid rgba(124, 156, 209, 0.30);
+                background-position: 50% 46%;
+                border-radius: 14px;
+                border: 1px solid rgba(124, 156, 209, 0.24);
                 {right_panel_style}
                 position: relative;
                 overflow: hidden;
                 animation: auth-fade-up 620ms ease-out;
-                filter: saturate(1.08) contrast(1.05);
+                filter: saturate(1.05) contrast(1.03);
             }}
             .st-key-login_image_panel::after {{
                 content: "";
                 position: absolute;
                 inset: 0;
-                background: linear-gradient(162deg, rgba(5, 16, 35, 0.10) 0%, rgba(5, 16, 35, 0.34) 100%);
+                background: linear-gradient(162deg, rgba(5, 16, 35, 0.08) 0%, rgba(5, 16, 35, 0.28) 100%);
                 backdrop-filter: blur(1.5px);
                 -webkit-backdrop-filter: blur(1.5px);
                 pointer-events: none;
@@ -560,32 +621,32 @@ def require_authentication() -> None:
             .st-key-login_form_panel h1 {{
                 margin: 0 0 0.28rem 0;
                 font-family: "Space Grotesk", "Segoe UI", sans-serif;
-                font-size: clamp(1.68rem, 1.35rem + 0.9vw, 2.08rem);
+                font-size: clamp(1.42rem, 1.18rem + 0.72vw, 1.76rem);
                 font-weight: 700;
                 letter-spacing: 0.02em;
                 color: var(--auth-text-strong);
             }}
             .st-key-login_form_panel p {{
-                margin: 0 0 1.2rem 0;
+                margin: 0 0 0.72rem 0;
                 color: var(--auth-text-muted);
-                font-size: 0.95rem;
-                line-height: 1.5;
+                font-size: 0.88rem;
+                line-height: 1.45;
             }}
             .st-key-login_form_panel form {{
                 display: grid;
-                gap: 0.3rem;
+                gap: 0.15rem;
             }}
             .st-key-login_form_panel label {{
                 color: #d8e7ff;
                 font-weight: 600;
                 letter-spacing: 0.015em;
-                font-size: 0.87rem;
+                font-size: 0.8rem;
             }}
             .st-key-login_form_panel div[data-baseweb="input"] > div {{
                 border: 1px solid rgba(145, 173, 216, 0.38);
-                border-radius: 14px;
+                border-radius: 10px;
                 background: var(--auth-fill-soft);
-                min-height: 50px;
+                min-height: 42px;
                 transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
             }}
             .st-key-login_form_panel div[data-baseweb="input"] > div:focus-within {{
@@ -613,21 +674,21 @@ def require_authentication() -> None:
             }}
             .st-key-login_form_panel input {{
                 color: #f3f8ff !important;
-                font-size: 0.98rem !important;
+                font-size: 0.92rem !important;
                 font-weight: 600 !important;
             }}
             .st-key-login_form_panel input::placeholder {{
                 color: rgba(200, 220, 249, 0.72) !important;
             }}
             .st-key-login_form_panel button[kind="formSubmit"] {{
-                margin-top: 0.52rem;
-                min-height: 50px;
-                border-radius: 14px;
+                margin-top: 0.28rem;
+                min-height: 42px;
+                border-radius: 10px;
                 border: 1px solid var(--auth-border-strong);
                 background: linear-gradient(180deg, rgba(26, 74, 145, 0.98) 0%, rgba(13, 44, 96, 0.98) 100%);
                 color: #eef5ff;
                 font-family: "Space Grotesk", "Segoe UI", sans-serif;
-                font-size: 0.92rem;
+                font-size: 0.84rem;
                 font-weight: 700;
                 letter-spacing: 0.05em;
                 text-transform: uppercase;
@@ -656,9 +717,39 @@ def require_authentication() -> None:
             }}
             .st-key-login_form_panel .stCaption {{
                 color: rgba(194, 214, 244, 0.92) !important;
-                margin-top: 0.2rem !important;
-                font-size: 0.81rem !important;
-                line-height: 1.45 !important;
+                margin-top: 0.14rem !important;
+                font-size: 0.76rem !important;
+                line-height: 1.38 !important;
+            }}
+            .auth-captcha-shell {{
+                margin-top: 0.25rem;
+                margin-bottom: 0.1rem;
+                border: 1px solid rgba(134, 173, 226, 0.48);
+                border-radius: 10px;
+                padding: 0.42rem 0.58rem;
+                background:
+                    radial-gradient(circle at 0% 0%, rgba(102, 168, 255, 0.18) 0%, rgba(102, 168, 255, 0) 52%),
+                    rgba(9, 20, 42, 0.76);
+            }}
+            .auth-captcha-label {{
+                font-size: 0.72rem;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                color: rgba(201, 223, 255, 0.88);
+                margin-bottom: 0.16rem;
+                font-weight: 700;
+            }}
+            .auth-captcha-question {{
+                font-family: "Space Grotesk", "Segoe UI", sans-serif;
+                font-size: 0.94rem;
+                font-weight: 700;
+                color: #f1f7ff;
+                letter-spacing: 0.02em;
+            }}
+            .auth-captcha-hint {{
+                margin-top: 0.1rem;
+                font-size: 0.68rem;
+                color: rgba(188, 212, 244, 0.86);
             }}
             .st-key-login_form_panel div[data-baseweb="input"] button[aria-label*="password"],
             .st-key-login_form_panel div[data-baseweb="input"] button[title*="password"] {{
@@ -691,6 +782,9 @@ def require_authentication() -> None:
                     padding-top: 0.95rem !important;
                     padding-bottom: 0.95rem !important;
                 }}
+                .st-key-login_shell > div[data-testid="stHorizontalBlock"] > div[data-testid="column"] > div {{
+                    display: block;
+                }}
                 .st-key-login_shell {{
                     border-radius: 18px;
                     padding: 0.38rem;
@@ -699,11 +793,13 @@ def require_authentication() -> None:
                     min-height: auto;
                     max-width: 100%;
                     border-radius: 14px;
-                    padding: 1.05rem 0.95rem 1.12rem 0.95rem;
+                    padding: 0.9rem 0.9rem 0.95rem 0.9rem;
                 }}
                 .st-key-login_image_panel {{
-                    min-height: 250px;
+                    min-height: 270px;
                     border-radius: 14px;
+                    background-size: cover;
+                    background-position: 50% 42%;
                 }}
             }}
             @media (max-width: 640px) {{
@@ -759,7 +855,8 @@ def require_authentication() -> None:
         submitted = False
         username = ""
         password = ""
-        col_form, col_image = st.columns([1, 1.2], gap="medium")
+        captcha_response = ""
+        col_form, col_image = st.columns([0.88, 1.12], gap="small")
         with col_form:
             with st.container(key="login_form_panel"):
                 if google_oauth_ready:
@@ -769,6 +866,21 @@ def require_authentication() -> None:
                 with st.form("login_form", clear_on_submit=False):
                     username = st.text_input("E-mail", placeholder="name@gmail.com")
                     password = st.text_input("Password", type="password", placeholder="Password")
+                    st.markdown(
+                        (
+                            "<div class='auth-captcha-shell'>"
+                            "<div class='auth-captcha-label'>Security Check</div>"
+                            f"<div class='auth-captcha-question'>{captcha_a} + {captcha_b} = ?</div>"
+                            "<div class='auth-captcha-hint'>Enter the exact sum to continue.</div>"
+                            "</div>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    captcha_response = st.text_input(
+                        "",
+                        placeholder="Type the answer (e.g., 30)",
+                        key=LOGIN_CAPTCHA_INPUT_SESSION_KEY,
+                    )
                     if google_oauth_ready:
                         st.caption(
                             "After login, the system verifies that this is a real Google account."
@@ -781,6 +893,13 @@ def require_authentication() -> None:
                 st.markdown("&nbsp;", unsafe_allow_html=True)
 
     if submitted:
+        captcha_answer = _parse_captcha_answer(captcha_response)
+        expected_captcha = st.session_state.get(LOGIN_CAPTCHA_ANSWER_SESSION_KEY)
+        if not isinstance(expected_captcha, int) or captcha_answer is None or captcha_answer != expected_captcha:
+            st.error("Captcha incorrect. Please solve the new challenge and try again.")
+            _reset_login_captcha()
+            st.rerun()
+
         clean_username = (username or "").strip().lower()
         if not is_valid_gmail_email(clean_username):
             st.error("Use a valid @gmail.com e-mail address.")
@@ -849,6 +968,7 @@ def require_authentication() -> None:
             "role": user.role,
             "is_active": user.is_active,
         }
+        _reset_login_captcha()
         persist_auth_session(user.username)
         st.rerun()
     st.stop()
