@@ -729,9 +729,9 @@ def _aggregate_incidents_for_daily_mac_destination_table(incidents_df: pd.DataFr
     src["orig_ip"] = src["orig_ip"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
     src["destination"] = src["destination"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "*": ""})
     src["domain"] = src["domain"].astype(str).str.strip().str.lower().replace({"nan": "", "None": "", "none": ""})
-    src["source_types"] = src["source_types"].fillna("").astype(str)
-    src["allow_basis"] = src["allow_basis"].fillna("").astype(str)
-    src["confidence_reasons"] = src["confidence_reasons"].fillna("").astype(str)
+    src["source_types"] = src["source_types"].astype(str).fillna("")
+    src["allow_basis"] = src["allow_basis"].astype(str).fillna("")
+    src["confidence_reasons"] = src["confidence_reasons"].astype(str).fillna("")
 
     src["bytes_out_total"] = pd.to_numeric(src["bytes_out_total"], errors="coerce").fillna(0)
     src["bytes_in_total"] = pd.to_numeric(src["bytes_in_total"], errors="coerce").fillna(0)
