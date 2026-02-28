@@ -6,7 +6,7 @@
 INVALID_DEST_STRINGS = {"", "unknown", "nan", "none", "(empty)", "*"}
 INVALID_DEST_SET = set(INVALID_DEST_STRINGS)
 AUTO_UNIQUE_ID_COL = "::auto_unique_id::"
-FILTER_CACHE_VERSION = "ratio-precision-3dp-v2"
+FILTER_CACHE_VERSION = "ratio-precision-3dp-v3-mac-dest-day-table"
 # ui/pages/shadow_sharings.py
 import hashlib
 import re
@@ -632,6 +632,210 @@ def _filter_incidents_nonzero_outbound(incidents_df: pd.DataFrame) -> pd.DataFra
     return out
 
 
+def _confidence_label_from_score(score: object) -> str:
+    score_num = pd.to_numeric(pd.Series([score]), errors="coerce").fillna(0).iloc[0]
+    s = int(score_num)
+    if s >= 80:
+        return "HIGH"
+    if s >= 50:
+        return "PROBABLE"
+    return "WEAK"
+
+
+def _clean_text_token(value: object, *, lower: bool = False) -> str:
+    s = str(value or "").strip()
+    if s.lower() in {"", "nan", "none", "-", "(empty)", "unknown"}:
+        return ""
+    return s.lower() if lower else s
+
+
+def _last_non_empty_text(values: pd.Series) -> str:
+    vals = list(values.astype(str).tolist())
+    for raw in reversed(vals):
+        cleaned = _clean_text_token(raw, lower=False)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _union_source_types(values: pd.Series) -> str:
+    seen = set()
+    merged: List[str] = []
+    for raw in values.fillna("").astype(str).tolist():
+        for chunk in raw.split(","):
+            tok = _clean_text_token(chunk, lower=True)
+            if not tok or tok in seen:
+                continue
+            seen.add(tok)
+            merged.append(tok)
+    return ", ".join(merged) if merged else "conn"
+
+
+def _combine_reason_texts(values: pd.Series) -> str:
+    seen = set()
+    merged: List[str] = []
+    for raw in values.fillna("").astype(str).tolist():
+        for chunk in raw.split(";"):
+            tok = _clean_text_token(chunk, lower=False)
+            key = tok.lower()
+            if not tok or key in seen:
+                continue
+            seen.add(key)
+            merged.append(tok)
+    return "; ".join(merged)
+
+
+def _aggregate_incidents_for_daily_mac_destination_table(incidents_df: pd.DataFrame, selected_date: str) -> pd.DataFrame:
+    """
+    Table-only rollup:
+    one row per unique MAC + destination within the selected 24h date scope.
+    Falls back to `orig_ip` when MAC is missing so unrelated blank-MAC devices do not merge.
+    """
+    if incidents_df is None or incidents_df.empty:
+        return pd.DataFrame()
+
+    src = incidents_df.copy()
+    defaults = [
+        ("incident_id", ""),
+        ("first_ts", pd.NaT),
+        ("last_ts", pd.NaT),
+        ("mac", ""),
+        ("host_name", ""),
+        ("orig_ip", ""),
+        ("destination", ""),
+        ("domain", ""),
+        ("source_types", ""),
+        ("sig_service", ""),
+        ("allowed", False),
+        ("allow_basis", ""),
+        ("bytes_out_total", 0),
+        ("bytes_in_total", 0),
+        ("conn_count", 0),
+        ("total_duration", 0),
+        ("action", ""),
+        ("action_basis", ""),
+        ("category", ""),
+        ("confidence_score", 0),
+        ("confidence_reasons", ""),
+        ("is_shadow_sharing", False),
+    ]
+    for col_name, default_value in defaults:
+        if col_name not in src.columns:
+            src[col_name] = default_value
+
+    src["first_ts"] = pd.to_datetime(src["first_ts"], errors="coerce")
+    src["last_ts"] = pd.to_datetime(src["last_ts"], errors="coerce")
+    src["mac"] = src["mac"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
+    src["orig_ip"] = src["orig_ip"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
+    src["destination"] = src["destination"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "*": ""})
+    src["domain"] = src["domain"].astype(str).str.strip().str.lower().replace({"nan": "", "None": "", "none": ""})
+    src["source_types"] = src["source_types"].fillna("").astype(str)
+    src["allow_basis"] = src["allow_basis"].fillna("").astype(str)
+    src["confidence_reasons"] = src["confidence_reasons"].fillna("").astype(str)
+
+    src["bytes_out_total"] = pd.to_numeric(src["bytes_out_total"], errors="coerce").fillna(0)
+    src["bytes_in_total"] = pd.to_numeric(src["bytes_in_total"], errors="coerce").fillna(0)
+    src["conn_count"] = pd.to_numeric(src["conn_count"], errors="coerce").fillna(0)
+    src["total_duration"] = pd.to_numeric(src["total_duration"], errors="coerce").fillna(0)
+    src["confidence_score"] = pd.to_numeric(src["confidence_score"], errors="coerce").fillna(0)
+    src["_allowed_b"] = src["allowed"].apply(_coerce_bool_value)
+    src["_shadow_b"] = src["is_shadow_sharing"].apply(_coerce_bool_value)
+
+    src["__mac_key"] = src["mac"].astype(str).str.strip().str.lower()
+    src["__ip_key"] = src["orig_ip"].astype(str).str.strip().str.lower()
+    src["__device_key"] = src["__mac_key"].where(src["__mac_key"].ne(""), "ip:" + src["__ip_key"])
+    src.loc[src["__device_key"].isin(["", "ip:"]), "__device_key"] = "device:unknown"
+
+    src["__dest_key"] = src["destination"].astype(str).str.strip().str.lower()
+    src["__dest_key"] = src["__dest_key"].where(src["__dest_key"].ne(""), src["domain"].astype(str).str.strip().str.lower())
+    src.loc[src["__dest_key"] == "", "__dest_key"] = "(unknown)"
+
+    day_fallback = pd.to_datetime(selected_date, errors="coerce")
+    day_fallback_txt = day_fallback.strftime("%Y-%m-%d") if pd.notna(day_fallback) else ""
+    day_from_first = src["first_ts"].dt.strftime("%Y-%m-%d")
+    day_from_last = src["last_ts"].dt.strftime("%Y-%m-%d")
+    src["__day_key"] = day_from_first.where(day_from_first.notna(), day_from_last)
+    src["__day_key"] = src["__day_key"].fillna(day_fallback_txt).astype(str)
+    if day_fallback_txt:
+        src.loc[src["__day_key"].eq(""), "__day_key"] = day_fallback_txt
+
+    src = src.sort_values(["last_ts", "first_ts"], ascending=[True, True], kind="stable")
+    group_keys = ["__device_key", "__dest_key", "__day_key"]
+    gb = src.groupby(group_keys, dropna=False, sort=False)
+
+    agg = gb.agg(
+        first_ts=("first_ts", "min"),
+        last_ts=("last_ts", "max"),
+        bytes_out_total=("bytes_out_total", "sum"),
+        bytes_in_total=("bytes_in_total", "sum"),
+        conn_count=("conn_count", "sum"),
+        total_duration=("total_duration", "sum"),
+        confidence_score=("confidence_score", "max"),
+        allowed=("_allowed_b", "min"),
+        is_shadow_sharing=("_shadow_b", "max"),
+    ).reset_index()
+
+    text_cols = [
+        "mac",
+        "host_name",
+        "orig_ip",
+        "destination",
+        "domain",
+        "sig_service",
+        "action",
+        "action_basis",
+        "category",
+        "method",
+        "uri",
+        "user_agent",
+        "file_names",
+        "file_mime_types",
+    ]
+    text_cols = [c for c in text_cols if c in src.columns]
+    if text_cols:
+        latest_rows = (
+            src[group_keys + text_cols]
+            .groupby(group_keys, dropna=False, sort=False)
+            .tail(1)
+            .drop_duplicates(subset=group_keys, keep="last")
+        )
+        agg = agg.merge(latest_rows, on=group_keys, how="left")
+
+    src_union = gb["source_types"].apply(_union_source_types).reset_index(name="source_types")
+    reason_union = gb["confidence_reasons"].apply(_combine_reason_texts).reset_index(name="confidence_reasons")
+    basis_last = gb["allow_basis"].apply(_last_non_empty_text).reset_index(name="allow_basis")
+    agg = agg.merge(src_union, on=group_keys, how="left")
+    agg = agg.merge(reason_union, on=group_keys, how="left")
+    agg = agg.merge(basis_last, on=group_keys, how="left")
+
+    agg["allowed"] = agg["allowed"].fillna(False).astype(bool)
+    agg["is_shadow_sharing"] = agg["is_shadow_sharing"].fillna(False).astype(bool)
+    agg["conn_count"] = pd.to_numeric(agg["conn_count"], errors="coerce").fillna(0).astype(int)
+    agg["confidence_score"] = pd.to_numeric(agg["confidence_score"], errors="coerce").fillna(0).astype(int)
+    agg["out_in_ratio_total"] = (
+        agg["bytes_out_total"] / pd.to_numeric(agg["bytes_in_total"], errors="coerce").fillna(0).clip(lower=1)
+    ).replace([float("inf"), float("-inf")], 0).fillna(0).round(3)
+    agg["confidence"] = agg["confidence_score"].apply(_confidence_label_from_score)
+    agg["incident_id"] = (
+        "day_mac_dest|"
+        + agg["__device_key"].astype(str)
+        + "|"
+        + agg["__dest_key"].astype(str)
+        + "|"
+        + agg["__day_key"].astype(str)
+    )
+
+    if "destination" in agg.columns and "domain" in agg.columns:
+        fill_dest = agg["destination"].astype(str).str.strip().eq("")
+        agg.loc[fill_dest, "destination"] = agg.loc[fill_dest, "domain"].astype(str)
+        fill_domain = agg["domain"].astype(str).str.strip().eq("")
+        agg.loc[fill_domain, "domain"] = agg.loc[fill_domain, "destination"].astype(str).str.lower()
+
+    agg = agg.drop(columns=["__device_key", "__dest_key", "__day_key"], errors="ignore")
+    agg = agg.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
+    return agg.reset_index(drop=True)
+
+
 def _strict_scope_by_selected_date(df: pd.DataFrame, selected_date: str, *, ts_col: str = "ts") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -1213,7 +1417,18 @@ def show_shadow_sharing_device_dialog(
         st.info("No non-zero outbound incident rows match your dialog search.")
         return
 
-    grid_rows = _build_incident_grid_frame(scoped_incidents, include_hostname=False)
+    scoped_incidents_raw = scoped_incidents.copy()
+    scoped_incidents_table = _aggregate_incidents_for_daily_mac_destination_table(
+        scoped_incidents_raw,
+        str(selected_scope_label),
+    )
+
+    grid_rows = _build_incident_grid_frame(scoped_incidents_table, include_hostname=False)
+    raw_grid_rows = _build_incident_grid_frame(scoped_incidents_raw, include_hostname=False)
+    if raw_grid_rows.empty and not grid_rows.empty:
+        raw_grid_rows = grid_rows.copy()
+    if grid_rows.empty and not raw_grid_rows.empty:
+        grid_rows = raw_grid_rows.copy()
     if grid_rows.empty:
         st.info("No incident rows above 0 MB are available for this MAC.")
         return
@@ -1225,13 +1440,18 @@ def show_shadow_sharing_device_dialog(
 
     first_seen = pd.to_datetime(scoped_incidents.get("first_ts", pd.Series([], dtype="datetime64[ns]")), errors="coerce").min()
     last_seen = pd.to_datetime(scoped_incidents.get("last_ts", pd.Series([], dtype="datetime64[ns]")), errors="coerce").max()
-    unique_dest = int(grid_rows["Destination"].replace({"": None, "Unknown": None, "unknown": None}).dropna().nunique())
-    total_outbound_mb = float(pd.to_numeric(grid_rows["Outbound_MB"], errors="coerce").fillna(0).sum())
-    unapproved = int((grid_rows["Allowed_Domain"] == False).sum())  # noqa: E712
-    high_conf = int((grid_rows["Confidence"] == "HIGH").sum())
+    unique_dest = int(raw_grid_rows["Destination"].replace({"": None, "Unknown": None, "unknown": None}).dropna().nunique())
+    total_outbound_mb = float(pd.to_numeric(raw_grid_rows["Outbound_MB"], errors="coerce").fillna(0).sum())
+    unapproved = int((raw_grid_rows["Allowed_Domain"] == False).sum())  # noqa: E712
+    high_conf = int((raw_grid_rows["Confidence"] == "HIGH").sum())
 
     st.markdown(
-        f"<div class='shadow-filter-hint shadow-scope-hint'>Loaded <strong>{len(grid_rows):,}</strong> incident rows for this device.</div>",
+        (
+            f"<div class='shadow-filter-hint shadow-scope-hint'>"
+            f"Table grouped to <strong>{len(grid_rows):,}</strong> unique MAC+Destination rows "
+            f"(from {len(raw_grid_rows):,} incident rows) for this device."
+            f"</div>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -1249,14 +1469,15 @@ def show_shadow_sharing_device_dialog(
     )
 
     dm1, dm2, dm3, dm4 = st.columns(4)
-    dm1.metric("Scoped Incidents", f"{len(grid_rows):,}")
+    dm1.metric("Scoped Incidents", f"{len(raw_grid_rows):,}")
     dm2.metric("Unapproved", unapproved, delta="Investigate" if unapproved > 0 else "Clear", delta_color="inverse")
     dm3.metric("Outbound Volume", f"{total_outbound_mb:.2f} MB")
     dm4.metric("High Confidence", f"{high_conf:,}")
 
     with st.container():
         st.markdown("#### Shadow Sharing Incidents (MAC Scope)")
-        _render_incident_table_insights(grid_rows)
+        st.caption("Table rows are grouped by unique MAC + Destination for the selected 24-hour date scope.")
+        _render_incident_table_insights(raw_grid_rows)
         gb_rows = GridOptionsBuilder.from_dataframe(grid_rows)
         _configure_incident_grid_columns(
             gb_rows,
@@ -1490,7 +1711,8 @@ def render_shadow_sharing(parquet_root: Path):
     if isinstance(filter_cache_state, dict) and filter_cache_state.get("key") == filter_cache_key:
         filtered = filter_cache_state.get("filtered", pd.DataFrame())
         filtered_incidents = filter_cache_state.get("filtered_incidents", pd.DataFrame())
-        dev_grid_cached = filter_cache_state.get("dev_grid", pd.DataFrame())
+        dev_grid_table_cached = filter_cache_state.get("dev_grid_table", filter_cache_state.get("dev_grid", pd.DataFrame()))
+        dev_grid_raw_cached = filter_cache_state.get("dev_grid_raw", pd.DataFrame())
     else:
         # Apply filters
         filtered = df.copy()
@@ -1537,12 +1759,17 @@ def render_shadow_sharing(parquet_root: Path):
 
         filtered_incidents = build_shadow_sharing_incidents(filtered)
         filtered_incidents = _filter_incidents_nonzero_outbound(filtered_incidents)
-        dev_grid_cached = _build_incident_grid_frame(filtered_incidents)
+        dev_grid_raw_cached = _build_incident_grid_frame(filtered_incidents)
+        table_incidents = _aggregate_incidents_for_daily_mac_destination_table(filtered_incidents, str(selected_date))
+        dev_grid_table_cached = _build_incident_grid_frame(table_incidents)
+        if dev_grid_table_cached.empty and not dev_grid_raw_cached.empty:
+            dev_grid_table_cached = dev_grid_raw_cached.copy()
         st.session_state["_shadow_sharing_filtered_cache_v1"] = {
             "key": filter_cache_key,
             "filtered": filtered,
             "filtered_incidents": filtered_incidents,
-            "dev_grid": dev_grid_cached,
+            "dev_grid_table": dev_grid_table_cached,
+            "dev_grid_raw": dev_grid_raw_cached,
         }
 
     if filtered.empty:
@@ -1717,21 +1944,37 @@ def render_shadow_sharing(parquet_root: Path):
     # -------------------------------------------------------------------------
     with tab_overview:
         st.markdown("#### Shadow Sharing Incidents")
-        st.caption("Rows mirror Shadow Sharing Incidents in this filtered scope. Click any MAC to open all matching rows for that MAC.")
+        st.caption(
+            "Table rows are grouped by unique MAC + Destination for the selected 24-hour date scope. "
+            "Click any MAC to open all matching rows for that MAC."
+        )
 
-        dev_grid = dev_grid_cached if isinstance(dev_grid_cached, pd.DataFrame) else _build_incident_grid_frame(filtered_incidents)
+        if isinstance(dev_grid_table_cached, pd.DataFrame):
+            dev_grid = dev_grid_table_cached.copy()
+        else:
+            table_incidents = _aggregate_incidents_for_daily_mac_destination_table(filtered_incidents, str(selected_date))
+            dev_grid = _build_incident_grid_frame(table_incidents)
+        if isinstance(dev_grid_raw_cached, pd.DataFrame):
+            dev_grid_raw = dev_grid_raw_cached.copy()
+        else:
+            dev_grid_raw = _build_incident_grid_frame(filtered_incidents)
+        if dev_grid_raw.empty and not dev_grid.empty:
+            dev_grid_raw = dev_grid.copy()
         if dev_grid.empty:
             st.info("No incident rows are available with the current filters.")
             st.session_state["shadow_sharing_last_selected_mac"] = None
         else:
             if "Hostname" not in dev_grid.columns:
-                dev_grid = _build_incident_grid_frame(filtered_incidents, include_hostname=True)
+                table_incidents = _aggregate_incidents_for_daily_mac_destination_table(filtered_incidents, str(selected_date))
+                dev_grid = _build_incident_grid_frame(table_incidents, include_hostname=True)
+            if "Hostname" not in dev_grid_raw.columns:
+                dev_grid_raw = _build_incident_grid_frame(filtered_incidents, include_hostname=True)
             if AUTO_UNIQUE_ID_COL in dev_grid.columns:
                 dev_grid = dev_grid.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
             if "#" not in dev_grid.columns:
                 dev_grid = dev_grid.reset_index(drop=True)
                 dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
-            _render_incident_table_insights(dev_grid)
+            _render_incident_table_insights(dev_grid_raw)
             gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
             _configure_incident_grid_columns(
                 gb_dev,
