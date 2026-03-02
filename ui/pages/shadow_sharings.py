@@ -10,6 +10,7 @@ FILTER_CACHE_VERSION = "ratio-precision-3dp-v3-mac-dest-day-table"
 # ui/pages/shadow_sharings.py
 import hashlib
 import re
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -54,7 +55,7 @@ CONFIDENCE_COLORS = {
 def _shadow_sharing_policy_stamp() -> tuple:
     project_root = Path(__file__).resolve().parents[2]
     out: List[int] = []
-    for policy_name in ("whitelist_domains.yaml", "shadow_sharing_signatures.yaml", "shadow_sharing_categories.yaml"):
+    for policy_name in ("whitelist_domains.yaml", "shadow_sharing_signatures.yaml"):
         policy_path = project_root / policy_name
         try:
             out.append(int(policy_path.stat().st_mtime_ns))
@@ -588,7 +589,7 @@ def _clean_reason_value(value: object) -> str:
     return s
 
 
-def _compose_incident_reason(base_reason: object, action: object, action_basis: object, category: object) -> str:
+def _compose_incident_reason(base_reason: object, action: object, action_basis: object) -> str:
     parts: List[str] = []
     base = _clean_reason_value(base_reason)
     if base:
@@ -596,15 +597,22 @@ def _compose_incident_reason(base_reason: object, action: object, action_basis: 
 
     action_txt = _clean_reason_value(action)
     action_basis_txt = _clean_reason_value(action_basis)
-    if action_txt and action_txt.lower() not in {"access", "baseline access"}:
-        if action_basis_txt and action_basis_txt.lower() != "baseline access":
+
+    # Do not surface Share Link action/basis text in the Reasons column.
+    action_l = action_txt.lower()
+    basis_l = action_basis_txt.lower()
+    is_share_link_action = (
+        action_l in {"share link", "shared link"}
+        or ("share/link" in basis_l)
+        or ("share link" in basis_l)
+        or ("shared link" in basis_l)
+    )
+
+    if action_txt and action_l not in {"access", "baseline access"} and not is_share_link_action:
+        if action_basis_txt and basis_l != "baseline access":
             parts.append(f"action: {action_txt} ({action_basis_txt})")
         else:
             parts.append(f"action: {action_txt}")
-
-    category_txt = _clean_reason_value(category)
-    if category_txt and category_txt.lower() not in {"file_sharing", "uncategorized", "other"}:
-        parts.append(f"category: {category_txt}")
 
     deduped: List[str] = []
     seen = set()
@@ -615,6 +623,7 @@ def _compose_incident_reason(base_reason: object, action: object, action_basis: 
         seen.add(k)
         deduped.append(p)
     return "; ".join(deduped)
+
 
 
 def _filter_incidents_nonzero_outbound(incidents_df: pd.DataFrame) -> pd.DataFrame:
@@ -659,16 +668,25 @@ def _last_non_empty_text(values: pd.Series) -> str:
 
 
 def _union_source_types(values: pd.Series) -> str:
+    """Merge comma-separated source tags in a stable, operator-friendly order."""
+    desired = ["conn", "http", "ssl", "dns", "files"]
     seen = set()
-    merged: List[str] = []
+    tokens: List[str] = []
     for raw in values.fillna("").astype(str).tolist():
         for chunk in raw.split(","):
             tok = _clean_text_token(chunk, lower=True)
+            if not tok:
+                continue
+            tok = tok.strip()
             if not tok or tok in seen:
                 continue
             seen.add(tok)
-            merged.append(tok)
-    return ", ".join(merged) if merged else "conn"
+            tokens.append(tok)
+
+    ordered: List[str] = [t for t in desired if t in seen]
+    extras = sorted([t for t in seen if t not in set(desired)])
+    out = ordered + extras
+    return ", ".join(out) if out else "conn"
 
 
 def _combine_reason_texts(values: pd.Series) -> str:
@@ -714,7 +732,6 @@ def _aggregate_incidents_for_daily_mac_destination_table(incidents_df: pd.DataFr
         ("total_duration", 0),
         ("action", ""),
         ("action_basis", ""),
-        ("category", ""),
         ("confidence_score", 0),
         ("confidence_reasons", ""),
         ("is_shadow_sharing", False),
@@ -784,7 +801,6 @@ def _aggregate_incidents_for_daily_mac_destination_table(incidents_df: pd.DataFr
         "sig_service",
         "action",
         "action_basis",
-        "category",
         "method",
         "uri",
         "user_agent",
@@ -882,7 +898,7 @@ def _confidence_score_explainer_text() -> str:
         "- `+30` when destination is not allowlisted (`Allowed (Domain)=False`).\n"
         "- `+30` when upload volume is high (`>=10MB`) and out/in ratio is high (`>=5`).\n"
         "- `+15` for chunking behavior (`Conns >= 5` in the same window).\n"
-        "- `+40` for share-link evidence (`http_any_share=True`, typically URI contains share/shared-link patterns).\n"
+        "- `+40` for share-link evidence (`http_share=True` derived from correlated `http_any_share`).\n"
         "- `+20` for repeat behavior (seen across `>=2` days while still unapproved).\n"
         "- Confidence labels: `HIGH >= 80`, `PROBABLE >= 50`, `WEAK < 50`.\n\n"
         
@@ -894,10 +910,9 @@ def _confidence_score_explainer_text() -> str:
         "- `Action` is inferred in priority order: `Share Link` -> `Upload` -> `File Transfer (Upload/Download)` -> `Upload (TLS)`/`Download` -> `Access`.\n"
         "- `Share Link`/`Upload` come from HTTP markers (`http_any_share`/`http_any_upload`). `File Transfer` requires `files.log` bytes (`>=1MB`) plus conn direction (`bytes_out` vs `bytes_in`).\n"
         "- TLS heuristics are fallback only: `Upload (TLS)` when `bytes_out>=10MB` and `out/in>=5`; `Download` when `bytes_in>=25MB` and inbound is at least 3x outbound.\n"
-        "- `Category` is matched from destination/domain against lists in `shadow_sharing_categories.yaml` (cloud storage, paste, messaging, code repo, remote access); unmatched destinations become `Unknown`.\n"
         "- `Domain` is derived from destination (`dest_domain`) with fallback to destination text.\n"
         "- `Allowed (Domain)` is a boundary-safe suffix match against `whitelist_domains.yaml` (`example.com` matches `a.b.example.com`, not `example.com.evil.tld`).\n"
-        "- `Allow Basis = no match` means no allowlist domain matched; improve it by adding the correct root domain (or wildcard entry) to the allowlist."
+        ""
     )
 
 
@@ -991,7 +1006,6 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
         ("total_duration", 0),
         ("action", ""),
         ("action_basis", ""),
-        ("category", ""),
         ("confidence", ""),
         ("confidence_score", 0),
         ("confidence_reasons", ""),
@@ -1010,12 +1024,12 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
     inc_src.loc[inc_src["Domain"] == "", "Domain"] = inc_src.loc[inc_src["Domain"] == "", "Destination"].astype(str).str.lower()
     inc_src["Source"] = inc_src["source_types"].astype(str).str.strip().str.lower().replace({"nan": "", "None": "", "none": ""})
     inc_src.loc[inc_src["Source"] == "", "Source"] = "conn"
+    inc_src["Source"] = inc_src["Source"].apply(lambda s: _union_source_types(pd.Series([s])))
     inc_src["Allowed_Domain"] = inc_src["allowed"].apply(_coerce_bool_value)
     inc_src["Service"] = inc_src["sig_service"].astype(str).str.strip()
     inc_src.loc[inc_src["Service"].isin(["", "nan", "None", "none"]), "Service"] = "No signature match"
     action_txt = inc_src["action"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
     action_basis_txt = inc_src["action_basis"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
-    category_txt = inc_src["category"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
     inc_src["allow_basis"] = inc_src["allow_basis"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
     inc_src.loc[(inc_src["allow_basis"] == "") & (inc_src["Allowed_Domain"] == False), "allow_basis"] = "no match"  # noqa: E712
     inc_src["Confidence"] = inc_src["confidence"].astype(str).str.upper()
@@ -1031,8 +1045,8 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
     inc_src["Duration"] = pd.to_numeric(inc_src["total_duration"], errors="coerce").fillna(0).apply(_format_duration_minutes_seconds)
     base_reasons = inc_src["confidence_reasons"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
     inc_src["Reasons"] = [
-        _compose_incident_reason(br, a, ab, c)
-        for br, a, ab, c in zip(base_reasons.tolist(), action_txt.tolist(), action_basis_txt.tolist(), category_txt.tolist())
+        _compose_incident_reason(br, a, ab)
+        for br, a, ab in zip(base_reasons.tolist(), action_txt.tolist(), action_basis_txt.tolist())
     ]
 
     if "incident_id" not in inc_src.columns:
@@ -1068,7 +1082,6 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
         "Source",
         "Service",
         "Allowed_Domain",
-        "allow_basis",
         "Outbound_MB",
         "Inbound_MB",
         "Ratio",
@@ -1150,8 +1163,6 @@ def _configure_incident_grid_columns(
         cellStyle=_allowed_cellstyle(),
         **allowed_kwargs,
     )
-
-    gb.configure_column("allow_basis", header_name="Allow Basis", minWidth=190)
     num_fmt = _fixed_3dp_formatter()
     gb.configure_column("Outbound_MB", header_name="Out MB", width=110, valueFormatter=num_fmt)
     gb.configure_column("Inbound_MB", header_name="In MB", width=110, valueFormatter=num_fmt)
@@ -1394,7 +1405,6 @@ def show_shadow_sharing_device_dialog(
             "source_types",
             "sig_service",
             "allow_basis",
-            "category",
             "action",
             "action_basis",
             "confidence",
@@ -1556,9 +1566,24 @@ def render_shadow_sharing(parquet_root: Path):
         if err_msgs:
             err_txt = "; ".join(err_msgs[:2]) + (" ..." if len(err_msgs) > 2 else "")
             st.warning(f"Whitelist update issues: {err_txt}")
-
     # Date scope
-    target_dates = [selected_date] if selected_date else []
+    # NOTE: Zeek can write logs into a "day folder" that contains spillover timestamps
+    # from the previous/next day around midnight. To avoid missing events for the
+    # selected date, we load the selected folder plus adjacent folders (if present),
+    # then apply a strict timestamp filter to keep only the selected date.
+    target_dates: List[str] = []
+    if selected_date:
+        target_dates = [str(selected_date)]
+        try:
+            sel_dt = pd.to_datetime(str(selected_date), errors="coerce")
+            if pd.notna(sel_dt):
+                prev_d = (sel_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+                next_d = (sel_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+                for d in [prev_d, next_d]:
+                    if d in available_dates and d not in target_dates:
+                        target_dates.append(d)
+        except Exception:
+            pass
     policy_stamp = _shadow_sharing_policy_stamp()
     sync_token = int(st.session_state.get("_parquet_sync_token", 0))
     scope_cache_key = (
@@ -1790,6 +1815,7 @@ def render_shadow_sharing(parquet_root: Path):
     top_offender = "Unknown"
     top_offender_type = "Unknown"
     top_offender_cnt = 0
+    top_offender_hostname = ""
     if not threat_metric_base.empty:
         mac_norm = threat_metric_base["mac"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
         ip_norm = threat_metric_base["id.orig_h"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
@@ -1811,6 +1837,22 @@ def render_shadow_sharing(parquet_root: Path):
             top_offender_type = str(top_off.iloc[0]["__offender_type"]) if not top_off.empty else "Unknown"
             top_offender_cnt = int(top_off.iloc[0]["events"]) if not top_off.empty else 0
 
+            # Try to attach a hostname for operator context (best-effort).
+            top_offender_hostname = ""
+            try:
+                if "host_name" in threat_metric_base.columns:
+                    hn_series = pd.Series("", index=threat_metric_base.index, dtype="object")
+                    if top_offender_type == "MAC":
+                        hn_series = threat_metric_base.loc[mac_norm == top_offender, "host_name"]
+                    elif top_offender_type == "IP":
+                        hn_series = threat_metric_base.loc[ip_norm == top_offender, "host_name"]
+                    hn = hn_series.astype(str).str.strip()
+                    hn = hn[~hn.str.lower().isin(["", "unknown", "nan", "none", "-", "(empty)"])]
+                    if not hn.empty:
+                        top_offender_hostname = str(hn.value_counts().index[0])
+            except Exception:
+                top_offender_hostname = ""
+
     metric_mac = filtered["mac"].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "-": ""})
     metric_ip = filtered["id.orig_h"].astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "-": ""})
     metric_device = metric_mac.where(metric_mac != "", "ip:" + metric_ip)
@@ -1820,10 +1862,13 @@ def render_shadow_sharing(parquet_root: Path):
     m1.metric("Selected Events", f"{len(filtered):,}", delta=f"Unapproved: {unapproved:,}", delta_color="inverse")
     m2.metric("Total Volume", f"{total_mb:.2f} MB")
     m3.metric("Automation / SDK", f"{autom:,}")
+    top_offender_delta = f"{top_offender_cnt:,} events"
+    if top_offender_hostname:
+        top_offender_delta = f"{top_offender_delta} · {top_offender_hostname}"
     m4.metric(
         f"Top Offender ({top_offender_type})",
         top_offender,
-        delta=f"{top_offender_cnt:,} events",
+        delta=top_offender_delta,
         delta_color="inverse",
     )
     st.markdown(

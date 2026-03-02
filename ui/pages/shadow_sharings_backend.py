@@ -15,7 +15,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v16-category-yaml-no-exfil"
+CACHE_VERSION = "shadow-sharing-cache-v17-no-categories"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -25,8 +25,7 @@ WHITELIST_FILE = PROJECT_ROOT / "whitelist_domains.yaml"
 # Sharing/service signatures (algorithm #6)
 # Optional override file. If missing, built-in defaults are used.
 SIGNATURES_FILE = PROJECT_ROOT / "shadow_sharing_signatures.yaml"
-CATEGORY_RULES_FILE = PROJECT_ROOT / "shadow_sharing_categories.yaml"
-
+CATEGORY_RULES_FILE = None  # categories disabled
 # Incident model (algorithm #2/#4/#5)
 INCIDENT_WINDOW_MINUTES = 5
 BIG_OUT_BYTES = 10 * 1024 * 1024          # 10 MB
@@ -342,14 +341,8 @@ def _extract_category_rule_map(y: dict) -> Dict[str, List[str]]:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_category_rules() -> Tuple[List[Tuple[str, List[str]]], int]:
-    y = _safe_yaml_load(CATEGORY_RULES_FILE)
-    category_map = _extract_category_rule_map(y)
-    rules: List[Tuple[str, List[str]]] = []
-    for cat, doms in category_map.items():
-        if doms:
-            rules.append((cat, doms))
-    mtime_ns = int(CATEGORY_RULES_FILE.stat().st_mtime_ns) if CATEGORY_RULES_FILE.exists() else 0
-    return rules, mtime_ns
+    """Categories are disabled for Shadow Sharing (always returns empty rules)."""
+    return [], 0
 
 
 CATEGORY_RULES, CATEGORY_RULES_MTIME_NS = load_category_rules()
@@ -493,7 +486,7 @@ def _remove_domain_from_whitelist(domain: str) -> Tuple[bool, str]:
 
 def refresh_shadow_sharing_runtime_state() -> None:
     """
-    Refresh in-memory whitelist/signature/category metadata and clear shadow-sharing caches.
+    Refresh in-memory whitelist/signature metadata and clear shadow-sharing caches.
     Call after mutating whitelist/signature files.
     """
     global WHITELIST_DOMAINS, WHITELIST_MTIME_NS
@@ -881,7 +874,7 @@ def _identity_confidence(row: pd.Series) -> str:
     return "Unknown"
 
 # -----------------------------------------------------------------------------
-# Action detection + Category tagging
+# Action detection
 # -----------------------------------------------------------------------------
 
 UPLOAD_URI_RE = re.compile(r"(^|/)(upload|uploads|file|files|attachments|drive|share|send|transfer|content)(/|$)", re.IGNORECASE)
@@ -1481,11 +1474,6 @@ def _risk_score_row(row: pd.Series) -> Tuple[int, str]:
         score += 15
         basis.append("destination not in whitelist")
 
-    cat = str(row.get("Category", "Unknown"))
-    if cat in ("Cloud Storage", "Paste", "Remote Access"):
-        score += 10
-        basis.append(f"category={cat}")
-
     action = str(row.get("Action", "") or "")
     if action in {"Upload", "Upload (TLS)", "File Transfer (Upload)"}:
         score += 20
@@ -1763,8 +1751,6 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     out["Signature_Match"] = sig.apply(lambda x: bool(x[0]))
     out["Signature_Service"] = sig.apply(lambda x: str(x[1] or ""))
     out["Signature_Basis"] = sig.apply(lambda x: str(x[2] or ""))  # noqa: E712
-    # category
-    out["Category"] = out["destination"].apply(_tag_category)
 
     # client type
     if "user_agent" not in out.columns:
@@ -1972,7 +1958,10 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     df["duration"] = pd.to_numeric(df.get("duration", 0), errors="coerce").fillna(0)
     df["is_long"] = df["duration"] >= LONG_DURATION_SEC
     df["is_big_out"] = df["bytes_out"] >= BIG_OUT_BYTES
-    df["http_share_evidence"] = _coerce_bool_series(pd.Series(df.get("http_any_share", False), index=df.index))
+    # Share-link evidence:
+    # Only from explicit http_any_share markers (do not infer from Action/Action_Basis).
+    _http_any_share = _coerce_bool_series(pd.Series(df.get("http_any_share", False), index=df.index))
+    df["http_share_evidence"] = _http_any_share
     df["sig_match_b"] = _coerce_bool_series(pd.Series(df.get("Signature_Match", False), index=df.index))
     df["allowed_b"] = _coerce_bool_series(pd.Series(df.get("Allowed", False), index=df.index))
 
@@ -1998,7 +1987,6 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         "allow_basis": _clean_text("Allow_Basis"),
         "action": _clean_text("Action"),
         "action_basis": _clean_text("Action_Basis"),
-        "category": _clean_text("Category"),
         "method": _clean_text("method"),
         "uri": _clean_text("uri"),
         "user_agent": _clean_text("user_agent"),
@@ -2050,8 +2038,7 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         "__allow_basis",
         "__action",
         "__action_basis",
-        "__category",
-        "__method",
+                "__method",
         "__uri",
         "__user_agent",
         "__file_names",
@@ -2069,14 +2056,25 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
             "__allow_basis": "allow_basis",
             "__action": "action",
             "__action_basis": "action_basis",
-            "__category": "category",
-            "__method": "method",
+                        "__method": "method",
             "__uri": "uri",
             "__user_agent": "user_agent",
             "__file_names": "file_names",
             "__file_mime_types": "file_mime_types",
         }
     )
+
+    # Capture an example HTTP share URI/method from rows where http_any_share was true in this window.
+    if "http_share_evidence" in df.columns:
+        share_rows = df[df["http_share_evidence"].fillna(False).astype(bool)].copy()
+        if not share_rows.empty:
+            share_txt = (
+                share_rows.groupby(group_keys, dropna=False)[["__method", "__uri"]]
+                .last()
+                .reset_index()
+                .rename(columns={"__method": "share_method", "__uri": "share_uri"})
+            )
+            agg = agg.merge(share_txt, on=group_keys, how="left")
 
     src_cols = ["conn", "http", "ssl", "dns", "files"]
     src_flags = ["src_conn", "src_http", "src_ssl", "src_dns", "src_files"]
@@ -2121,12 +2119,22 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     reason_chunks.append(pd.Series("policy: not allowlisted; ", index=agg.index).where(cond_not_allowed, ""))
     reason_chunks.append(pd.Series("upload: >=10MB and high out/in ratio; ", index=agg.index).where(cond_upload, ""))
     reason_chunks.append(pd.Series("chunking: many conns in window; ", index=agg.index).where(cond_chunking, ""))
-    reason_chunks.append(pd.Series("sharing: HTTP share-link evidence; ", index=agg.index).where(cond_share, ""))
+    # HTTP share-link evidence details (derived from correlated http.log markers)
+    _m_share = agg.get("share_method", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _u_share = agg.get("share_uri", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _m_fallback = agg.get("method", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _u_fallback = agg.get("uri", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _m = _m_share.where(_m_share.ne(""), _m_fallback).str.upper()
+    _u = _u_share.where(_u_share.ne(""), _u_fallback)
+    _detail = (_m + " " + _u).str.strip()
+    _detail = _detail.where(_detail.ne(""), "http_any_share=True")
+    _detail = _detail.where(_detail.str.len() <= 220, _detail.str.slice(0, 217) + "...")
+    http_share_reason = ("http_any_share evidence: " + _detail + "; ")
+    reason_chunks.append(http_share_reason.where(cond_share, ""))
     reason_chunks.append(pd.Series("repeat: seen across >=2 days; ", index=agg.index).where(cond_repeat, ""))
     agg["confidence_reasons"] = pd.concat(reason_chunks, axis=1).sum(axis=1).str.rstrip("; ").str.strip()
     agg["is_shadow_sharing"] = (agg["sig_match"] == True) & (agg["allowed"] == False) & (agg["confidence_score"] >= 50)  # noqa: E712
     agg["incident_id"] = agg["device_id"].astype(str) + "|" + agg["domain"].astype(str) + "|" + agg["time_window"].astype(str)
-    agg["category"] = agg["category"].where(agg["category"].astype(str).str.strip() != "", "file_sharing")
 
     cols = [
         "incident_id",
@@ -2134,7 +2142,6 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         "mac", "host_name", "orig_ip",
         "source_types",
         "destination", "domain",
-        "category",
         "action", "action_basis",
         "sig_service",
         "allowed", "allow_basis",
