@@ -1090,6 +1090,7 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
         "Confidence",
         "Score",
         "Reasons",
+        "allow_basis",
         "incident_id",
     ]
     if not include_hostname:
@@ -1155,6 +1156,8 @@ def _configure_incident_grid_columns(
             "cellEditor": "agCheckboxCellEditor",
             "cellRenderer": "agCheckboxCellRenderer",
             "singleClickEdit": True,
+            "filter": False,
+            "sortable": False,
         }
     gb.configure_column(
         "Allowed_Domain",
@@ -1172,18 +1175,34 @@ def _configure_incident_grid_columns(
     gb.configure_column("Confidence", width=110, cellStyle=_confidence_cellstyle())
     gb.configure_column("Score", width=82)
     gb.configure_column("Reasons", minWidth=420)
+    gb.configure_column("allow_basis", hide=True)
     gb.configure_column("incident_id", hide=True)
 
 
+def _clean_whitelist_target_value(value: object) -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return ""
+    if txt.lower() in INVALID_DEST_SET:
+        return ""
+    return txt
+
+
 def _resolve_whitelist_target(row: pd.Series, *, remove: bool) -> str:
+    # For allow actions, always use the Domain column so one allow entry
+    # can immediately apply to all rows that share the same domain.
+    domain = _clean_whitelist_target_value(row.get("Domain", ""))
+    if domain:
+        return domain
+
+    # For remove actions, keep compatibility with prior basis-driven removal.
     if remove:
-        basis = str(row.get("allow_basis", "") or "").strip()
+        basis = _clean_whitelist_target_value(row.get("allow_basis", ""))
         if basis and basis.lower() not in {"no match", "n/a (unknown destination)"}:
             return basis
-    for col in ["Domain", "Destination"]:
-        val = str(row.get(col, "") or "").strip()
-        if val and val.lower() not in INVALID_DEST_SET:
-            return val
+        destination = _clean_whitelist_target_value(row.get("Destination", ""))
+        if destination:
+            return destination
     return ""
 
 
@@ -1234,7 +1253,7 @@ def _apply_allowed_domain_checkbox_changes(grid_before: pd.DataFrame, grid_respo
         seen_ops.add(op_key)
 
         if not str(target).strip():
-            error_msgs.append(f"{incident_id}: missing domain target")
+            error_msgs.append(f"{incident_id}: missing domain target (Domain column empty)")
             continue
 
         if new_allowed:
@@ -1500,7 +1519,7 @@ def show_shadow_sharing_device_dialog(
             gb_rows,
             key=f"shadow_sharing_rows_grid_{selected_scope_key}_{mac_key}",
             height=450,
-            update_mode=GridUpdateMode.VALUE_CHANGED,
+            update_mode=(GridUpdateMode.VALUE_CHANGED | GridUpdateMode.MODEL_CHANGED),
             wrap_shell=False,
             force_scrollbars=True,
             hide_scrollbar_buttons=True,
@@ -1608,13 +1627,25 @@ def render_shadow_sharing(parquet_root: Path):
         st.session_state.pop("_shadow_sharing_source_masks_cache_v1", None)
 
     # Keep date scope strict to selected day by event timestamp.
-    # Some date folders can still contain spillover rows around midnight.
-    total_scope_rows = int(len(df))
-    df = _strict_scope_by_selected_date(df, str(selected_date), ts_col="ts")
+    # Some day folders can still contain spillover rows around midnight.
+    df_union = df
+    total_scope_rows = int(len(df_union))
+    df = _strict_scope_by_selected_date(df_union, str(selected_date), ts_col="ts")
+
     trimmed_rows = max(0, total_scope_rows - int(len(df)))
-    if trimmed_rows > 0:
+
+    adjacent_dates = [str(d) for d in (target_dates or []) if str(d) != str(selected_date)]
+    included_from_adjacent = 0
+    if adjacent_dates and "_folder_date" in df.columns:
+        try:
+            included_from_adjacent = int(df["_folder_date"].astype(str).isin(set(adjacent_dates)).sum())
+        except Exception:
+            included_from_adjacent = 0
+
+    if trimmed_rows > 0 or adjacent_dates:
         st.caption(
-            f"Date scope note: excluded {trimmed_rows:,} rows because their timestamps were outside `{selected_date}`."
+            f"Date scope note: excluded {trimmed_rows:,} rows because their timestamps were outside `{selected_date}`. "
+            f"Included {included_from_adjacent:,} rows from adjacent day folders (yesterday/tomorrow)."
         )
     if isinstance(incidents, pd.DataFrame) and not incidents.empty:
         incidents = _strict_scope_by_selected_date(incidents, str(selected_date), ts_col="first_ts")
@@ -2033,7 +2064,11 @@ def render_shadow_sharing(parquet_root: Path):
                 gb_dev,
                 key=f"shadow_sharing_device_grid_{selected_scope_key}_{int(st.session_state.get('shadow_sharing_grid_nonce', 0))}",
                 height=430,
-                update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.VALUE_CHANGED),
+                update_mode=(
+                    GridUpdateMode.SELECTION_CHANGED
+                    | GridUpdateMode.VALUE_CHANGED
+                    | GridUpdateMode.MODEL_CHANGED
+                ),
                 wrap_shell=False,
                 force_scrollbars=True,
                 hide_scrollbar_buttons=True,

@@ -15,7 +15,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v17-no-categories"
+CACHE_VERSION = "shadow-sharing-cache-v18-no-categories-folderdates"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -878,7 +878,9 @@ def _identity_confidence(row: pd.Series) -> str:
 # -----------------------------------------------------------------------------
 
 UPLOAD_URI_RE = re.compile(r"(^|/)(upload|uploads|file|files|attachments|drive|share|send|transfer|content)(/|$)", re.IGNORECASE)
-PASTE_URI_RE = re.compile(r"(paste|bin|snippet|gist)", re.IGNORECASE)
+# Keep share-link indicators boundary-aware to avoid false positives
+# such as "/molbin/.../events.json" matching on the "bin" substring.
+PASTE_URI_RE = re.compile(r"(?:^|[/?._-])(paste(?:bin)?|snippet|gist)(?:$|[/?._-])", re.IGNORECASE)
 REMOTE_URI_RE = re.compile(r"(remote|rdp|vpn|tunnel|teamviewer|anydesk)", re.IGNORECASE)
 API_UPLOAD_RE = re.compile(r"(multipart/form-data|application/octet-stream)", re.IGNORECASE)
 
@@ -1827,6 +1829,7 @@ def _load_shadow_sharing_data_cached(
             continue
         df_d = _build_one_date(parquet_root, str(d), known_files)
         if not df_d.empty:
+            df_d["_folder_date"] = str(d)
             frames.append(df_d)
 
     if not frames:
