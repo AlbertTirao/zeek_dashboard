@@ -6,6 +6,7 @@ from pathlib import Path
 from .shadow_apps import render_shadow_apps
 from .shadow_sharings import render_shadow_uploads
 from .shadow_ai import render_shadow_ai
+from .anonymization_network import render_anonymization_network
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 
@@ -126,14 +127,14 @@ def render(parquet_root: Path):
     updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     render_traffic_style_header(
         title="Traffic Monitoring",
-        subtitle="Shadow Apps, Shadow Sharings, and Shadow AI telemetry",
+        subtitle="Shadow Apps, Shadow Sharings, Shadow AI, and Anonymization Network telemetry",
         chip_label="Network Monitoring",
         updated_txt=updated_txt,
     )
 
     section = st.radio(
-        "Analytics section",
-        ["Shadow Apps", "Shadow Sharings", "Shadow AI"],
+        "",
+        ["Shadow Apps", "Shadow Sharings", "Shadow AI", "Anonymization Network"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -142,5 +143,7 @@ def render(parquet_root: Path):
         render_shadow_apps(parquet_root)
     elif section == "Shadow Sharings":
         render_shadow_uploads(parquet_root)
-    else:
+    elif section == "Shadow AI":
         render_shadow_ai(parquet_root)
+    elif section == "Anonymization Network":
+        render_anonymization_network(parquet_root)

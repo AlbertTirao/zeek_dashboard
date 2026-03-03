@@ -79,7 +79,7 @@ def _session_secret() -> Optional[bytes]:
     )
     if not secret:
         # Fallback keeps persistence working without extra setup in local environments.
-        secret = auth_service.get_mongodb_uri()
+        secret = auth_service.get_auth_connection_fingerprint()
     if not secret:
         return None
     return str(secret).encode("utf-8")

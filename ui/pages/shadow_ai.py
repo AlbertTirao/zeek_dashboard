@@ -74,6 +74,47 @@ def write_yaml(path: Path, data: dict) -> None:
         pass
 
 
+def _normalize_provider_name(value: str) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def add_provider_to_authorized(provider_value: str) -> tuple[bool, str]:
+    provider = _normalize_provider_name(provider_value)
+    if not provider or provider.lower() in {"unknown", "-", "nan", "none", "null"}:
+        return False, "Invalid AI provider for allowlist."
+
+    data = read_yaml(AI_SIGNATURES_FILE)
+    if not isinstance(data, dict):
+        data = {}
+
+    existing_list = data.get("authorized_providers")
+    if not isinstance(existing_list, list):
+        existing_list = []
+
+    existing_norm: List[str] = []
+    existing_set = set()
+    for item in existing_list:
+        clean = _normalize_provider_name(item)
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in existing_set:
+            continue
+        existing_set.add(key)
+        existing_norm.append(clean)
+
+    provider_key = provider.lower()
+    if provider_key in existing_set:
+        return True, f"{provider} is already allowlisted."
+
+    existing_norm.append(provider)
+    data["authorized_providers"] = existing_norm
+    write_yaml(AI_SIGNATURES_FILE, data)
+    return True, f"{provider} added to authorized_providers."
+
+
 # =============================================================================
 # YAML LOADER
 # =============================================================================
@@ -429,6 +470,8 @@ AI_HOST_PROVIDER_HINTS: Dict[str, Tuple[str, ...]] = {
     "Ollama (Local/Cloud)": ("ollama",),
     "LM Studio": ("lmstudio",),
 }
+HEURISTIC_MULTI_PART_TLDS = {"uk", "au", "jp", "nz", "kr", "za", "tr", "il", "mx", "br"}
+HEURISTIC_MULTI_PART_SECOND_LEVELS = {"ac", "co", "com", "edu", "gov", "net", "org"}
 FUZZY_PROVIDER_SEEDS: Dict[str, List[str]] = {
     "OpenAI / ChatGPT": ["chat gpt", "chat-gpt", "open ai"],
     "Ollama (Local/Cloud)": ["ollama ai", "ollama local"],
@@ -629,6 +672,103 @@ def _is_generic_ai_like_text(raw_text: str) -> bool:
     if re.search(r"\bv1[\/ ](?:chat[\/ ]completions|responses|embeddings)\b", raw):
         return True
     return False
+
+
+def _heuristic_root_domain(host: str) -> str:
+    h = str(host or "").strip().lower().strip(".")
+    if not h:
+        return ""
+    try:
+        ipaddress.ip_address(h)
+        return ""
+    except Exception:
+        pass
+    if not re.fullmatch(r"[a-z0-9.-]+", h):
+        return ""
+    labels = [x for x in h.split(".") if x]
+    if len(labels) < 2:
+        return ""
+    if (
+        len(labels) >= 3
+        and labels[-1] in HEURISTIC_MULTI_PART_TLDS
+        and labels[-2] in HEURISTIC_MULTI_PART_SECOND_LEVELS
+    ):
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _canonical_provider_from_hint(text_hint: str) -> str:
+    norm = _normalize_fuzzy_text(text_hint)
+    if not norm:
+        return ""
+
+    direct = FUZZY_ALIAS_TO_PROVIDER.get(norm)
+    if direct:
+        return direct
+
+    compact = norm.replace(" ", "")
+    if compact and compact in FUZZY_ALIAS_TO_PROVIDER:
+        return FUZZY_ALIAS_TO_PROVIDER[compact]
+
+    best_alias, best_score = _extract_best_fuzzy_alias(norm)
+    if best_alias and int(best_score) >= max(80, FUZZY_MIN_SCORE - 8):
+        if not (_has_ai_signal_tokens(norm) or _has_ai_signal_tokens(best_alias)):
+            return ""
+        prov = FUZZY_ALIAS_TO_PROVIDER.get(best_alias, "")
+        if prov:
+            return prov
+    return ""
+
+
+def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
+    raw = str(raw_text or "").strip()
+    if not raw:
+        return "Unknown AI (Heuristic)", "generic-ai-hint"
+
+    host = _to_domain_from_destination(raw)
+    root_domain = _heuristic_root_domain(host)
+    if root_domain:
+        canonical = _canonical_provider_from_hint(root_domain)
+        if canonical:
+            return canonical, f"heuristic-domain:{root_domain}"
+        return root_domain, f"heuristic-domain:{root_domain}"
+
+    norm = _normalize_fuzzy_text(raw)
+    if not norm:
+        return "Unknown AI (Heuristic)", "generic-ai-hint"
+
+    tokens = [
+        t
+        for t in norm.split()
+        if t and t not in FUZZY_TOKEN_STOPWORDS and t not in FUZZY_GENERIC_VENDOR_TOKENS
+    ]
+    if not tokens:
+        return "Unknown AI (Heuristic)", "generic-ai-hint"
+
+    ai_stems = tuple(sorted({s for s in FUZZY_AI_SIGNAL_TOKENS if len(s) >= 4}, key=len, reverse=True))
+    strong_tokens = [
+        t
+        for t in tokens
+        if (
+            t in FUZZY_AI_SIGNAL_TOKENS
+            or t.endswith("ai")
+            or any(st in t for st in ai_stems)
+        )
+    ]
+    preferred = strong_tokens + [t for t in tokens if t not in strong_tokens]
+
+    for tok in preferred:
+        canonical = _canonical_provider_from_hint(tok)
+        if canonical:
+            return canonical, f"heuristic-token:{tok}"
+
+    chosen = preferred[0]
+    label = re.sub(r"[_\-]+", " ", chosen).strip()
+    label = re.sub(r"\s+", " ", label)
+    if not label:
+        return "Unknown AI (Heuristic)", "generic-ai-hint"
+    pretty = label.upper() if len(label) <= 4 else label.title()
+    return pretty[:48], f"heuristic-token:{chosen}"
 
 
 def _extract_best_fuzzy_alias(candidate: str) -> Tuple[str, int]:
@@ -1225,9 +1365,14 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
             ai_like = rem.map(_is_generic_ai_like_text).fillna(False)
             candidate = hint | ai_like
             if candidate.any():
-                idx = rem.index[candidate]
-                provider.loc[idx] = "Unknown AI (Heuristic)"
-                sig.loc[idx] = "generic-ai-hint"
+                generic_map: Dict[str, Tuple[str, str]] = {}
+                for raw_text in rem[candidate].drop_duplicates().tolist():
+                    generic_map[raw_text] = _heuristic_provider_name_from_generic(raw_text)
+                for raw_text, (prov, generic_sig) in generic_map.items():
+                    m = remaining & text_series.eq(raw_text)
+                    if m.any():
+                        provider[m] = prov
+                        sig[m] = generic_sig
 
     return provider.fillna("Unknown"), sig.fillna("-")
 
@@ -3385,6 +3530,16 @@ def _drop_empty_rows_and_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _coerce_checkbox_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"true", "1", "yes", "y", "on"}
+
+
 def render_shadow_aggrid(
     df: pd.DataFrame,
     gb: GridOptionsBuilder,
@@ -3536,6 +3691,22 @@ def _new_grid_builder(df_grid: pd.DataFrame, page_size: int = 15) -> GridOptions
     if "#" in df_grid.columns:
         gb.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False, flex=0)
     return gb
+
+
+def _close_shadow_ai_allow_dialog() -> None:
+    st.session_state["shadow_ai_allow_dialog_open"] = False
+    st.session_state.pop("shadow_ai_allow_candidate", None)
+
+
+def _open_shadow_ai_allow_dialog(candidate: dict) -> None:
+    st.session_state["shadow_ai_allow_candidate"] = candidate
+    st.session_state["shadow_ai_allow_dialog_open"] = True
+
+
+def _bump_shadow_ai_provider_grid_nonce() -> None:
+    st.session_state["shadow_ai_provider_grid_nonce"] = int(
+        st.session_state.get("shadow_ai_provider_grid_nonce", 0)
+    ) + 1
 
 
 def _close_shadow_ai_mac_dialog(*, preserve_last_selected: bool = True) -> None:
@@ -4028,6 +4199,49 @@ def _render_shadow_ai_mac_drilldown(
             auto_fit_columns=False,
         )
 
+
+@st.dialog("Allow AI Provider", width="small", dismissible=False)
+def show_shadow_ai_allow_dialog() -> None:
+    candidate = st.session_state.get("shadow_ai_allow_candidate") or {}
+    provider_raw = _normalize_provider_name(candidate.get("provider"))
+    verdict_raw = str(candidate.get("verdict") or "").strip()
+    events_raw = candidate.get("events", "")
+    invalid_target = provider_raw == ""
+
+    st.markdown(f"Confirm allowlisting AI provider `{provider_raw or 'unknown'}`.")
+    st.markdown(f"- Current Verdict: `{verdict_raw or '-'}`")
+    st.markdown(f"- Events in view: `{events_raw if str(events_raw).strip() else '-'}`")
+    st.caption(
+        "This updates ai_signatures.yaml (`authorized_providers`) and refreshes policy verdicts on rerun."
+    )
+
+    if invalid_target:
+        st.error("This row has no valid AI provider value to allowlist.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button(
+            "Allow This AI",
+            type="primary",
+            use_container_width=True,
+            disabled=invalid_target,
+            key="shadow_ai_allow_confirm_btn",
+        ):
+            ok, message = add_provider_to_authorized(provider_raw)
+            if ok:
+                _close_shadow_ai_allow_dialog()
+                _shadow_ai_bust_ui_caches()
+                _bump_shadow_ai_provider_grid_nonce()
+                st.success(message)
+                st.rerun()
+            st.error(message)
+    with c2:
+        if st.button("Cancel", use_container_width=True, key="shadow_ai_allow_cancel_btn"):
+            _close_shadow_ai_allow_dialog()
+            _bump_shadow_ai_provider_grid_nonce()
+            st.rerun()
+
+
 @st.dialog("MAC Drilldown - Shadow AI (Forensics)", width="large")
 def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: str) -> None:
     active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
@@ -4131,17 +4345,18 @@ def inject_shadow_ai_css():
             border: 1px solid var(--panel-border);
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
-            min-height: 115px;
-            height: 115px;
+            min-height: 118px;
+            height: 118px;
             display: flex;
             flex-direction: column;
             justify-content: space-between;
         }
         [data-testid="stMetric"] > div {
             height: 100%;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
+            display: grid;
+            grid-template-rows: auto auto minmax(1.1rem, auto);
+            align-content: start;
+            row-gap: 0.1rem;
         }
         [data-testid="stMetricDelta"] {
             min-height: 1.1rem;
@@ -4150,7 +4365,6 @@ def inject_shadow_ai_css():
             width: auto !important;
             max-width: max-content !important;
             align-self: flex-start !important;
-            margin-top: 0.12rem;
         }
         [data-testid="stMetricDelta"] > div {
             width: auto !important;
@@ -4230,6 +4444,9 @@ def _shadow_ai_bust_ui_caches() -> None:
     # Close any pending dialog so rerun doesn't double-open it
     st.session_state["shadow_ai_mac_dialog_open"] = False
     st.session_state["shadow_ai_mac_dialog_mac"] = None
+    st.session_state["shadow_ai_allow_dialog_open"] = False
+    st.session_state["shadow_ai_allow_candidate"] = None
+    _bump_shadow_ai_provider_grid_nonce()
 
 
     # Full refresh (re-read yaml/signatures and rebuild caches)
@@ -4248,6 +4465,9 @@ def render_shadow_ai(parquet_root: Path):
     st.session_state.setdefault("shadow_ai_mac_dialog_mac", None)
     st.session_state.setdefault("shadow_ai_mac_dialog_last_selected", None)
     st.session_state.setdefault("shadow_ai_mac_grid_nonce", 0)
+    st.session_state.setdefault("shadow_ai_provider_grid_nonce", 0)
+    st.session_state.setdefault("shadow_ai_allow_dialog_open", False)
+    st.session_state.setdefault("shadow_ai_allow_candidate", None)
     st.session_state.setdefault("_shadow_ai_scoped_df_key_v1", None)
     st.session_state.setdefault("_shadow_ai_scoped_df_v1", None)
     st.session_state.setdefault("_shadow_ai_scoped_decision_v1", "all_dates")
@@ -4297,7 +4517,7 @@ def render_shadow_ai(parquet_root: Path):
         st.write(
             "Events are generated when Zeek telemetry matches `ai_signatures.yaml` (HTTP host/uri, TLS SNI, DNS query) "
             "or a configured local AI port (`conn id.resp_p`). Regex misses get fuzzy and host/domain heuristic fallback for known AI providers. "
-            "Remaining rows with explicit AI-like tokens/domains are tagged as `Unknown AI (Heuristic)`."
+            "Remaining rows with explicit AI-like tokens/domains are labeled using heuristic provider names (domain/token based)."
         )
         st.write(
             f"Behavior scoring includes first-seen SaaS detection over a {BASELINE_DAYS}-day baseline, "
@@ -4313,7 +4533,6 @@ def render_shadow_ai(parquet_root: Path):
         set((RAW_AI_SIGNATURES or {}).keys())
         | set(FUZZY_PROVIDER_ALIASES.keys())
         | set(LOCAL_AI_PORTS.values())
-        | {"Unknown AI (Heuristic)"}
     )
     port_signature_values = {f"port {p}" for p in sorted(LOCAL_AI_PORTS.keys())}
     signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])} | port_signature_values)
@@ -4501,6 +4720,9 @@ def render_shadow_ai(parquet_root: Path):
         st.warning("No data matches your filters.")
         return
 
+    if st.session_state.get("shadow_ai_allow_dialog_open") and st.session_state.get("shadow_ai_allow_candidate"):
+        show_shadow_ai_allow_dialog()
+
     dialog_mac_pending = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     if st.session_state.get("shadow_ai_mac_dialog_open") and dialog_mac_pending:
         mac_cache_state = st.session_state.get("_shadow_ai_mac_tab_cache_v1", {})
@@ -4549,7 +4771,6 @@ def render_shadow_ai(parquet_root: Path):
         "Trends",
         "Top Destinations",
         "Shadow AI by MAC",
-        "Big Transfers",
         "Policy / Noise Control",
     ])
 
@@ -4636,10 +4857,46 @@ def render_shadow_ai(parquet_root: Path):
         prov_grid["Risk_Level_Basis"] = prov_grid.get("Risk_Level_Basis", pd.Series("", index=prov_grid.index)).astype(str)
         prov_grid["Risk_Level_Basis"] = prov_grid["Risk_Level_Basis"].replace({"nan": "", "None": ""})
         prov_grid.loc[prov_grid["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
+        prov_grid["Allowed"] = prov_grid["Policy_Verdict"].astype(str).str.lower().eq("allowed")
+        prov_grid["_allow_key"] = (
+            prov_grid["AI_Provider"].astype(str).str.strip().str.lower()
+            + "|"
+            + prov_grid["Policy_Verdict"].astype(str).str.strip().str.lower()
+        )
+        if "Policy_Verdict" in prov_grid.columns and "Allowed" in prov_grid.columns:
+            verdict_idx = prov_grid.columns.get_loc("Policy_Verdict")
+            allow_series = prov_grid.pop("Allowed")
+            prov_grid.insert(verdict_idx + 1, "Allowed", allow_series)
+        prov_original_allowed = {
+            str(k): _coerce_checkbox_bool(v)
+            for k, v in zip(prov_grid["_allow_key"].tolist(), prov_grid["Allowed"].tolist())
+        }
+        prov_allow_editable = JsCode(
+            """
+            function(params) {
+                const provider = (params.data && params.data.AI_Provider ? params.data.AI_Provider : '').toString().trim();
+                if (!provider) return false;
+                const verdict = (params.data && params.data.Policy_Verdict ? params.data.Policy_Verdict : '').toString().toLowerCase();
+                return verdict !== 'allowed';
+            }
+            """
+        )
 
         gb_prov = _new_grid_builder(prov_grid, page_size=15)
         gb_prov.configure_column("AI_Provider", header_name="Provider", minWidth=160, flex=1.3)
         gb_prov.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
+        gb_prov.configure_column(
+            "Allowed",
+            header_name="Allowed",
+            width=96,
+            editable=prov_allow_editable,
+            cellRenderer="agCheckboxCellRenderer",
+            cellEditor="agCheckboxCellEditor",
+            singleClickEdit=True,
+            filter=False,
+            sortable=False,
+            suppressMovable=True,
+        )
         gb_prov.configure_column("Events", width=92, flex=0.8)
         gb_prov.configure_column("Unique_MACs", header_name="Unique MACs", minWidth=110)
         gb_prov.configure_column("Last_Seen", header_name="Last Seen", minWidth=150)
@@ -4648,7 +4905,53 @@ def render_shadow_ai(parquet_root: Path):
         gb_prov.configure_column("Max_Risk", header_name="Max Risk", minWidth=95, cellStyle=_risk_score_cellstyle())
         gb_prov.configure_column("Max_Risk_Level", header_name="Risk Level", minWidth=110, cellStyle=_severity_cellstyle())
         gb_prov.configure_column("Risk_Level_Basis", header_name="Risk Level Basis", minWidth=320, flex=2.2)
-        render_shadow_aggrid(prov_grid, gb_prov, key=f"shadow_ai_provider_grid_{selected_scope_key}", height=390)
+        gb_prov.configure_column("_allow_key", hide=True)
+        prov_response = render_shadow_aggrid(
+            prov_grid,
+            gb_prov,
+            key=f"shadow_ai_provider_grid_{selected_scope_key}_{int(st.session_state.get('shadow_ai_provider_grid_nonce', 0))}",
+            height=390,
+            update_mode=GridUpdateMode.MODEL_CHANGED,
+        )
+
+        edited_prov = prov_response.get("data", None)
+        if isinstance(edited_prov, pd.DataFrame):
+            edited_df = edited_prov.copy()
+        elif isinstance(edited_prov, list):
+            edited_df = pd.DataFrame(edited_prov)
+        else:
+            edited_df = pd.DataFrame()
+
+        if (
+            not edited_df.empty
+            and "Allowed" in edited_df.columns
+            and "_allow_key" in edited_df.columns
+            and not st.session_state.get("shadow_ai_allow_dialog_open")
+        ):
+            edited_df["Allowed"] = edited_df["Allowed"].apply(_coerce_checkbox_bool)
+            edited_df["_was_allowed"] = edited_df["_allow_key"].astype(str).map(
+                lambda k: bool(prov_original_allowed.get(k, False))
+            )
+            provider_text = edited_df.get("AI_Provider", pd.Series("", index=edited_df.index)).astype(str).str.strip()
+            verdict_text = edited_df.get("Policy_Verdict", pd.Series("", index=edited_df.index)).astype(str).str.strip().str.lower()
+            newly_allowed = edited_df[
+                (edited_df["Allowed"])
+                & (~edited_df["_was_allowed"])
+                & provider_text.ne("")
+                & verdict_text.eq("shadow ai")
+            ]
+            if not newly_allowed.empty:
+                pick = newly_allowed.iloc[0]
+                events_value = pd.to_numeric(pick.get("Events", 0), errors="coerce")
+                events_value = int(events_value) if pd.notna(events_value) else 0
+                _open_shadow_ai_allow_dialog(
+                    {
+                        "provider": str(pick.get("AI_Provider", "")),
+                        "verdict": str(pick.get("Policy_Verdict", "")),
+                        "events": events_value,
+                    }
+                )
+                st.rerun()
 
     # =============================================================================
     # TAB: TRENDS
@@ -4969,77 +5272,9 @@ def render_shadow_ai(parquet_root: Path):
                 show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
 
     # =============================================================================
-    # TAB: BIG TRANSFERS
-    # =============================================================================
-    with tabs[4]:
-        st.markdown("### Large transfer alerts")
-        bdf = filtered.copy()
-        bdf["transfer_bucket"] = bdf["Upload_Bytes"].apply(lambda b: _bucket_transfer(float(b or 0)))
-
-        st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-        cA, cB, cC = st.columns(3)
-        with cA:
-            thresh_kb = st.number_input("Alert threshold (KB)", min_value=1, value=1024, step=256, key="shadow_ai_alert_thresh_v2")
-        with cB:
-            only_shadow = st.checkbox("Only Shadow AI", value=True, key="shadow_ai_alert_only_shadow_v2")
-        with cC:
-            only_http_post = st.checkbox("Only HTTP POST", value=False, key="shadow_ai_alert_only_post_v2")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        alert_df = bdf.copy()
-        if only_shadow:
-            alert_df = alert_df[alert_df["Policy_Verdict"] == "Shadow AI"]
-        alert_df = alert_df[alert_df["Upload_Bytes"] >= float(thresh_kb) * 1024]
-
-        if only_http_post:
-            alert_df = alert_df[_http_post_mask(alert_df)]
-
-        if alert_df.empty:
-            st.info("No events above the threshold in the current view.")
-        else:
-            alert_cols = [
-                "ts", "Severity", "mac", "Actor", "Actor_Type", "host_name", "id.orig_h",
-                "AI_Provider", "Domain", "Evidence_Type",
-                "Upload_Bytes", "Risk_Score", "Risk_Level", "Detail", "Destination",
-                "Matched_Value", "Files_Log_Correlation", "Detection_Basis", "Risk_Basis", "Critical_Reason", "Behavior_Indicators",
-                "First_Seen_SaaS", "Governance_Alert",
-            ]
-            for c in alert_cols:
-                if c not in alert_df.columns:
-                    alert_df[c] = ""
-            alert_grid = alert_df[alert_cols].head(MAX_ROWS_DISPLAY).copy()
-            alert_grid.insert(0, "#", range(1, len(alert_grid) + 1))
-            alert_grid["ts"] = pd.to_datetime(alert_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-            alert_grid["Upload_Bytes"] = pd.to_numeric(alert_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
-            alert_grid["Risk_Level"] = _risk_level_from_scores(alert_grid.get("Risk_Score", pd.Series(0, index=alert_grid.index)))
-
-            gb_alert = _new_grid_builder(alert_grid, page_size=20)
-            gb_alert.configure_column("ts", header_name="Time", minWidth=150, flex=1.1)
-            gb_alert.configure_column("Severity", minWidth=90, flex=0.8, cellStyle=_severity_cellstyle())
-            gb_alert.configure_column("mac", header_name="MAC", minWidth=150, flex=1.2)
-            gb_alert.configure_column("Actor", header_name="Who", minWidth=160, flex=1.2)
-            gb_alert.configure_column("Actor_Type", header_name="Who Type", minWidth=105, flex=0.8)
-            gb_alert.configure_column("host_name", header_name="Host", minWidth=130, flex=1.1)
-            gb_alert.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=1.0)
-            gb_alert.configure_column("AI_Provider", header_name="Provider", minWidth=140, flex=1.2)
-            gb_alert.configure_column("Domain", minWidth=165, flex=1.3)
-            gb_alert.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=1.0)
-            gb_alert.configure_column("Upload_Bytes", header_name="Bytes", minWidth=100, flex=0.9)
-            gb_alert.configure_column("Risk_Score", header_name="Risk", minWidth=85, flex=0.6, cellStyle=_risk_score_cellstyle())
-            gb_alert.configure_column("Risk_Level", header_name="Risk Level", minWidth=105, flex=0.8, cellStyle=_severity_cellstyle())
-            gb_alert.configure_column("Detail", minWidth=180, flex=1.7)
-            gb_alert.configure_column("Destination", minWidth=170, flex=1.5)
-            gb_alert.configure_column("Matched_Value", header_name="Matched", minWidth=180, flex=1.6)
-            gb_alert.configure_column("Files_Log_Correlation", header_name="files.log Corr", minWidth=125, flex=0.9)
-            gb_alert.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=180, flex=1.7)
-            gb_alert.configure_column("Risk_Basis", header_name="Risk Level Basis", minWidth=220, flex=1.8)
-            gb_alert.configure_column("Critical_Reason", header_name="Why Critical/High", minWidth=200, flex=1.5)
-            render_shadow_aggrid(alert_grid, gb_alert, key=f"shadow_ai_alert_grid_{selected_scope_key}", height=560)
-
-    # =============================================================================
     # TAB: POLICY / NOISE CONTROL
     # =============================================================================
-    with tabs[5]:
+    with tabs[4]:
         st.markdown("### Policy posture / noise controls")
 
         st.write(

@@ -65,6 +65,8 @@ _UNIDENTIFIED_DEST_VALUES = {
 _MAC_HEX_RE = re.compile(r"[^0-9a-fA-F]")
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$")
+_MULTI_PART_TLDS = {"uk", "au", "jp", "nz", "kr", "za", "tr", "il", "mx", "br"}
+_MULTI_PART_SECOND_LEVELS = {"ac", "co", "com", "edu", "gov", "net", "org"}
 _APP_SOFTWARE_NULLS = {"", "-", "unknown", "nan", "none", "null", "n/a", "unidentified_activity"}
 _HOSTNAME_NULLS = {"", "-", "unknown", "nan", "none", "null", "n/a"}
 _MAC_UNKNOWNS = {"", "unknown", "nan", "none", "null"}
@@ -119,14 +121,14 @@ def _is_real_destination_series(values: pd.Series) -> pd.Series:
     low = s.str.lower().str.strip(".")
     invalid = _UNIDENTIFIED_DEST_VALUES | {"unresolved_destination", "unknown host"}
     strict_domain = low.apply(extract_domain_strict)
-    com_domain = strict_domain.str.endswith(".com")
+    has_domain = strict_domain.ne("")
     return (
         s.ne("")
         & ~low.isin(invalid)
         & ~s.str.match(_IPV4_RE, na=False)
         & ~low.str.match(r"^port/\d+$", na=False)
         & ~low.str.contains(r"\s|/|\\", regex=True)
-        & com_domain
+        & has_domain
     )
 
 
@@ -134,7 +136,7 @@ def _is_real_identifier_series(values: pd.Series) -> pd.Series:
     s = _normalize_application_display_series(values)
     low = s.str.lower()
     invalid = _UNIDENTIFIED_DEST_VALUES | {"conn telemetry", "unmapped"}
-    com_domain = low.apply(_to_com_root_domain).ne("")
+    domain_identifier = low.apply(_to_root_domain).ne("")
     human_readable_app = (
         low.str.match(r"^[a-z0-9][a-z0-9 ._:+()&-]{1,119}$", na=False)
         & low.str.contains(r"[a-z]", na=False)
@@ -147,7 +149,7 @@ def _is_real_identifier_series(values: pd.Series) -> pd.Series:
         & ~low.str.match(_IPV4_RE, na=False)
         & ~low.str.match(r"^conn port\s+\d+$", na=False)
         & ~low.str.match(r"^port/\d+$", na=False)
-        & (com_domain | human_readable_app)
+        & (domain_identifier | human_readable_app)
     )
 
 
@@ -178,13 +180,20 @@ def _normalize_destination_display_series(values: pd.Series) -> pd.Series:
     return s
 
 
-def _to_com_root_domain(value) -> str:
+def _to_root_domain(value) -> str:
     d = extract_domain_strict(value)
-    if not d or not d.endswith(".com"):
+    if not d:
         return ""
     parts = d.split(".")
     if len(parts) < 2:
         return d
+    # Handle common multi-part public suffixes like *.co.uk.
+    if (
+        len(parts) >= 3
+        and parts[-1] in _MULTI_PART_TLDS
+        and parts[-2] in _MULTI_PART_SECOND_LEVELS
+    ):
+        return ".".join(parts[-3:])
     return ".".join(parts[-2:])
 
 
@@ -192,21 +201,21 @@ def _normalize_application_display_series(values: pd.Series, destination_values:
     s = values.fillna("").astype(str).str.strip().replace(_SHADOW_SHARINGS_EMPTY_REPLACEMENTS)
     s = s.str.strip().str.strip(".")
 
-    # For domain-like identifiers, mirror Shadow Sharings Domain style (root .com).
-    domain_norm = s.str.lower().apply(_to_com_root_domain)
+    # For domain-like identifiers, collapse to root domain for stable grouping.
+    domain_norm = s.str.lower().apply(_to_root_domain)
     m_domain = domain_norm.ne("")
     if m_domain.any():
         s.loc[m_domain] = domain_norm.loc[m_domain]
 
-    # When app/software is missing, derive root .com domain from destination.
+    # When app/software is missing, derive root domain from destination.
     if destination_values is not None:
-        dest_norm = _normalize_destination_display_series(destination_values).str.lower().apply(_to_com_root_domain)
+        dest_norm = _normalize_destination_display_series(destination_values).str.lower().apply(_to_root_domain)
         m_empty = s.eq("")
         if m_empty.any():
             s.loc[m_empty] = dest_norm.loc[m_empty]
     if destination_values is not None:
-        dest_domain = _normalize_destination_display_series(destination_values).str.lower().apply(_to_com_root_domain)
-        app_domain = s.str.lower().apply(_to_com_root_domain)
+        dest_domain = _normalize_destination_display_series(destination_values).str.lower().apply(_to_root_domain)
+        app_domain = s.str.lower().apply(_to_root_domain)
         m_same_as_dest = app_domain.eq(dest_domain) & dest_domain.ne("")
         if m_same_as_dest.any():
             s.loc[m_same_as_dest] = dest_domain.loc[m_same_as_dest]
@@ -2351,6 +2360,7 @@ def show_inventory_app_dialog(conn):
     sel_dest = str(ctx.get("destination") or "").strip()
     sel_dest_lookup = str(ctx.get("destination_lookup") or sel_dest).strip()
     sel_app = str(ctx.get("application_or_identifier") or "").strip()
+    selected_identity_type = str(ctx.get("identity_type") or "").strip()
     selected_f_source = str(ctx.get("selected_f_source") or "All").strip() or "All"
     forensic_risk = ctx.get("forensic_risk") or []
     if not isinstance(forensic_risk, list):
@@ -2390,13 +2400,7 @@ def show_inventory_app_dialog(conn):
         st.warning("Missing application context. Please select an Application / Identifier row again.")
         return
 
-    def _fetch_app_events(destination_key: str) -> pd.DataFrame:
-        app_where = [
-            "lower(destination_lookup) = lower(?)",
-            "lower(app_identity_norm) = lower(?)",
-        ]
-        app_params = [target_mac, destination_key, sel_app]
-
+    def _append_scope_filters(app_where: list[str], app_params: list) -> None:
         if selected_f_source != "All":
             app_where.append("upper(source_log) = upper(?)")
             app_params.append(selected_f_source)
@@ -2405,7 +2409,7 @@ def show_inventory_app_dialog(conn):
             app_where.append("1=0")
         elif set(forensic_risk) != set(RISK_OPTIONS):
             app_in = _build_in_clause(forensic_risk, app_params)
-            app_where.append(f""""Risk Level" IN {app_in}""")
+            app_where.append(f"\"Risk Level\" IN {app_in}")
 
         if forensic_search:
             q = f"%{forensic_search}%"
@@ -2414,7 +2418,8 @@ def show_inventory_app_dialog(conn):
             )
             app_params.extend([q, q, q, q, q])
 
-        app_where_sql = " AND ".join(app_where)
+    def _query_app_events(app_where: list[str], app_params: list) -> pd.DataFrame:
+        app_where_sql = " AND ".join(app_where) if app_where else "1=1"
         return _sql_fetch_df(
             conn,
             f"""
@@ -2478,26 +2483,116 @@ def show_inventory_app_dialog(conn):
                 bytes_sent,
                 bytes_received,
                 dst_port,
-                Info
+                Info,
+                destination_lookup,
+                app_identity_raw,
+                app_identity_norm,
+                ip,
+                hostname
             FROM app_base
             WHERE {app_where_sql}
             ORDER BY datetime DESC
             """,
-            app_params,
+            [target_mac, *app_params],
         )
 
+    def _fetch_app_events(destination_key: str, application_key: str) -> pd.DataFrame:
+        app_where = [
+            "lower(destination_lookup) = lower(?)",
+            "lower(app_identity_norm) = lower(?)",
+        ]
+        app_params = [destination_key, application_key]
+        _append_scope_filters(app_where, app_params)
+        return _query_app_events(app_where, app_params)
+
+    def _fetch_scoped_events() -> pd.DataFrame:
+        app_where: list[str] = []
+        app_params: list = []
+        _append_scope_filters(app_where, app_params)
+        return _query_app_events(app_where, app_params)
+
+    def _filter_scoped_events_by_display(
+        events_df: pd.DataFrame,
+        destination_key: str,
+        application_key: str,
+        *,
+        app_only: bool = False,
+    ) -> pd.DataFrame:
+        if events_df.empty:
+            return events_df
+
+        base_dest = events_df.get("destination_lookup", pd.Series("", index=events_df.index)).fillna("").astype(str)
+        base_app = events_df.get("app_identity_norm", pd.Series("", index=events_df.index)).fillna("").astype(str)
+        norm_dest = _normalize_destination_display_series(base_dest)
+        root_dest = norm_dest.fillna("").astype(str).str.lower().apply(_to_root_domain)
+        norm_app = _normalize_application_display_series(base_app, norm_dest)
+
+        selected_dest_norm = ""
+        selected_dest_root = ""
+        if destination_key:
+            selected_dest_norm = str(
+                _normalize_destination_display_series(pd.Series([destination_key])).iloc[0]
+            ).strip()
+            selected_dest_root = _to_root_domain(selected_dest_norm).lower()
+        selected_app_norm = str(
+            _normalize_application_display_series(
+                pd.Series([application_key]),
+                pd.Series([selected_dest_norm]),
+            ).iloc[0]
+        ).strip()
+        if not selected_app_norm:
+            return events_df.iloc[0:0].copy()
+
+        app_mask = norm_app.fillna("").astype(str).str.lower().eq(selected_app_norm.lower())
+        if app_only or not selected_dest_norm:
+            match_mask = app_mask
+        else:
+            dest_exact_mask = norm_dest.fillna("").astype(str).str.lower().eq(selected_dest_norm.lower())
+            if selected_dest_root:
+                dest_mask = dest_exact_mask | root_dest.eq(selected_dest_root)
+            else:
+                dest_mask = dest_exact_mask
+            match_mask = app_mask & dest_mask
+        return events_df.loc[match_mask].copy()
+
     matched_destination_key = sel_dest_lookup
-    app_df = _fetch_app_events(matched_destination_key)
+    match_strategy = "Exact destination + app match"
+    app_df = _fetch_app_events(matched_destination_key, sel_app)
     if app_df.empty and sel_dest and sel_dest_lookup.lower() != sel_dest.lower():
-        fallback_df = _fetch_app_events(sel_dest)
+        fallback_df = _fetch_app_events(sel_dest, sel_app)
         if not fallback_df.empty:
             app_df = fallback_df
             matched_destination_key = sel_dest
+            match_strategy = "Exact destination + app match (fallback destination key)"
+
+    scoped_app_df = pd.DataFrame()
+    if app_df.empty:
+        scoped_app_df = _fetch_scoped_events()
+        normalized_df = _filter_scoped_events_by_display(scoped_app_df, matched_destination_key, sel_app)
+        if normalized_df.empty and sel_dest and sel_dest_lookup.lower() != sel_dest.lower():
+            normalized_alt = _filter_scoped_events_by_display(scoped_app_df, sel_dest, sel_app)
+            if not normalized_alt.empty:
+                normalized_df = normalized_alt
+                matched_destination_key = sel_dest
+        if not normalized_df.empty:
+            app_df = normalized_df
+            match_strategy = "Display-normalized destination + app match"
+
+    if app_df.empty and selected_identity_type.lower() in {"software", "port"}:
+        if scoped_app_df.empty:
+            scoped_app_df = _fetch_scoped_events()
+        app_only_df = _filter_scoped_events_by_display(scoped_app_df, "", sel_app, app_only=True)
+        if not app_only_df.empty:
+            app_df = app_only_df
+            match_strategy = "Application-only fallback (inferred destination context)"
+            matched_destination_key = ""
 
     if app_df.empty:
         st.info("No events found for this application with current filters.")
         return
-    st.caption(f"Matched destination: {matched_destination_key}")
+    if matched_destination_key:
+        st.caption(f"Matched destination: {matched_destination_key}")
+    st.caption(f"Match strategy: {match_strategy}")
 
     app_df["datetime"] = pd.to_datetime(app_df["datetime"], errors="coerce")
     invalid_ts = int(app_df["datetime"].isna().sum())
@@ -2524,6 +2619,65 @@ def show_inventory_app_dialog(conn):
     app_metrics[4].metric("Duration", _format_duration_seconds(duration_seconds))
     st.caption(f"First Seen: {first_seen_txt}")
     st.caption(f"Last Seen: {last_seen_txt}")
+
+    st.markdown("#### Port Usage (This MAC + App)")
+    port_base = app_df.copy()
+    port_base["dst_port_num"] = pd.to_numeric(
+        port_base.get("dst_port", pd.Series(0, index=port_base.index)),
+        errors="coerce",
+    ).fillna(0).astype("int64")
+    port_base["Port"] = np.where(
+        port_base["dst_port_num"].gt(0),
+        port_base["dst_port_num"].astype(str),
+        "Unknown / Missing",
+    )
+    port_base["bytes_sent_num"] = pd.to_numeric(
+        port_base.get("bytes_sent", pd.Series(0, index=port_base.index)),
+        errors="coerce",
+    ).fillna(0)
+    port_base["bytes_received_num"] = pd.to_numeric(
+        port_base.get("bytes_received", pd.Series(0, index=port_base.index)),
+        errors="coerce",
+    ).fillna(0)
+
+    port_summary = (
+        port_base.groupby(["dst_port_num", "Port"], as_index=False)
+        .agg(
+            Events=("Port", "size"),
+            Upload_Bytes=("bytes_sent_num", "sum"),
+            Download_Bytes=("bytes_received_num", "sum"),
+            Last_Seen=("datetime", "max"),
+        )
+        .sort_values(
+            by=["Events", "dst_port_num"],
+            ascending=[False, True],
+        )
+    )
+    if not port_summary.empty:
+        port_summary["Upload_MB"] = (
+            pd.to_numeric(port_summary["Upload_Bytes"], errors="coerce").fillna(0) / (1024 * 1024)
+        ).round(2)
+        port_summary["Download_MB"] = (
+            pd.to_numeric(port_summary["Download_Bytes"], errors="coerce").fillna(0) / (1024 * 1024)
+        ).round(2)
+        port_summary["Last_Seen"] = (
+            pd.to_datetime(port_summary["Last_Seen"], errors="coerce")
+            .dt.strftime("%Y-%m-%d %H:%M:%S")
+            .fillna("")
+        )
+        port_summary["Port"] = np.where(
+            port_summary["dst_port_num"].gt(0),
+            port_summary["Port"],
+            "Unknown / Missing",
+        )
+        st.dataframe(
+            port_summary[["Port", "Events", "Upload_MB", "Download_MB", "Last_Seen"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Rows are grouped by destination port; repeated hits on the same port are counted in `Events`.")
+    else:
+        st.info("No port data available for this application.")
 
     trend = app_df.dropna(subset=["datetime"]).copy()
     trend = trend.set_index("datetime").resample("1H").size().reset_index(name="events")
@@ -2992,9 +3146,25 @@ def show_forensics_dialog(conn):
         port_df = port_df[(port_df["domain_clean"] != "") & (port_df["app_identity_norm"] != "")]
 
         if not port_df.empty:
+            def _top3_ports_text(values: pd.Series) -> str:
+                ports = pd.to_numeric(values, errors="coerce").fillna(0).astype("int64")
+                ports = ports[ports.gt(0)]
+                if ports.empty:
+                    return ""
+                port_counts = (
+                    ports.value_counts()
+                    .rename_axis("port")
+                    .reset_index(name="hits")
+                    .sort_values(["hits", "port"], ascending=[False, True])
+                )
+                top_ports = port_counts["port"].head(3).astype(str).tolist()
+                if int(len(port_counts)) > 3:
+                    return ", ".join(top_ports) + ", ..."
+                return ", ".join(top_ports)
+
             port_map = (
                 port_df.groupby(["domain_clean", "app_identity_norm"], as_index=False)["dst_port"]
-                .agg(lambda s: ", ".join(str(v) for v in sorted({int(x) for x in s if int(x) > 0})))
+                .agg(_top3_ports_text)
                 .rename(
                     columns={
                         "domain_clean": "destination",
@@ -3775,11 +3945,12 @@ def show_forensics_dialog(conn):
             "Rows are grouped by Destination + Application/Software/Domain. Sources, first/last seen, duration, and hits "
             "are aggregated per MAC while Status and Max Risk keep the highest-severity state."
         )
-        st.caption("Only rows with real `.com` destinations and real application/software/domain identifiers are shown.")
+        st.caption("Only rows with valid domains and real application/software/domain identifiers are shown.")
         st.caption(
             "Software/CONN rows may use inferred domain context from nearest non-software events for this MAC (\u00b12s). "
             "Port(s) inferred are labeled '(inferred)'."
         )
+        st.caption("Port(s) in this table show up to the top 3 ports; `...` means more ports exist. Click an app row to view all port usage details.")
         st.caption(
             "WEIRD and other logs without native application identity are matched to nearby events when possible; "
             "rows with no real destination+application after inference are excluded from this table."
@@ -3849,6 +4020,7 @@ def show_forensics_dialog(conn):
                         "destination": sel_dest,
                         "destination_lookup": sel_dest_lookup,
                         "application_or_identifier": sel_app,
+                        "identity_type": str(selected_inv.get("identity_type", "") or "").strip(),
                         "selected_f_source": selected_f_source,
                         "forensic_risk": list(forensic_risk),
                         "forensic_search": forensic_search,
@@ -4447,7 +4619,7 @@ def render_shadow_apps(parquet_root: Path):
                 "Destination + Application + MAC + Hostname + IP + Source, then computing First Seen, Last Seen, Duration, "
                 "Hits, and max risk; groups are sorted by max risk score and hit count, and only the top 1,000 are displayed."
             )
-            st.caption("Table excludes unresolved placeholders and keeps only real `.com` destinations with real app identifiers.")
+            st.caption("Table excludes unresolved placeholders and keeps only valid domains with real app identifiers.")
 
             # selection -> open dialog
             selected_rows = grid_response.get("selected_rows", None)

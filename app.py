@@ -78,7 +78,7 @@ def perform_logout():
 
 
 # =====================================================
-# Authentication (MongoDB via Python)
+# Authentication (MongoDB/MySQL via Python)
 # =====================================================
 
 if "auth_schema_initialized" not in st.session_state:
@@ -89,7 +89,8 @@ if "auth_schema_initialized" not in st.session_state:
     except Exception as e:
         st.error("Authentication service is not available.")
         st.caption(
-            "Set AUTH_MONGODB_URI (or MONGODB_URI). "
+            "Set AUTH_DB_BACKEND plus DB settings. For MongoDB: AUTH_MONGODB_URI. "
+            "For MySQL: AUTH_MYSQL_HOST, AUTH_MYSQL_PORT, AUTH_MYSQL_USER, AUTH_MYSQL_PASSWORD, AUTH_MYSQL_DATABASE. "
             "Optional first-run admin: BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD."
         )
         st.code(str(e))

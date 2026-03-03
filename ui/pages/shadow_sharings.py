@@ -22,20 +22,20 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 try:
     from .shadow_sharings_backend import (
         _add_domain_to_whitelist,
-        _remove_domain_from_whitelist,
         get_available_dates,
         load_shadow_sharing_bundle,
         build_shadow_sharing_incidents,
         refresh_shadow_sharing_runtime_state,
+        shadow_sharing_logs_signature,
     )
 except ImportError:
     from shadow_sharings_backend import (  # type: ignore
         _add_domain_to_whitelist,
-        _remove_domain_from_whitelist,
         get_available_dates,
         load_shadow_sharing_bundle,
         build_shadow_sharing_incidents,
         refresh_shadow_sharing_runtime_state,
+        shadow_sharing_logs_signature,
     )
 
 SEVERITY_COLORS = {
@@ -75,7 +75,22 @@ def _grid_data_signature(df: pd.DataFrame) -> tuple:
 
     sig_cols = [
         c
-        for c in ["event_id", "incident_id", "uid", "ts", "destination", "domain", "mac", "id.orig_h", "bytes", "Allowed", "allowed"]
+        for c in [
+            "event_id",
+            "incident_id",
+            "uid",
+            "ts",
+            "destination",
+            "domain",
+            "mac",
+            "id.orig_h",
+            "bytes",
+            "Allowed",
+            "allowed",
+            "Allowed_Domain",
+            "Status",
+            "allow_basis",
+        ]
         if c in df.columns
     ]
     if not sig_cols:
@@ -218,6 +233,19 @@ def _allowed_cellstyle() -> JsCode:
             const yes = (v === true) || (String(v).toLowerCase() === 'true');
             if (yes) return { 'color': '#22c55e', 'fontWeight': '700' };
             return { 'color': '#ef4444', 'fontWeight': '800' };
+        }
+        """
+    )
+
+
+def _status_cellstyle() -> JsCode:
+    return JsCode(
+        """
+        function(params) {
+            const v = (params.value || '').toString().toLowerCase();
+            if (v === 'authorized') return { 'color': '#22c55e', 'fontWeight': '700' };
+            if (v === 'unauthorized') return { 'color': '#ef4444', 'fontWeight': '800' };
+            return {};
         }
         """
     )
@@ -550,10 +578,39 @@ def _close_shadow_sharing_dialog() -> None:
     st.session_state["shadow_sharing_dialog_open"] = False
     st.session_state["shadow_sharing_dialog_mac"] = None
     st.session_state["shadow_sharing_last_selected_mac"] = None
+    st.session_state.pop("shadow_sharing_dialog_origin", None)
     st.session_state.pop("shadow_sharing_dialog_base_df", None)
     st.session_state.pop("shadow_sharing_dialog_base_key", None)
     st.session_state.pop("shadow_sharing_dialog_incidents_df", None)
     st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
+
+
+def _invalidate_shadow_sharing_frontend_cache() -> None:
+    for key in [
+        "_shadow_sharing_scope_cache_key_v1",
+        "_shadow_sharing_scope_df_v1",
+        "_shadow_sharing_scope_incidents_v1",
+        "_shadow_sharing_filtered_cache_v1",
+        "_shadow_sharing_source_masks_cache_v1",
+        "shadow_sharing_dialog_base_df",
+        "shadow_sharing_dialog_base_key",
+        "shadow_sharing_dialog_incidents_df",
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
+
+
+def _close_shadow_sharing_allow_dialog(*, reset_grid: bool = True) -> None:
+    st.session_state["shadow_sharing_allow_dialog_open"] = False
+    st.session_state.pop("shadow_sharing_allow_candidate", None)
+    if reset_grid:
+        st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
+
+
+def _open_shadow_sharing_allow_dialog(candidate: dict) -> None:
+    st.session_state["shadow_sharing_allow_candidate"] = candidate
+    st.session_state["shadow_sharing_allow_dialog_open"] = True
+    st.session_state["shadow_sharing_dialog_origin"] = "dialog"
 
 
 def _extract_selected_mac(selected_rows) -> Optional[str]:
@@ -1026,6 +1083,7 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
     inc_src.loc[inc_src["Source"] == "", "Source"] = "conn"
     inc_src["Source"] = inc_src["Source"].apply(lambda s: _union_source_types(pd.Series([s])))
     inc_src["Allowed_Domain"] = inc_src["allowed"].apply(_coerce_bool_value)
+    inc_src["Status"] = inc_src["Allowed_Domain"].map(lambda v: "Authorized" if bool(v) else "Unauthorized")
     inc_src["Service"] = inc_src["sig_service"].astype(str).str.strip()
     inc_src.loc[inc_src["Service"].isin(["", "nan", "None", "none"]), "Service"] = "No signature match"
     action_txt = inc_src["action"].astype(str).str.strip().replace({"nan": "", "None": "", "none": ""})
@@ -1069,6 +1127,15 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
     dev_grid = inc_src.copy()
     dev_grid["First_Seen"] = dev_grid["first_ts"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
     dev_grid["Last_Seen"] = dev_grid["last_ts"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+    allow_key = dev_grid["incident_id"].astype(str).str.strip()
+    fallback_key = (
+        dev_grid["mac"].astype(str).str.strip().str.lower()
+        + "|"
+        + dev_grid["Domain"].astype(str).str.strip().str.lower()
+        + "|"
+        + dev_grid["First_Seen"].astype(str).str.strip()
+    )
+    dev_grid["_allow_key"] = allow_key.where(allow_key.ne(""), fallback_key)
 
     show_cols = [
         "#",
@@ -1079,9 +1146,10 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
         "orig_ip",
         "Destination",
         "Domain",
+        "Allowed_Domain",
+        "Status",
         "Source",
         "Service",
-        "Allowed_Domain",
         "Outbound_MB",
         "Inbound_MB",
         "Ratio",
@@ -1092,6 +1160,7 @@ def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: 
         "Reasons",
         "allow_basis",
         "incident_id",
+        "_allow_key",
     ]
     if not include_hostname:
         show_cols = [c for c in show_cols if c != "Hostname"]
@@ -1122,9 +1191,10 @@ def _configure_incident_grid_columns(
             function(params) {
                 if (!params || !params.column || !params.node) return;
                 const colId = params.column.getColId ? params.column.getColId() : '';
-                if (colId === 'mac') {
-                    params.node.setSelected(true, true);
-                }
+            if (colId === 'mac') {
+                params.node.setSelected(true, true);
+                return;
+            }
             }
             """
         )
@@ -1168,20 +1238,34 @@ def _configure_incident_grid_columns(
 
     allowed_kwargs = {}
     if editable_allowed_domain:
+        allowed_editable = JsCode(
+            """
+            function(params) {
+                const row = params && params.data ? params.data : {};
+                const allowed = row.Allowed_Domain;
+                const isAllowed = (allowed === true) || (String(allowed).toLowerCase() === 'true');
+                if (isAllowed) return false;
+                return true;
+            }
+            """
+        )
         allowed_kwargs = {
-            "editable": True,
-            "cellEditor": "agCheckboxCellEditor",
+            "editable": allowed_editable,
             "cellRenderer": "agCheckboxCellRenderer",
+            "cellEditor": "agCheckboxCellEditor",
             "singleClickEdit": True,
             "filter": False,
             "sortable": False,
         }
+    gb.configure_column("Allowed_Domain", header_name="Allowed", width=96, cellStyle=_allowed_cellstyle(), **allowed_kwargs)
     gb.configure_column(
-        "Allowed_Domain",
-        header_name="Allowed (Domain)",
-        width=145,
-        cellStyle=_allowed_cellstyle(),
-        **allowed_kwargs,
+        "Status",
+        header_name="Status",
+        width=118,
+        editable=False,
+        filter=False,
+        sortable=True,
+        cellStyle=_status_cellstyle(),
     )
     num_fmt = _fixed_3dp_formatter()
     gb.configure_column("Outbound_MB", header_name="Out MB", width=110, valueFormatter=num_fmt)
@@ -1194,6 +1278,7 @@ def _configure_incident_grid_columns(
     gb.configure_column("Reasons", minWidth=420)
     gb.configure_column("allow_basis", hide=True)
     gb.configure_column("incident_id", hide=True)
+    gb.configure_column("_allow_key", hide=True)
 
 
 def _clean_whitelist_target_value(value: object) -> str:
@@ -1223,83 +1308,145 @@ def _resolve_whitelist_target(row: pd.Series, *, remove: bool) -> str:
     return ""
 
 
-def _apply_allowed_domain_checkbox_changes(grid_before: pd.DataFrame, grid_response: dict) -> bool:
-    if grid_before is None or grid_before.empty or not isinstance(grid_response, dict):
+def _apply_allowed_domain_checkbox_changes(grid_before: pd.DataFrame, grid_response) -> bool:
+    if grid_before is None or grid_before.empty or grid_response is None:
         return False
 
-    data_after = grid_response.get("data", None)
+    if st.session_state.get("shadow_sharing_allow_dialog_open"):
+        return False
+
+    getter = getattr(grid_response, "get", None)
+    if not callable(getter):
+        return False
+
+    data_after = getter("data", None)
     if data_after is None:
         return False
 
     after_df = pd.DataFrame(data_after)
     if after_df.empty:
         return False
-    if "incident_id" not in grid_before.columns or "incident_id" not in after_df.columns:
-        return False
     if "Allowed_Domain" not in grid_before.columns or "Allowed_Domain" not in after_df.columns:
         return False
 
-    before = grid_before[["incident_id", "Allowed_Domain"]].drop_duplicates(subset=["incident_id"], keep="last").copy()
-    before["Allowed_Domain"] = before["Allowed_Domain"].apply(_coerce_bool_value)
-    after = after_df[["incident_id", "Allowed_Domain"]].drop_duplicates(subset=["incident_id"], keep="last").copy()
-    after["Allowed_Domain"] = after["Allowed_Domain"].apply(_coerce_bool_value)
+    before_work = grid_before.copy()
+    after_work = after_df.copy()
 
-    merged = before.merge(after, on="incident_id", how="inner", suffixes=("_old", "_new"))
-    changed = merged[merged["Allowed_Domain_old"] != merged["Allowed_Domain_new"]]
-    if changed.empty:
-        return False
-
-    rows_after = after_df.drop_duplicates(subset=["incident_id"], keep="last").set_index("incident_id")
-    success_msgs: List[str] = []
-    error_msgs: List[str] = []
-    seen_ops = set()
-
-    for _, ch in changed.iterrows():
-        incident_id = ch.get("incident_id")
-        if incident_id not in rows_after.index:
-            continue
-        row = rows_after.loc[incident_id]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[0]
-
-        new_allowed = bool(ch.get("Allowed_Domain_new"))
-        target = _resolve_whitelist_target(row, remove=not new_allowed)
-        op_key = (new_allowed, str(target).strip().lower())
-        if op_key in seen_ops:
-            continue
-        seen_ops.add(op_key)
-
-        if not str(target).strip():
-            error_msgs.append(f"{incident_id}: missing domain target (Domain column empty)")
-            continue
-
-        if new_allowed:
-            ok, msg = _add_domain_to_whitelist(str(target))
+    # Be tolerant if hidden key column is not returned by grid response.
+    if "_allow_key" not in before_work.columns:
+        if "incident_id" in before_work.columns:
+            before_work["_allow_key"] = before_work["incident_id"].astype(str).str.strip()
         else:
-            ok, msg = _remove_domain_from_whitelist(str(target))
-
-        if ok:
-            success_msgs.append(msg)
+            before_work["_allow_key"] = before_work.index.astype(str)
+    if "_allow_key" not in after_work.columns:
+        if "incident_id" in after_work.columns:
+            after_work["_allow_key"] = after_work["incident_id"].astype(str).str.strip()
         else:
-            error_msgs.append(msg)
+            after_work["_allow_key"] = after_work.index.astype(str)
 
-    if not success_msgs and not error_msgs:
-        return False
-
-    st.session_state["shadow_sharing_whitelist_feedback"] = {
-        "ok": success_msgs,
-        "error": error_msgs,
+    before_keys = before_work["_allow_key"].astype(str).str.strip()
+    before_allowed = before_work["Allowed_Domain"].apply(_coerce_bool_value)
+    original_allow_map = {
+        str(k): bool(v)
+        for k, v in zip(before_keys.tolist(), before_allowed.tolist())
+        if str(k).strip()
     }
 
-    if success_msgs:
-        try:
-            refresh_shadow_sharing_runtime_state()
-        except Exception:
-            pass
+    edited = after_work.drop_duplicates(subset=["_allow_key"], keep="last").copy()
+    edited["_allow_key"] = edited["_allow_key"].astype(str).str.strip()
+    edited = edited[edited["_allow_key"].str.len() > 0].copy()
+    if edited.empty:
+        return False
 
-    st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
-    st.rerun()
-    return True
+    edited["Allowed_Domain"] = edited["Allowed_Domain"].apply(_coerce_bool_value)
+    edited["_was_allowed"] = edited["_allow_key"].map(lambda k: bool(original_allow_map.get(str(k), False)))
+
+    newly_allowed = edited[
+        (edited["Allowed_Domain"])
+        & (~edited["_was_allowed"])
+    ]
+    if not newly_allowed.empty:
+        pick = newly_allowed.iloc[0]
+        target = _resolve_whitelist_target(pick, remove=False)
+        if not str(target).strip():
+            target = str(pick.get("Domain", "") or "").strip()
+        incident_id = str(pick.get("incident_id", "") or "").strip()
+        destination = str(pick.get("Destination", pick.get("destination", "")) or "").strip()
+        mac = str(pick.get("mac", pick.get("Mac", "")) or "").strip().lower()
+        hostname = str(pick.get("Hostname", pick.get("host_name", "")) or "").strip()
+        candidate = {
+            "incident_id": incident_id,
+            "domain": str(target).strip(),
+            "destination": destination,
+            "mac": mac,
+            "hostname": hostname,
+        }
+        _open_shadow_sharing_allow_dialog(candidate)
+        st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
+        st.rerun()
+        return True
+
+    changed_mask = edited["Allowed_Domain"] != edited["_was_allowed"]
+    if bool(changed_mask.any()):
+        # Revert unsupported toggle directions (e.g., unchecking) or invalid target clicks.
+        st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
+        st.rerun()
+        return True
+    return False
+
+
+@st.dialog("Allow Destination Domain", width="small", dismissible=False)
+def show_shadow_sharing_allow_dialog():
+    st.session_state["shadow_sharing_dialog_origin"] = "dialog"
+    candidate = st.session_state.get("shadow_sharing_allow_candidate") or {}
+    target_domain = _clean_whitelist_target_value(candidate.get("domain", ""))
+    destination = str(candidate.get("destination") or "").strip()
+    target_mac = str(candidate.get("mac") or "").strip().lower()
+    target_host = str(candidate.get("hostname") or "").strip()
+    incident_id = str(candidate.get("incident_id") or "").strip()
+    invalid_target = not bool(target_domain)
+    whitelist_path = Path(__file__).resolve().parents[2] / "whitelist_domains.yaml"
+    try:
+        whitelist_label = str(whitelist_path.resolve())
+    except Exception:
+        whitelist_label = str(whitelist_path)
+
+    st.markdown(f"Confirm allowlisting for MAC `{target_mac or 'unknown'}`.")
+    st.markdown(f"- Domain: `{target_domain or '-'}`")
+    st.markdown(f"- Destination: `{destination or '-'}`")
+    st.markdown(f"- Hostname: `{target_host or '-'}`")
+    st.markdown(f"- Incident ID: `{incident_id or '-'}`")
+    st.caption(
+        f"This will update `{whitelist_label}` and refresh Shadow Sharing cache/policy columns."
+    )
+
+    if invalid_target:
+        st.error("This row has no valid domain in the Domain column.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button(
+            "Allow Domain",
+            type="primary",
+            width="stretch",
+            disabled=invalid_target,
+            key="shadow_sharing_allow_confirm_btn",
+        ):
+            ok, message = _add_domain_to_whitelist(str(target_domain))
+            if ok:
+                try:
+                    refresh_shadow_sharing_runtime_state()
+                except Exception:
+                    pass
+                _invalidate_shadow_sharing_frontend_cache()
+                _close_shadow_sharing_allow_dialog(reset_grid=False)
+                st.session_state["shadow_sharing_whitelist_feedback"] = {"ok": [str(message)], "error": []}
+                st.rerun()
+            st.error(str(message))
+    with c2:
+        if st.button("Cancel", width="stretch", key="shadow_sharing_allow_cancel_btn"):
+            _close_shadow_sharing_allow_dialog(reset_grid=True)
+            st.rerun()
 
 
 @st.dialog("Device Forensics Details", width="large")
@@ -1310,6 +1457,7 @@ def show_shadow_sharing_device_dialog(
     selected_scope_key: str,
     selected_scope_label: str,
 ):
+    st.session_state["shadow_sharing_dialog_origin"] = "dialog"
     target_mac = str(st.session_state.get("shadow_sharing_dialog_mac") or "").strip().lower()
     if not target_mac:
         st.info("No MAC selected.")
@@ -1534,7 +1682,10 @@ def show_shadow_sharing_device_dialog(
         row_response = render_shadow_aggrid(
             grid_rows,
             gb_rows,
-            key=f"shadow_sharing_rows_grid_{selected_scope_key}_{mac_key}",
+            key=(
+                f"shadow_sharing_rows_grid_{selected_scope_key}_{mac_key}_"
+                f"{int(st.session_state.get('shadow_sharing_grid_nonce', 0))}"
+            ),
             height=450,
             update_mode=(GridUpdateMode.VALUE_CHANGED | GridUpdateMode.MODEL_CHANGED),
             wrap_shell=False,
@@ -1570,8 +1721,27 @@ def render_shadow_sharing(parquet_root: Path):
         st.warning("No logs found.")
         return
 
+    st.session_state.setdefault("shadow_sharing_dialog_open", False)
+    st.session_state.setdefault("shadow_sharing_dialog_mac", None)
+    st.session_state.setdefault("shadow_sharing_last_selected_mac", None)
+    st.session_state.setdefault("shadow_sharing_dialog_base_df", None)
+    st.session_state.setdefault("shadow_sharing_dialog_base_key", None)
+    st.session_state.setdefault("shadow_sharing_dialog_incidents_df", None)
+    st.session_state.setdefault("shadow_sharing_grid_nonce", 0)
+    st.session_state.setdefault("shadow_sharing_allow_dialog_open", False)
+    st.session_state.setdefault("shadow_sharing_allow_candidate", None)
+    st.session_state.setdefault("_shadow_sharing_scope_cache_key_v1", None)
+    st.session_state.setdefault("_shadow_sharing_scope_df_v1", None)
+    st.session_state.setdefault("_shadow_sharing_scope_incidents_v1", None)
+
+    origin = st.session_state.pop("shadow_sharing_dialog_origin", None)
+    if st.session_state.get("shadow_sharing_dialog_open") and origin not in ("grid", "dialog"):
+        _close_shadow_sharing_dialog()
+        origin = None
+
     def _on_scope_change():
         _close_shadow_sharing_dialog()
+        _close_shadow_sharing_allow_dialog(reset_grid=False)
 
     selected_date = st.selectbox(
         "Dataset Scope",
@@ -1581,16 +1751,6 @@ def render_shadow_sharing(parquet_root: Path):
         on_change=_on_scope_change,
     )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
-    st.session_state.setdefault("shadow_sharing_dialog_open", False)
-    st.session_state.setdefault("shadow_sharing_dialog_mac", None)
-    st.session_state.setdefault("shadow_sharing_last_selected_mac", None)
-    st.session_state.setdefault("shadow_sharing_dialog_base_df", None)
-    st.session_state.setdefault("shadow_sharing_dialog_base_key", None)
-    st.session_state.setdefault("shadow_sharing_dialog_incidents_df", None)
-    st.session_state.setdefault("shadow_sharing_grid_nonce", 0)
-    st.session_state.setdefault("_shadow_sharing_scope_cache_key_v1", None)
-    st.session_state.setdefault("_shadow_sharing_scope_df_v1", None)
-    st.session_state.setdefault("_shadow_sharing_scope_incidents_v1", None)
 
     feedback = st.session_state.pop("shadow_sharing_whitelist_feedback", None)
     if isinstance(feedback, dict):
@@ -1620,13 +1780,11 @@ def render_shadow_sharing(parquet_root: Path):
                         target_dates.append(d)
         except Exception:
             pass
-    policy_stamp = _shadow_sharing_policy_stamp()
-    sync_token = int(st.session_state.get("_parquet_sync_token", 0))
+    logs_sig = shadow_sharing_logs_signature(parquet_root, target_dates)
     scope_cache_key = (
-        int(sync_token),
         str(parquet_root.resolve()),
         tuple(target_dates),
-        tuple(policy_stamp),
+        str(logs_sig),
     )
 
     cached_key = st.session_state.get("_shadow_sharing_scope_cache_key_v1")
@@ -1636,7 +1794,8 @@ def render_shadow_sharing(parquet_root: Path):
         df = cached_df
         incidents = cached_incidents if isinstance(cached_incidents, pd.DataFrame) else pd.DataFrame()
     else:
-        df, incidents = load_shadow_sharing_bundle(parquet_root, target_dates)
+        with st.spinner("Optimizing logs for fast load..."):
+            df, incidents = load_shadow_sharing_bundle(parquet_root, target_dates)
         st.session_state["_shadow_sharing_scope_cache_key_v1"] = scope_cache_key
         st.session_state["_shadow_sharing_scope_df_v1"] = df
         st.session_state["_shadow_sharing_scope_incidents_v1"] = incidents
@@ -2101,6 +2260,7 @@ def render_shadow_sharing(parquet_root: Path):
                     st.session_state["shadow_sharing_last_selected_mac"] = selected_mac
                     st.session_state["shadow_sharing_dialog_mac"] = selected_mac
                     st.session_state["shadow_sharing_dialog_open"] = True
+                    st.session_state["shadow_sharing_dialog_origin"] = "grid"
                     st.rerun()
             else:
                 st.session_state["shadow_sharing_last_selected_mac"] = None
@@ -2124,7 +2284,9 @@ def render_shadow_sharing(parquet_root: Path):
     with st.expander("Confidence score computation", expanded=False):
         st.markdown(_confidence_score_explainer_text())
 
-    if st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac"):
+    if st.session_state.get("shadow_sharing_allow_dialog_open") and st.session_state.get("shadow_sharing_allow_candidate"):
+        show_shadow_sharing_allow_dialog()
+    elif st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac") and origin in ("grid", "dialog"):
         show_shadow_sharing_device_dialog(
             filtered,
             filtered_incidents,

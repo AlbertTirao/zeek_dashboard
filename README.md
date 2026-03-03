@@ -69,9 +69,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Authentication (Python + MongoDB)
+## Authentication (Python + MongoDB/MySQL)
 
 Authentication is implemented directly in Python (no Node auth service).
+Set `auth.db_backend` to choose the login store:
+
+1. `mongodb` (default)
+2. `mysql`
 
 ### Option A: MongoDB Atlas (Recommended)
 
@@ -82,6 +86,7 @@ Authentication is implemented directly in Python (no Node auth service).
 
 ```toml
 [auth]
+db_backend = "mongodb"
 mongodb_uri = "mongodb+srv://<db_user>:<db_password>@<cluster-host>/?appName=Cluster0"
 mongodb_db = "zeek_auth"
 bootstrap_admin_username = "admin@gmail.com"
@@ -115,6 +120,7 @@ docker compose up -d auth-mongo
 
 ```toml
 [auth]
+db_backend = "mongodb"
 mongodb_uri = "mongodb://zeek_root:zeek_root_dev@localhost:27017/?authSource=admin"
 mongodb_db = "zeek_auth"
 bootstrap_admin_username = "admin@gmail.com"
@@ -140,6 +146,47 @@ docker compose down
 docker compose down -v
 ```
 
+### Option C: MySQL (Supervisor/Remote Server)
+
+1. Prepare `.streamlit/secrets.toml` with MySQL settings:
+
+```toml
+[auth]
+db_backend = "mysql"
+mysql_host = "<server-host-or-ip>"
+mysql_port = 3306
+mysql_user = "<db_user>"
+mysql_password = "<db_password>"
+mysql_database = "zeek_auth"
+bootstrap_admin_username = "admin@gmail.com"
+bootstrap_admin_password = "AdminPass123!"
+allowed_google_emails = ["admin@gmail.com"]
+google_oauth_enabled = false
+google_client_id = "your-google-oauth-client-id.apps.googleusercontent.com"
+google_client_secret = "your-google-oauth-client-secret"
+google_redirect_uri = "http://localhost:8501"
+session_secret = "replace-with-a-long-random-secret"
+session_ttl_seconds = 604800
+```
+
+2. Validate connectivity and auto-create auth tables on the target MySQL server:
+
+```bash
+python scripts/check_auth_mysql.py
+```
+
+3. If current login users are stored in MongoDB, migrate users:
+
+```bash
+python scripts/migrate_auth_users_mongo_to_mysql.py
+```
+
+4. Start/restart the app:
+
+```bash
+streamlit run app.py
+```
+
 ## First Login
 
 1. On first startup, if `app_users` is empty, the app creates the bootstrap admin from `.streamlit/secrets.toml`.
@@ -161,19 +208,21 @@ Make sure your Google account is a collaborator on the Zeek logs Drive folder.
 ## Troubleshooting
 
 1. `MongoDB is not configured`:
-   - Missing `auth.mongodb_uri` in `.streamlit/secrets.toml`
-2. Atlas authentication/connection failure:
+   - Missing `auth.mongodb_uri` while `auth.db_backend="mongodb"`
+2. `MySQL is not configured`:
+   - Missing one or more of `auth.mysql_host`, `auth.mysql_port`, `auth.mysql_user`, `auth.mysql_password`, `auth.mysql_database` while `auth.db_backend="mysql"`
+3. DB authentication/connection failure:
    - Wrong DB username/password
-   - IP not allowlisted
-   - malformed URI
-3. `Invalid username or password` on first login:
+   - DB user has no access to the selected database
+   - server/network/firewall/IP allowlist blocks access
+4. `Invalid username or password` on first login:
    - `app_users` already contains users and bootstrap was skipped
-4. `Google sign-in is unavailable`:
+5. `Google sign-in is unavailable`:
    - check `auth.google_client_id`, `auth.google_client_secret`, `auth.google_redirect_uri`
    - ensure the same redirect URI is configured in Google Cloud
-5. `Google account verification failed for the entered e-mail`:
+6. `Google account verification failed for the entered e-mail`:
    - sign in using the exact same email typed in the form
-6. `This e-mail is not approved for login`:
+7. `This e-mail is not approved for login`:
    - this check applies when Google OAuth is enabled
    - add the address to `auth.allowed_google_emails` in `.streamlit/secrets.toml`
 

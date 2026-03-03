@@ -3,6 +3,7 @@ import re
 import math
 import warnings
 import ipaddress
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -15,7 +16,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v18-no-categories-folderdates"
+CACHE_VERSION = "shadow-sharing-cache-v19-logstamp-runtime-policy"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -81,15 +82,9 @@ def _file_signature(paths: List[Path]) -> List[List[object]]:
 
 def _meta_expected(
     files_sig: Dict[str, List[List[object]]],
-    whitelist_mtime_ns: int,
-    signatures_mtime_ns: int,
-    category_rules_mtime_ns: int,
 ) -> dict:
     return {
         "cache_version": CACHE_VERSION,
-        "whitelist_mtime_ns": int(whitelist_mtime_ns),
-        "signatures_mtime_ns": int(signatures_mtime_ns),
-        "category_rules_mtime_ns": int(category_rules_mtime_ns),
         "files_sig": files_sig,
     }
 
@@ -640,8 +635,7 @@ def get_available_dates(parquet_root: Path) -> List[str]:
     return sorted(out, reverse=True)
 
 
-@st.cache_data(show_spinner=False)
-def _collect_known_files(parquet_root: Path) -> List[Path]:
+def _collect_known_files_uncached(parquet_root: Path) -> List[Path]:
     parquet_root = Path(parquet_root)
     known: List[Path] = []
     if not parquet_root.exists():
@@ -672,6 +666,11 @@ def _collect_known_files(parquet_root: Path) -> List[Path]:
     return sorted(set(known))
 
 
+@st.cache_data(show_spinner=False)
+def _collect_known_files(parquet_root: Path) -> List[Path]:
+    return _collect_known_files_uncached(parquet_root)
+
+
 def _collect_date_files(date_dir: Path) -> Dict[str, List[Path]]:
     buckets = {"http": [], "ssl": [], "dns": [], "conn": [], "files": [], "dhcp": []}
     if not date_dir.exists():
@@ -698,6 +697,45 @@ def _collect_date_files(date_dir: Path) -> Dict[str, List[Path]]:
     for k in buckets:
         buckets[k] = sorted(set(buckets[k]))
     return buckets
+
+
+def _files_signature_digest(paths: List[Path]) -> str:
+    if not paths:
+        return "none"
+    rows: List[str] = []
+    for p in sorted(set(paths)):
+        try:
+            st_ = p.stat()
+            rows.append(f"{p.resolve().as_posix()}|{int(st_.st_mtime_ns)}|{int(st_.st_size)}")
+        except Exception:
+            rows.append(f"{p.resolve().as_posix()}|0|0")
+    blob = "\n".join(rows).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()
+
+
+@st.cache_data(show_spinner=False, ttl=20)
+def _target_logs_signature_cached(parquet_root_str: str, target_dates: Tuple[str, ...]) -> str:
+    root = Path(parquet_root_str)
+    if not root.exists():
+        return "missing-root"
+
+    scan_paths: List[Path] = []
+    for d in target_dates or ():
+        if not d or not DATE_DIR_RE.match(str(d)):
+            continue
+        buckets = _collect_date_files(root / str(d))
+        for key in ["http", "ssl", "dns", "conn", "files", "dhcp"]:
+            scan_paths.extend(buckets.get(key) or [])
+
+    # identity attribution can depend on known_hosts/known_devices outside the selected date folder.
+    scan_paths.extend(_collect_known_files_uncached(root))
+    return _files_signature_digest(scan_paths)
+
+
+def shadow_sharing_logs_signature(parquet_root: Path, target_dates: List[str]) -> str:
+    root = str(Path(parquet_root).resolve())
+    dates_key = _normalize_target_dates_key(target_dates)
+    return _target_logs_signature_cached(root, dates_key)
 
 # -----------------------------------------------------------------------------
 # Identity enrichment (DHCP + conn + known)
@@ -1634,7 +1672,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     cpath = cache_events_path(parquet_root, date_str)
     mpath = cache_meta_path(parquet_root, date_str)
 
-    expected = _meta_expected(files_sig, WHITELIST_MTIME_NS, SIGNATURES_MTIME_NS, CATEGORY_RULES_MTIME_NS)
+    expected = _meta_expected(files_sig)
     meta = read_yaml(mpath)
 
     if cpath.exists() and meta == expected:
@@ -1802,26 +1840,167 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     return out
 
 
+def _apply_runtime_policy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Re-apply policy columns from in-memory whitelist/signatures.
+    This keeps dashboard refreshes fast because we can reuse cached day parquet rows and
+    recompute policy fields without rescanning raw logs.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    if "destination" not in out.columns:
+        out["destination"] = ""
+
+    def _normalize_host_series(series: pd.Series) -> pd.Series:
+        s = series.fillna("").astype(str).str.strip().str.lower()
+        s = s.str.replace(r"^[a-z][a-z0-9+.\-]*://", "", regex=True)
+        s = s.str.replace(r"^//", "", regex=True)
+        s = s.str.split("/").str[0].str.split("?").str[0].str.split("#").str[0]
+        s = s.str.replace(r"^\[([^\]]+)\](?::\d+)?$", r"\1", regex=True)
+        s = s.str.replace(r"^([^:\s]+):\d+$", r"\1", regex=True)
+        s = s.str.strip().str.strip(".")
+        s = s.replace({"nan": "", "none": "", "-": "", "(empty)": "", "*": ""})
+        return s
+
+    dest_raw = out["destination"].fillna("").astype(str)
+    dest_host = _normalize_host_series(dest_raw)
+    dest_unknown = dest_host.isin({"", "unknown"})
+
+    # --- Allowlist matching (boundary-safe suffix match) ---
+    allow_domains: List[str] = []
+    for a in (WHITELIST_DOMAINS or []):
+        a0 = _normalize_host(str(a or "").strip().lower())
+        if a0:
+            allow_domains.append(a0)
+    allow_domains = sorted(set(allow_domains), key=len, reverse=True)
+
+    allowed = pd.Series(False, index=out.index, dtype=bool)
+    allow_basis = pd.Series("", index=out.index, dtype="object")
+    for dom in allow_domains:
+        m = (~allowed) & (dest_host.eq(dom) | dest_host.str.endswith("." + dom))
+        if bool(m.any()):
+            allowed.loc[m] = True
+            allow_basis.loc[m] = dom
+
+    out["Allowed"] = allowed
+    out["Allow_Basis"] = allow_basis.astype(str)
+    out.loc[dest_unknown & (~out["Allowed"]), "Allow_Basis"] = "n/a (unknown destination)"
+    out.loc[(~dest_unknown) & (~out["Allowed"]) & (out["Allow_Basis"].astype(str).str.strip() == ""), "Allow_Basis"] = "no match"
+
+    # --- Signature matching (first match wins, boundary-safe) ---
+    sig_target_raw = out["destination"] if "dest_domain" not in out.columns else out["dest_domain"]
+    sig_host = _normalize_host_series(sig_target_raw.astype(str))
+    sig_match = pd.Series(False, index=out.index, dtype=bool)
+    sig_service = pd.Series("", index=out.index, dtype="object")
+    sig_basis = pd.Series("", index=out.index, dtype="object")
+    sig_rules: List[Tuple[str, str]] = []
+    for svc, doms in (SIGNATURES_MAP or {}).items():
+        for d in (doms or []):
+            d0 = _normalize_host(str(d or "").strip().lower())
+            if d0:
+                sig_rules.append((str(svc), d0))
+    for svc, dom in sig_rules:
+        m = (~sig_match) & (sig_host.eq(dom) | sig_host.str.endswith("." + dom))
+        if bool(m.any()):
+            sig_match.loc[m] = True
+            sig_service.loc[m] = svc
+            sig_basis.loc[m] = dom
+
+    out["Signature_Match"] = sig_match
+    out["Signature_Service"] = sig_service.astype(str)
+    out["Signature_Basis"] = sig_basis.astype(str)
+
+    # --- Client type ---
+    ua = out.get("user_agent", pd.Series("", index=out.index)).fillna("").astype(str)
+    ua_l = ua.str.lower()
+    auto_mask = ua_l.str.contains(
+        r"python|curl|wget|aiohttp|requests|httpx|postman|powershell|go-http-client|okhttp|java",
+        regex=True,
+        na=False,
+    )
+    browser_mask = ua_l.str.contains(r"mozilla|chrome|safari|edge|firefox", regex=True, na=False)
+    client_type = pd.Series("Mobile / App", index=out.index, dtype="object")
+    client_type.loc[browser_mask] = "Web Browser"
+    client_type.loc[auto_mask] = "Automation / SDK"
+    client_type.loc[ua_l.isin({"", "-"})] = "Unknown"
+    out["Client_Type"] = client_type
+
+    # --- Risk scoring (vectorized equivalent of _risk_score_row) ---
+    action = out.get("Action", pd.Series("", index=out.index)).fillna("").astype(str)
+    bytes_out = pd.to_numeric(out.get("bytes_out", out.get("bytes", 0)), errors="coerce").fillna(0.0)
+    bytes_in = pd.to_numeric(out.get("bytes_in", 0), errors="coerce").fillna(0.0)
+    ratio = pd.to_numeric(out.get("out_in_ratio", 0), errors="coerce").fillna(0.0)
+    file_bytes = pd.to_numeric(out.get("file_total_bytes", 0), errors="coerce").fillna(0.0)
+    req_body = pd.to_numeric(out.get("request_body_len", 0), errors="coerce").fillna(0.0)
+
+    unapproved = (~out["Allowed"]) & (~dest_unknown)
+    m_action_upload = action.isin({"Upload", "Upload (TLS)", "File Transfer (Upload)"})
+    m_action_share = action.isin({"Share Link", "Paste/Share"})
+    m_action_post = action.eq("Post Data")
+    m_auto = out["Client_Type"].eq("Automation / SDK")
+
+    m_out_500 = bytes_out >= (500 * 1024 * 1024)
+    m_out_100 = (~m_out_500) & (bytes_out >= (100 * 1024 * 1024))
+    m_out_10 = (~m_out_500) & (~m_out_100) & (bytes_out >= (10 * 1024 * 1024))
+    m_high_ratio = (bytes_out >= (10 * 1024 * 1024)) & (ratio >= 5) & unapproved
+    m_file_10 = file_bytes >= (10 * 1024 * 1024)
+    m_req_10 = req_body >= (10 * 1024 * 1024)
+
+    score = pd.Series(10, index=out.index, dtype="int32")
+    score = (
+        score
+        + (unapproved.astype("int32") * 15)
+        + (m_action_upload.astype("int32") * 20)
+        + (m_action_share.astype("int32") * 12)
+        + (m_action_post.astype("int32") * 10)
+        + (m_auto.astype("int32") * 10)
+        + (m_out_500.astype("int32") * 35)
+        + (m_out_100.astype("int32") * 25)
+        + (m_out_10.astype("int32") * 12)
+        + (m_high_ratio.astype("int32") * 10)
+        + (m_file_10.astype("int32") * 10)
+        + (m_req_10.astype("int32") * 10)
+    ).clip(lower=0, upper=100)
+    out["Risk_Score"] = score.astype(int)
+
+    reasons = pd.concat(
+        [
+            pd.Series("destination not in whitelist; ", index=out.index).where(unapproved, ""),
+            ("action=" + action + "; ").where(m_action_upload | m_action_share, ""),
+            pd.Series("http post; ", index=out.index).where(m_action_post, ""),
+            pd.Series("automation user-agent; ", index=out.index).where(m_auto, ""),
+            pd.Series(">=500MB outbound; ", index=out.index).where(m_out_500, ""),
+            pd.Series(">=100MB outbound; ", index=out.index).where(m_out_100, ""),
+            pd.Series(">=10MB outbound; ", index=out.index).where(m_out_10, ""),
+            pd.Series("high outbound ratio; ", index=out.index).where(m_high_ratio, ""),
+            pd.Series("files.log >=10MB; ", index=out.index).where(m_file_10, ""),
+            pd.Series("http request_body_len >=10MB; ", index=out.index).where(m_req_10, ""),
+        ],
+        axis=1,
+    ).sum(axis=1).str.rstrip("; ").str.strip()
+    out["Risk_Basis"] = reasons.where(reasons.ne(""), "baseline")
+    out["Severity"] = out["Risk_Score"].astype(int).apply(_severity_label)
+    return out
+
+
 @st.cache_resource(show_spinner=False)
 def _load_shadow_sharing_data_cached(
     parquet_root_str: str,
     target_dates: Tuple[str, ...],
     cache_version: str,
-    whitelist_mtime_ns: int,
-    signatures_mtime_ns: int,
-    category_rules_mtime_ns: int,
+    logs_signature: str,
 ) -> pd.DataFrame:
-    # cache_version + whitelist_mtime_ns are explicit cache-busters.
+    # cache_version + logs_signature are explicit cache-busters.
     _ = cache_version
-    _ = whitelist_mtime_ns
-    _ = signatures_mtime_ns
-    _ = category_rules_mtime_ns
+    _ = logs_signature
 
     parquet_root = Path(parquet_root_str)
     if not parquet_root.exists():
         return pd.DataFrame()
 
-    known_files = _collect_known_files(parquet_root)
+    known_files = _collect_known_files_uncached(parquet_root)
 
     frames: List[pd.DataFrame] = []
     for d in target_dates:
@@ -1837,6 +2016,7 @@ def _load_shadow_sharing_data_cached(
 
     out = pd.concat(frames, ignore_index=True)
     out = _ensure_ts_datetime(out)
+    out = _apply_runtime_policy_columns(out)
     return out.sort_values("ts", ascending=False)
 
 
@@ -1852,13 +2032,12 @@ def _normalize_target_dates_key(target_dates: List[str]) -> Tuple[str, ...]:
 def load_shadow_sharing_data(parquet_root: Path, target_dates: List[str]) -> pd.DataFrame:
     parquet_root = Path(parquet_root).resolve()
     dates_key = _normalize_target_dates_key(target_dates)
+    logs_sig = shadow_sharing_logs_signature(parquet_root, list(dates_key))
     return _load_shadow_sharing_data_cached(
         str(parquet_root),
         dates_key,
         CACHE_VERSION,
-        int(WHITELIST_MTIME_NS),
-        int(SIGNATURES_MTIME_NS),
-        int(CATEGORY_RULES_MTIME_NS),
+        str(logs_sig),
     )
 
 
@@ -2166,24 +2345,18 @@ def _load_shadow_sharing_bundle_cached(
     parquet_root_str: str,
     target_dates: Tuple[str, ...],
     cache_version: str,
-    whitelist_mtime_ns: int,
-    signatures_mtime_ns: int,
-    category_rules_mtime_ns: int,
+    logs_signature: str,
     incident_window_minutes: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Keep these in the cache key for safe invalidation.
     _ = cache_version
-    _ = whitelist_mtime_ns
-    _ = signatures_mtime_ns
-    _ = category_rules_mtime_ns
+    _ = logs_signature
 
     events = _load_shadow_sharing_data_cached(
         parquet_root_str,
         target_dates,
         cache_version,
-        whitelist_mtime_ns,
-        signatures_mtime_ns,
-        category_rules_mtime_ns,
+        logs_signature,
     )
     if events is None or events.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -2194,13 +2367,12 @@ def _load_shadow_sharing_bundle_cached(
 def load_shadow_sharing_bundle(parquet_root: Path, target_dates: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     root = Path(parquet_root).resolve()
     dates_key = _normalize_target_dates_key(target_dates)
+    logs_sig = shadow_sharing_logs_signature(root, list(dates_key))
     return _load_shadow_sharing_bundle_cached(
         str(root),
         dates_key,
         CACHE_VERSION,
-        int(WHITELIST_MTIME_NS),
-        int(SIGNATURES_MTIME_NS),
-        int(CATEGORY_RULES_MTIME_NS),
+        str(logs_sig),
         int(INCIDENT_WINDOW_MINUTES),
     )
 

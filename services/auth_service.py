@@ -4,7 +4,7 @@ import hmac
 import os
 import re
 import string
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -16,17 +16,33 @@ from google.oauth2 import id_token as google_id_token
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
+try:
+    import mysql.connector as mysql_connector
+    from mysql.connector import Error as MySQLError
+    from mysql.connector import errorcode as MYSQL_ERRORCODE
+except Exception:
+    mysql_connector = None
+    MySQLError = Exception
+    MYSQL_ERRORCODE = None
+
 
 PBKDF2_ALG = "sha256"
 PBKDF2_ITERATIONS = 260_000
 PBKDF2_SALT_BYTES = 16
 MONGO_TIMEOUT_MS = 6000
+MYSQL_DEFAULT_PORT = 3306
+MYSQL_DEFAULT_CONNECT_TIMEOUT_SECONDS = 6
+AUTH_DB_BACKEND_DEFAULT = "mongodb"
 GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_OAUTH_SCOPES = "openid email profile"
 DEFAULT_GOOGLE_OAUTH_CLOCK_SKEW_SECONDS = 90
 GMAIL_EMAIL_PATTERN = re.compile(r"^[a-z0-9._%+-]+@gmail\.com$")
 SPECIAL_CHARACTER_SET = set(string.punctuation)
+
+
+class DuplicateUsernameError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -118,6 +134,23 @@ def _coerce_bool(value, default: bool = False) -> bool:
     if text in {"0", "false", "no", "off", "n"}:
         return False
     return default
+
+
+def get_auth_backend() -> str:
+    raw = _first_non_empty(
+        [
+            os.getenv("AUTH_DB_BACKEND"),
+            os.getenv("AUTH_DATABASE_BACKEND"),
+            _get_secret("auth.db_backend"),
+            _get_secret("db_backend"),
+        ]
+    )
+    backend = str(raw or AUTH_DB_BACKEND_DEFAULT).strip().lower()
+    if backend == "mongo":
+        backend = "mongodb"
+    if backend not in {"mongodb", "mysql"}:
+        backend = AUTH_DB_BACKEND_DEFAULT
+    return backend
 
 
 def _google_oauth_clock_skew_seconds() -> int:
@@ -296,6 +329,179 @@ def is_email_allowed_for_login(username: str) -> bool:
     return clean_user in allowlist
 
 
+def _mysql_connect_timeout_seconds() -> int:
+    raw = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_CONNECT_TIMEOUT"),
+            os.getenv("MYSQL_CONNECT_TIMEOUT"),
+            _get_secret("auth.mysql_connect_timeout"),
+            _get_secret("mysql_connect_timeout"),
+        ]
+    )
+    if raw is None:
+        return MYSQL_DEFAULT_CONNECT_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except Exception:
+        return MYSQL_DEFAULT_CONNECT_TIMEOUT_SECONDS
+    return max(1, min(60, value))
+
+
+def _parse_mysql_uri(uri: str) -> Optional[dict]:
+    text = str(uri or "").strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    if not parsed.scheme.lower().startswith("mysql"):
+        return None
+    host = (parsed.hostname or "").strip()
+    database = (parsed.path or "").lstrip("/").strip()
+    if not host or not database:
+        return None
+    cfg = {
+        "host": host,
+        "port": int(parsed.port or MYSQL_DEFAULT_PORT),
+        "user": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+        "database": database,
+    }
+    query = parse_qs(parsed.query or "", keep_blank_values=True)
+    if "ssl_disabled" in query:
+        cfg["ssl_disabled"] = _coerce_bool((query.get("ssl_disabled") or [None])[0], default=False)
+    for key in ("ssl_ca", "ssl_cert", "ssl_key"):
+        if key in query:
+            cfg[key] = str((query.get(key) or [""])[0] or "").strip()
+    return cfg
+
+
+def get_mysql_config() -> Optional[dict]:
+    uri_cfg = {}
+    mysql_uri = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_URI"),
+            os.getenv("MYSQL_URI"),
+            _get_secret("auth.mysql_uri"),
+            _get_secret("mysql_uri"),
+        ]
+    )
+    if mysql_uri:
+        uri_cfg = _parse_mysql_uri(mysql_uri) or {}
+
+    host = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_HOST"),
+            os.getenv("MYSQL_HOST"),
+            _get_secret("auth.mysql_host"),
+            _get_secret("mysql_host"),
+            uri_cfg.get("host"),
+        ]
+    )
+    port_raw = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_PORT"),
+            os.getenv("MYSQL_PORT"),
+            _get_secret("auth.mysql_port"),
+            _get_secret("mysql_port"),
+            uri_cfg.get("port"),
+        ]
+    )
+    user = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_USER"),
+            os.getenv("MYSQL_USER"),
+            _get_secret("auth.mysql_user"),
+            _get_secret("mysql_user"),
+            uri_cfg.get("user"),
+        ]
+    )
+    password = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_PASSWORD"),
+            os.getenv("MYSQL_PASSWORD"),
+            _get_secret("auth.mysql_password"),
+            _get_secret("mysql_password"),
+            uri_cfg.get("password"),
+        ]
+    )
+    database = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_DATABASE"),
+            os.getenv("AUTH_MYSQL_DB"),
+            os.getenv("MYSQL_DATABASE"),
+            os.getenv("MYSQL_DB"),
+            _get_secret("auth.mysql_database"),
+            _get_secret("auth.mysql_db"),
+            _get_secret("mysql_database"),
+            _get_secret("mysql_db"),
+            uri_cfg.get("database"),
+        ]
+    )
+    if not (host and user and database):
+        return None
+
+    try:
+        port = int(port_raw) if port_raw is not None else MYSQL_DEFAULT_PORT
+    except Exception:
+        port = MYSQL_DEFAULT_PORT
+
+    ssl_disabled_raw = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_SSL_DISABLED"),
+            os.getenv("MYSQL_SSL_DISABLED"),
+            _get_secret("auth.mysql_ssl_disabled"),
+            _get_secret("mysql_ssl_disabled"),
+            uri_cfg.get("ssl_disabled"),
+        ]
+    )
+    ssl_ca = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_SSL_CA"),
+            os.getenv("MYSQL_SSL_CA"),
+            _get_secret("auth.mysql_ssl_ca"),
+            _get_secret("mysql_ssl_ca"),
+            uri_cfg.get("ssl_ca"),
+        ]
+    )
+    ssl_cert = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_SSL_CERT"),
+            os.getenv("MYSQL_SSL_CERT"),
+            _get_secret("auth.mysql_ssl_cert"),
+            _get_secret("mysql_ssl_cert"),
+            uri_cfg.get("ssl_cert"),
+        ]
+    )
+    ssl_key = _first_non_empty(
+        [
+            os.getenv("AUTH_MYSQL_SSL_KEY"),
+            os.getenv("MYSQL_SSL_KEY"),
+            _get_secret("auth.mysql_ssl_key"),
+            _get_secret("mysql_ssl_key"),
+            uri_cfg.get("ssl_key"),
+        ]
+    )
+
+    cfg = {
+        "host": str(host).strip(),
+        "port": int(port),
+        "user": str(user).strip(),
+        "password": "" if password is None else str(password),
+        "database": str(database).strip(),
+        "connection_timeout": _mysql_connect_timeout_seconds(),
+        "autocommit": False,
+    }
+    if _coerce_bool(ssl_disabled_raw, default=False):
+        cfg["ssl_disabled"] = True
+    else:
+        if ssl_ca:
+            cfg["ssl_ca"] = str(ssl_ca).strip()
+        if ssl_cert:
+            cfg["ssl_cert"] = str(ssl_cert).strip()
+        if ssl_key:
+            cfg["ssl_key"] = str(ssl_key).strip()
+    return cfg
+
+
 def authenticate_google_oauth_code(code: str, expected_email: Optional[str] = None) -> Optional[AuthUser]:
     cfg = _get_google_oauth_config()
     clean_code = str(code or "").strip()
@@ -317,8 +523,7 @@ def authenticate_google_oauth_code(code: str, expected_email: Optional[str] = No
         _audit_login(email, False, "email_not_allowlisted")
         return None
 
-    db = _get_db()
-    row = db["app_users"].find_one({"username": email})
+    row = _fetch_user_row(email)
     if not row:
         _audit_login(email, False, "user_not_found")
         return None
@@ -327,10 +532,7 @@ def authenticate_google_oauth_code(code: str, expected_email: Optional[str] = No
         return None
 
     now = datetime.now(timezone.utc)
-    db["app_users"].update_one(
-        {"username": email},
-        {"$set": {"last_login_at": now, "updated_at": now}},
-    )
+    _update_user_row(email, {"last_login_at": now, "updated_at": now})
 
     _audit_login(email, True, "ok_google_oauth")
     return AuthUser(
@@ -352,6 +554,19 @@ def get_mongodb_uri() -> Optional[str]:
             _get_secret("MONGODB_URI"),
         ]
     )
+
+
+def get_auth_connection_fingerprint() -> Optional[str]:
+    if get_auth_backend() == "mysql":
+        cfg = get_mysql_config()
+        if not cfg:
+            return None
+        user = str(cfg.get("user", "")).strip()
+        host = str(cfg.get("host", "")).strip()
+        port = str(cfg.get("port", "")).strip()
+        database = str(cfg.get("database", "")).strip()
+        return f"mysql://{user}@{host}:{port}/{database}"
+    return get_mongodb_uri()
 
 
 def _get_database_name() -> str:
@@ -411,6 +626,327 @@ def _get_db():
     return client[db_name]
 
 
+def _mysql_connect():
+    if mysql_connector is None:
+        raise RuntimeError("MySQL backend requested but mysql-connector-python is not installed.")
+
+    cfg = get_mysql_config()
+    if not cfg:
+        raise RuntimeError(
+            "MySQL is not configured. Set AUTH_MYSQL_HOST, AUTH_MYSQL_PORT, AUTH_MYSQL_USER, AUTH_MYSQL_PASSWORD, "
+            "AUTH_MYSQL_DATABASE (or AUTH_MYSQL_URI), and set AUTH_DB_BACKEND=mysql."
+        )
+
+    try:
+        return mysql_connector.connect(**cfg)
+    except MySQLError as exc:
+        raise RuntimeError(
+            "Could not connect to MySQL. Check AUTH_MYSQL_* credentials, database name, network/IP allowlist, and server reachability."
+        ) from exc
+
+
+def _mysql_errno(exc: Exception) -> Optional[int]:
+    try:
+        raw = getattr(exc, "errno", None)
+        if raw is None:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _is_mysql_duplicate_entry(exc: Exception) -> bool:
+    code = _mysql_errno(exc)
+    if code is None:
+        return False
+    if MYSQL_ERRORCODE is not None:
+        try:
+            return code == int(MYSQL_ERRORCODE.ER_DUP_ENTRY)
+        except Exception:
+            return code == 1062
+    return code == 1062
+
+
+def _to_mysql_datetime(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _fetch_user_row(username: str) -> Optional[dict]:
+    backend = get_auth_backend()
+    if backend == "mysql":
+        conn = _mysql_connect()
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                """
+                SELECT name, username, password_hash, role, is_active, created_at, updated_at, last_login_at, created_by
+                FROM app_users
+                WHERE username = %s
+                LIMIT 1
+                """,
+                (username,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            cur.close()
+            conn.close()
+
+    row = _get_db()["app_users"].find_one({"username": username})
+    return dict(row) if row else None
+
+
+def _count_users() -> int:
+    backend = get_auth_backend()
+    if backend == "mysql":
+        conn = _mysql_connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT COUNT(*) FROM app_users")
+            row = cur.fetchone()
+            return int((row or [0])[0] or 0)
+        finally:
+            cur.close()
+            conn.close()
+    return int(_get_db()["app_users"].count_documents({}))
+
+
+def _insert_user_row(payload: dict) -> None:
+    backend = get_auth_backend()
+    if backend == "mysql":
+        conn = _mysql_connect()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO app_users (
+                    name, username, password_hash, role, is_active, created_at, updated_at, last_login_at, created_by
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(payload.get("name", "") or ""),
+                    str(payload.get("username", "") or ""),
+                    str(payload.get("password_hash", "") or ""),
+                    str(payload.get("role", "staff") or "staff"),
+                    1 if bool(payload.get("is_active", True)) else 0,
+                    _to_mysql_datetime(payload.get("created_at")),
+                    _to_mysql_datetime(payload.get("updated_at")),
+                    _to_mysql_datetime(payload.get("last_login_at")),
+                    str(payload.get("created_by", "") or ""),
+                ),
+            )
+            conn.commit()
+            return
+        except MySQLError as exc:
+            conn.rollback()
+            if _is_mysql_duplicate_entry(exc):
+                raise DuplicateUsernameError("Username already exists.") from exc
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+    try:
+        _get_db()["app_users"].insert_one(payload)
+    except DuplicateKeyError as exc:
+        raise DuplicateUsernameError("Username already exists.") from exc
+
+
+def _update_user_row(username: str, updates: dict) -> int:
+    if not updates:
+        return 0
+
+    backend = get_auth_backend()
+    if backend == "mysql":
+        allowed_cols = {
+            "name",
+            "username",
+            "password_hash",
+            "role",
+            "is_active",
+            "created_at",
+            "updated_at",
+            "last_login_at",
+            "created_by",
+        }
+        set_parts = []
+        params = []
+        for key, value in updates.items():
+            if key not in allowed_cols:
+                continue
+            if key in {"created_at", "updated_at", "last_login_at"}:
+                value = _to_mysql_datetime(value)
+            if key == "is_active":
+                value = 1 if bool(value) else 0
+            set_parts.append(f"{key} = %s")
+            params.append(value)
+        if not set_parts:
+            return 0
+
+        conn = _mysql_connect()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"UPDATE app_users SET {', '.join(set_parts)} WHERE username = %s",
+                tuple(params + [username]),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+        except MySQLError as exc:
+            conn.rollback()
+            if _is_mysql_duplicate_entry(exc):
+                raise DuplicateUsernameError("Username already exists.") from exc
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+    try:
+        result = _get_db()["app_users"].update_one({"username": username}, {"$set": updates})
+    except DuplicateKeyError as exc:
+        raise DuplicateUsernameError("Username already exists.") from exc
+    return int(result.matched_count or 0)
+
+
+def _delete_user_row(username: str) -> int:
+    backend = get_auth_backend()
+    if backend == "mysql":
+        conn = _mysql_connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("DELETE FROM app_users WHERE username = %s", (username,))
+            conn.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            cur.close()
+            conn.close()
+
+    result = _get_db()["app_users"].delete_one({"username": username})
+    return int(result.deleted_count or 0)
+
+
+def _list_user_rows() -> list[dict]:
+    backend = get_auth_backend()
+    if backend == "mysql":
+        conn = _mysql_connect()
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                """
+                SELECT name, username, role, is_active, created_by, created_at, last_login_at
+                FROM app_users
+                ORDER BY username ASC
+                """
+            )
+            return [dict(row) for row in (cur.fetchall() or [])]
+        finally:
+            cur.close()
+            conn.close()
+
+    rows = _get_db()["app_users"].find({}, {"_id": 0, "password_hash": 0}).sort("username", ASCENDING)
+    return [dict(row) for row in rows]
+
+
+def _insert_audit_row(username: str, success: bool, reason: str, occurred_at: datetime) -> None:
+    backend = get_auth_backend()
+    if backend == "mysql":
+        conn = _mysql_connect()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO auth_login_audit (username, success, reason, occurred_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    str(username or "unknown").strip().lower(),
+                    1 if bool(success) else 0,
+                    str(reason or "")[:120],
+                    _to_mysql_datetime(occurred_at),
+                ),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        return
+
+    _get_db()["auth_login_audit"].insert_one(
+        {
+            "username": (username or "unknown").strip().lower(),
+            "success": bool(success),
+            "reason": (reason or "")[:120],
+            "occurred_at": occurred_at,
+        }
+    )
+
+
+def _mysql_index_exists(cur, table_name: str, index_name: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND INDEX_NAME = %s
+        LIMIT 1
+        """,
+        (table_name, index_name),
+    )
+    return cur.fetchone() is not None
+
+
+def _init_mysql_auth_schema() -> None:
+    conn = _mysql_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_users (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                name VARCHAR(100) NOT NULL,
+                username VARCHAR(255) NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                role VARCHAR(20) NOT NULL DEFAULT 'staff',
+                is_active TINYINT(1) NOT NULL DEFAULT 1,
+                created_at DATETIME(6) NOT NULL,
+                updated_at DATETIME(6) NOT NULL,
+                last_login_at DATETIME(6) NULL,
+                created_by VARCHAR(255) NOT NULL DEFAULT '',
+                PRIMARY KEY (id),
+                UNIQUE KEY ux_app_users_username (username)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_login_audit (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                username VARCHAR(255) NOT NULL,
+                success TINYINT(1) NOT NULL,
+                reason VARCHAR(120) NOT NULL DEFAULT '',
+                occurred_at DATETIME(6) NOT NULL,
+                PRIMARY KEY (id),
+                KEY ix_auth_login_audit_occurred_at (occurred_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+
+        if not _mysql_index_exists(cur, "app_users", "ux_app_users_username"):
+            cur.execute("CREATE UNIQUE INDEX ux_app_users_username ON app_users (username)")
+        if not _mysql_index_exists(cur, "auth_login_audit", "ix_auth_login_audit_occurred_at"):
+            cur.execute("CREATE INDEX ix_auth_login_audit_occurred_at ON auth_login_audit (occurred_at)")
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
 def hash_password(password: str) -> str:
     validate_password_policy(password)
     salt = os.urandom(PBKDF2_SALT_BYTES)
@@ -434,6 +970,10 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def init_auth_schema() -> None:
+    if get_auth_backend() == "mysql":
+        _init_mysql_auth_schema()
+        return
+
     db = _get_db()
     users = db["app_users"]
     audit = db["auth_login_audit"]
@@ -447,38 +987,36 @@ def seed_bootstrap_admin() -> None:
     if not username or not password:
         return
 
-    db = _get_db()
-    users = db["app_users"]
-    if users.count_documents({}) > 0:
+    if _count_users() > 0:
         return
 
     clean_username = validate_username_policy(username)
     now = datetime.now(timezone.utc)
-    users.insert_one(
-        {
-            "name": "Administrator",
-            "username": clean_username,
-            "password_hash": hash_password(password),
-            "role": "admin",
-            "is_active": True,
-            "created_at": now,
-            "updated_at": now,
-            "last_login_at": None,
-            "created_by": "bootstrap",
-        }
-    )
+    try:
+        _insert_user_row(
+            {
+                "name": "Administrator",
+                "username": clean_username,
+                "password_hash": hash_password(password),
+                "role": "admin",
+                "is_active": True,
+                "created_at": now,
+                "updated_at": now,
+                "last_login_at": None,
+                "created_by": "bootstrap",
+            }
+        )
+    except DuplicateUsernameError:
+        return
 
 
 def _audit_login(username: str, success: bool, reason: str = "") -> None:
     try:
-        db = _get_db()
-        db["auth_login_audit"].insert_one(
-            {
-                "username": (username or "unknown").strip().lower(),
-                "success": bool(success),
-                "reason": (reason or "")[:120],
-                "occurred_at": datetime.now(timezone.utc),
-            }
+        _insert_audit_row(
+            username=(username or "unknown").strip().lower(),
+            success=bool(success),
+            reason=(reason or "")[:120],
+            occurred_at=datetime.now(timezone.utc),
         )
     except Exception:
         return
@@ -500,15 +1038,14 @@ def authenticate_user_password_only(username: str, password: str) -> Optional[Au
         _audit_login(clean_user, False, "password_policy_violation")
         return None
 
-    db = _get_db()
-    row = db["app_users"].find_one({"username": clean_user})
+    row = _fetch_user_row(clean_user)
 
     # Backward compatibility: allow legacy local usernames (e.g. "admin")
     # to authenticate via "<name>@gmail.com", then migrate them in place.
     if not row and clean_user.endswith("@gmail.com"):
         legacy_username = clean_user.split("@", 1)[0].strip().lower()
         if legacy_username:
-            legacy_row = db["app_users"].find_one({"username": legacy_username})
+            legacy_row = _fetch_user_row(legacy_username)
             if legacy_row:
                 if not bool(legacy_row.get("is_active", False)):
                     _audit_login(clean_user, False, "inactive_user")
@@ -519,11 +1056,11 @@ def authenticate_user_password_only(username: str, password: str) -> Optional[Au
 
                 now = datetime.now(timezone.utc)
                 try:
-                    db["app_users"].update_one(
-                        {"username": legacy_username},
-                        {"$set": {"username": clean_user, "last_login_at": now, "updated_at": now}},
+                    _update_user_row(
+                        legacy_username,
+                        {"username": clean_user, "last_login_at": now, "updated_at": now},
                     )
-                except DuplicateKeyError:
+                except DuplicateUsernameError:
                     _audit_login(clean_user, False, "username_conflict_during_migration")
                     return None
 
@@ -546,10 +1083,7 @@ def authenticate_user_password_only(username: str, password: str) -> Optional[Au
         return None
 
     now = datetime.now(timezone.utc)
-    db["app_users"].update_one(
-        {"username": clean_user},
-        {"$set": {"last_login_at": now, "updated_at": now}},
-    )
+    _update_user_row(clean_user, {"last_login_at": now, "updated_at": now})
 
     _audit_login(clean_user, True, "ok")
     return AuthUser(
@@ -573,7 +1107,7 @@ def get_active_user(username: str) -> Optional[AuthUser]:
     if not clean_user or not is_email_allowed_for_login(clean_user):
         return None
 
-    row = _get_db()["app_users"].find_one({"username": clean_user})
+    row = _fetch_user_row(clean_user)
     if not row:
         return None
     if not bool(row.get("is_active", False)):
@@ -597,7 +1131,7 @@ def create_user(name: str, username: str, password: str, role: str, created_by: 
 
     now = datetime.now(timezone.utc)
     try:
-        _get_db()["app_users"].insert_one(
+        _insert_user_row(
             {
                 "name": clean_name,
                 "username": clean_user,
@@ -610,7 +1144,7 @@ def create_user(name: str, username: str, password: str, role: str, created_by: 
                 "created_by": clean_created_by,
             }
         )
-    except DuplicateKeyError as exc:
+    except DuplicateUsernameError as exc:
         raise ValueError("Username already exists.") from exc
     except PyMongoError as exc:
         raise RuntimeError("Database error while creating user.") from exc
@@ -618,9 +1152,9 @@ def create_user(name: str, username: str, password: str, role: str, created_by: 
 
 def set_user_status(username: str, is_active: bool) -> None:
     clean_user = normalize_username(username)
-    _get_db()["app_users"].update_one(
-        {"username": clean_user},
-        {"$set": {"is_active": bool(is_active), "updated_at": datetime.now(timezone.utc)}},
+    _update_user_row(
+        clean_user,
+        {"is_active": bool(is_active), "updated_at": datetime.now(timezone.utc)},
     )
 
 
@@ -660,10 +1194,10 @@ def update_user(
 
     updates["updated_at"] = datetime.now(timezone.utc)
     try:
-        result = _get_db()["app_users"].update_one({"username": clean_user}, {"$set": updates})
-    except DuplicateKeyError as exc:
+        matched_count = _update_user_row(clean_user, updates)
+    except DuplicateUsernameError as exc:
         raise ValueError("Username already exists.") from exc
-    if result.matched_count == 0:
+    if matched_count == 0:
         raise ValueError("User not found.")
 
 
@@ -672,13 +1206,13 @@ def delete_user(username: str) -> None:
     if not clean_user:
         raise ValueError("E-mail is required.")
 
-    result = _get_db()["app_users"].delete_one({"username": clean_user})
-    if result.deleted_count == 0:
+    deleted_count = _delete_user_row(clean_user)
+    if deleted_count == 0:
         raise ValueError("User not found.")
 
 
 def list_users():
-    rows = _get_db()["app_users"].find({}, {"_id": 0, "password_hash": 0}).sort("username", ASCENDING)
+    rows = _list_user_rows()
     users = []
     for row in rows:
         users.append(
