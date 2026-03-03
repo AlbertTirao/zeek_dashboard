@@ -1117,6 +1117,23 @@ def _configure_incident_grid_columns(
     gb.configure_default_column(filter=True, sortable=True, resizable=True, flex=1)
     if clickable_mac:
         gb.configure_selection(selection_mode="single", use_checkbox=False)
+        mac_only_click_js = JsCode(
+            """
+            function(params) {
+                if (!params || !params.column || !params.node) return;
+                const colId = params.column.getColId ? params.column.getColId() : '';
+                if (colId === 'mac') {
+                    params.node.setSelected(true, true);
+                }
+            }
+            """
+        )
+        gb.configure_grid_options(
+            rowSelection="single",
+            suppressRowClickSelection=True,
+            rowMultiSelectWithClick=False,
+            onCellClicked=mac_only_click_js,
+        )
     gb.configure_column("#", header_name="#", width=62, pinned="left", suppressMovable=True, resizable=False)
     gb.configure_column(AUTO_UNIQUE_ID_COL, hide=True)
 
