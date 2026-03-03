@@ -493,5 +493,5 @@ def debug_print_catalog(parquet_root: Path):
                     "size_mb": st.column_config.NumberColumn("Size (MB)", format="%.2f MB"),
                 },
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )

@@ -2326,7 +2326,7 @@ def show_inventory_allow_dialog():
         if st.button(
             "Allow This App/Domain",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=invalid_target,
             key="shadow_allow_confirm_btn",
         ):
@@ -2338,7 +2338,7 @@ def show_inventory_allow_dialog():
                 st.rerun()
             st.error(message)
     with c2:
-        if st.button("Cancel", use_container_width=True, key="shadow_allow_cancel_btn"):
+        if st.button("Cancel", width="stretch", key="shadow_allow_cancel_btn"):
             st.session_state["shadow_dialog_origin"] = "dialog"
             _close_inventory_allow_dialog()
             st.rerun()
@@ -2359,7 +2359,7 @@ def show_inventory_app_dialog(conn):
 
     top = st.columns([1, 6])
     with top[0]:
-        if st.button("Close", use_container_width=True, type="primary", key="shadow_app_detail_close_btn"):
+        if st.button("Close", width="stretch", type="primary", key="shadow_app_detail_close_btn"):
             st.session_state["shadow_dialog_origin"] = "dialog"
             _close_inventory_app_dialog()
             st.rerun()
@@ -2553,7 +2553,7 @@ def show_inventory_app_dialog(conn):
             style_plotly_figure(fig_app_usage, height=310, show_legend=False)
             fig_app_usage.update_xaxes(title=None)
             fig_app_usage.update_yaxes(title="Events")
-            st.plotly_chart(fig_app_usage, use_container_width=True)
+            st.plotly_chart(fig_app_usage, width="stretch")
         else:
             st.info("No valid timestamps for this application usage trend.")
 
@@ -2569,7 +2569,7 @@ def show_inventory_app_dialog(conn):
             )
             style_plotly_figure(fig_app_risk, height=310, show_legend=False)
             fig_app_risk.update_xaxes(categoryorder="array", categoryarray=["Critical", "High", "Medium", "Low", "Safe"])
-            st.plotly_chart(fig_app_risk, use_container_width=True)
+            st.plotly_chart(fig_app_risk, width="stretch")
         else:
             st.info("No risk-level data available.")
 
@@ -2590,7 +2590,7 @@ def show_inventory_app_dialog(conn):
         st.caption(
             f"Top observed cause: {top_reason['Risk Level']} - {top_reason['Risk Reason']} ({int(top_reason['Events']):,} events)."
         )
-        st.dataframe(reason_df, use_container_width=True, hide_index=True)
+        st.dataframe(reason_df, width="stretch", hide_index=True)
     else:
         st.info("No risk reason details available for this application.")
 
@@ -2622,7 +2622,7 @@ def show_forensics_dialog(conn):
 
     top = st.columns([1, 6])
     with top[0]:
-        if st.button("Close", use_container_width=True, type="primary"):
+        if st.button("Close", width="stretch", type="primary"):
             _close_shadow_dialog(reset_grid=True)
             st.rerun()
 
@@ -2823,7 +2823,7 @@ def show_forensics_dialog(conn):
 
         fig_f.update_xaxes(title=None)
         fig_f.update_yaxes(title="Events")
-        st.plotly_chart(fig_f, use_container_width=True)
+        st.plotly_chart(fig_f, width="stretch")
     else:
         st.warning("No timeline events match the selected status/bucket filters.")
 
@@ -2852,7 +2852,7 @@ def show_forensics_dialog(conn):
         style_plotly_figure(fig_dest, height=330, show_legend=False)
         fig_dest.update_layout(yaxis_title=None, xaxis_title="Hits", coloraxis_showscale=False)
         fig_dest.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_dest, use_container_width=True)
+        st.plotly_chart(fig_dest, width="stretch")
     else:
         st.info("No destination data for the selected filters.")
 
@@ -3999,7 +3999,7 @@ def render_shadow_apps(parquet_root: Path):
             style_plotly_figure(fig, height=345)
             fig.update_xaxes(title=None)
             fig.update_yaxes(title="Events")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No data for timeline chart.")
 
@@ -4024,7 +4024,7 @@ def render_shadow_apps(parquet_root: Path):
             )
             style_plotly_figure(fig_pie, height=345)
             fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width="stretch")
         else:
             st.info("No data for source chart.")
 
@@ -4479,11 +4479,12 @@ def render_shadow_apps(parquet_root: Path):
                 unsafe_allow_html=True,
             )
             ref_df = build_risk_policy_reference(risk_policy)
-            st.dataframe(ref_df, use_container_width=True, hide_index=True)
+            st.dataframe(ref_df, width="stretch", hide_index=True)
             if risk_policy:
                 st.caption(
                     f"Policy source: `{RISK_POLICY_FILE.name}`. Update that file to tune ports/log sources/status defaults."
                 )
             else:
                 st.caption("No risk_policy.yaml found. Only behavior rules and Safe fallback are active.")
+
 

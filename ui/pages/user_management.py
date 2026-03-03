@@ -442,7 +442,7 @@ def _render_delete_user_dialog(target_username: str, current_username: str) -> N
 
     if target not in user_map:
         st.error("Selected user no longer exists.")
-        if st.button("Close", use_container_width=True, key="um_delete_missing_close"):
+        if st.button("Close", width="stretch", key="um_delete_missing_close"):
             st.session_state.pop("um_delete_target", None)
             st.rerun()
         return
@@ -456,14 +456,14 @@ def _render_delete_user_dialog(target_username: str, current_username: str) -> N
     with c1:
         do_delete = st.button(
             "Delete User",
-            use_container_width=True,
+            width="stretch",
             key=f"um_confirm_delete_{target}",
             type="primary",
         )
     with c2:
         cancel = st.button(
             "Cancel",
-            use_container_width=True,
+            width="stretch",
             key=f"um_cancel_delete_{target}",
         )
 
@@ -500,7 +500,7 @@ def _render_edit_user_dialog(
 
     if target not in user_map:
         st.error("Selected user no longer exists.")
-        if st.button("Close", use_container_width=True):
+        if st.button("Close", width="stretch"):
             st.session_state.pop("um_edit_target", None)
             st.rerun()
         return
@@ -516,7 +516,7 @@ def _render_edit_user_dialog(
             placeholder="Leave blank to keep current password",
         )
         st.caption("If set, password must be at least 8 characters and include a special character.")
-        submit = st.form_submit_button("Save User Changes", use_container_width=True)
+        submit = st.form_submit_button("Save User Changes", width="stretch")
 
     if submit:
         try:
@@ -539,7 +539,7 @@ def _render_edit_user_dialog(
         except Exception as e:
             st.error(str(e))
 
-    if st.button("Cancel", use_container_width=True, key="um_edit_cancel"):
+    if st.button("Cancel", width="stretch", key="um_edit_cancel"):
         st.rerun()
 
 
@@ -596,7 +596,7 @@ def render(current_username: str):
         current_role = str(st.session_state.get("um_create_role", "staff") or "staff").strip().lower()
         role_index = role_options.index(current_role) if current_role in role_options else 0
         role = st.selectbox("Role", options=role_options, index=role_index, key="um_create_role")
-        submit_create = st.form_submit_button("Create User", use_container_width=True, type="primary")
+        submit_create = st.form_submit_button("Create User", width="stretch", type="primary")
 
     if submit_create:
         try:
@@ -814,3 +814,4 @@ def render(current_username: str):
         st.info("No accounts available.")
 
     st.markdown("</div>", unsafe_allow_html=True)
+

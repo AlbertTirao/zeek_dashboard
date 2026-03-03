@@ -962,7 +962,7 @@ def _render_incident_table_insights(grid_rows: pd.DataFrame) -> None:
             style_plotly_figure(fig_conf, height=300, show_legend=False)
             fig_conf.update_xaxes(title="")
             fig_conf.update_yaxes(title="Incident Count")
-            st.plotly_chart(fig_conf, use_container_width=True)
+            st.plotly_chart(fig_conf, width="stretch")
 
     with ch2:
         if top_dest.empty:
@@ -978,7 +978,7 @@ def _render_incident_table_insights(grid_rows: pd.DataFrame) -> None:
             style_plotly_figure(fig_dest, height=300, show_legend=False)
             fig_dest.update_xaxes(title="Outbound MB")
             fig_dest.update_yaxes(title="Destination/Domain", categoryorder="total ascending")
-            st.plotly_chart(fig_dest, use_container_width=True)
+            st.plotly_chart(fig_dest, width="stretch")
 
 
 def _build_incident_grid_frame(incidents_df: pd.DataFrame, *, include_hostname: bool = True) -> pd.DataFrame:
@@ -1406,7 +1406,7 @@ def show_shadow_sharing_device_dialog(
 
     top = st.columns([1.0, 5.0])
     with top[0]:
-        if st.button("Close", use_container_width=True, type="primary", key=f"shadow_sharing_dlg_close_{selected_scope_key}_{mac_key}"):
+        if st.button("Close", width="stretch", type="primary", key=f"shadow_sharing_dlg_close_{selected_scope_key}_{mac_key}"):
             _close_shadow_sharing_dialog()
             st.rerun()
     with top[1]:
@@ -1997,7 +1997,7 @@ def render_shadow_sharing(parquet_root: Path):
                 fig_timeline.update_layout(legend_title_text="Confidence")
                 fig_timeline.update_xaxes(title=f"Time ({bucket} buckets)")
                 fig_timeline.update_yaxes(title="Incidents")
-                st.plotly_chart(fig_timeline, use_container_width=True)
+                st.plotly_chart(fig_timeline, width="stretch")
 
             with tl_right:
                 signal_line = (
@@ -2030,7 +2030,7 @@ def render_shadow_sharing(parquet_root: Path):
                 fig_signal.update_layout(legend_title_text=None)
                 fig_signal.update_xaxes(title="Time")
                 fig_signal.update_yaxes(title="Incident Count")
-                st.plotly_chart(fig_signal, use_container_width=True)
+                st.plotly_chart(fig_signal, width="stretch")
 
     # -------------------------------------------------------------------------
     # Device Forensics (incident rows under Overview)

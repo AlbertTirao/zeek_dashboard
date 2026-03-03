@@ -352,7 +352,8 @@ def query_parquet_log(
         if "TIMESTAMP" in ts_type or "DATE" in ts_type:
             dt_series = pd.to_datetime(df["ts"], errors="coerce")
         else:
-            dt_series = pd.to_datetime(df["ts"], unit="s", errors="coerce")
+            ts_numeric = pd.to_numeric(df["ts"], errors="coerce")
+            dt_series = pd.to_datetime(ts_numeric, unit="s", errors="coerce")
 
         df.insert(0, "date time", dt_series)
 
@@ -427,5 +428,6 @@ def render(parquet_root: Path):
     df_display.index = df_display.index + 1
 
     st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-    st.dataframe(df_display, use_container_width=True, height=600)
+    st.dataframe(df_display, width="stretch", height=600)
     st.markdown("</div>", unsafe_allow_html=True)
+

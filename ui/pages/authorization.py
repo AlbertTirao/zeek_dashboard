@@ -382,13 +382,13 @@ def _coerce_ts_any(series: pd.Series) -> pd.Series:
         return series
 
     if pd.api.types.is_object_dtype(series):
-        parsed = pd.to_datetime(series, errors="coerce", utc=False)
+        parsed = pd.to_datetime(series, errors="coerce", utc=False, format="mixed")
         if parsed.notna().any():
             return parsed
 
     num = pd.to_numeric(series, errors="coerce")
     if not num.notna().any():
-        return pd.to_datetime(series, errors="coerce")
+        return pd.to_datetime(series, errors="coerce", format="mixed")
 
     m = float(num.dropna().abs().max())
     if m > 1e17:
@@ -947,7 +947,7 @@ def render_device_manager(device_list: list[dict], filepath: Path):
     edited_df = _st_data_editor(
         editor_df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
             "_id": st.column_config.TextColumn("_id", disabled=True, width="small"),  # hidden-ish identifier
@@ -1173,7 +1173,7 @@ def render_domain_manager(domain_rows: list[dict], filepath: Path):
     edited_df = _st_data_editor(
         editor_df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
             "_id": st.column_config.TextColumn("_id", disabled=True, width="small"),
@@ -1307,7 +1307,7 @@ def render_ai_signature_manager(yaml_path: Path):
     edited_sigs = _st_data_editor(
         sig_df[["#", "Provider", "Patterns"]],
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
             "Provider": st.column_config.TextColumn("Provider Name", required=True),
@@ -1409,7 +1409,7 @@ def render_banning_list(ban_file: Path):
     edited_df = _st_data_editor(
         editor_df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "#": st.column_config.NumberColumn("#", disabled=True, width="small"),
             "_id": st.column_config.TextColumn("_id", disabled=True, width="small"),
@@ -1560,7 +1560,7 @@ def render(mac_file: Path):
             _open_shadow_table_shell()
             _st_dataframe(
                 hist_show,
-                use_container_width=True,
+                width="stretch",
                 height=500,
                 column_config={"#": st.column_config.NumberColumn("#", width="small")}
             )

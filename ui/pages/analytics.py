@@ -132,9 +132,10 @@ def render(parquet_root: Path):
     )
 
     section = st.radio(
-        "",
+        "Analytics section",
         ["Shadow Apps", "Shadow Sharings", "Shadow AI"],
         horizontal=True,
+        label_visibility="collapsed",
     )
 
     if section == "Shadow Apps":

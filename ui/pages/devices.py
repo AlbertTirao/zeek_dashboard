@@ -187,7 +187,7 @@ def _coerce_ts_any(series: pd.Series) -> pd.Series:
                 return parsed_dt
 
     if pd.api.types.is_object_dtype(series):
-        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+        parsed = pd.to_datetime(series, errors="coerce", utc=True, format="mixed")
         if parsed.notna().any():
             try:
                 return parsed.dt.tz_convert(None)
@@ -199,7 +199,7 @@ def _coerce_ts_any(series: pd.Series) -> pd.Series:
 
     num = pd.to_numeric(series, errors="coerce")
     if not num.notna().any():
-        fallback = pd.to_datetime(series, errors="coerce", utc=True)
+        fallback = pd.to_datetime(series, errors="coerce", utc=True, format="mixed")
         try:
             return fallback.dt.tz_convert(None)
         except Exception:
@@ -1498,7 +1498,7 @@ def render_metric_card_dialog(
     up_color: str = "#2ecc71",
     down_color: str = "#9aa0a6",
 ):
-    clicked = st.button(" ", key=key, use_container_width=True)
+    clicked = st.button(" ", key=key, width="stretch")
 
     value_str = str(value)
     delta_html = _metric_delta_html(delta_value, delta_is_percent=delta_is_percent, up_color=up_color, down_color=down_color)
@@ -1547,7 +1547,7 @@ def active_today_popup(
             unsafe_allow_html=True,
         )
     with h2:
-        if st.button("Close", key="dlg_active_close", use_container_width=True):
+        if st.button("Close", key="dlg_active_close", width="stretch"):
             _close_dialog()
 
     known_hosts_sig = _known_hosts_sig_for_day(parquet_root, active_day_str)
@@ -1671,7 +1671,7 @@ def device_list_popup(
             unsafe_allow_html=True,
         )
     with h2:
-        if st.button("Close", key=f"dlg_list_close_{status_type.lower()}", use_container_width=True):
+        if st.button("Close", key=f"dlg_list_close_{status_type.lower()}", width="stretch"):
             _close_dialog()
 
     available_dates_for_filter = list(available_dates_list or [])
@@ -1852,7 +1852,7 @@ def device_list_popup(
             file_name=f"{status_type.lower()}_devices.csv",
             mime="text/csv",
             key=f"dl_{status_type.lower()}",
-            use_container_width=True,
+            width="stretch",
         )
     st.markdown("</div>", unsafe_allow_html=True)
     
@@ -2016,7 +2016,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
             unsafe_allow_html=True,
         )
     with h2:
-        if st.button("Close", key="dlg_forensics_close", use_container_width=True):
+        if st.button("Close", key="dlg_forensics_close", width="stretch"):
             _close_dialog()
 
     if not available_dates_list:
@@ -2119,7 +2119,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
     )
     fig.update_yaxes(rangemode="tozero")
     st.markdown("<div class='section-panel'>", unsafe_allow_html=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("#### Top Destinations")
@@ -2129,7 +2129,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
     st.markdown("<div class='grid-card'>", unsafe_allow_html=True)
     st.dataframe(
         top,
-        use_container_width=True,
+        width="stretch",
         height=_table_height_for_rows(len(top), row_px=36, header_px=44, min_px=190, max_px=360),
     )
     st.markdown("</div>", unsafe_allow_html=True)
@@ -2330,7 +2330,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         )
 
     with m3:
-        clicked = st.button(" ", key="card_open_auth", use_container_width=True)
+        clicked = st.button(" ", key="card_open_auth", width="stretch")
         st.markdown(
             f"""
             <div class="metric-overlay">
@@ -2348,7 +2348,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             st.rerun()
 
     with m4:
-        clicked = st.button(" ", key="card_open_unauth", use_container_width=True)
+        clicked = st.button(" ", key="card_open_unauth", width="stretch")
         st.markdown(
             f"""
             <div class="metric-overlay">
@@ -2376,7 +2376,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         hourly = (
             in_scope.set_index("ts")
             .groupby("status")
-            .resample("1H")
+            .resample("1h", include_groups=False)
             .size()
             .reset_index(name="events")
         )
@@ -2456,7 +2456,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             )
             fig.update_yaxes(rangemode="tozero", showgrid=True, gridcolor="rgba(255,255,255,0.06)")
             fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.06)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No activity data to chart.")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2472,7 +2472,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             unsafe_allow_html=True,
         )
         st.markdown("<div class='section-panel'>", unsafe_allow_html=True)
-        st.plotly_chart(gauge_fig, use_container_width=True)
+        st.plotly_chart(gauge_fig, width="stretch")
         st.markdown(
             """
             <div class='gauge-legend'>
@@ -2517,3 +2517,4 @@ def render(logs_root: Path, authorized_mac_file: Path):
             st.session_state.selected_forensic_ip,
             raw_dates,
         )
+

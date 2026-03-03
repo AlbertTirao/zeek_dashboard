@@ -3863,7 +3863,7 @@ def _render_shadow_ai_mac_drilldown(
             style_plotly_figure(figm, height=360)
             figm.update_xaxes(title="Time")
             figm.update_yaxes(title="Provider")
-            st.plotly_chart(figm, use_container_width=True)
+            st.plotly_chart(figm, width="stretch")
 
         with cB:
             byprov = view_df.groupby("AI_Provider").agg(
@@ -3882,7 +3882,7 @@ def _render_shadow_ai_mac_drilldown(
             style_plotly_figure(figp, height=360, show_legend=False)
             figp.update_xaxes(title="Events")
             figp.update_yaxes(title=None)
-            st.plotly_chart(figp, use_container_width=True)
+            st.plotly_chart(figp, width="stretch")
 
         dom = view_df["Domain"].astype(str).replace({"": None, "nan": None}).dropna()
         if not dom.empty:
@@ -3899,7 +3899,7 @@ def _render_shadow_ai_mac_drilldown(
             style_plotly_figure(figd, height=340, show_legend=False)
             figd.update_xaxes(title="Events")
             figd.update_yaxes(title=None)
-            st.plotly_chart(figd, use_container_width=True)
+            st.plotly_chart(figd, width="stretch")
 
     with tabs[1]:
         st.markdown("#### Priority incidents (this MAC)")
@@ -3974,7 +3974,7 @@ def _render_shadow_ai_mac_drilldown(
             style_plotly_figure(fige, height=320, show_legend=False)
             fige.update_xaxes(title="Events")
             fige.update_yaxes(title=None)
-            st.plotly_chart(fige, use_container_width=True)
+            st.plotly_chart(fige, width="stretch")
 
     with tabs[2]:
         mac_event_cols = [
@@ -4037,7 +4037,7 @@ def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: s
 
     c_left, c_right = st.columns([1.0, 3.5])
     with c_left:
-        if st.button("Close", use_container_width=True, type="primary", key=f"shadow_ai_mac_dlg_close_{selected_scope_key}"):
+        if st.button("Close", width="stretch", type="primary", key=f"shadow_ai_mac_dlg_close_{selected_scope_key}"):
             _close_shadow_ai_mac_dialog()
             st.rerun()
     with c_right:
@@ -4591,7 +4591,7 @@ def render_shadow_ai(parquet_root: Path):
             style_plotly_figure(fig_scatter, height=370)
             fig_scatter.update_xaxes(title="Time")
             fig_scatter.update_yaxes(title="Provider")
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width="stretch")
 
         with g2:
             if "Client_Type" in filtered.columns and not filtered.empty:
@@ -4610,7 +4610,7 @@ def render_shadow_ai(parquet_root: Path):
             style_plotly_figure(fig_bar, height=370, show_legend=False)
             fig_bar.update_xaxes(title="Average Risk Score")
             fig_bar.update_yaxes(title=None)
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width="stretch")
 
         # Provider summary
         st.markdown("### Providers in View")
@@ -4683,7 +4683,7 @@ def render_shadow_ai(parquet_root: Path):
                 style_plotly_figure(fig1, height=360)
                 fig1.update_xaxes(title="Day")
                 fig1.update_yaxes(title="Events")
-                st.plotly_chart(fig1, use_container_width=True)
+                st.plotly_chart(fig1, width="stretch")
 
             with c_right:
                 fig2 = px.line(
@@ -4699,7 +4699,7 @@ def render_shadow_ai(parquet_root: Path):
                 style_plotly_figure(fig2, height=360)
                 fig2.update_xaxes(title="Day")
                 fig2.update_yaxes(title="Unique MACs")
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
             fig3 = px.bar(
                 daily,
@@ -4713,7 +4713,7 @@ def render_shadow_ai(parquet_root: Path):
             style_plotly_figure(fig3, height=360)
             fig3.update_xaxes(title="Day")
             fig3.update_yaxes(title="Upload MB")
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
 
     # =============================================================================
     # TAB: TOP DESTINATIONS
@@ -5100,3 +5100,4 @@ def render_shadow_ai(parquet_root: Path):
         st.write("- If many hits are DNS-only, enable `Ignore DNS-only events` and focus on HTTP/SSL evidence.")
         st.write("- If one signature fragment dominates noisy matches, narrow or anchor it in `ai_signatures.yaml`.")
         st.write("- Prefer HTTP host/uri and TLS SNI for stronger attribution; DNS is weaker evidence.")
+

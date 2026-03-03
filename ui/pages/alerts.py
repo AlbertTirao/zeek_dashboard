@@ -1481,7 +1481,7 @@ def render_alert_metric_card(
     is_active: bool = False,
     tone: str = "neutral",
 ) -> None:
-    clicked = st.button(" ", key=key, use_container_width=True)
+    clicked = st.button(" ", key=key, width="stretch")
 
     label_safe = html.escape(str(label))
     value_safe = html.escape(str(value))
@@ -1936,7 +1936,7 @@ def _render_alerts_ui(
             data=csv_bytes,
             file_name=f"alerts_{view.lower()}_devices.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
             key=f"alerts_dl_{view.lower()}",
         )
 
@@ -1951,7 +1951,7 @@ def _render_alerts_ui(
     st.markdown("<div class='alerts-table-shell'>", unsafe_allow_html=True)
     st.dataframe(
         filtered_table.style.map(style_status, subset=["Status"]),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Last Seen": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss"),
@@ -1959,3 +1959,4 @@ def _render_alerts_ui(
     )
     st.markdown("</div>", unsafe_allow_html=True)
     return
+

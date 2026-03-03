@@ -877,9 +877,10 @@ def require_authentication() -> None:
                         unsafe_allow_html=True,
                     )
                     captcha_response = st.text_input(
-                        "",
+                        "Captcha answer",
                         placeholder="Type the answer (e.g., 30)",
                         key=LOGIN_CAPTCHA_INPUT_SESSION_KEY,
+                        label_visibility="collapsed",
                     )
                     if google_oauth_ready:
                         st.caption(
@@ -887,7 +888,7 @@ def require_authentication() -> None:
                         )
                     else:
                         st.caption("Use an approved @gmail.com address. Password must include at least one special character.")
-                    submitted = st.form_submit_button("LOG IN", use_container_width=True)
+                    submitted = st.form_submit_button("LOG IN", width="stretch")
         with col_image:
             with st.container(key="login_image_panel"):
                 st.markdown("&nbsp;", unsafe_allow_html=True)
@@ -945,7 +946,7 @@ def require_authentication() -> None:
             st.link_button(
                 "Continue to Google Sign-In",
                 oauth_url,
-                use_container_width=True,
+                width="stretch",
             )
             st.stop()
 
