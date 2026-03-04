@@ -3549,6 +3549,8 @@ def render_shadow_aggrid(
     update_mode=GridUpdateMode.NO_UPDATE,
     grid_options_overrides: Optional[Dict[str, object]] = None,
     auto_fit_columns: bool = True,
+    wrap_shell: bool = True,
+    hide_top_border: bool = False,
 ):
     df = _drop_empty_rows_and_columns(df)
     grid_options = gb.build()
@@ -3632,9 +3634,16 @@ def render_shadow_aggrid(
 
     ag_theme, ag_css = get_aggrid_theme_and_css()
     table_css = dict(ag_css)
+    root_wrapper_style = {
+        "background-color": "#061120",
+        "color": "#EAF2FF",
+        "border": "1px solid #2A466E",
+    }
+    if hide_top_border:
+        root_wrapper_style["border-top"] = "0 !important"
     table_css.update(
         {
-            ".ag-root-wrapper": {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"},
+            ".ag-root-wrapper": root_wrapper_style,
             ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E"},
             ".ag-header-cell, .ag-header-group-cell": {"background-color": "#10213E", "color": "#EAF2FF", "border-right": "1px solid #2A466E"},
             ".ag-header-cell-menu-button": {
@@ -3665,7 +3674,8 @@ def render_shadow_aggrid(
         }
     )
 
-    st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
+    if wrap_shell:
+        st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
     grid_response = AgGrid(
         df,
         gridOptions=grid_options,
@@ -3680,7 +3690,8 @@ def render_shadow_aggrid(
         reload_data=False,
         key=key,
     )
-    st.markdown("</div>", unsafe_allow_html=True)
+    if wrap_shell:
+        st.markdown("</div>", unsafe_allow_html=True)
     return grid_response
 
 
@@ -4300,11 +4311,21 @@ def inject_shadow_ai_css():
             margin-bottom: 0.45rem;
         }
         .shadow-filter-shell {
-            border: 1px solid rgba(148, 163, 184, 0.28);
-            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
-            border-radius: 12px;
-            padding: 0.72rem 0.85rem 0.55rem 0.85rem;
+            border: 0;
+            background: transparent;
+            border-radius: 0;
+            padding: 0;
             margin-bottom: 0.45rem;
+            box-shadow: none;
+        }
+        .shadow-detection-basis [data-testid="stExpander"] {
+            border: 0 !important;
+            box-shadow: none !important;
+            background: transparent !important;
+        }
+        .shadow-detection-basis [data-testid="stExpander"] details {
+            border: 0 !important;
+            background: transparent !important;
         }
         .shadow-filter-hint {
             font-size: 0.76rem;
@@ -4476,43 +4497,7 @@ def render_shadow_ai(parquet_root: Path):
         "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN telemetry with signature and policy context to surface potential Shadow AI usage and leakage risk.</div>",
         unsafe_allow_html=True,
     )
-
-    parquet_root = Path(parquet_root)
-    if not parquet_root.exists():
-        st.error(f"Parquet root not found: {parquet_root}")
-        return
-
-    available_dates = get_available_dates(parquet_root)
-    if not available_dates:
-        st.warning("No logs found.")
-        return
-
-    date_options = ["All Available Dates"] + available_dates
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    default_scope = today_str if today_str in available_dates else available_dates[0]
-    default_index = date_options.index(default_scope) if default_scope in date_options else 0
-    top1, top2, top3 = st.columns([1.5, 2.3, 0.8])
-    with top1:
-        selected_date = st.selectbox(
-            "Dataset Scope",
-            date_options,
-            index=default_index,
-            key="shadow_ai_date_v4",
-        )
-    selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
-    with top2:
-        scope_label = selected_date if selected_date != "All Available Dates" else f"All Available Dates ({len(available_dates)})"
-        st.markdown(
-            f"<div class='shadow-day-chip'>Active scope:&nbsp;<strong>{scope_label}</strong></div>",
-            unsafe_allow_html=True,
-        )
-    with top3:
-        st.write("")
-        st.write("")
-        if st.button("Refresh", key="shadow_ai_refresh_v2"):
-            _shadow_ai_bust_ui_caches()
-            st.rerun()
-
+    st.markdown("<div class='shadow-detection-basis'>", unsafe_allow_html=True)
     with st.expander("Detection basis (how Shadow AI is decided)", expanded=False):
         st.write(
             "Events are generated when Zeek telemetry matches `ai_signatures.yaml` (HTTP host/uri, TLS SNI, DNS query) "
@@ -4528,6 +4513,44 @@ def render_shadow_ai(parquet_root: Path):
             "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, Policy_Basis, "
             "Risk_Basis, Critical_Reason, Actor, Evidence_Type, Behavior_Indicators, First_Seen_SaaS, Files_Log_Correlation, Governance_Alert, and Confidence."
         )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    parquet_root = Path(parquet_root)
+    if not parquet_root.exists():
+        st.error(f"Parquet root not found: {parquet_root}")
+        return
+
+    available_dates = get_available_dates(parquet_root)
+    if not available_dates:
+        st.warning("No logs found.")
+        return
+
+    date_options = ["All Available Dates"] + available_dates
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    default_scope = today_str if today_str in available_dates else available_dates[0]
+    default_index = date_options.index(default_scope) if default_scope in date_options else 0
+    top1, top2 = st.columns([1.5, 3.1])
+    with top1:
+        selected_date = st.selectbox(
+            "Dataset Scope",
+            date_options,
+            index=default_index,
+            key="shadow_ai_date_v4",
+        )
+    selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
+    with top2:
+        scope_col, refresh_col = st.columns([4.8, 1.1])
+        scope_label = selected_date if selected_date != "All Available Dates" else f"All Available Dates ({len(available_dates)})"
+        with scope_col:
+            st.markdown(
+                f"<div class='shadow-day-chip'>Active scope:&nbsp;<strong>{scope_label}</strong></div>",
+                unsafe_allow_html=True,
+            )
+        with refresh_col:
+            st.write("")
+            if st.button("Refresh", key="shadow_ai_refresh_v2"):
+                _shadow_ai_bust_ui_caches()
+                st.rerun()
 
     provider_values = sorted(
         set((RAW_AI_SIGNATURES or {}).keys())
@@ -4602,14 +4625,6 @@ def render_shadow_ai(parquet_root: Path):
     ignore_dns_only = False
     st.markdown("</div>", unsafe_allow_html=True)
 
-    verdict_summary = ", ".join(selected_verdict) if selected_verdict else "None"
-    severity_summary = ", ".join(selected_severity) if selected_severity else "None"
-    provider_summary = f"{len(provider_filter)} selected" if provider_filter else "All"
-    search_summary = "On" if (search_q or "").strip() else "Off"
-    st.markdown(
-        f"<div class='shadow-filter-hint'>Verdict: <strong>{verdict_summary}</strong> | Severity: <strong>{severity_summary}</strong> | Providers: <strong>{provider_summary}</strong> | Search: <strong>{search_summary}</strong></div>",
-        unsafe_allow_html=True,
-    )
     # Scope behavior: always interpret selected day in Asia/Manila local time (with automatic boundary coverage)
     scope_mode = "local_auto"
 
@@ -4742,7 +4757,6 @@ def render_shadow_ai(parquet_root: Path):
         show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
         st.stop()
 
-    st.divider()
     m1, m2, m3, m4, m5, m6 = st.columns(6)
 
     total_leakage_mb = _sum_upload_mb(filtered.get("Upload_Bytes", pd.Series(0, index=filtered.index)))
@@ -4912,6 +4926,8 @@ def render_shadow_ai(parquet_root: Path):
             key=f"shadow_ai_provider_grid_{selected_scope_key}_{int(st.session_state.get('shadow_ai_provider_grid_nonce', 0))}",
             height=390,
             update_mode=GridUpdateMode.MODEL_CHANGED,
+            wrap_shell=False,
+            hide_top_border=True,
         )
 
         edited_prov = prov_response.get("data", None)
@@ -5063,7 +5079,14 @@ def render_shadow_ai(parquet_root: Path):
         gb_dest.configure_column("Max_Risk_Level", header_name="Risk Level", minWidth=110, cellStyle=_severity_cellstyle())
         gb_dest.configure_column("Evidence", minWidth=130)
         gb_dest.configure_column("Risk_Level_Basis", header_name="Risk Level Basis", minWidth=320, flex=2.2)
-        render_shadow_aggrid(dest_grid, gb_dest, key=f"shadow_ai_dest_grid_{selected_scope_key}", height=455)
+        render_shadow_aggrid(
+            dest_grid,
+            gb_dest,
+            key=f"shadow_ai_dest_grid_{selected_scope_key}",
+            height=455,
+            wrap_shell=False,
+            hide_top_border=True,
+        )
 
         st.markdown("### POST/Upload focus (HTTP evidence)")
         st.caption("HTTP scope uses detection source + method/evidence fallback to avoid missing valid upload rows.")
@@ -5243,6 +5266,8 @@ def render_shadow_ai(parquet_root: Path):
                     "onCellClicked": mac_only_click_js,
                 },
                 auto_fit_columns=False,
+                wrap_shell=False,
+                hide_top_border=True,
             )
 
             selected_mac = _extract_selected_mac(mac_response.get("selected_rows", None))
@@ -5318,7 +5343,14 @@ def render_shadow_ai(parquet_root: Path):
         gb_dist.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
         gb_dist.configure_column("Detection_Source", header_name="Source", minWidth=130)
         gb_dist.configure_column("Events", minWidth=90)
-        render_shadow_aggrid(dist_grid, gb_dist, key=f"shadow_ai_dist_grid_{selected_scope_key}", height=290)
+        render_shadow_aggrid(
+            dist_grid,
+            gb_dist,
+            key=f"shadow_ai_dist_grid_{selected_scope_key}",
+            height=290,
+            wrap_shell=False,
+            hide_top_border=True,
+        )
 
         st.markdown("#### Signature fragments causing matches (top)")
         sig_top = filtered.groupby(["Policy_Verdict", "Signature_Match"]).size().reset_index(name="Events")
@@ -5329,7 +5361,14 @@ def render_shadow_ai(parquet_root: Path):
         gb_sig.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
         gb_sig.configure_column("Signature_Match", header_name="Signature", minWidth=220, flex=1.8)
         gb_sig.configure_column("Events", minWidth=90)
-        render_shadow_aggrid(sig_grid, gb_sig, key=f"shadow_ai_sig_grid_{selected_scope_key}", height=360)
+        render_shadow_aggrid(
+            sig_grid,
+            gb_sig,
+            key=f"shadow_ai_sig_grid_{selected_scope_key}",
+            height=360,
+            wrap_shell=False,
+            hide_top_border=True,
+        )
 
         st.markdown("#### Suggested tuning (if noisy)")
         st.write("- If many hits are DNS-only, enable `Ignore DNS-only events` and focus on HTTP/SSL evidence.")
