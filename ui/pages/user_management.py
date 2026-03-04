@@ -592,6 +592,7 @@ def render(current_username: str):
             key="um_create_password",
         )
         st.caption("Name is required. Only @gmail.com e-mail accounts are allowed.")
+        st.caption("The new user receives this e-mail and default password, then must verify OTP and change it on first login.")
         role_options = ["staff", "admin"]
         current_role = str(st.session_state.get("um_create_role", "staff") or "staff").strip().lower()
         role_index = role_options.index(current_role) if current_role in role_options else 0
@@ -611,7 +612,25 @@ def render(current_username: str):
                 role=clean_role,
                 created_by=current_username,
             )
-            st.success(f"User '{clean_name or clean_username}' created.")
+            email_warning = ""
+            try:
+                auth_service.send_new_user_credentials_email(
+                    username=clean_username,
+                    default_password=password,
+                    created_by=current_username,
+                )
+            except Exception as email_exc:
+                email_warning = str(email_exc)
+
+            if email_warning:
+                st.warning(
+                    f"User '{clean_name or clean_username}' created, but the credentials e-mail was not sent."
+                )
+                st.caption(email_warning)
+            else:
+                st.success(
+                    f"User '{clean_name or clean_username}' created and credentials e-mail sent."
+                )
             users = auth_service.list_users()
         except Exception as e:
             st.error(str(e))

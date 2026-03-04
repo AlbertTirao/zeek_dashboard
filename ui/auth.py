@@ -13,13 +13,16 @@ import streamlit as st
 from services import auth_service
 from services.auth_service import (
     authenticate_google_oauth_code,
-    authenticate_user_password_only,
-    authenticate_user,
     build_google_oauth_authorization_url,
+    complete_default_password_reset,
+    complete_login_after_otp,
+    generate_email_otp_code,
     is_email_allowed_for_login,
     is_google_oauth_configured,
     is_valid_gmail_email,
     password_has_special_character,
+    send_login_otp_email,
+    verify_user_credentials_for_otp,
 )
 
 
@@ -35,6 +38,17 @@ LOGIN_CAPTCHA_B_SESSION_KEY = "login_captcha_b"
 LOGIN_CAPTCHA_ANSWER_SESSION_KEY = "login_captcha_answer"
 LOGIN_CAPTCHA_INPUT_SESSION_KEY = "login_captcha_input"
 LOGIN_CAPTCHA_CLEAR_INPUT_FLAG_SESSION_KEY = "login_captcha_clear_input_flag"
+LOGIN_STAGE_SESSION_KEY = "login_stage"
+LOGIN_PENDING_USER_SESSION_KEY = "login_pending_user"
+LOGIN_OTP_HASH_SESSION_KEY = "login_otp_hash"
+LOGIN_OTP_EXPIRES_AT_SESSION_KEY = "login_otp_expires_at"
+LOGIN_OTP_SENT_AT_SESSION_KEY = "login_otp_sent_at"
+LOGIN_FEEDBACK_MESSAGE_SESSION_KEY = "login_feedback_message"
+LOGIN_FEEDBACK_LEVEL_SESSION_KEY = "login_feedback_level"
+LOGIN_STAGE_CREDENTIALS = "credentials"
+LOGIN_STAGE_OTP = "otp"
+LOGIN_STAGE_PASSWORD_RESET = "password_reset"
+LOGIN_OTP_EXPIRES_SECONDS = 60
 GOOGLE_OAUTH_QUERY_KEYS = (
     "code",
     "state",
@@ -134,6 +148,131 @@ def _parse_captcha_answer(raw_value: str) -> Optional[int]:
         return int(cleaned)
     except Exception:
         return None
+
+
+def _set_login_feedback(message: str, level: str = "info") -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    lvl = str(level or "info").strip().lower()
+    if lvl not in {"info", "success", "warning", "error"}:
+        lvl = "info"
+    st.session_state[LOGIN_FEEDBACK_MESSAGE_SESSION_KEY] = text
+    st.session_state[LOGIN_FEEDBACK_LEVEL_SESSION_KEY] = lvl
+
+
+def _show_login_feedback() -> None:
+    message = str(st.session_state.pop(LOGIN_FEEDBACK_MESSAGE_SESSION_KEY, "") or "").strip()
+    if not message:
+        return
+    level = str(st.session_state.pop(LOGIN_FEEDBACK_LEVEL_SESSION_KEY, "info") or "info").strip().lower()
+    if level == "success":
+        st.success(message)
+    elif level == "warning":
+        st.warning(message)
+    elif level == "error":
+        st.error(message)
+    else:
+        st.info(message)
+
+
+def _login_stage() -> str:
+    raw_stage = str(st.session_state.get(LOGIN_STAGE_SESSION_KEY, LOGIN_STAGE_CREDENTIALS) or "").strip().lower()
+    if raw_stage not in {LOGIN_STAGE_CREDENTIALS, LOGIN_STAGE_OTP, LOGIN_STAGE_PASSWORD_RESET}:
+        raw_stage = LOGIN_STAGE_CREDENTIALS
+    st.session_state[LOGIN_STAGE_SESSION_KEY] = raw_stage
+    return raw_stage
+
+
+def _set_login_stage(stage: str) -> None:
+    clean_stage = str(stage or "").strip().lower()
+    if clean_stage not in {LOGIN_STAGE_CREDENTIALS, LOGIN_STAGE_OTP, LOGIN_STAGE_PASSWORD_RESET}:
+        clean_stage = LOGIN_STAGE_CREDENTIALS
+    st.session_state[LOGIN_STAGE_SESSION_KEY] = clean_stage
+
+
+def _pending_login_user() -> Optional[dict]:
+    row = st.session_state.get(LOGIN_PENDING_USER_SESSION_KEY)
+    if not isinstance(row, dict):
+        return None
+    username = str(row.get("username", "") or "").strip().lower()
+    if not username:
+        return None
+    return row
+
+
+def _clear_pending_login_flow(*, reset_stage: bool = True) -> None:
+    for key in (
+        LOGIN_PENDING_USER_SESSION_KEY,
+        LOGIN_OTP_HASH_SESSION_KEY,
+        LOGIN_OTP_EXPIRES_AT_SESSION_KEY,
+        LOGIN_OTP_SENT_AT_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    if reset_stage:
+        _set_login_stage(LOGIN_STAGE_CREDENTIALS)
+
+
+def _otp_signature(username: str, otp_code: str) -> str:
+    secret = _session_secret() or b"otp-session-secret"
+    payload = f"{str(username or '').strip().lower()}|{str(otp_code or '').strip()}".encode("utf-8")
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def _issue_and_send_login_otp(username: str) -> None:
+    clean_username = str(username or "").strip().lower()
+    code = generate_email_otp_code(length=6)
+    send_login_otp_email(clean_username, code, expires_seconds=LOGIN_OTP_EXPIRES_SECONDS)
+    now = int(time.time())
+    st.session_state[LOGIN_OTP_HASH_SESSION_KEY] = _otp_signature(clean_username, code)
+    st.session_state[LOGIN_OTP_SENT_AT_SESSION_KEY] = now
+    st.session_state[LOGIN_OTP_EXPIRES_AT_SESSION_KEY] = now + LOGIN_OTP_EXPIRES_SECONDS
+
+
+def _otp_seconds_remaining() -> int:
+    expires_at = int(st.session_state.get(LOGIN_OTP_EXPIRES_AT_SESSION_KEY, 0) or 0)
+    return max(0, expires_at - int(time.time()))
+
+
+def _complete_authenticated_session(user) -> None:
+    st.session_state.auth_user = {
+        "name": user.name,
+        "username": user.username,
+        "role": user.role,
+        "is_active": user.is_active,
+    }
+    _clear_pending_login_flow(reset_stage=True)
+    _reset_login_captcha()
+    persist_auth_session(user.username)
+    st.rerun()
+
+
+def _begin_google_oauth_after_otp(clean_username: str) -> None:
+    state = _issue_google_oauth_state(clean_username)
+    if not state:
+        st.error("Google sign-in is not configured correctly.")
+        st.stop()
+
+    st.session_state[GOOGLE_OAUTH_STATE_SESSION_KEY] = state
+    st.session_state[GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY] = clean_username
+    _clear_pending_login_flow(reset_stage=True)
+
+    oauth_url = build_google_oauth_authorization_url(state)
+    if not oauth_url:
+        st.error("Google sign-in is not configured correctly.")
+        st.stop()
+
+    st.info("OTP verified. Redirecting to Google sign-in...")
+    st.markdown(
+        f"<meta http-equiv='refresh' content='0;url={oauth_url}'>",
+        unsafe_allow_html=True,
+    )
+    st.link_button(
+        "Continue to Google Sign-In",
+        oauth_url,
+        width="stretch",
+    )
+    st.stop()
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -851,49 +990,109 @@ def require_authentication() -> None:
         unsafe_allow_html=True,
     )
 
+    stage = _login_stage()
+    pending_user = _pending_login_user()
+    if stage in {LOGIN_STAGE_OTP, LOGIN_STAGE_PASSWORD_RESET} and pending_user is None:
+        _clear_pending_login_flow(reset_stage=True)
+        stage = _login_stage()
+
+    credentials_submitted = False
+    otp_verify_submitted = False
+    otp_resend_clicked = False
+    otp_cancel_clicked = False
+    password_reset_submitted = False
+    password_reset_cancel_clicked = False
+    username = ""
+    password = ""
+    captcha_response = ""
+    otp_code = ""
+    new_password = ""
+    confirm_new_password = ""
+
     with st.container(key="login_shell"):
-        submitted = False
-        username = ""
-        password = ""
-        captcha_response = ""
         col_form, col_image = st.columns([0.88, 1.12], gap="small")
         with col_form:
             with st.container(key="login_form_panel"):
-                if google_oauth_ready:
-                    st.markdown("<h1>Log In</h1><p>Use your Gmail and password to continue.</p>", unsafe_allow_html=True)
+                _show_login_feedback()
+
+                if stage == LOGIN_STAGE_CREDENTIALS:
+                    if google_oauth_ready:
+                        st.markdown("<h1>Log In</h1><p>Use your Gmail and password to continue.</p>", unsafe_allow_html=True)
+                    else:
+                        st.markdown("<h1>Log In</h1><p>Sign in with your assigned @gmail.com account.</p>", unsafe_allow_html=True)
+                    with st.form("login_form", clear_on_submit=False):
+                        username = st.text_input("E-mail", placeholder="name@gmail.com")
+                        password = st.text_input("Password", type="password", placeholder="Password")
+                        st.markdown(
+                            (
+                                "<div class='auth-captcha-shell'>"
+                                "<div class='auth-captcha-label'>Security Check</div>"
+                                f"<div class='auth-captcha-question'>{captcha_a} + {captcha_b} = ?</div>"
+                                "<div class='auth-captcha-hint'>Enter the exact sum to continue.</div>"
+                                "</div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        captcha_response = st.text_input(
+                            "Captcha answer",
+                            placeholder="Type the answer (e.g., 30)",
+                            key=LOGIN_CAPTCHA_INPUT_SESSION_KEY,
+                            label_visibility="collapsed",
+                        )
+                        st.caption(
+                            "If your account is still on a default password, an OTP is sent to your e-mail and expires in 1 minute."
+                        )
+                        credentials_submitted = st.form_submit_button("LOG IN", width="stretch")
+                elif stage == LOGIN_STAGE_OTP:
+                    pending_username = str((pending_user or {}).get("username", "") or "").strip().lower()
+                    seconds_left = _otp_seconds_remaining()
+                    st.markdown("<h1>Verify OTP</h1><p>An OTP was sent to your e-mail.</p>", unsafe_allow_html=True)
+                    st.caption(f"OTP for {pending_username} expires in {seconds_left} second(s).")
+                    with st.form("login_otp_form", clear_on_submit=False):
+                        otp_code = st.text_input(
+                            "OTP Code",
+                            placeholder="Enter the 6-digit code",
+                        )
+                        otp_verify_submitted = st.form_submit_button("VERIFY OTP", width="stretch", type="primary")
+                    c1, c2 = st.columns(2, gap="small")
+                    with c1:
+                        otp_resend_clicked = st.button("Resend OTP", width="stretch", key="login_otp_resend")
+                    with c2:
+                        otp_cancel_clicked = st.button("Use Different Account", width="stretch", key="login_otp_cancel")
                 else:
-                    st.markdown("<h1>Log In</h1><p>Sign in with your assigned @gmail.com account.</p>", unsafe_allow_html=True)
-                with st.form("login_form", clear_on_submit=False):
-                    username = st.text_input("E-mail", placeholder="name@gmail.com")
-                    password = st.text_input("Password", type="password", placeholder="Password")
+                    pending_username = str((pending_user or {}).get("username", "") or "").strip().lower()
                     st.markdown(
-                        (
-                            "<div class='auth-captcha-shell'>"
-                            "<div class='auth-captcha-label'>Security Check</div>"
-                            f"<div class='auth-captcha-question'>{captcha_a} + {captcha_b} = ?</div>"
-                            "<div class='auth-captcha-hint'>Enter the exact sum to continue.</div>"
-                            "</div>"
-                        ),
+                        "<h1>Change Password</h1><p>Your account is using a default password. Set a new password to continue.</p>",
                         unsafe_allow_html=True,
                     )
-                    captcha_response = st.text_input(
-                        "Captcha answer",
-                        placeholder="Type the answer (e.g., 30)",
-                        key=LOGIN_CAPTCHA_INPUT_SESSION_KEY,
-                        label_visibility="collapsed",
-                    )
-                    if google_oauth_ready:
-                        st.caption(
-                            "After login, the system verifies that this is a real Google account."
+                    st.caption(f"Account: {pending_username}")
+                    with st.form("login_password_reset_form", clear_on_submit=False):
+                        new_password = st.text_input(
+                            "New Password",
+                            type="password",
+                            placeholder="At least 8 characters and 1 special character",
                         )
-                    else:
-                        st.caption("Use an approved @gmail.com address. Password must include at least one special character.")
-                    submitted = st.form_submit_button("LOG IN", width="stretch")
+                        confirm_new_password = st.text_input(
+                            "Confirm New Password",
+                            type="password",
+                            placeholder="Re-enter new password",
+                        )
+                        st.caption("After changing the default password, you will return to the login page.")
+                        password_reset_submitted = st.form_submit_button(
+                            "CHANGE PASSWORD",
+                            width="stretch",
+                            type="primary",
+                        )
+                    password_reset_cancel_clicked = st.button(
+                        "Back to Login",
+                        width="stretch",
+                        key="login_password_reset_cancel",
+                    )
         with col_image:
             with st.container(key="login_image_panel"):
                 st.markdown("&nbsp;", unsafe_allow_html=True)
 
-    if submitted:
+    if credentials_submitted:
         captcha_answer = _parse_captcha_answer(captcha_response)
         expected_captcha = st.session_state.get(LOGIN_CAPTCHA_ANSWER_SESSION_KEY)
         if not isinstance(expected_captcha, int) or captcha_answer is None or captcha_answer != expected_captcha:
@@ -912,66 +1111,149 @@ def require_authentication() -> None:
             st.error("Password must include at least one special character.")
             st.stop()
 
-        if google_oauth_ready:
-            try:
-                user = authenticate_user_password_only(username=clean_username, password=password)
-            except Exception as e:
-                st.error("Login service is unavailable.")
-                st.caption(
-                    "Check AUTH_MONGODB_URI / MONGODB_URI and MongoDB connectivity."
-                )
-                st.code(str(e))
-                st.stop()
-
-            if user is None:
-                st.error("Invalid e-mail or password.")
-                st.stop()
-
-            state = _issue_google_oauth_state(clean_username)
-            if not state:
-                st.error("Google sign-in is not configured correctly.")
-                st.stop()
-            st.session_state[GOOGLE_OAUTH_STATE_SESSION_KEY] = state
-            st.session_state[GOOGLE_OAUTH_EXPECTED_EMAIL_SESSION_KEY] = clean_username
-            oauth_url = build_google_oauth_authorization_url(state)
-            if not oauth_url:
-                st.error("Google sign-in is not configured correctly.")
-                st.stop()
-
-            st.info("Redirecting to Google sign-in...")
-            st.markdown(
-                f"<meta http-equiv='refresh' content='0;url={oauth_url}'>",
-                unsafe_allow_html=True,
-            )
-            st.link_button(
-                "Continue to Google Sign-In",
-                oauth_url,
-                width="stretch",
-            )
-            st.stop()
-
         try:
-            user = authenticate_user(username=clean_username, password=password)
+            user = verify_user_credentials_for_otp(username=clean_username, password=password)
         except Exception as e:
             st.error("Login service is unavailable.")
-            st.caption(
-                "Check AUTH_MONGODB_URI / MONGODB_URI and MongoDB connectivity."
-            )
+            st.caption("Check AUTH_MONGODB_URI / MONGODB_URI and database connectivity.")
             st.code(str(e))
             st.stop()
 
         if user is None:
             st.error("Invalid e-mail or password.")
             st.stop()
-        st.session_state.auth_user = {
+
+        requires_password_reset = bool(getattr(user, "password_reset_required", False))
+        if not requires_password_reset:
+            try:
+                final_user = complete_login_after_otp(user.username)
+            except Exception as e:
+                st.error("Login service is unavailable.")
+                st.caption("Check AUTH_MONGODB_URI / MONGODB_URI and database connectivity.")
+                st.code(str(e))
+                st.stop()
+            if final_user is None:
+                st.error("User account is not available for login.")
+                st.stop()
+            _complete_authenticated_session(final_user)
+
+        st.session_state[LOGIN_PENDING_USER_SESSION_KEY] = {
             "name": user.name,
             "username": user.username,
             "role": user.role,
             "is_active": user.is_active,
+            "password_reset_required": requires_password_reset,
         }
-        _reset_login_captcha()
-        persist_auth_session(user.username)
+        try:
+            _issue_and_send_login_otp(user.username)
+        except Exception as e:
+            _clear_pending_login_flow(reset_stage=True)
+            st.error("Could not send OTP to your e-mail.")
+            st.caption(str(e))
+            st.stop()
+
+        _set_login_stage(LOGIN_STAGE_OTP)
+        _set_login_feedback("OTP sent to your e-mail. The code expires in 1 minute.", "success")
         st.rerun()
+
+    if otp_cancel_clicked:
+        _clear_pending_login_flow(reset_stage=True)
+        _set_login_feedback("OTP verification canceled. Enter your credentials again.", "info")
+        st.rerun()
+
+    if otp_resend_clicked:
+        pending = _pending_login_user()
+        pending_username = str((pending or {}).get("username", "") or "").strip().lower()
+        if not pending_username:
+            _clear_pending_login_flow(reset_stage=True)
+            _set_login_feedback("Your login session expired. Enter your credentials again.", "warning")
+            st.rerun()
+        try:
+            _issue_and_send_login_otp(pending_username)
+        except Exception as e:
+            st.error("Could not resend OTP to your e-mail.")
+            st.caption(str(e))
+            st.stop()
+        _set_login_feedback("A new OTP was sent. It expires in 1 minute.", "success")
+        st.rerun()
+
+    if otp_verify_submitted:
+        pending = _pending_login_user()
+        pending_username = str((pending or {}).get("username", "") or "").strip().lower()
+        if not pending_username:
+            _clear_pending_login_flow(reset_stage=True)
+            _set_login_feedback("Your login session expired. Enter your credentials again.", "warning")
+            st.rerun()
+
+        clean_otp = str(otp_code or "").strip()
+        if not clean_otp.isdigit():
+            st.error("OTP code must be numeric.")
+            st.stop()
+        if _otp_seconds_remaining() <= 0:
+            st.error("OTP expired. Click Resend OTP to get a new code.")
+            st.stop()
+
+        expected_hash = str(st.session_state.get(LOGIN_OTP_HASH_SESSION_KEY, "") or "").strip()
+        if not expected_hash or not hmac.compare_digest(_otp_signature(pending_username, clean_otp), expected_hash):
+            st.error("Invalid OTP code.")
+            st.stop()
+
+        st.session_state.pop(LOGIN_OTP_HASH_SESSION_KEY, None)
+        st.session_state.pop(LOGIN_OTP_EXPIRES_AT_SESSION_KEY, None)
+        st.session_state.pop(LOGIN_OTP_SENT_AT_SESSION_KEY, None)
+
+        if bool((pending or {}).get("password_reset_required", False)):
+            _set_login_stage(LOGIN_STAGE_PASSWORD_RESET)
+            _set_login_feedback("OTP verified. Set a new password to replace your default password.", "success")
+            st.rerun()
+
+        if google_oauth_ready:
+            _begin_google_oauth_after_otp(pending_username)
+
+        try:
+            final_user = complete_login_after_otp(pending_username)
+        except Exception as e:
+            st.error("Login service is unavailable.")
+            st.caption("Check AUTH_MONGODB_URI / MONGODB_URI and database connectivity.")
+            st.code(str(e))
+            st.stop()
+        if final_user is None:
+            st.error("User account is not available for login.")
+            st.stop()
+        _complete_authenticated_session(final_user)
+
+    if password_reset_cancel_clicked:
+        _clear_pending_login_flow(reset_stage=True)
+        _set_login_feedback("Password update canceled. Log in again to continue.", "info")
+        st.rerun()
+
+    if password_reset_submitted:
+        pending = _pending_login_user()
+        pending_username = str((pending or {}).get("username", "") or "").strip().lower()
+        if not pending_username:
+            _clear_pending_login_flow(reset_stage=True)
+            _set_login_feedback("Your login session expired. Enter your credentials again.", "warning")
+            st.rerun()
+
+        clean_new_password = str(new_password or "")
+        clean_confirm_password = str(confirm_new_password or "")
+        if clean_new_password != clean_confirm_password:
+            st.error("New password and confirmation do not match.")
+            st.stop()
+        try:
+            complete_default_password_reset(
+                username=pending_username,
+                new_password=clean_new_password,
+            )
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
+        _clear_pending_login_flow(reset_stage=True)
+        _reset_login_captcha()
+        _set_login_feedback("Password changed successfully. Log in again with your new password.", "success")
+        st.rerun()
+
     st.stop()
 
 
