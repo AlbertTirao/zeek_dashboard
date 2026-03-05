@@ -50,7 +50,7 @@ ROLLING_TIME_WINDOWS_DAYS = {
     "Last 7 Days": 7,
     "Last 30 Days": 30,
 }
-ALERT_TIME_RANGE_OPTIONS = ["Last 7 Days", "Last 30 Days", "Specific Date"]
+ALERT_TIME_RANGE_OPTIONS = ["Last 7 Days", "Last 30 Days", "Specific Date", "All Time"]
 
 
 # =============================================================================
@@ -408,7 +408,7 @@ def _build_ip_to_mac_map_cached(
     return ip_to_mac
 
 
-@st.cache_data(show_spinner=False, ttl=120)
+@st.cache_data(show_spinner=False, ttl=300)
 def _infer_events_from_ip_logs_cached(
     parquet_root_str: str,
     selected_date_dirs_str: Tuple[Tuple[str, str], ...],
@@ -1018,7 +1018,7 @@ def _load_cached_for_date_dirs(
     return events, known_hosts
 
 
-@st.cache_data(show_spinner=False, ttl=120)
+@st.cache_data(show_spinner=False, ttl=600)
 def _load_cached_for_date_dirs_cached(
     parquet_root_str: str,
     selected_date_dirs_str: Tuple[Tuple[str, str], ...],
@@ -1043,6 +1043,11 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
         return f"{label} (since {cutoff_ts.strftime('%Y-%m-%d %H:%M')})"
 
     if events is None or events.empty:
+        if mode == "All Time":
+            return (
+                pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]),
+                "All Time",
+            )
         if mode == "Specific Date" and selected_date:
             return (
                 pd.DataFrame(columns=["ts_dt", "mac_norm", "ip", "host", "source"]),
@@ -1063,6 +1068,9 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
 
     tmp = tmp.dropna(subset=["ts_dt", "mac_norm"])
 
+    if mode == "All Time":
+        return tmp, "All Time"
+
     if mode in ROLLING_TIME_WINDOWS_DAYS:
         cutoff = now - pd.Timedelta(days=_rolling_days(mode))
         tmp = tmp[tmp["ts_dt"] >= cutoff]
@@ -1079,7 +1087,7 @@ def _apply_time_filter(events: pd.DataFrame, mode: str, selected_date: Optional[
         tmp = tmp[(tmp["ts_dt"] >= start) & (tmp["ts_dt"] < end)]
         return tmp, f"Specific Date ({selected_date})"
 
-    # No legacy removed mode: default to Last 7 Days semantics if an unexpected mode is passed.
+    # Default to Last 7 Days semantics if an unexpected mode is passed.
     cutoff = now - pd.Timedelta(days=7)
     tmp = tmp[tmp["ts_dt"] >= cutoff]
     return tmp, _rolling_label("Last 7 Days", cutoff)
@@ -1615,6 +1623,10 @@ def render(parquet_root: str, authorized_macs_file: str):
     if time_mode == "Specific Date" and selected_date:
         for p in by_date.get(selected_date, []):
             selected_date_dirs.append((selected_date, p))
+    elif time_mode == "All Time":
+        for d in available_dates:
+            for p in by_date[d]:
+                selected_date_dirs.append((d, p))
     else:
         rolling_days = ROLLING_TIME_WINDOWS_DAYS.get(time_mode, ROLLING_TIME_WINDOWS_DAYS["Last 7 Days"])
         cutoff_date = datetime.now().date() - timedelta(days=rolling_days)
@@ -1623,6 +1635,8 @@ def render(parquet_root: str, authorized_macs_file: str):
                 dd = datetime.strptime(d, "%Y-%m-%d").date()
             except Exception:
                 continue
+            if dd < cutoff_date:
+                break
             if dd >= cutoff_date:
                 for p in by_date[d]:
                     selected_date_dirs.append((d, p))
@@ -1803,12 +1817,17 @@ def _render_alerts_ui(
     view = st.session_state.get("unauth_macs_view", "Unauthorized")
 
     # =============================================================================
-    # CHANGED (FIX): Cards must be scope-aware (Specific Date / Last 7 Days)
+    # CHANGED (FIX): Cards must be scope-aware (Specific Date / Last 30 Days / All Time)
     # Use the filtered + augmented tables for the card numbers.
     # =============================================================================
-    scope_total = int(len(devices)) if devices is not None else 0
-    scope_verified = int(len(verified_df))
-    scope_unauthorized = int(len(unauth_df))
+    def _count_unique_macs(df: pd.DataFrame) -> int:
+        if df is None or df.empty or "mac_norm" not in df.columns:
+            return 0
+        return int(df["mac_norm"].astype(str).nunique())
+
+    scope_total = _count_unique_macs(devices)
+    scope_verified = _count_unique_macs(verified_df)
+    scope_unauthorized = _count_unique_macs(unauth_df)
 
     colA, colB, colC = st.columns([1, 1, 1])
 
@@ -1848,8 +1867,8 @@ def _render_alerts_ui(
     if removed_from_allowlist:
         st.error(f"ALLOWLIST ALERT: {len(removed_from_allowlist)} MAC(s) REMOVED from allowlist - {range_label}")
         st.caption("Removed MACs are included in the table below as 'Unauthorized' with note 'Removed from allowlist'.")
-    elif len(unauth_df) > 0:
-        st.warning(f"Unauthorized devices present: {len(unauth_df)} - {range_label}")
+    elif scope_unauthorized > 0:
+        st.warning(f"Unauthorized devices present: {scope_unauthorized} - {range_label}")
     else:
         st.success(f"System Secure. No unauthorized devices detected - {range_label}")
 

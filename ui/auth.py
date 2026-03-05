@@ -1035,7 +1035,7 @@ def require_authentication() -> None:
                         )
                         captcha_response = st.text_input(
                             "Captcha answer",
-                            placeholder="Type the answer (e.g., 30)",
+                            placeholder="Type the answer here",
                             key=LOGIN_CAPTCHA_INPUT_SESSION_KEY,
                             label_visibility="collapsed",
                         )
@@ -1077,7 +1077,7 @@ def require_authentication() -> None:
                             type="password",
                             placeholder="Re-enter new password",
                         )
-                        st.caption("After changing the default password, you will return to the login page.")
+                        st.caption("After changing the default password, you will be signed in and redirected to Zeek Dashboard.")
                         password_reset_submitted = st.form_submit_button(
                             "CHANGE PASSWORD",
                             width="stretch",
@@ -1249,10 +1249,29 @@ def require_authentication() -> None:
             st.error(str(e))
             st.stop()
 
-        _clear_pending_login_flow(reset_stage=True)
-        _reset_login_captcha()
-        _set_login_feedback("Password changed successfully. Log in again with your new password.", "success")
-        st.rerun()
+        if google_oauth_ready:
+            _set_login_feedback(
+                "Password changed successfully. Continue with Google sign-in to open Zeek Dashboard.",
+                "success",
+            )
+            _begin_google_oauth_after_otp(pending_username)
+
+        try:
+            final_user = complete_login_after_otp(pending_username)
+        except Exception as e:
+            _clear_pending_login_flow(reset_stage=True)
+            _reset_login_captcha()
+            st.error("Password changed, but automatic sign-in is unavailable.")
+            st.caption("Log in again with your new password.")
+            st.code(str(e))
+            st.stop()
+        if final_user is None:
+            _clear_pending_login_flow(reset_stage=True)
+            _reset_login_captcha()
+            _set_login_feedback("Password changed successfully. Log in again with your new password.", "warning")
+            st.rerun()
+
+        _complete_authenticated_session(final_user)
 
     st.stop()
 

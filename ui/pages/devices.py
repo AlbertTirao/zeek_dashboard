@@ -626,6 +626,81 @@ def load_alerts_latest_inventory_rows(
     return out
 
 
+@st.cache_data(show_spinner=False)
+def load_hourly_status_from_alert_cache(
+    parquet_root: Path,
+    alert_cache_sig: tuple[tuple[str, float, int], ...],
+    allowed_macs_tuple: tuple[str, ...],
+    banned_macs_tuple: tuple[str, ...],
+) -> pd.DataFrame:
+    """
+    Fast hourly trend using Alerts cache files.
+    Returns columns: ts, status, events
+    """
+    cache_files = list(_list_alert_event_cache_files(parquet_root, alert_cache_sig))
+    if not cache_files:
+        return pd.DataFrame(columns=["ts", "status", "events"])
+
+    try:
+        import duckdb
+
+        con = duckdb.connect(database=":memory:")
+        hourly_mac = con.execute(
+            """
+            WITH ev AS (
+              SELECT
+                try_cast(ts_dt AS timestamp) AS ts_dt,
+                cast(mac_norm AS varchar) AS mac
+              FROM read_parquet(?, union_by_name=true)
+            ),
+            clean AS (
+              SELECT
+                date_trunc('hour', ts_dt) AS ts,
+                mac
+              FROM ev
+              WHERE ts_dt IS NOT NULL
+                AND mac IS NOT NULL
+                AND mac != 'ff:ff:ff:ff:ff:ff'
+            )
+            SELECT
+              ts,
+              mac,
+              count(*) AS events
+            FROM clean
+            GROUP BY ts, mac
+            ORDER BY ts
+            """,
+            [cache_files],
+        ).df()
+        con.close()
+    except Exception:
+        return pd.DataFrame(columns=["ts", "status", "events"])
+
+    if hourly_mac is None or hourly_mac.empty:
+        return pd.DataFrame(columns=["ts", "status", "events"])
+
+    out = hourly_mac.copy()
+    out["mac"] = out["mac"].map(normalize_mac)
+    out = out.dropna(subset=["mac", "ts"])
+    if out.empty:
+        return pd.DataFrame(columns=["ts", "status", "events"])
+
+    banned_set = set(banned_macs_tuple or ())
+    if banned_set:
+        out = out[~out["mac"].isin(banned_set)]
+        if out.empty:
+            return pd.DataFrame(columns=["ts", "status", "events"])
+
+    allowed_set = set(allowed_macs_tuple or ())
+    out["status"] = out["mac"].apply(lambda m: "Authorized" if m in allowed_set else "Unauthorized")
+    out = (
+        out.groupby(["ts", "status"], as_index=False)["events"]
+        .sum()
+        .sort_values("ts")
+    )
+    return out
+
+
 # =====================================================
 # 2) Drill-Down Log Loader (robust ts + robust MAC)
 # =====================================================
@@ -1702,7 +1777,7 @@ def device_list_popup(
     with t2:
         date_filter_mode = st.selectbox(
             "Time Range:",
-            ["Last 7 Days", "Specific Date", "All Time"],
+            ["Last 7 Days", "Last 30 Days", "Specific Date", "All Time"],
             index=0,
             key=f"popup_list_mode_{status_type.lower()}",
         )
@@ -1796,6 +1871,9 @@ def device_list_popup(
     if date_filter_mode == "Last 7 Days":
         seven_days_ago = get_local_now() - timedelta(days=7)
         inventory = inventory[inventory["sort_dt"].notna() & (inventory["sort_dt"] >= seven_days_ago)]
+    elif date_filter_mode == "Last 30 Days":
+        thirty_days_ago = get_local_now() - timedelta(days=30)
+        inventory = inventory[inventory["sort_dt"].notna() & (inventory["sort_dt"] >= thirty_days_ago)]
     elif date_filter_mode == "Specific Date":
         if spec_date:
             inventory = inventory[inventory["sort_dt"].dt.strftime("%Y-%m-%d") == spec_date]
@@ -2029,7 +2107,7 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
     with col_time:
         forensic_mode = st.selectbox(
             "Time Range:",
-            ["Last 7 Days", "Specific Date", "All Time"],
+            ["Last 7 Days", "Last 30 Days", "Specific Date", "All Time"],
             index=0,
             key="popup_forensic_mode",
         )
@@ -2055,6 +2133,9 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
 
     if forensic_mode == "Last 7 Days":
         selected_dates_tuple = tuple(available_dates_list[:7])
+        f_date = "All Dates"
+    elif forensic_mode == "Last 30 Days":
+        selected_dates_tuple = tuple(available_dates_list[:30])
         f_date = "All Dates"
     elif forensic_mode == "All Time":
         selected_dates_tuple = None
@@ -2161,7 +2242,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     PARQUET_ROOT = Path(logs_root)
     inventory_sig = _inventory_file_signature(PARQUET_ROOT)
     alerts_cache_sig = _alerts_event_cache_signature(PARQUET_ROOT)
-    known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT, inventory_sig)
     alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
 
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
@@ -2176,6 +2256,19 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if intersect:
         banned_macs = banned_macs - intersect
         save_banned_macs(BAN_FILE, banned_macs)
+
+    # Prefer alerts cache path (fast). Fallback to full historical scan only when needed.
+    known_hosts = pd.DataFrame(columns=["mac", "host", "ts"])
+    dhcp = pd.DataFrame()
+    if alerts_latest_rows.empty:
+        known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT, inventory_sig)
+
+    hourly = load_hourly_status_from_alert_cache(
+        PARQUET_ROOT,
+        alerts_cache_sig,
+        tuple(sorted(authorized_macs)),
+        tuple(sorted(banned_macs)),
+    )
 
     if "mac" in known_hosts.columns:
         known_hosts = known_hosts.copy()
@@ -2197,11 +2290,15 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     # Supplement inventory with Alerts latest-per-MAC rows.
     if not alerts_latest_rows.empty:
-        known_hosts = pd.concat(
-            [known_hosts, alerts_latest_rows[["mac", "host", "ts"]]],
-            ignore_index=True,
-            sort=False,
-        )
+        latest_rows = alerts_latest_rows[["mac", "host", "ts"]].copy()
+        if known_hosts.empty:
+            known_hosts = latest_rows
+        else:
+            known_hosts = pd.concat(
+                [known_hosts, latest_rows],
+                ignore_index=True,
+                sort=False,
+            )
 
     if known_hosts.empty:
         st.info("No device data available")
@@ -2240,13 +2337,41 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if "mac" in in_scope.columns and banned_macs:
         in_scope = in_scope[~in_scope["mac"].isin(banned_macs)]
 
+    # Keep Device cards/list aligned with Alerts inventory basis (latest per MAC).
+    inventory_scope = pd.DataFrame(columns=["mac", "host", "host_name", "ts", "status"])
+    if not alerts_latest_rows.empty:
+        inventory_scope = alerts_latest_rows.copy()
+        inventory_scope["mac"] = inventory_scope["mac"].map(normalize_mac)
+        inventory_scope = inventory_scope.dropna(subset=["mac"])
+        inventory_scope = inventory_scope[~inventory_scope["mac"].map(is_broadcast_mac)]
+        host_series = inventory_scope.get("host", pd.Series("-", index=inventory_scope.index, dtype="object"))
+        inventory_scope["host"] = host_series.astype("string").fillna("-")
+        inventory_scope["host_name"] = "-"
+        inventory_scope["ts"] = _coerce_ts_any(
+            inventory_scope.get("ts", pd.Series(index=inventory_scope.index, dtype="object"))
+        )
+        inventory_scope = inventory_scope.dropna(subset=["ts"])
+        inventory_scope["status"] = inventory_scope["mac"].apply(
+            lambda m: "Authorized" if (m in authorized_macs) else "Unauthorized"
+        )
+
+    if inventory_scope.empty:
+        inventory_scope = (
+            in_scope.sort_values("ts", ascending=False)
+            .drop_duplicates(subset=["mac"], keep="first")
+            .copy()
+        )
+
+    if "mac" in inventory_scope.columns and banned_macs:
+        inventory_scope = inventory_scope[~inventory_scope["mac"].isin(banned_macs)].copy()
+
     # Metrics
     today = get_local_now().date()
     today_str = today.strftime("%Y-%m-%d")
     active_day_str, active_known_hosts_sig = _resolve_active_devices_day(PARQUET_ROOT, today_str)
 
-    unauth_seen = int(in_scope[in_scope["status"] == "Unauthorized"]["mac"].nunique())
-    auth_seen = len(authorized_macs)
+    unauth_seen = int(inventory_scope[inventory_scope["status"] == "Unauthorized"]["mac"].nunique())
+    auth_seen = int(inventory_scope[inventory_scope["status"] == "Authorized"]["mac"].nunique())
     total_devices = auth_seen + unauth_seen
 
     active_today_set = set()
@@ -2371,8 +2496,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if active_day_str and active_day_str != today_str:
         st.caption(f"Active Devices source date: {active_day_str} (latest available known_hosts capture).")
 
-    hourly = pd.DataFrame()
-    if not in_scope.empty:
+    if hourly.empty and not in_scope.empty:
         hourly = (
             in_scope.set_index("ts")
             .groupby("status")
@@ -2493,7 +2617,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if st.session_state.active_dialog == "list":
         device_list_popup(
             st.session_state.list_status_type,
-            in_scope,
+            inventory_scope,
             PARQUET_ROOT,
             raw_dates,
             banned_macs,
