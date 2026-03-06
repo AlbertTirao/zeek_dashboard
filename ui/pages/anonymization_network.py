@@ -2072,6 +2072,15 @@ def inject_anonymization_network_css():
             margin-bottom: 0.45rem;
             box-shadow: none;
         }
+        .shadow-detection-basis [data-testid="stExpander"] {
+            border: 0 !important;
+            box-shadow: none !important;
+            background: transparent !important;
+        }
+        .shadow-detection-basis [data-testid="stExpander"] details {
+            border: 0 !important;
+            background: transparent !important;
+        }
         .shadow-filter-shell-primary {
             border-top: 0;
             padding-top: 0;
@@ -2373,6 +2382,7 @@ def render_anonymization_network(parquet_root: Path):
         "conn/http/ssl/dns/tunnel/vpn_detect_v2, plus feed-backed Tor/proxy intelligence and fast cache loading.</div>",
         unsafe_allow_html=True,
     )
+    st.markdown("<div class='shadow-detection-basis'>", unsafe_allow_html=True)
     with st.expander("Detection basis", expanded=False):
         st.markdown("- `http.method == CONNECT` => `proxy_explicit` (+80)")
         st.markdown("- Proxy ports `{3128,8080,8000,8888,1080}` => `proxy_port` (+25)")
@@ -2387,6 +2397,7 @@ def render_anonymization_network(parquet_root: Path):
         st.info(
             "Optional local `IP2Proxy` lookup (`data/ip2proxy_lookup.parquet` or env `IP2PROXY_LOOKUP_FILE`) is used as supporting enrichment."
         )
+    st.markdown("</div>", unsafe_allow_html=True)
     if not HAS_AGGRID:
         st.caption("AgGrid package not available in this runtime; using dataframe fallback.")
 
@@ -2395,38 +2406,13 @@ def render_anonymization_network(parquet_root: Path):
         st.error("No dated parquet folders found.")
         return
 
-    scope_options = ["Selected date", "Last 7 dates", "All dates"]
     date_sel_state = str(st.session_state.get("anonym_net_date", dates[0]))
     if date_sel_state not in dates:
         date_sel_state = dates[0]
-    scope_state = str(st.session_state.get("anonym_net_scope", scope_options[0]))
-    if scope_state not in scope_options:
-        scope_state = scope_options[0]
-    if scope_state == "Selected date":
-        target_dates_state = [date_sel_state]
-    elif scope_state == "Last 7 dates":
-        target_dates_state = dates[:7]
-    else:
-        target_dates_state = dates
 
     feeds = load_feeds(parquet_root, date_sel_state, force=False)
-    ip2, ip2_msg, ip2_sig = load_ip2proxy_lookup()
-    allowlist, allowlist_msg = load_anonymization_allowlist()
-
-    st.caption(f"Tor feed: {_feed_label(feeds['tor'])}")
-    if feeds["tor"].get("error"):
-        st.caption(f"Tor warning: {feeds['tor']['error']}")
-    st.caption(f"Open proxy feed: {_feed_label(feeds['proxy'])}")
-    if feeds["proxy"].get("error"):
-        st.caption(f"Open proxy warning: {feeds['proxy']['error']}")
-    st.caption(f"Processing {len(target_dates_state)} date(s) using per-date base + scored cache files.")
-    st.caption(
-        "Cache root: "
-        + str(cache_dir(Path(parquet_root)).as_posix())
-        + f" | active feed cache folder: {feed_cache_dir(Path(parquet_root), date_sel_state).as_posix()}"
-    )
-    st.caption(ip2_msg)
-    st.caption(allowlist_msg)
+    ip2, _, ip2_sig = load_ip2proxy_lookup()
+    allowlist, _ = load_anonymization_allowlist()
 
     q = st.text_input(
         "Search",
@@ -2436,17 +2422,10 @@ def render_anonymization_network(parquet_root: Path):
     ).strip().lower()
 
     st.markdown("<div class='shadow-filter-shell shadow-filter-shell-primary'>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([1.25, 1.1, 1.2])
+    c1, c2 = st.columns([1.35, 1.2])
     with c1:
         date_sel = st.selectbox("Date", dates, index=dates.index(date_sel_state), key="anonym_net_date")
     with c2:
-        scope = st.selectbox(
-            "Scope",
-            scope_options,
-            index=scope_options.index(scope_state),
-            key="anonym_net_scope",
-        )
-    with c3:
         conf_filter = st.multiselect(
             "Confidence",
             ["High", "Medium", "Low"],
@@ -2455,12 +2434,7 @@ def render_anonymization_network(parquet_root: Path):
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    if scope == "Selected date":
-        target_dates = [date_sel]
-    elif scope == "Last 7 dates":
-        target_dates = dates[:7]
-    else:
-        target_dates = dates
+    target_dates = [date_sel]
 
     ensure_scored_cache(
         parquet_root,
@@ -2472,7 +2446,7 @@ def render_anonymization_network(parquet_root: Path):
 
     cached_files = read_scored_cached_files(parquet_root, target_dates)
     if not cached_files:
-        st.info("No cached anonymization files available for selected scope.")
+        st.info("No cached anonymization files available for selected date.")
         return
     scored = load_scored_scope(cached_files)
 
@@ -2574,7 +2548,7 @@ def render_anonymization_network(parquet_root: Path):
             render_shadow_aggrid(
                 soc_table,
                 gb_soc,
-                key=f"anonym_net_soc_table_{scope}_{date_sel}",
+                key=f"anonym_net_soc_table_{date_sel}",
                 height=_table_height_for_rows(len(soc_table), min_px=290, max_px=520),
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
             )
@@ -2920,7 +2894,7 @@ def render_anonymization_network(parquet_root: Path):
         table_response = render_shadow_aggrid(
             table,
             gb,
-            key=f"anonym_net_table_{scope}_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
+            key=f"anonym_net_table_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
             height=_table_height_for_rows(len(table), min_px=320, max_px=640),
             update_mode=(GridUpdateMode.VALUE_CHANGED | GridUpdateMode.MODEL_CHANGED),
         )
@@ -2928,7 +2902,7 @@ def render_anonymization_network(parquet_root: Path):
         render_shadow_aggrid(
             table.drop(columns=["Allow", "_allow_key", "_allow_src_ip", "_allow_src_mac", "_allow_dst_ip", "_allow_dst_host"], errors="ignore"),
             gb=None,  # type: ignore[arg-type]
-            key=f"anonym_net_table_{scope}_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
+            key=f"anonym_net_table_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
             height=_table_height_for_rows(len(table), min_px=320, max_px=640),
             update_mode=GridUpdateMode.SELECTION_CHANGED,
         )
@@ -2978,7 +2952,7 @@ def render_anonymization_network(parquet_root: Path):
             columns=["Allow", "_allow_key", "_allow_src_ip", "_allow_src_mac", "_allow_dst_ip", "_allow_dst_host"],
             errors="ignore",
         ).to_csv(index=False).encode("utf-8"),
-        file_name=f"anonymization_network_{scope.replace(' ', '_').lower()}_{date_sel}.csv",
+        file_name=f"anonymization_network_{date_sel}.csv",
         mime="text/csv",
         key="anonym_net_csv",
     )

@@ -681,6 +681,29 @@ def inject_shadow_apps_css():
             line-height: 1.1;
         }
 
+        .shadow-filter-hint {
+            font-size: 0.76rem;
+            color: #9fb1c8;
+            margin-top: 0.2rem;
+            margin-bottom: 0.3rem;
+        }
+
+        .shadow-scope-hint {
+            font-size: 0.9rem;
+            color: #c8d7ea;
+            margin-top: 0.35rem;
+            margin-bottom: 0.7rem;
+            padding: 0.36rem 0.62rem;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            background: linear-gradient(135deg, rgba(15,23,42,0.52), rgba(2,6,23,0.46));
+            border-radius: 10px;
+        }
+
+        .shadow-scope-hint strong {
+            font-size: 1.05rem;
+            color: #e5eefc;
+        }
+
         .stTabs [data-baseweb="tab-list"] {
             gap: 0.45rem;
             margin-bottom: 0.35rem;
@@ -4079,6 +4102,27 @@ def render_shadow_apps(parquet_root: Path):
         st.warning("No log directories found.")
         return
 
+    risk_policy = load_risk_policy()
+    st.markdown("### Shadow App Incidents")
+    st.caption(
+        "Incidents correlate conn/http/ssl/dns/files/software telemetry and score risk confidence "
+        "for unauthorized app activity (Critical/High/Medium/Low/Safe)."
+    )
+    app_scope_hint = st.empty()
+    with st.expander("Detection basis", expanded=False):
+        st.markdown(
+            "<div class='shadow-callout'>Risk uses highest-severity matching rules per event, plus multi-signal escalation for unauthorized traffic.</div>",
+            unsafe_allow_html=True,
+        )
+        ref_df = build_risk_policy_reference(risk_policy)
+        st.dataframe(ref_df, width="stretch", hide_index=True)
+        if risk_policy:
+            st.caption(
+                f"Policy source: `{RISK_POLICY_FILE.name}`. Update that file to tune ports/log sources/status defaults."
+            )
+        else:
+            st.caption("No risk_policy.yaml found. Only behavior rules and Safe fallback are active.")
+
     def _on_day_change():
         _close_shadow_dialog(reset_grid=True)
 
@@ -4094,7 +4138,6 @@ def render_shadow_apps(parquet_root: Path):
 
     approved = load_allowlist()
     allow_re = compile_allow_regex(approved)
-    risk_policy = load_risk_policy()
 
     conn = get_db_connection()
     with st.spinner("Optimizing logs for fast load..."):
@@ -4134,6 +4177,10 @@ def render_shadow_apps(parquet_root: Path):
     auth_pct = (authorized_count / total_events * 100) if total_events else 0
     unauth_pct = (unauthorized_count / total_events * 100) if total_events else 0
     crit_high_pct = (crit_high_count / total_events * 100) if total_events else 0
+    app_scope_hint.markdown(
+        f"<div class='shadow-filter-hint shadow-scope-hint'>Detected <strong>{total_events:,}</strong> shadow app events in this dataset. Use filters below to refine the incident timeline and table.</div>",
+        unsafe_allow_html=True,
+    )
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Events", f"{total_events:,}")
@@ -4644,19 +4691,5 @@ def render_shadow_apps(parquet_root: Path):
                     st.rerun()
             else:
                 st.session_state["shadow_last_selected_mac"] = None
-
-        with st.expander("How Risk Is Calculated", expanded=False):
-            st.markdown(
-                "<div class='shadow-callout'>Risk uses highest-severity matching rules per event, plus multi-signal escalation for unauthorized traffic.</div>",
-                unsafe_allow_html=True,
-            )
-            ref_df = build_risk_policy_reference(risk_policy)
-            st.dataframe(ref_df, width="stretch", hide_index=True)
-            if risk_policy:
-                st.caption(
-                    f"Policy source: `{RISK_POLICY_FILE.name}`. Update that file to tune ports/log sources/status defaults."
-                )
-            else:
-                st.caption("No risk_policy.yaml found. Only behavior rules and Safe fallback are active.")
 
 

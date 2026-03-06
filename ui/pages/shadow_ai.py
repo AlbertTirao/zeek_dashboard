@@ -4510,7 +4510,7 @@ def render_shadow_ai(parquet_root: Path):
         unsafe_allow_html=True,
     )
     st.markdown("<div class='shadow-detection-basis'>", unsafe_allow_html=True)
-    with st.expander("Detection basis (how Shadow AI is decided)", expanded=False):
+    with st.expander("Detection basis", expanded=False):
         st.write(
             "Events are generated when Zeek telemetry matches `ai_signatures.yaml` (HTTP host/uri, TLS SNI, DNS query) "
             "or a configured local AI port (`conn id.resp_p`). Regex misses get fuzzy and host/domain heuristic fallback for known AI providers. "

@@ -1842,6 +1842,8 @@ def render_shadow_sharing(parquet_root: Path):
 
     st.markdown("### Shadow Sharing Incidents")
     st.caption("Incidents roll up conn/ssl/http/files evidence into 5-minute windows and score confidence (HIGH/PROBABLE/WEAK).")
+    with st.expander("Detection basis", expanded=False):
+        st.markdown(_confidence_score_explainer_text())
     if incidents.empty:
         st.info("No flow-based incidents were found in this scope.")
     else:
@@ -2280,9 +2282,6 @@ def render_shadow_sharing(parquet_root: Path):
                 mime="text/csv",
                 key=f"shadow_sharing_incidents_csv_{selected_scope_key}",
             )
-
-    with st.expander("Confidence score computation", expanded=False):
-        st.markdown(_confidence_score_explainer_text())
 
     if st.session_state.get("shadow_sharing_allow_dialog_open") and st.session_state.get("shadow_sharing_allow_candidate"):
         show_shadow_sharing_allow_dialog()
