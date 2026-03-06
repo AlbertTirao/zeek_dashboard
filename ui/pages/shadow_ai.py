@@ -4303,7 +4303,7 @@ def inject_shadow_ai_css():
             align-items: center;
         }
         .shadow-callout {
-            border: 1px solid var(--panel-border);
+            border: 0;
             background: var(--panel-bg);
             border-radius: 10px;
             padding: 0.5rem 0.72rem;
@@ -4326,6 +4326,18 @@ def inject_shadow_ai_css():
         .shadow-detection-basis [data-testid="stExpander"] details {
             border: 0 !important;
             background: transparent !important;
+        }
+        [data-testid="stExpander"] details > div[role="region"] {
+            border-top: 0 !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            border: 0 !important;
+            box-shadow: none !important;
+        }
+        hr {
+            border: 0 !important;
+            height: 0 !important;
+            margin: 0 !important;
         }
         .shadow-filter-hint {
             font-size: 0.76rem;
@@ -4355,7 +4367,7 @@ def inject_shadow_ai_css():
             min-height: 2.42rem;
         }
         .shadow-table-shell {
-            border: 1px solid rgba(148, 163, 184, 0.24);
+            border: 0;
             background: linear-gradient(180deg, rgba(2,6,23,0.5), rgba(2,6,23,0.35));
             border-radius: 12px;
             padding: 0.56rem 0.62rem 0.46rem 0.62rem;
@@ -4363,7 +4375,7 @@ def inject_shadow_ai_css():
         }
         [data-testid="stMetric"] {
             background: var(--panel-bg);
-            border: 1px solid var(--panel-border);
+            border: 0;
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
             min-height: 118px;
@@ -4529,28 +4541,13 @@ def render_shadow_ai(parquet_root: Path):
     today_str = datetime.now().strftime("%Y-%m-%d")
     default_scope = today_str if today_str in available_dates else available_dates[0]
     default_index = date_options.index(default_scope) if default_scope in date_options else 0
-    top1, top2 = st.columns([1.5, 3.1])
-    with top1:
-        selected_date = st.selectbox(
-            "Dataset Scope",
-            date_options,
-            index=default_index,
-            key="shadow_ai_date_v4",
-        )
+    selected_date = st.selectbox(
+        "Dataset Scope",
+        date_options,
+        index=default_index,
+        key="shadow_ai_date_v4",
+    )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
-    with top2:
-        scope_col, refresh_col = st.columns([4.8, 1.1])
-        scope_label = selected_date if selected_date != "All Available Dates" else f"All Available Dates ({len(available_dates)})"
-        with scope_col:
-            st.markdown(
-                f"<div class='shadow-day-chip'>Active scope:&nbsp;<strong>{scope_label}</strong></div>",
-                unsafe_allow_html=True,
-            )
-        with refresh_col:
-            st.write("")
-            if st.button("Refresh", key="shadow_ai_refresh_v2"):
-                _shadow_ai_bust_ui_caches()
-                st.rerun()
 
     provider_values = sorted(
         set((RAW_AI_SIGNATURES or {}).keys())

@@ -2057,7 +2057,7 @@ def inject_anonymization_network_css():
                 #040B18;
         }
         .shadow-callout {
-            border: 1px solid var(--panel-border);
+            border: 0;
             background: var(--panel-bg);
             border-radius: 10px;
             padding: 0.5rem 0.72rem;
@@ -2065,11 +2065,52 @@ def inject_anonymization_network_css():
             margin-bottom: 0.45rem;
         }
         .shadow-filter-shell {
-            border: 1px solid rgba(148, 163, 184, 0.28);
-            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
-            border-radius: 12px;
-            padding: 0.72rem 0.85rem 0.55rem 0.85rem;
+            border: 0;
+            background: transparent;
+            border-radius: 0;
+            padding: 0;
             margin-bottom: 0.45rem;
+            box-shadow: none;
+        }
+        .shadow-filter-shell-primary {
+            border-top: 0;
+            padding-top: 0;
+        }
+        [data-testid="stExpander"] {
+            border: 0 !important;
+            box-shadow: none !important;
+            background: transparent !important;
+        }
+        [data-testid="stExpander"] details {
+            border: 0 !important;
+            box-shadow: none !important;
+            background: transparent !important;
+        }
+        [data-testid="stExpander"] details > summary {
+            border: 0 !important;
+            border-bottom: 0 !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stExpander"] details > div[role="region"] {
+            border-top: 0 !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stExpander"] details > div {
+            border: 0 !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stElementContainer"] {
+            border: 0 !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            border: 0 !important;
+            box-shadow: none !important;
+        }
+        hr {
+            border: 0 !important;
+            height: 0 !important;
+            margin: 0 !important;
         }
         .shadow-filter-shell [data-testid="stWidgetLabel"] p {
             font-size: 0.76rem;
@@ -2093,7 +2134,7 @@ def inject_anonymization_network_css():
             min-height: 2.42rem;
         }
         .shadow-table-shell {
-            border: 1px solid rgba(148, 163, 184, 0.24);
+            border: 0;
             background: linear-gradient(180deg, rgba(2,6,23,0.5), rgba(2,6,23,0.35));
             border-radius: 12px;
             padding: 0.56rem 0.62rem 0.46rem 0.62rem;
@@ -2101,7 +2142,7 @@ def inject_anonymization_network_css():
         }
         [data-testid="stMetric"] {
             background: var(--panel-bg);
-            border: 1px solid var(--panel-border);
+            border: 0;
             border-radius: 12px;
             padding: 0.55rem 0.75rem;
             min-height: 118px;
@@ -2332,48 +2373,6 @@ def render_anonymization_network(parquet_root: Path):
         "conn/http/ssl/dns/tunnel/vpn_detect_v2, plus feed-backed Tor/proxy intelligence and fast cache loading.</div>",
         unsafe_allow_html=True,
     )
-    if not HAS_AGGRID:
-        st.caption("AgGrid package not available in this runtime; using dataframe fallback.")
-
-    dates = get_available_dates(parquet_root)
-    if not dates:
-        st.error("No dated parquet folders found.")
-        return
-
-    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    c1, c2, c3, c4, c5, c6 = st.columns([1.25, 1.1, 0.95, 1.2, 0.75, 1.05])
-    with c1:
-        date_sel = st.selectbox("Date", dates, index=0, key="anonym_net_date")
-    with c2:
-        scope = st.selectbox(
-            "Scope",
-            ["Selected date", "Last 7 dates", "All dates"],
-            index=0,
-            key="anonym_net_scope",
-        )
-    with c3:
-        min_score = st.slider("Min Score", 0, 260, 35, 5, key="anonym_net_min_score")
-    with c4:
-        conf_filter = st.multiselect(
-            "Confidence",
-            ["High", "Medium", "Low"],
-            default=["High", "Medium", "Low"],
-            key="anonym_net_conf",
-        )
-    with c5:
-        refresh = st.button("Refresh Feeds", use_container_width=True, key="anonym_net_refresh")
-    with c6:
-        hide_allowlisted = st.checkbox("Hide Allowlist", value=True, key="anonym_net_hide_allowlisted")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    feeds = load_feeds(parquet_root, date_sel, force=bool(refresh))
-    st.caption(f"Tor feed: {_feed_label(feeds['tor'])}")
-    if feeds["tor"].get("error"):
-        st.caption(f"Tor warning: {feeds['tor']['error']}")
-    st.caption(f"Open proxy feed: {_feed_label(feeds['proxy'])}")
-    if feeds["proxy"].get("error"):
-        st.caption(f"Open proxy warning: {feeds['proxy']['error']}")
-
     with st.expander("Detection basis", expanded=False):
         st.markdown("- `http.method == CONNECT` => `proxy_explicit` (+80)")
         st.markdown("- Proxy ports `{3128,8080,8000,8888,1080}` => `proxy_port` (+25)")
@@ -2388,6 +2387,73 @@ def render_anonymization_network(parquet_root: Path):
         st.info(
             "Optional local `IP2Proxy` lookup (`data/ip2proxy_lookup.parquet` or env `IP2PROXY_LOOKUP_FILE`) is used as supporting enrichment."
         )
+    if not HAS_AGGRID:
+        st.caption("AgGrid package not available in this runtime; using dataframe fallback.")
+
+    dates = get_available_dates(parquet_root)
+    if not dates:
+        st.error("No dated parquet folders found.")
+        return
+
+    scope_options = ["Selected date", "Last 7 dates", "All dates"]
+    date_sel_state = str(st.session_state.get("anonym_net_date", dates[0]))
+    if date_sel_state not in dates:
+        date_sel_state = dates[0]
+    scope_state = str(st.session_state.get("anonym_net_scope", scope_options[0]))
+    if scope_state not in scope_options:
+        scope_state = scope_options[0]
+    if scope_state == "Selected date":
+        target_dates_state = [date_sel_state]
+    elif scope_state == "Last 7 dates":
+        target_dates_state = dates[:7]
+    else:
+        target_dates_state = dates
+
+    feeds = load_feeds(parquet_root, date_sel_state, force=False)
+    ip2, ip2_msg, ip2_sig = load_ip2proxy_lookup()
+    allowlist, allowlist_msg = load_anonymization_allowlist()
+
+    st.caption(f"Tor feed: {_feed_label(feeds['tor'])}")
+    if feeds["tor"].get("error"):
+        st.caption(f"Tor warning: {feeds['tor']['error']}")
+    st.caption(f"Open proxy feed: {_feed_label(feeds['proxy'])}")
+    if feeds["proxy"].get("error"):
+        st.caption(f"Open proxy warning: {feeds['proxy']['error']}")
+    st.caption(f"Processing {len(target_dates_state)} date(s) using per-date base + scored cache files.")
+    st.caption(
+        "Cache root: "
+        + str(cache_dir(Path(parquet_root)).as_posix())
+        + f" | active feed cache folder: {feed_cache_dir(Path(parquet_root), date_sel_state).as_posix()}"
+    )
+    st.caption(ip2_msg)
+    st.caption(allowlist_msg)
+
+    q = st.text_input(
+        "Search",
+        value="",
+        placeholder="ip, host, provider, reason, uid, mac",
+        key="anonym_net_q",
+    ).strip().lower()
+
+    st.markdown("<div class='shadow-filter-shell shadow-filter-shell-primary'>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1.25, 1.1, 1.2])
+    with c1:
+        date_sel = st.selectbox("Date", dates, index=dates.index(date_sel_state), key="anonym_net_date")
+    with c2:
+        scope = st.selectbox(
+            "Scope",
+            scope_options,
+            index=scope_options.index(scope_state),
+            key="anonym_net_scope",
+        )
+    with c3:
+        conf_filter = st.multiselect(
+            "Confidence",
+            ["High", "Medium", "Low"],
+            default=["High", "Medium", "Low"],
+            key="anonym_net_conf",
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
     if scope == "Selected date":
         target_dates = [date_sel]
@@ -2396,37 +2462,13 @@ def render_anonymization_network(parquet_root: Path):
     else:
         target_dates = dates
 
-    cc1, cc2 = st.columns([1.0, 3.0])
-    with cc1:
-        rebuild_cache = st.button("Rebuild Cache", key="anonym_net_rebuild_cache", use_container_width=True)
-    with cc2:
-        st.caption(f"Processing {len(target_dates)} date(s) using per-date base + scored cache files.")
-    if rebuild_cache:
-        purged = 0
-        for d in target_dates:
-            purged += purge_date_cache_files(parquet_root, d)
-        st.cache_data.clear()
-        st.success(f"Rebuilt cache requested. Removed {purged} cache file(s).")
-
-    st.caption(
-        "Cache root: "
-        + str(cache_dir(Path(parquet_root)).as_posix())
-        + f" | active feed cache folder: {feed_cache_dir(Path(parquet_root), date_sel).as_posix()}"
+    ensure_scored_cache(
+        parquet_root,
+        target_dates,
+        feeds=feeds,
+        ip2_df=ip2,
+        ip2_sig=ip2_sig,
     )
-
-    ip2, ip2_msg, ip2_sig = load_ip2proxy_lookup()
-    st.caption(ip2_msg)
-    allowlist, allowlist_msg = load_anonymization_allowlist()
-    st.caption(allowlist_msg)
-
-    with st.spinner("Optimizing logs for fast load..."):
-        ensure_scored_cache(
-            parquet_root,
-            target_dates,
-            feeds=feeds,
-            ip2_df=ip2,
-            ip2_sig=ip2_sig,
-        )
 
     cached_files = read_scored_cached_files(parquet_root, target_dates)
     if not cached_files:
@@ -2442,47 +2484,24 @@ def render_anonymization_network(parquet_root: Path):
     scored["Allowlisted"] = compute_allowlist_mask(scored, allowlist)
 
     view = scored.copy()
-    if hide_allowlisted:
-        view = view[~view["Allowlisted"]].copy()
-    view = view[view["Risk_Score"] >= int(min_score)].copy()
     if conf_filter:
         view = view[view["Confidence"].isin(conf_filter)].copy()
     view["Detection_Source"] = _derive_detection_source(view)
 
     cat_opts = sorted(view["Category"].dropna().astype(str).unique().tolist())
     source_opts = sorted([x for x in view["Detection_Source"].dropna().astype(str).unique().tolist() if x])
-    src_opts = sorted([x for x in view["id.orig_h"].dropna().astype(str).unique().tolist() if x])
-    mac_opts = sorted([x for x in view["mac"].dropna().astype(str).unique().tolist() if x])
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    c6, c7, c8, c9 = st.columns([1.0, 1.0, 1.0, 1.0])
+    c6, c7 = st.columns([1.0, 1.0])
     with c6:
         cat_filter = st.multiselect("Category", cat_opts, default=cat_opts, key="anonym_net_cat")
     with c7:
         source_filter = st.multiselect("Source", source_opts, default=source_opts, key="anonym_net_source_filter")
-    with c8:
-        src_filter = st.multiselect("Source IP", src_opts, default=[], key="anonym_net_src_filter", placeholder="All")
-    with c9:
-        mac_filter = st.multiselect("MAC", mac_opts, default=[], key="anonym_net_mac_filter", placeholder="All")
-
-    c10, c11, c12 = st.columns([2.0, 0.8, 0.8])
-    with c10:
-        q = st.text_input("Search", value="", placeholder="ip, host, provider, reason, uid, mac", key="anonym_net_q").strip().lower()
-    with c11:
-        high_evidence_only = st.checkbox("High Evidence Only", value=False, key="anonym_net_high_evd_only")
-    with c12:
-        top_n = st.selectbox("Top rows", [100, 250, 500, 1000], index=1, key="anonym_net_top_rows")
     st.markdown("</div>", unsafe_allow_html=True)
 
     if cat_filter:
         view = view[view["Category"].isin(cat_filter)].copy()
     if source_filter:
         view = view[view["Detection_Source"].isin(source_filter)].copy()
-    if src_filter:
-        view = view[view["id.orig_h"].isin(src_filter)].copy()
-    if mac_filter:
-        view = view[view["mac"].isin(mac_filter)].copy()
-    if high_evidence_only:
-        view = view[view["High_Confidence_Evidence"] == True].copy()  # noqa: E712
     if q:
         blob = (
             view["id.orig_h"].astype(str) + " " + view["id.resp_h"].astype(str) + " " + view["Destination_Host"].astype(str)
@@ -2765,7 +2784,8 @@ def render_anonymization_network(parquet_root: Path):
     if dedup_subset:
         view_sorted = view_sorted.drop_duplicates(subset=dedup_subset, keep="first")
 
-    view_sorted = view_sorted.sort_values(["Risk_Score", "ts"], ascending=[False, False]).head(int(top_n)).copy()
+    top_n = 100
+    view_sorted = view_sorted.sort_values(["Risk_Score", "ts"], ascending=[False, False]).head(top_n).copy()
     st.caption(f"Showing top {len(view_sorted):,} unique events (highest risk and most recent).")
 
     table = view_sorted.reindex(columns=show_cols).copy()
