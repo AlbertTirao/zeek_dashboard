@@ -35,7 +35,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 14:5a:fc:78:57:9b
-  ip: 192.168.201.14
+  ip: 192.168.201.123
   hostname: Mikamiks
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
@@ -45,7 +45,7 @@ authorized_macs:
   vendor: LCFC(Hefei) Electronics Technology co., ltd
   date_modified: '2026-02-23 16:43:30'
 - mac: 1c:87:e3:a3:4a:48
-  ip: 192.168.201.10
+  ip: 192.168.201.121
   hostname: TECNO-CAMON-16
   vendor: TECNO MOBILE LIMITED
   date_modified: '2026-02-12 12:37:33'
@@ -65,7 +65,7 @@ authorized_macs:
   vendor: Ruijie Networks Co.,LTD
   date_modified: '2026-02-12 15:31:30'
 - mac: 2c:3b:70:9f:7b:73
-  ip: 192.168.201.15
+  ip: 192.168.201.126
   hostname: PC-02
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-14 15:42:55'
@@ -75,22 +75,22 @@ authorized_macs:
   vendor: AltoBeam Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:8a:06:d5:3c:4e
-  ip: 192.168.201.13
+  ip: 192.168.201.127
   hostname: Galaxy-A15-5G
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:8f:30:9f:11:f3
-  ip: 192.168.201.11
+  ip: 192.168.201.128
   hostname: Lana-s-phone
   vendor: Samsung Electronics Co.,Ltd
   date_modified: '2026-02-12 12:37:33'
 - mac: 38:d5:7a:78:15:5f
-  ip: 192.168.201.16
+  ip: 192.168.201.125
   hostname: Lana-HP
   vendor: CLOUD NETWORK TECHNOLOGY SINGAPORE PTE. LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: 40:d1:33:7c:27:a7
-  ip: 192.168.201.67
+  ip: 192.168.201.114
   hostname: LAPTOP-8SDVCIRA
   vendor: Intel Corporate
   date_modified: '2026-02-12 12:37:33'
@@ -105,7 +105,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.31
+  ip: 192.168.201.102
   hostname: JE-s-A06
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -115,7 +115,7 @@ authorized_macs:
   vendor: D-Link International
   date_modified: '2026-02-12 12:37:33'
 - mac: 50:bb:b5:32:16:9c
-  ip: 192.168.201.19
+  ip: 192.168.201.131
   hostname: LAPTOP-250P3062
   vendor: AzureWave Technology Inc.
   date_modified: '2026-02-12 12:37:33'
@@ -125,7 +125,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 72:88:84:63:71:0c
-  ip: 192.168.201.46
+  ip: 192.168.201.88
   hostname: B-n4rY-RM6
   vendor: ''
   date_modified: '2026-02-23 16:52:39'
@@ -160,7 +160,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: c0:35:32:b5:43:5f
-  ip: 192.168.201.17
+  ip: 192.168.201.130
   hostname: chesca
   vendor: Liteon Technology Corporation
   date_modified: '2026-02-12 12:37:33'
@@ -175,7 +175,7 @@ authorized_macs:
   vendor: None
   date_modified: '2026-02-12 12:37:33'
 - mac: dc:41:a9:64:da:c5
-  ip: 192.168.201.12
+  ip: 192.168.201.124
   hostname: Shiraishi
   vendor: Intel Corporate
   date_modified: '2026-02-14 15:22:42'
@@ -190,7 +190,7 @@ authorized_macs:
   vendor: Infinix mobility limited
   date_modified: '2026-02-12 12:37:33'
 - mac: e0:bc:c6:33:77:c8
-  ip: 192.168.201.18
+  ip: 192.168.201.132
   hostname: Mayt
   vendor: ''
   date_modified: '2026-02-23 16:45:52'
@@ -205,12 +205,12 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.13
+  ip: 192.168.201.44
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: f8:5e:0b:7c:50:f5
-  ip: 192.168.201.106
+  ip: 192.168.201.122
   hostname: Realme-X
   vendor: Realme Chongqing Mobile Telecommunications Corp.,Ltd.
   date_modified: '2026-02-12 12:37:33'

@@ -1511,6 +1511,33 @@ def create_user(name: str, username: str, password: str, role: str, created_by: 
     except PyMongoError as exc:
         raise RuntimeError("Database error while creating user.") from exc
 
+    # Guard against silent persistence mismatches by validating the stored record
+    # immediately after insert.
+    persisted = _fetch_user_row(clean_user)
+    if not persisted:
+        raise RuntimeError(
+            "User creation could not be verified. The account was not found after insert."
+        )
+
+    stored_name = normalize_display_name(str(persisted.get("name", "") or ""))
+    stored_role = str(persisted.get("role", "") or "").strip().lower()
+    stored_active = bool(persisted.get("is_active", False))
+    stored_password_reset_required = bool(persisted.get("password_reset_required", False))
+    if (
+        stored_name != clean_name
+        or stored_role != clean_role
+        or not stored_active
+        or not stored_password_reset_required
+    ):
+        raise RuntimeError(
+            "User creation verification failed. Stored account details do not match the submitted form."
+        )
+
+    if not verify_password(password, str(persisted.get("password_hash", "") or "")):
+        raise RuntimeError(
+            "User creation verification failed. Stored password does not match the submitted credential."
+        )
+
 
 def set_user_status(username: str, is_active: bool) -> None:
     clean_user = normalize_username(username)
