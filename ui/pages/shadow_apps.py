@@ -2322,6 +2322,74 @@ def register_shadow_view(conn, cached_files: list[str]):
         )
 
 
+def apply_strict_selected_day_scope(conn, selected_day: str, adjacent_dates: list[str]) -> tuple[int, int]:
+    """
+    Keep only rows whose timestamps truly belong to selected_day, even when
+    day folders contain spillover events around midnight.
+    Returns: (excluded_rows, included_from_adjacent_rows)
+    """
+    try:
+        total_union_rows = int(conn.execute("SELECT COUNT(*) FROM shadow_events").fetchone()[0] or 0)
+    except Exception:
+        total_union_rows = 0
+
+    selected_ts = pd.to_datetime(str(selected_day), errors="coerce")
+    if pd.isna(selected_ts):
+        return 0, 0
+
+    day_start = selected_ts.normalize()
+    day_end = day_start + pd.Timedelta(days=1)
+    day_start_sql = day_start.strftime("%Y-%m-%d %H:%M:%S")
+    day_end_sql = day_end.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Materialize to a temp table first to avoid recursive view dependency when
+    # we replace `shadow_events` below.
+    try:
+        conn.execute("DROP VIEW IF EXISTS shadow_events_scope_union")
+    except Exception:
+        pass
+    try:
+        conn.execute("DROP TABLE IF EXISTS shadow_events_scope_union")
+    except Exception:
+        pass
+    conn.execute("CREATE TEMP TABLE shadow_events_scope_union AS SELECT * FROM shadow_events")
+    conn.execute(
+        f"""
+        CREATE OR REPLACE VIEW shadow_events AS
+        SELECT *
+        FROM shadow_events_scope_union
+        WHERE datetime >= TIMESTAMP '{day_start_sql}'
+          AND datetime < TIMESTAMP '{day_end_sql}'
+        """
+    )
+
+    try:
+        scoped_rows = int(conn.execute("SELECT COUNT(*) FROM shadow_events").fetchone()[0] or 0)
+    except Exception:
+        scoped_rows = 0
+    excluded_rows = max(0, total_union_rows - scoped_rows)
+
+    included_from_adjacent = 0
+    if adjacent_dates:
+        cols = set(_describe_cols(conn, "shadow_events"))
+        if "date" in cols:
+            params = []
+            in_clause = _build_in_clause([str(d) for d in adjacent_dates], params)
+            if in_clause:
+                try:
+                    included_from_adjacent = int(
+                        conn.execute(
+                            f"SELECT COUNT(*) FROM shadow_events WHERE CAST(date AS VARCHAR) IN {in_clause}",
+                            params,
+                        ).fetchone()[0]
+                        or 0
+                    )
+                except Exception:
+                    included_from_adjacent = 0
+
+    return excluded_rows, included_from_adjacent
+
+
 def color_risk(val):
     color_map = {
         "Critical": "color: #FF0000; font-weight: 800;",
@@ -2802,7 +2870,7 @@ def show_inventory_app_dialog(conn):
         st.info("No risk reason details available for this application.")
 
 
-@st.dialog("Device Details", width="large", dismissible=False)
+@st.dialog("Device App Incidents", width="large", dismissible=False)
 def show_forensics_dialog(conn):
     target_mac = st.session_state.get("shadow_dialog_mac")
 
@@ -3024,7 +3092,7 @@ def show_forensics_dialog(conn):
     # MOVED: Applications / Software inventory table (BOTTOM)
     # =============================================================================
     st.divider()
-    st.markdown(f"#### Applications / Identifiers Observed ({mac_display})")
+    st.markdown(f"#### Device App Incidents ({mac_display})")
 
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
     forensic_search = st.text_input(
@@ -3976,22 +4044,14 @@ def show_forensics_dialog(conn):
         )
         with st.expander("Table information", expanded=False):
             st.markdown(
-                f"{len(inv_grid):,} rows shown. Each row is an application/software/domain identifier for this MAC with current filters."
+                f"{len(inv_grid):,} rows shown for this MAC. Each row is an application/software/domain identifier under current table filters."
             )
             st.markdown(
-                "Rows are grouped by Destination + Application/Software/Domain. Sources, first/last seen, duration, and hits "
-                "are aggregated per MAC while Status and Max Risk keep the highest-severity state."
+                "Rows are grouped by Destination + Application/Software/Domain. Sources, first/last seen, duration, and hits are aggregated per MAC."
             )
-            st.markdown("Only rows with valid domains and real application/software/domain identifiers are shown.")
-            st.markdown(
-                "Software/CONN rows may use inferred domain context from nearest non-software events for this MAC (\u00b12s). "
-                "Port(s) inferred are labeled '(inferred)'."
-            )
-            st.markdown("Port(s) in this table show up to the top 3 ports; `...` means more ports exist. Click an app row to view all port usage details.")
-            st.markdown(
-                "WEIRD and other logs without native application identity are matched to nearby events when possible; "
-                "rows with no real destination+application after inference are excluded from this table."
-            )
+            st.markdown("Search, Risk Level, and Source Logs filters above affect this table only.")
+            st.markdown("`Status` and `Max Risk` keep the highest-severity state per grouped row; `Allowed` is editable.")
+            st.markdown("`Port(s)` shows top observed ports (up to 3). Click an app row to open full per-port details.")
 
         edited_inv = inv_grid_response.get("data", None)
         if isinstance(edited_inv, pd.DataFrame):
@@ -4149,6 +4209,15 @@ def render_shadow_apps(parquet_root: Path):
     )
 
     target_dates = [selected_day]
+    selected_day_adjacent: list[str] = []
+    sel_dt = pd.to_datetime(str(selected_day), errors="coerce")
+    if pd.notna(sel_dt):
+        prev_d = (sel_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        next_d = (sel_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        for d in [prev_d, next_d]:
+            if d in available_dates and d not in target_dates:
+                target_dates.append(d)
+                selected_day_adjacent.append(d)
 
     approved = load_allowlist()
     allow_re = compile_allow_regex(approved)
@@ -4163,6 +4232,16 @@ def render_shadow_apps(parquet_root: Path):
         return
 
     register_shadow_view(conn, cached_files)
+    excluded_rows, included_from_adjacent = apply_strict_selected_day_scope(
+        conn,
+        str(selected_day),
+        selected_day_adjacent,
+    )
+    st.caption(
+        "Date scope note: "
+        f"excluded {excluded_rows:,} rows because their timestamps were outside {selected_day}. "
+        f"Included {included_from_adjacent:,} rows from adjacent day folders (yesterday/tomorrow)."
+    )
 
     # --- render dialog only when allowed for this rerun ---
     if st.session_state.get("shadow_allow_dialog_open") and st.session_state.get("shadow_allow_candidate"):
@@ -4263,7 +4342,7 @@ def render_shadow_apps(parquet_root: Path):
     # TAB 1: AgGrid (CLICK MAC CELL -> OPEN DIALOG)
     # =============================================================================
     with tab_main:
-        st.markdown("### Incident rows")
+        st.markdown("### Shadow App Incidents")
 
         st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         search_query_audit = st.text_input(
@@ -4656,7 +4735,7 @@ def render_shadow_apps(parquet_root: Path):
 
             grid_key = f"shadow_audit_grid_{int(st.session_state.get('shadow_grid_nonce', 0))}"
 
-            st.caption("Click on any MAC Address to show device forensics dialog.")
+            st.caption("Click on any MAC Address to show device incidents dialog.")
             grid_response = AgGrid(
                 df_grid,
                 gridOptions=grid_options,
@@ -4673,11 +4752,14 @@ def render_shadow_apps(parquet_root: Path):
             )
             with st.expander("Table information", expanded=False):
                 st.markdown(
-                    f"{len(df_grid):,} grouped rows shown. Rows are built by grouping filtered events on "
-                    "Destination + Application + MAC + Hostname + IP + Source, then computing First Seen, Last Seen, Duration, "
-                    "Hits, and max risk; groups are sorted by max risk score and hit count, and only the top 1,000 are displayed."
+                    f"{len(df_grid):,} grouped rows shown for the selected scope."
                 )
+                st.markdown(
+                    "Rows are grouped by Destination + Application + MAC + Hostname + IP + Source, with First Seen, Last Seen, Duration, Hits, and Max Risk aggregated per group."
+                )
+                st.markdown("Rows are sorted by Max Risk then Hits, and only the top 1,000 grouped rows are displayed.")
                 st.markdown("Table excludes unresolved placeholders and keeps only valid domains with real app identifiers.")
+                st.markdown("Click a MAC row to open scoped device incident rows.")
             export_grid = grid_response.get("data", None)
             if isinstance(export_grid, pd.DataFrame):
                 export_df = export_grid.copy()

@@ -313,6 +313,12 @@ def render_shadow_aggrid(
     grid_options["enableCellTextSelection"] = True
     grid_options["ensureDomOrder"] = True
     grid_options["enableRtl"] = False
+    # Match shadow apps behavior: page-size limits + bottom pager navigation.
+    grid_options.setdefault("pagination", True)
+    if grid_options.get("pagination"):
+        grid_options.setdefault("paginationAutoPageSize", False)
+        grid_options.setdefault("paginationPageSize", 25)
+        grid_options.setdefault("paginationPageSizeSelector", [25, 50, 100])
     # Large grids render much faster with column virtualization enabled.
     grid_options["suppressColumnVirtualisation"] = bool(row_count <= 2000)
     if force_scrollbars:
@@ -456,6 +462,15 @@ def inject_shadow_sharing_css():
             background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
             border-radius: 12px;
             padding: 0.72rem 0.85rem 0.55rem 0.85rem;
+            margin-bottom: 0.45rem;
+        }
+
+        .shadow-filter-shell.shadow-filter-no-divider {
+            border: none;
+            background: transparent;
+            border-radius: 0;
+            padding: 0.12rem 0 0 0;
+            margin-top: 0.15rem;
             margin-bottom: 0.45rem;
         }
 
@@ -1449,7 +1464,7 @@ def show_shadow_sharing_allow_dialog():
             st.rerun()
 
 
-@st.dialog("Device Forensics Details", width="large")
+@st.dialog("Device Sharing Incidents", width="large", dismissible=False)
 def show_shadow_sharing_device_dialog(
     filtered: pd.DataFrame,
     filtered_incidents: pd.DataFrame,
@@ -1479,6 +1494,13 @@ def show_shadow_sharing_device_dialog(
             padding-left: 1.05rem !important;
             padding-right: 1.05rem !important;
             padding-bottom: 0.8rem !important;
+        }
+        div[role="dialog"] button[aria-label="Close"],
+        div[role="dialog"] button[title="Close"],
+        div[data-testid="stDialog"] button[aria-label="Close"],
+        div[data-testid="stDialog"] button[title="Close"] {
+            display: none !important;
+            visibility: hidden !important;
         }
         div[data-testid="stDialog"] .shadow-dialog-hero {
             border: 1px solid rgba(148, 163, 184, 0.28);
@@ -1566,112 +1588,143 @@ def show_shadow_sharing_device_dialog(
         st.markdown(
             f"""
             <div class='shadow-dialog-hero'>
-                <div class='shadow-dialog-title'>Device Forensics Drilldown</div>
-                <div class='shadow-dialog-subtitle'>Scope locked to {scope_label}</div>
+                <div class='shadow-dialog-title'>Scoped to:</div>
+                <div class='shadow-dialog-subtitle'>{scope_label}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    dialog_search = st.text_input(
-        "Search (time, destination, domain, source, reason/basis)",
-        placeholder="e.g., drive.google.com",
-        key=f"shadow_sharing_dlg_search_{selected_scope_key}_{mac_key}",
-    ).strip()
-
-    if dialog_search:
-        q = dialog_search.lower()
-        search_cols = [
-            "mac",
-            "orig_ip",
-            "destination",
-            "domain",
-            "source_types",
-            "sig_service",
-            "allow_basis",
-            "action",
-            "action_basis",
-            "confidence",
-            "confidence_reasons",
-        ]
-        search_mask = pd.Series(False, index=scoped_incidents.index)
-        for col in search_cols:
-            if col in scoped_incidents.columns:
-                search_mask = search_mask | scoped_incidents[col].astype(str).str.lower().str.contains(q, na=False, regex=False)
-        if "first_ts" in scoped_incidents.columns:
-            first_txt = pd.to_datetime(scoped_incidents["first_ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
-            search_mask = search_mask | first_txt.str.lower().str.contains(q, na=False, regex=False)
-        if "last_ts" in scoped_incidents.columns:
-            last_txt = pd.to_datetime(scoped_incidents["last_ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
-            search_mask = search_mask | last_txt.str.lower().str.contains(q, na=False, regex=False)
-        scoped_incidents = scoped_incidents[search_mask].copy()
-
+    table_grouped_line = st.empty()
     scoped_incidents = _filter_incidents_nonzero_outbound(scoped_incidents)
     if scoped_incidents.empty:
-        st.info("No non-zero outbound incident rows match your dialog search.")
+        st.info("No non-zero outbound incident rows are available for this MAC.")
         return
 
     scoped_incidents_raw = scoped_incidents.copy()
-    scoped_incidents_table = _aggregate_incidents_for_daily_mac_destination_table(
-        scoped_incidents_raw,
-        str(selected_scope_label),
-    )
-
-    grid_rows = _build_incident_grid_frame(scoped_incidents_table, include_hostname=False)
-    raw_grid_rows = _build_incident_grid_frame(scoped_incidents_raw, include_hostname=False)
-    if raw_grid_rows.empty and not grid_rows.empty:
-        raw_grid_rows = grid_rows.copy()
-    if grid_rows.empty and not raw_grid_rows.empty:
-        grid_rows = raw_grid_rows.copy()
-    if grid_rows.empty:
+    base_raw_grid_rows = _build_incident_grid_frame(scoped_incidents_raw, include_hostname=False)
+    if base_raw_grid_rows.empty:
         st.info("No incident rows above 0 MB are available for this MAC.")
         return
-    if AUTO_UNIQUE_ID_COL in grid_rows.columns:
-        grid_rows = grid_rows.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
-    if "#" not in grid_rows.columns:
-        grid_rows = grid_rows.reset_index(drop=True)
-        grid_rows.insert(0, "#", range(1, len(grid_rows) + 1))
 
-    first_seen = pd.to_datetime(scoped_incidents.get("first_ts", pd.Series([], dtype="datetime64[ns]")), errors="coerce").min()
-    last_seen = pd.to_datetime(scoped_incidents.get("last_ts", pd.Series([], dtype="datetime64[ns]")), errors="coerce").max()
-    unique_dest = int(raw_grid_rows["Destination"].replace({"": None, "Unknown": None, "unknown": None}).dropna().nunique())
-    total_outbound_mb = float(pd.to_numeric(raw_grid_rows["Outbound_MB"], errors="coerce").fillna(0).sum())
-    unapproved = int((raw_grid_rows["Allowed_Domain"] == False).sum())  # noqa: E712
-    high_conf = int((raw_grid_rows["Confidence"] == "HIGH").sum())
+    popup_source_options: List[str] = []
+    source_blob = scoped_incidents_raw.get("source_types", pd.Series("", index=scoped_incidents_raw.index)).astype(str).str.lower()
+    for src_name in ["conn", "http", "ssl", "dns", "files"]:
+        src_pat = rf"(?:^|[^\w]){re.escape(src_name)}(?:[^\w]|$)"
+        if bool(source_blob.str.contains(src_pat, regex=True, na=False).any()):
+            popup_source_options.append(src_name)
+    if not popup_source_options:
+        popup_source_options = ["conn", "http", "ssl", "dns", "files"]
 
-    st.markdown(
-        (
-            f"<div class='shadow-filter-hint shadow-scope-hint'>"
-            f"Table grouped to <strong>{len(grid_rows):,}</strong> unique MAC+Destination rows "
-            f"(from {len(raw_grid_rows):,} incident rows) for this device."
-            f"</div>"
-        ),
-        unsafe_allow_html=True,
-    )
-
-    first_seen_txt = first_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(first_seen) else "-"
-    last_seen_txt = last_seen.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(last_seen) else "-"
-    st.markdown(
-        f"""
-        <div class='shadow-dialog-chips'>
-            <span class='shadow-dialog-chip'>First Seen: <strong>{first_seen_txt}</strong></span>
-            <span class='shadow-dialog-chip'>Last Seen: <strong>{last_seen_txt}</strong></span>
-            <span class='shadow-dialog-chip'>Unique Destinations: <strong>{unique_dest:,}</strong></span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    total_outbound_mb = float(pd.to_numeric(base_raw_grid_rows["Outbound_MB"], errors="coerce").fillna(0).sum())
+    unapproved = int((base_raw_grid_rows["Allowed_Domain"] == False).sum())  # noqa: E712
+    high_conf = int((base_raw_grid_rows["Confidence"] == "HIGH").sum())
 
     dm1, dm2, dm3, dm4 = st.columns(4)
-    dm1.metric("Scoped Incidents", f"{len(raw_grid_rows):,}")
+    dm1.metric("Scoped Incidents", f"{len(base_raw_grid_rows):,}")
     dm2.metric("Unapproved", unapproved, delta="Investigate" if unapproved > 0 else "Clear", delta_color="inverse")
     dm3.metric("Outbound Volume", f"{total_outbound_mb:.2f} MB")
     dm4.metric("High Confidence", f"{high_conf:,}")
 
     with st.container():
-        st.markdown("#### Shadow Sharing Incidents (MAC Scope)")
-        st.caption("Table rows are grouped by unique MAC + Destination for the selected 24-hour date scope.")
-        _render_incident_table_insights(raw_grid_rows)
+        st.markdown(f"#### Shadow Sharing Incidents ({target_mac})")
+        st.markdown("<div class='shadow-filter-shell shadow-filter-no-divider'>", unsafe_allow_html=True)
+        dialog_search = st.text_input(
+            "Search (time, destination, domain, source, reason/basis)",
+            placeholder="e.g., drive.google.com",
+            key=f"shadow_sharing_dlg_search_{selected_scope_key}_{mac_key}",
+        ).strip()
+        f1, f2 = st.columns([1.35, 1.65])
+        with f1:
+            dlg_conf_levels = st.multiselect(
+                "Confidence Level",
+                ["WEAK", "PROBABLE", "HIGH"],
+                default=["WEAK", "PROBABLE", "HIGH"],
+                key=f"shadow_sharing_dlg_conf_{selected_scope_key}_{mac_key}",
+            )
+        with f2:
+            dlg_sources = st.multiselect(
+                "Source Logs",
+                popup_source_options,
+                default=popup_source_options,
+                key=f"shadow_sharing_dlg_sources_{selected_scope_key}_{mac_key}",
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        table_scoped_incidents = scoped_incidents_raw.copy()
+        if dialog_search:
+            q = dialog_search.lower()
+            search_cols = [
+                "mac",
+                "orig_ip",
+                "destination",
+                "domain",
+                "source_types",
+                "sig_service",
+                "allow_basis",
+                "action",
+                "action_basis",
+                "confidence",
+                "confidence_reasons",
+            ]
+            search_mask = pd.Series(False, index=table_scoped_incidents.index)
+            for col in search_cols:
+                if col in table_scoped_incidents.columns:
+                    search_mask = search_mask | table_scoped_incidents[col].astype(str).str.lower().str.contains(q, na=False, regex=False)
+            if "first_ts" in table_scoped_incidents.columns:
+                first_txt = pd.to_datetime(table_scoped_incidents["first_ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+                search_mask = search_mask | first_txt.str.lower().str.contains(q, na=False, regex=False)
+            if "last_ts" in table_scoped_incidents.columns:
+                last_txt = pd.to_datetime(table_scoped_incidents["last_ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+                search_mask = search_mask | last_txt.str.lower().str.contains(q, na=False, regex=False)
+            table_scoped_incidents = table_scoped_incidents[search_mask].copy()
+
+        if dlg_conf_levels:
+            conf_keep = table_scoped_incidents.get("confidence", pd.Series("", index=table_scoped_incidents.index)).astype(str).str.upper()
+            table_scoped_incidents = table_scoped_incidents[conf_keep.isin(set(dlg_conf_levels))].copy()
+
+        if dlg_sources:
+            src_blob = table_scoped_incidents.get("source_types", pd.Series("", index=table_scoped_incidents.index)).astype(str).str.lower()
+            src_keep = pd.Series(False, index=table_scoped_incidents.index)
+            for src_name in dlg_sources:
+                src_pat = rf"(?:^|[^\w]){re.escape(str(src_name).strip().lower())}(?:[^\w]|$)"
+                src_keep = src_keep | src_blob.str.contains(src_pat, regex=True, na=False)
+            table_scoped_incidents = table_scoped_incidents[src_keep].copy()
+
+        table_scoped_incidents = _filter_incidents_nonzero_outbound(table_scoped_incidents)
+        if table_scoped_incidents.empty:
+            st.info("No incident rows match current table filters.")
+            return
+
+        scoped_incidents_table = _aggregate_incidents_for_daily_mac_destination_table(
+            table_scoped_incidents,
+            str(selected_scope_label),
+        )
+        grid_rows = _build_incident_grid_frame(scoped_incidents_table, include_hostname=False)
+        raw_grid_rows = _build_incident_grid_frame(table_scoped_incidents, include_hostname=False)
+        if raw_grid_rows.empty and not grid_rows.empty:
+            raw_grid_rows = grid_rows.copy()
+        if grid_rows.empty and not raw_grid_rows.empty:
+            grid_rows = raw_grid_rows.copy()
+        if grid_rows.empty:
+            st.info("No incident rows above 0 MB are available for this MAC.")
+            return
+        if AUTO_UNIQUE_ID_COL in grid_rows.columns:
+            grid_rows = grid_rows.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
+        if "#" not in grid_rows.columns:
+            grid_rows = grid_rows.reset_index(drop=True)
+            grid_rows.insert(0, "#", range(1, len(grid_rows) + 1))
+
+        table_grouped_line.markdown(
+            (
+                f"<div class='shadow-filter-hint shadow-scope-hint'>"
+                f"Table grouped to <strong>{len(grid_rows):,}</strong> unique MAC+Destination rows "
+                f"(from {len(raw_grid_rows):,} incident rows) for this device."
+                f"</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
         gb_rows = GridOptionsBuilder.from_dataframe(grid_rows)
         _configure_incident_grid_columns(
             gb_rows,
@@ -1696,16 +1749,19 @@ def show_shadow_sharing_device_dialog(
         export_rows = pd.DataFrame(row_response.get("data", [])) if isinstance(row_response, dict) else pd.DataFrame()
         if export_rows.empty:
             export_rows = grid_rows.copy()
+        with st.expander("Table information", expanded=False):
+            st.markdown(
+                f"{len(grid_rows):,} grouped rows shown for this MAC. Rows are grouped by unique MAC + Destination within the selected date scope."
+            )
+            st.markdown("`Allowed` is editable and updates whitelist decisions for the destination domain.")
+            st.markdown("`Confidence`, `Score`, and `Reasons` summarize correlated conn/ssl/http/files evidence per incident row.")
         st.download_button(
-            "Download CSV (MAC scope)",
+            "Download CSV",
             data=_table_csv_bytes(export_rows),
             file_name=f"shadow_sharing_mac_{mac_key}_{selected_scope_label}.csv",
             mime="text/csv",
             key=f"shadow_sharing_mac_csv_{selected_scope_key}_{mac_key}",
         )
-
-    with st.expander("Confidence score computation", expanded=False):
-        st.markdown(_confidence_score_explainer_text())
 
 
 def render_shadow_sharing(parquet_root: Path):
@@ -1738,6 +1794,11 @@ def render_shadow_sharing(parquet_root: Path):
     if st.session_state.get("shadow_sharing_dialog_open") and origin not in ("grid", "dialog"):
         _close_shadow_sharing_dialog()
         origin = None
+
+    st.markdown("### Shadow Sharing Incidents")
+    st.caption("Incidents roll up conn/ssl/http/files evidence into 5-minute windows and score confidence (HIGH/PROBABLE/WEAK).")
+    with st.expander("Detection basis", expanded=False):
+        st.markdown(_confidence_score_explainer_text())
 
     def _on_scope_change():
         _close_shadow_sharing_dialog()
@@ -1840,19 +1901,8 @@ def render_shadow_sharing(parquet_root: Path):
     # -------------------------------------------------------------------------
     incidents = _filter_incidents_nonzero_outbound(incidents)
 
-    st.markdown("### Shadow Sharing Incidents")
-    st.caption("Incidents roll up conn/ssl/http/files evidence into 5-minute windows and score confidence (HIGH/PROBABLE/WEAK).")
-    with st.expander("Detection basis", expanded=False):
-        st.markdown(_confidence_score_explainer_text())
     if incidents.empty:
         st.info("No flow-based incidents were found in this scope.")
-    else:
-        st.markdown(
-            f"<div class='shadow-filter-hint shadow-scope-hint'>Detected <strong>{len(incidents):,}</strong> incident windows in this dataset. Use filters below to refine the incident timeline and table.</div>",
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
 
     def _has_text(s: pd.Series) -> pd.Series:
         t = s.astype(str).str.strip().str.lower()
@@ -1925,19 +1975,50 @@ def render_shadow_sharing(parquet_root: Path):
             "options": source_options,
         }
 
-    search_q = st.text_input("Search (MAC, Host, IP, Destination, Basis)", placeholder="e.g., 192.168.1.14",)
+    def _prepare_scope_event_rows(src_df: pd.DataFrame) -> pd.DataFrame:
+        out_df = src_df.copy()
+        if out_df.empty:
+            return out_df
+        # Hard filter: hide Unknown/placeholder destinations.
+        if "destination" in out_df.columns:
+            dest_norm = out_df["destination"].astype(str).str.strip().str.lower()
+            out_df = out_df[~dest_norm.isin(INVALID_DEST_SET)].copy()
+        out_df["bytes"] = pd.to_numeric(out_df["bytes"], errors="coerce").fillna(0)
+        out_df = out_df[out_df["bytes"] > 0].copy()
+        if "event_id" in out_df.columns:
+            out_df = out_df.drop_duplicates(subset=["event_id"], keep="last")
+        else:
+            dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes"] if c in out_df.columns]
+            if dedupe_cols:
+                out_df = out_df.drop_duplicates(subset=dedupe_cols, keep="last")
+            else:
+                out_df = out_df.drop_duplicates()
+        return out_df
 
-    c1, c2 = st.columns([1.4, 2.2])
-    with c1:
-        selected_risk_levels = st.multiselect("Risk Level", ["CRITICAL", "HIGH", "MEDIUM", "LOW"], default=["CRITICAL", "HIGH", "MEDIUM", "LOW"])
+    overview_filtered = _prepare_scope_event_rows(df)
+    overview_incidents = build_shadow_sharing_incidents(overview_filtered)
+    overview_incidents = _filter_incidents_nonzero_outbound(overview_incidents)
 
-    with c2:
-        selected_sources = st.multiselect("Source Logs", source_options, default=source_options)
+    search_q = str(st.session_state.get("shadow_sharing_search_q", "")).strip()
+    confidence_default = ["WEAK", "PROBABLE", "HIGH"]
+    confidence_state = st.session_state.get("shadow_sharing_conf_levels", confidence_default)
+    if not isinstance(confidence_state, list):
+        confidence_state = confidence_default
+    selected_conf_levels = [str(x).upper() for x in confidence_state if str(x).upper() in confidence_default]
+    if not selected_conf_levels:
+        selected_conf_levels = confidence_default
+
+    source_state = st.session_state.get("shadow_sharing_sources", source_options)
+    if not isinstance(source_state, list):
+        source_state = source_options
+    selected_sources = [str(x) for x in source_state if str(x) in source_options]
+    if source_options and not selected_sources:
+        selected_sources = source_options
 
     filter_cache_key = _shadow_sharing_filter_cache_key(
         selected_scope_key=selected_scope_key,
         selected_sources=selected_sources,
-        selected_risk_levels=selected_risk_levels,
+        selected_risk_levels=selected_conf_levels,
         search_q=search_q,
         data_stamp=source_data_stamp,
     )
@@ -1959,14 +2040,11 @@ def render_shadow_sharing(parquet_root: Path):
                     source_keep = source_keep | mask
             filtered = filtered[source_keep]
 
-        if selected_risk_levels:
-            filtered = filtered[filtered["Severity"].isin(selected_risk_levels)]
-
         if search_q:
             q = search_q.lower().strip()
             if q:
                 filtered = filtered[
-                    filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
                     | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
                     | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
                     | filtered["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
@@ -1975,24 +2053,13 @@ def render_shadow_sharing(parquet_root: Path):
                     | filtered["Allow_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
                 ]
 
-        # Hard filter: hide Unknown/placeholder destinations in tables and Top Dest computations
-        if "destination" in filtered.columns:
-            dest_norm = filtered["destination"].astype(str).str.strip().str.lower()
-            filtered = filtered[~dest_norm.isin(INVALID_DEST_SET)].copy()
-        filtered["bytes"] = pd.to_numeric(filtered["bytes"], errors="coerce").fillna(0)
-        filtered = filtered[filtered["bytes"] > 0].copy()
-
-        if "event_id" in filtered.columns:
-            filtered = filtered.drop_duplicates(subset=["event_id"], keep="last")
-        else:
-            dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes"] if c in filtered.columns]
-            if dedupe_cols:
-                filtered = filtered.drop_duplicates(subset=dedupe_cols, keep="last")
-            else:
-                filtered = filtered.drop_duplicates()
+        filtered = _prepare_scope_event_rows(filtered)
 
         filtered_incidents = build_shadow_sharing_incidents(filtered)
         filtered_incidents = _filter_incidents_nonzero_outbound(filtered_incidents)
+        if selected_conf_levels and isinstance(filtered_incidents, pd.DataFrame) and not filtered_incidents.empty:
+            conf_series = filtered_incidents.get("confidence", pd.Series("", index=filtered_incidents.index)).astype(str).str.upper()
+            filtered_incidents = filtered_incidents[conf_series.isin(set(selected_conf_levels))].copy()
         dev_grid_raw_cached = _build_incident_grid_frame(filtered_incidents)
         table_incidents = _aggregate_incidents_for_daily_mac_destination_table(filtered_incidents, str(selected_date))
         dev_grid_table_cached = _build_incident_grid_frame(table_incidents)
@@ -2006,12 +2073,17 @@ def render_shadow_sharing(parquet_root: Path):
             "dev_grid_raw": dev_grid_raw_cached,
         }
 
+    # Keep overview (metrics/charts) independent from table-only filters.
+    table_filtered = filtered.copy() if isinstance(filtered, pd.DataFrame) else pd.DataFrame()
+    table_filtered_incidents = filtered_incidents.copy() if isinstance(filtered_incidents, pd.DataFrame) else pd.DataFrame()
+    filtered = overview_filtered
+    filtered_incidents = overview_incidents
+
     if filtered.empty:
-        st.warning("No rows above 0 MB match your filters.")
+        st.warning("No rows above 0 MB are available in this scope.")
         return
 
     # Metrics
-    st.divider()
     m1, m2, m3, m4 = st.columns(4)
 
     total_b = float(filtered.loc[filtered["bytes"] > 0, "bytes"].sum())
@@ -2198,20 +2270,38 @@ def render_shadow_sharing(parquet_root: Path):
     # -------------------------------------------------------------------------
     with tab_overview:
         st.markdown("#### Shadow Sharing Incidents")
-        st.caption(
-            "Table rows are grouped by unique MAC + Destination for the selected 24-hour date scope. "
-            "Click any MAC to open all matching rows for that MAC."
-        )
+        st.markdown("<div class='shadow-filter-shell shadow-filter-no-divider'>", unsafe_allow_html=True)
+        search_q = st.text_input(
+            "Search (MAC, Host, IP, Destination, Basis)",
+            placeholder="e.g., 192.168.1.14",
+            key="shadow_sharing_search_q",
+        ).strip()
+        c1, c2 = st.columns([1.4, 2.2])
+        with c1:
+            selected_conf_levels = st.multiselect(
+                "Confidence Level",
+                ["WEAK", "PROBABLE", "HIGH"],
+                default=selected_conf_levels,
+                key="shadow_sharing_conf_levels",
+            )
+        with c2:
+            selected_sources = st.multiselect(
+                "Source Logs",
+                source_options,
+                default=selected_sources,
+                key="shadow_sharing_sources",
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
 
         if isinstance(dev_grid_table_cached, pd.DataFrame):
             dev_grid = dev_grid_table_cached.copy()
         else:
-            table_incidents = _aggregate_incidents_for_daily_mac_destination_table(filtered_incidents, str(selected_date))
+            table_incidents = _aggregate_incidents_for_daily_mac_destination_table(table_filtered_incidents, str(selected_date))
             dev_grid = _build_incident_grid_frame(table_incidents)
         if isinstance(dev_grid_raw_cached, pd.DataFrame):
             dev_grid_raw = dev_grid_raw_cached.copy()
         else:
-            dev_grid_raw = _build_incident_grid_frame(filtered_incidents)
+            dev_grid_raw = _build_incident_grid_frame(table_filtered_incidents)
         if dev_grid_raw.empty and not dev_grid.empty:
             dev_grid_raw = dev_grid.copy()
         if dev_grid.empty:
@@ -2219,16 +2309,15 @@ def render_shadow_sharing(parquet_root: Path):
             st.session_state["shadow_sharing_last_selected_mac"] = None
         else:
             if "Hostname" not in dev_grid.columns:
-                table_incidents = _aggregate_incidents_for_daily_mac_destination_table(filtered_incidents, str(selected_date))
+                table_incidents = _aggregate_incidents_for_daily_mac_destination_table(table_filtered_incidents, str(selected_date))
                 dev_grid = _build_incident_grid_frame(table_incidents, include_hostname=True)
             if "Hostname" not in dev_grid_raw.columns:
-                dev_grid_raw = _build_incident_grid_frame(filtered_incidents, include_hostname=True)
+                dev_grid_raw = _build_incident_grid_frame(table_filtered_incidents, include_hostname=True)
             if AUTO_UNIQUE_ID_COL in dev_grid.columns:
                 dev_grid = dev_grid.drop(columns=[AUTO_UNIQUE_ID_COL], errors="ignore")
             if "#" not in dev_grid.columns:
                 dev_grid = dev_grid.reset_index(drop=True)
                 dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
-            _render_incident_table_insights(dev_grid_raw)
             gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
             _configure_incident_grid_columns(
                 gb_dev,
@@ -2275,8 +2364,15 @@ def render_shadow_sharing(parquet_root: Path):
             export_dev = pd.DataFrame(dev_response.get("data", [])) if isinstance(dev_response, dict) else pd.DataFrame()
             if export_dev.empty:
                 export_dev = dev_grid.copy()
+            with st.expander("Table information", expanded=False):
+                st.markdown(
+                    f"{len(dev_grid):,} grouped rows shown. Rows are grouped by unique MAC + Destination for the selected date scope."
+                )
+                st.markdown("Search, Confidence Level, and Source Logs filters above affect this table only.")
+                st.markdown("`Allowed` is editable and updates whitelist decisions for each destination domain.")
+                st.markdown("`Outbound_MB`, `Inbound_MB`, `Ratio`, `Confidence`, and `Score` help prioritize suspicious transfer behavior.")
             st.download_button(
-                "Download CSV (current incident table)",
+                "Download CSV",
                 data=_table_csv_bytes(export_dev),
                 file_name=f"shadow_sharing_incidents_{selected_date}.csv",
                 mime="text/csv",
@@ -2287,8 +2383,8 @@ def render_shadow_sharing(parquet_root: Path):
         show_shadow_sharing_allow_dialog()
     elif st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac") and origin in ("grid", "dialog"):
         show_shadow_sharing_device_dialog(
-            filtered,
-            filtered_incidents,
+            table_filtered,
+            table_filtered_incidents,
             selected_scope_key=selected_scope_key,
             selected_scope_label=str(selected_date),
         )
