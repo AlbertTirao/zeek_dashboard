@@ -270,6 +270,11 @@ def _users_signature(users: list[dict]) -> str:
     return "||".join(parts)
 
 
+def _um_table_height_for_rows(row_count: int) -> int:
+    visible_rows = max(4, min(int(row_count or 0), 8))
+    return 50 + (visible_rows * 54) + 4
+
+
 def _user_table_aggrid_theme_and_css() -> tuple[str, dict]:
     custom_css = {
         ".ag-root-wrapper": {
@@ -339,13 +344,6 @@ def _user_table_aggrid_theme_and_css() -> tuple[str, dict]:
             "display": "none !important",
             "width": "0 !important",
             "min-width": "0 !important",
-        },
-        ".ag-body-vertical-scroll": {
-            "display": "none !important",
-            "width": "0 !important",
-            "min-width": "0 !important",
-            "max-width": "0 !important",
-            "overflow": "hidden !important",
         },
     }
     return "alpine-dark", custom_css
@@ -565,6 +563,23 @@ def render(current_username: str):
         updated_txt=updated_txt,
     )
 
+    create_feedback = st.session_state.pop("um_create_feedback", None)
+    if isinstance(create_feedback, dict):
+        feedback_level = str(create_feedback.get("level", "") or "").strip().lower()
+        feedback_message = str(create_feedback.get("message", "") or "").strip()
+        feedback_detail = str(create_feedback.get("detail", "") or "").strip()
+        if feedback_message:
+            if feedback_level == "success":
+                st.success(feedback_message)
+            elif feedback_level == "warning":
+                st.warning(feedback_message)
+            elif feedback_level == "error":
+                st.error(feedback_message)
+            else:
+                st.info(feedback_message)
+        if feedback_detail:
+            st.caption(feedback_detail)
+
     m1, m2, m3 = st.columns(3, gap="large")
     with m1:
         _render_metric_card("Total Accounts", str(total_users), "All users in the authentication store")
@@ -623,15 +638,22 @@ def render(current_username: str):
                 email_warning = str(email_exc)
 
             if email_warning:
-                st.warning(
-                    f"User '{clean_name or clean_username}' created, but the credentials e-mail was not sent."
-                )
-                st.caption(email_warning)
+                st.session_state["um_create_feedback"] = {
+                    "level": "warning",
+                    "message": (
+                        f"User '{clean_name or clean_username}' created, but the credentials e-mail was not sent."
+                    ),
+                    "detail": email_warning,
+                }
             else:
-                st.success(
-                    f"User '{clean_name or clean_username}' created and credentials e-mail sent."
-                )
-            users = auth_service.list_users()
+                st.session_state["um_create_feedback"] = {
+                    "level": "success",
+                    "message": (
+                        f"User '{clean_name or clean_username}' created and credentials e-mail sent."
+                    ),
+                    "detail": "",
+                }
+            st.rerun()
         except Exception as e:
             st.error(str(e))
 
@@ -717,8 +739,8 @@ def render(current_username: str):
         grid_options["headerHeight"] = 50
         grid_options["suppressHorizontalScroll"] = True
         grid_options["alwaysShowHorizontalScroll"] = False
-        grid_options["alwaysShowVerticalScroll"] = False
-        grid_options["domLayout"] = "autoHeight"
+        grid_options["alwaysShowVerticalScroll"] = True
+        grid_options["domLayout"] = "normal"
         grid_options["onCellClicked"] = _UM_ACTION_CLICK_JS
         grid_options["onGridSizeChanged"] = _UM_GRID_SIZE_CHANGED_JS
         grid_options["onFirstDataRendered"] = _UM_GRID_SIZE_CHANGED_JS
@@ -732,6 +754,7 @@ def render(current_username: str):
             server_sync_strategy="server_wins",
             theme=ag_theme,
             custom_css=ag_css,
+            height=_um_table_height_for_rows(len(editor_df)),
             reload_data=True,
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=True,
