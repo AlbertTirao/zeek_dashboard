@@ -704,6 +704,36 @@ def inject_shadow_apps_css():
             color: #e5eefc;
         }
 
+        div[data-testid="stDialog"] .shadow-dialog-hero {
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
+            border-radius: 12px;
+            padding: 0.58rem 0.76rem;
+            margin-bottom: 0.4rem;
+        }
+
+        div[data-testid="stDialog"] .shadow-dialog-title {
+            color: #e7efff;
+            font-weight: 800;
+            letter-spacing: 0.02em;
+            font-size: 1rem;
+            line-height: 1.2;
+        }
+
+        div[data-testid="stDialog"] .shadow-dialog-subtitle {
+            color: #b8cae6;
+            font-size: 0.8rem;
+            margin-top: 0.22rem;
+        }
+
+        div[data-testid="stDialog"] .shadow-dialog-subtitle code {
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            background: rgba(8, 20, 40, 0.78);
+            color: #dbeafe;
+            border-radius: 999px;
+            padding: 0.12rem 0.52rem;
+        }
+
         .stTabs [data-baseweb="tab-list"] {
             gap: 0.45rem;
             margin-bottom: 0.35rem;
@@ -2772,7 +2802,7 @@ def show_inventory_app_dialog(conn):
         st.info("No risk reason details available for this application.")
 
 
-@st.dialog("Shadow App Forensics Details", width="large", dismissible=False)
+@st.dialog("Device Details", width="large", dismissible=False)
 def show_forensics_dialog(conn):
     target_mac = st.session_state.get("shadow_dialog_mac")
 
@@ -2805,8 +2835,6 @@ def show_forensics_dialog(conn):
 
     with top[1]:
         forensic_scope_line = st.empty()
-        forensic_summary_line = st.empty()
-        forensic_note_line = st.empty()
 
     if not target_mac:
         st.info("No MAC selected.")
@@ -2842,73 +2870,56 @@ def show_forensics_dialog(conn):
         if has_software:
             f_raw_sources.append("SOFTWARE")
     f_raw_sources = sorted({s for s in f_raw_sources if s})
-    forensic_search = st.text_input(
-        "Quick Search",
-        placeholder="IP, domain, context...",
-        key=f"dlg_search_{target_mac}",
-        on_change=_mark_dialog_origin,
-    ).strip()
-    f_bottom_left, f_bottom_right = st.columns([2.6, 1.4])
-    with f_bottom_left:
-        forensic_risk = risk_multiselect(
-            "Risk Level",
-            key=f"dlg_risk_{target_mac}",
-            default=RISK_OPTIONS,
-            on_change=_mark_dialog_origin,
-        )
-    with f_bottom_right:
-        selected_f_source = st.selectbox(
-            "Source Logs",
-            ["All"] + f_raw_sources,
-            key=f"dlg_src_{target_mac}",
-            on_change=_mark_dialog_origin,
-        )
-
-    is_all_risk_selected = bool(forensic_risk) and set(forensic_risk) == set(RISK_OPTIONS)
-    risk_summary = summarize_multiselect(forensic_risk, RISK_OPTIONS, all_label="All")
-    source_summary = "All" if selected_f_source == "All" else selected_f_source
-    forensic_scope_line.caption(f"Forensic analysis scope: {target_mac}")
-    forensic_summary_line.caption(
-        f"Source: {source_summary} | Risk: {risk_summary} | Search: {'On' if forensic_search else 'Off'}"
-    )
-    forensic_note_line.caption("Graphs below are computed from the current MAC + Source/Risk/Search filters.")
-
-    where = ["lower(mac) = lower(?)"]
-    params = [target_mac]
-
-    if selected_f_source != "All":
-        where.append("upper(source_log) = upper(?)")
-        params.append(selected_f_source)
-
-    if not forensic_risk:
-        where.append("1=0")
-    elif not is_all_risk_selected:
-        in_clause = _build_in_clause(forensic_risk, params)
-        where.append(f""""Risk Level" IN {in_clause}""")
-
-    if forensic_search:
-        q = f"%{forensic_search}%"
-        where.append("(domain_clean ILIKE ? OR ip ILIKE ? OR Info ILIKE ? OR hostname ILIKE ? OR app_identity ILIKE ?)")
-        params.extend([q, q, q, q, q])
-
-    where_sql = " AND ".join(where)
 
     forensic_df = _sql_fetch_df(
         conn,
-        f"""
+        """
         SELECT
             datetime, mac, hostname, ip, domain_clean, app_identity, source_log, Info, dst_port,
             bytes_sent, bytes_received, Behavior, "App Status", "Risk Level", "Risk Basis"
         FROM shadow_events
-        WHERE {where_sql}
+        WHERE lower(mac) = lower(?)
         ORDER BY datetime DESC
         """,
-        params,
+        [target_mac],
     )
 
     if forensic_df.empty:
-        st.warning("No events match your filters for this MAC.")
+        st.warning("No events found for this MAC.")
         return
+
+    mac_display_series = (
+        forensic_df.get("mac", pd.Series("", index=forensic_df.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    mac_display_series = mac_display_series[~mac_display_series.str.lower().isin({"", "unknown", "nan", "none", "null"})]
+    mac_display = str(mac_display_series.iloc[0]).lower() if not mac_display_series.empty else str(target_mac).strip().lower()
+
+    host_series = (
+        forensic_df.get("hostname", pd.Series("", index=forensic_df.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    host_series = host_series[~host_series.str.lower().isin({"", "unknown", "nan", "none", "null", "n/a", "-", "(empty)"})]
+    scope_hostname = str(host_series.value_counts(dropna=True).index[0]).strip() if not host_series.empty else "Unknown"
+    scope_date = str(st.session_state.get("shadow_day_select") or "-").strip()
+    scope_label = (
+        f"MAC <code>{mac_display}</code> | "
+        f"Hostname <code>{scope_hostname}</code> | "
+        f"Date <code>{scope_date}</code>"
+    )
+    forensic_scope_line.markdown(
+        f"""
+        <div class='shadow-dialog-hero'>
+            <div class='shadow-dialog-title'>Scoped to:</div>
+            <div class='shadow-dialog-subtitle'>{scope_label}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     forensic_total = int(len(forensic_df))
     forensic_domain_series = _normalize_destination_display_series(forensic_df["domain_clean"])
@@ -2933,22 +2944,6 @@ def show_forensics_dialog(conn):
     # Dialog analytics: Timeline + Top Destinations
     # =============================================================================
     st.markdown("#### Activity Timeline")
-    timeline_controls = st.columns([1.6, 1.2, 2.2])
-    with timeline_controls[0]:
-        timeline_status_filter = st.selectbox(
-            "Status Filter",
-            ["All", "Authorized", "Unauthorized", "Unknown"],
-            key=f"dlg_timeline_status_{target_mac}",
-            on_change=_mark_dialog_origin,
-        )
-    with timeline_controls[1]:
-        timeline_bucket_label = st.selectbox(
-            "Bucket",
-            ["5 min", "10 min", "30 min", "1 hour"],
-            index=1,
-            key=f"dlg_timeline_bucket_{target_mac}",
-            on_change=_mark_dialog_origin,
-        )
     timeline_mode = st.radio(
         "Timeline View",
         ["Total Events", "Status Split"],
@@ -2957,17 +2952,9 @@ def show_forensics_dialog(conn):
         on_change=_mark_dialog_origin,
     )
 
-    bucket_map = {
-        "5 min": ("5min", "5 min"),
-        "10 min": ("10min", "10 min"),
-        "30 min": ("30min", "30 min"),
-        "1 hour": ("1H", "1 hour"),
-    }
-    bucket_rule, timeline_label = bucket_map.get(timeline_bucket_label, ("10min", "10 min"))
+    bucket_rule, timeline_label = ("10min", "10 min")
     timeline = forensic_df.dropna(subset=["datetime"]).copy()
     timeline["App Status"] = timeline["App Status"].fillna("Unknown").astype(str).str.strip().replace("", "Unknown")
-    if timeline_status_filter != "All":
-        timeline = timeline[timeline["App Status"].eq(timeline_status_filter)]
 
     if not timeline.empty:
         if timeline_mode == "Status Split":
@@ -3002,7 +2989,7 @@ def show_forensics_dialog(conn):
         fig_f.update_yaxes(title="Events")
         st.plotly_chart(fig_f, width="stretch")
     else:
-        st.warning("No timeline events match the selected status/bucket filters.")
+        st.warning("No timeline events available for this MAC.")
 
     st.markdown("#### Top Destinations")
     top_dest_src = forensic_df.assign(
@@ -3031,13 +3018,39 @@ def show_forensics_dialog(conn):
         fig_dest.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_dest, width="stretch")
     else:
-        st.info("No destination data for the selected filters.")
+        st.info("No destination data for this MAC.")
 
     # =============================================================================
     # MOVED: Applications / Software inventory table (BOTTOM)
     # =============================================================================
     st.divider()
-    st.markdown("#### Applications / Identifiers Observed (This MAC)")
+    st.markdown(f"#### Applications / Identifiers Observed ({mac_display})")
+
+    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+    forensic_search = st.text_input(
+        "Search",
+        placeholder="IP, domain, context...",
+        key=f"dlg_search_{target_mac}",
+        on_change=_mark_dialog_origin,
+    ).strip()
+    f_bottom_left, f_bottom_right = st.columns([2.6, 1.4])
+    with f_bottom_left:
+        forensic_risk = risk_multiselect(
+            "Risk Level",
+            key=f"dlg_risk_{target_mac}",
+            default=RISK_OPTIONS,
+            on_change=_mark_dialog_origin,
+        )
+    with f_bottom_right:
+        selected_f_source = st.selectbox(
+            "Source Logs",
+            ["All"] + f_raw_sources,
+            key=f"dlg_src_{target_mac}",
+            on_change=_mark_dialog_origin,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    is_all_risk_selected = bool(forensic_risk) and set(forensic_risk) == set(RISK_OPTIONS)
 
     inv_where = ["lower(mac) = lower(?)"]
     inv_params = [target_mac]
@@ -3961,23 +3974,24 @@ def show_forensics_dialog(conn):
             reload_data=False,
             key=f"dlg_inventory_grid_{target_mac}_{int(st.session_state.get('shadow_inv_grid_nonce', 0))}",
         )
-        st.caption(
-            f"{len(inv_grid):,} rows shown. Each row is an application/software/domain identifier for this MAC with current filters."
-        )
-        st.caption(
-            "Rows are grouped by Destination + Application/Software/Domain. Sources, first/last seen, duration, and hits "
-            "are aggregated per MAC while Status and Max Risk keep the highest-severity state."
-        )
-        st.caption("Only rows with valid domains and real application/software/domain identifiers are shown.")
-        st.caption(
-            "Software/CONN rows may use inferred domain context from nearest non-software events for this MAC (\u00b12s). "
-            "Port(s) inferred are labeled '(inferred)'."
-        )
-        st.caption("Port(s) in this table show up to the top 3 ports; `...` means more ports exist. Click an app row to view all port usage details.")
-        st.caption(
-            "WEIRD and other logs without native application identity are matched to nearby events when possible; "
-            "rows with no real destination+application after inference are excluded from this table."
-        )
+        with st.expander("Table information", expanded=False):
+            st.markdown(
+                f"{len(inv_grid):,} rows shown. Each row is an application/software/domain identifier for this MAC with current filters."
+            )
+            st.markdown(
+                "Rows are grouped by Destination + Application/Software/Domain. Sources, first/last seen, duration, and hits "
+                "are aggregated per MAC while Status and Max Risk keep the highest-severity state."
+            )
+            st.markdown("Only rows with valid domains and real application/software/domain identifiers are shown.")
+            st.markdown(
+                "Software/CONN rows may use inferred domain context from nearest non-software events for this MAC (\u00b12s). "
+                "Port(s) inferred are labeled '(inferred)'."
+            )
+            st.markdown("Port(s) in this table show up to the top 3 ports; `...` means more ports exist. Click an app row to view all port usage details.")
+            st.markdown(
+                "WEIRD and other logs without native application identity are matched to nearby events when possible; "
+                "rows with no real destination+application after inference are excluded from this table."
+            )
 
         edited_inv = inv_grid_response.get("data", None)
         if isinstance(edited_inv, pd.DataFrame):
@@ -4052,10 +4066,11 @@ def show_forensics_dialog(conn):
                 st.rerun()
 
         st.download_button(
-            "Download Application Inventory CSV",
+            "Download CSV",
             data=inventory_df.to_csv(index=False).encode("utf-8"),
             file_name=f"shadow_app_inventory_{target_mac}.csv",
             mime="text/csv",
+            key=f"shadow_app_inventory_csv_{target_mac}",
         )
 
 def hide_dialog_x_button():
@@ -4108,7 +4123,6 @@ def render_shadow_apps(parquet_root: Path):
         "Incidents correlate conn/http/ssl/dns/files/software telemetry and score risk confidence "
         "for unauthorized app activity (Critical/High/Medium/Low/Safe)."
     )
-    app_scope_hint = st.empty()
     with st.expander("Detection basis", expanded=False):
         st.markdown(
             "<div class='shadow-callout'>Risk uses highest-severity matching rules per event, plus multi-signal escalation for unauthorized traffic.</div>",
@@ -4177,10 +4191,6 @@ def render_shadow_apps(parquet_root: Path):
     auth_pct = (authorized_count / total_events * 100) if total_events else 0
     unauth_pct = (unauthorized_count / total_events * 100) if total_events else 0
     crit_high_pct = (crit_high_count / total_events * 100) if total_events else 0
-    app_scope_hint.markdown(
-        f"<div class='shadow-filter-hint shadow-scope-hint'>Detected <strong>{total_events:,}</strong> shadow app events in this dataset. Use filters below to refine the incident timeline and table.</div>",
-        unsafe_allow_html=True,
-    )
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Events", f"{total_events:,}")
@@ -4253,7 +4263,7 @@ def render_shadow_apps(parquet_root: Path):
     # TAB 1: AgGrid (CLICK MAC CELL -> OPEN DIALOG)
     # =============================================================================
     with tab_main:
-        st.markdown("### Application Audit Log")
+        st.markdown("### Incident rows")
 
         st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
         search_query_audit = st.text_input(
@@ -4661,12 +4671,29 @@ def render_shadow_apps(parquet_root: Path):
                 reload_data=False,
                 key=grid_key,
             )
-            st.caption(
-                f"{len(df_grid):,} grouped rows shown. Rows are built by grouping filtered events on "
-                "Destination + Application + MAC + Hostname + IP + Source, then computing First Seen, Last Seen, Duration, "
-                "Hits, and max risk; groups are sorted by max risk score and hit count, and only the top 1,000 are displayed."
+            with st.expander("Table information", expanded=False):
+                st.markdown(
+                    f"{len(df_grid):,} grouped rows shown. Rows are built by grouping filtered events on "
+                    "Destination + Application + MAC + Hostname + IP + Source, then computing First Seen, Last Seen, Duration, "
+                    "Hits, and max risk; groups are sorted by max risk score and hit count, and only the top 1,000 are displayed."
+                )
+                st.markdown("Table excludes unresolved placeholders and keeps only valid domains with real app identifiers.")
+            export_grid = grid_response.get("data", None)
+            if isinstance(export_grid, pd.DataFrame):
+                export_df = export_grid.copy()
+            elif isinstance(export_grid, list):
+                export_df = pd.DataFrame(export_grid)
+            else:
+                export_df = pd.DataFrame()
+            if export_df.empty:
+                export_df = df_grid.copy()
+            st.download_button(
+                "Download CSV",
+                data=export_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"shadow_app_incident_rows_{selected_day}.csv",
+                mime="text/csv",
+                key=f"shadow_app_incident_rows_csv_{selected_day}",
             )
-            st.caption("Table excludes unresolved placeholders and keeps only valid domains with real app identifiers.")
 
             # selection -> open dialog
             selected_rows = grid_response.get("selected_rows", None)
