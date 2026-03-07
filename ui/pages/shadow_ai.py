@@ -20,7 +20,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v28-http-bytes-risklevel-ui"
+CACHE_VERSION = "shadow-ai-cache-v28-http-bytes-risklevel-uis"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -710,6 +710,15 @@ def _heuristic_root_domain(host: str) -> str:
     return ".".join(labels[-2:])
 
 
+def _unknown_ai_provider_label(raw_text: str) -> str:
+    host = _to_domain_from_destination(raw_text)
+    root_domain = _heuristic_root_domain(host)
+    base = str(root_domain or host or "").strip().lower()
+    if not base:
+        return "Unknown AI (Heuristic)"
+    return f"{base} (unknown ai provider)"
+
+
 def _canonical_provider_from_hint(text_hint: str) -> str:
     norm = _normalize_fuzzy_text(text_hint)
     if not norm:
@@ -736,7 +745,7 @@ def _canonical_provider_from_hint(text_hint: str) -> str:
 def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
     raw = str(raw_text or "").strip()
     if not raw:
-        return "Unknown AI (Heuristic)", "generic-ai-hint"
+        return _unknown_ai_provider_label(raw), "generic-ai-hint"
 
     host = _to_domain_from_destination(raw)
     root_domain = _heuristic_root_domain(host)
@@ -744,11 +753,11 @@ def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
         explicit_provider = HEURISTIC_DOMAIN_PROVIDER_MAP.get(str(root_domain).strip().lower())
         if explicit_provider:
             return explicit_provider, f"heuristic-domain-config:{root_domain}"
-        return "Unknown AI (Heuristic)", f"heuristic-domain-unmapped:{root_domain}"
+        return _unknown_ai_provider_label(root_domain), f"heuristic-domain-unmapped:{root_domain}"
 
     norm = _normalize_fuzzy_text(raw)
     if not norm:
-        return "Unknown AI (Heuristic)", "generic-ai-hint"
+        return _unknown_ai_provider_label(raw), "generic-ai-hint"
 
     tokens = [
         t
@@ -756,7 +765,7 @@ def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
         if t and t not in FUZZY_TOKEN_STOPWORDS and t not in FUZZY_GENERIC_VENDOR_TOKENS
     ]
     if not tokens:
-        return "Unknown AI (Heuristic)", "generic-ai-hint"
+        return _unknown_ai_provider_label(raw), "generic-ai-hint"
 
     ai_stems = tuple(sorted({s for s in FUZZY_AI_SIGNAL_TOKENS if len(s) >= 4}, key=len, reverse=True))
     strong_tokens = [
@@ -779,7 +788,7 @@ def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
     label = re.sub(r"[_\-]+", " ", chosen).strip()
     label = re.sub(r"\s+", " ", label)
     if not label:
-        return "Unknown AI (Heuristic)", "generic-ai-hint"
+        return _unknown_ai_provider_label(raw), "generic-ai-hint"
     pretty = label.upper() if len(label) <= 4 else label.title()
     return pretty[:48], f"heuristic-token:{chosen}"
 
@@ -1108,6 +1117,41 @@ def _enforce_ai_only_rows(df: pd.DataFrame) -> pd.DataFrame:
     if "AI_Provider" not in df.columns:
         return df.iloc[0:0]
     return df.loc[_is_ai_provider_series(df["AI_Provider"])].copy()
+
+
+def _relabel_unknown_heuristic_providers(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    if df.empty or "AI_Provider" not in df.columns:
+        return df
+
+    out = df.copy()
+    provider = out["AI_Provider"].astype(str).str.strip()
+    unknown_mask = provider.str.lower().eq("unknown ai (heuristic)")
+    if not bool(unknown_mask.any()):
+        return out
+
+    invalid_values = {"", "nan", "none", "null", "-"}
+    domain = out.get("Domain", pd.Series("", index=out.index)).astype(str).str.strip().str.lower()
+    domain = domain.mask(domain.isin(invalid_values), "")
+
+    if "Destination" in out.columns:
+        dest_domain = _domain_series_from_destination(out.get("Destination", pd.Series("", index=out.index))).astype(str).str.strip().str.lower()
+        dest_domain = dest_domain.mask(dest_domain.isin(invalid_values), "")
+        domain = domain.where(domain.ne(""), dest_domain)
+
+    if "Matched_Value" in out.columns:
+        match_domain = _domain_series_from_destination(out.get("Matched_Value", pd.Series("", index=out.index))).astype(str).str.strip().str.lower()
+        match_domain = match_domain.mask(match_domain.isin(invalid_values), "")
+        domain = domain.where(domain.ne(""), match_domain)
+
+    root = domain.map(_heuristic_root_domain)
+    label_base = root.where(root.astype(str).str.strip().ne(""), domain)
+    label_base = label_base.astype(str).str.strip().str.lower()
+    label_base = label_base.mask(label_base.isin(invalid_values), "unknown-ai")
+    label = label_base + " (unknown ai provider)"
+    out.loc[unknown_mask, "AI_Provider"] = label.loc[unknown_mask]
+    return out
 
 
 def _attach_actor_identity_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -4552,6 +4596,10 @@ def render_shadow_ai(parquet_root: Path):
             "If regex/fuzzy misses, generic fallback only maps domains when explicitly configured."
         )
         st.markdown(
+            "`Unknown AI` heuristic hits are shown as `<domain> (unknown ai provider)` when traffic is AI-like "
+            "but the provider is not explicitly mapped in `heuristic_domain_provider_map`."
+        )
+        st.markdown(
             f"Risk score starts at **10** and adds weighted signals: HTTP (+20), POST (+20), "
             f"upload >= {int(round(LARGE_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB (+40), "
             f"upload >= {int(round(MEDIUM_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB (+20), "
@@ -4712,6 +4760,9 @@ def render_shadow_ai(parquet_root: Path):
                 f"Included {included_from_adjacent:,} rows from adjacent day folders (yesterday/tomorrow)."
             )
 
+    # Keep cached legacy labels readable: Unknown AI (Heuristic) -> <domain> (unknown ai provider).
+    df = _relabel_unknown_heuristic_providers(df)
+
 
     if df.empty:
         st.info("No AI signatures detected in the selected range.")
@@ -4805,9 +4856,7 @@ def render_shadow_ai(parquet_root: Path):
     tabs = st.tabs([
         "Overview",
         "Trends",
-        "Top Destinations",
-        "Shadow AI by MAC",
-        "Policy / Noise Control",
+        "Shadow AI Incidents",
     ])
 
     # =============================================================================
@@ -4966,6 +5015,16 @@ def render_shadow_ai(parquet_root: Path):
                 "`Max_Risk_Level` and `Risk_Level_Basis` explain prioritized providers.",
             ],
         )
+        export_prov = pd.DataFrame(prov_response.get("data", [])) if isinstance(prov_response, dict) else pd.DataFrame()
+        if export_prov.empty:
+            export_prov = prov_grid.copy()
+        st.download_button(
+            "Download CSV",
+            data=export_prov.to_csv(index=False).encode("utf-8"),
+            file_name=f"shadow_ai_providers_in_view_{selected_scope_key}.csv",
+            mime="text/csv",
+            key=f"shadow_ai_provider_csv_{selected_scope_key}",
+        )
 
         edited_prov = prov_response.get("data", None)
         if isinstance(edited_prov, pd.DataFrame):
@@ -5094,7 +5153,7 @@ def render_shadow_ai(parquet_root: Path):
             st.plotly_chart(fig3, width="stretch")
 
     # =============================================================================
-    # TAB: TOP DESTINATIONS
+    # TAB: SHADOW AI INCIDENTS (Top Destinations)
     # =============================================================================
     with tabs[2]:
         st.markdown("### Top destinations/domains")
@@ -5174,9 +5233,9 @@ def render_shadow_ai(parquet_root: Path):
         )
 
     # =============================================================================
-    # TAB: SHADOW AI BY MAC (with drilldown)
+    # TAB: SHADOW AI INCIDENTS (Shadow AI by MAC)
     # =============================================================================
-    with tabs[3]:
+    with tabs[2]:
         st.markdown("### Shadow AI by MAC")
         st.caption("Click on ony MAC address to show device AI incidents dialog")
 
@@ -5326,44 +5385,10 @@ def render_shadow_ai(parquet_root: Path):
                 show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
 
     # =============================================================================
-    # TAB: POLICY / NOISE CONTROL
+    # TAB: SHADOW AI INCIDENTS (Signature Matches)
     # =============================================================================
-    with tabs[4]:
-        st.markdown("### Policy posture / noise controls")
-
-        st.write(
-            "Verdict behavior: providers matched by `ai_signatures` (or configured `local_ai_ports`) are marked `Allowed`. "
-            "Only unknown/heuristic providers remain `Shadow AI`."
-        )
-        st.write(
-            "Optional allowlist override: add provider names to `authorized_providers` in `ai_signatures.yaml` "
-            "to force specific names to `Allowed`."
-        )
-
-        # show allowlist content
-        st.markdown("#### Current allowlist (authorized_providers)")
-        if AUTHORIZED_PROVIDERS:
-            st.code("\n".join(AUTHORIZED_PROVIDERS))
-        else:
-            st.info("authorized_providers is empty (using ai_signatures/local_ai_ports as allowed set).")
-
-        st.markdown("#### Detection settings")
-        st.code(yaml.safe_dump(
-            {
-                "baseline_days": BASELINE_DAYS,
-                "large_https_post_threshold_mb": round(LARGE_UPLOAD_THRESHOLD_BYTES / (1024 * 1024), 2),
-                "medium_https_post_threshold_mb": round(MEDIUM_UPLOAD_THRESHOLD_BYTES / (1024 * 1024), 2),
-                "high_frequency_calls_per_hour": HIGH_FREQUENCY_CALLS_PER_HOUR,
-                "json_post_calls_per_hour": JSON_POST_CALLS_PER_HOUR,
-                "small_request_max_kb": int(SMALL_REQUEST_MAX_BYTES / 1024),
-                "smb_window_minutes": SMB_WINDOW_MINUTES,
-                "file_upload_extensions": FILE_UPLOAD_EXTENSIONS,
-                "saas_allowlist_domains": SAAS_ALLOWLIST_DOMAINS,
-            },
-            sort_keys=False,
-        ))
-
-        st.markdown("#### Signature fragments causing matches (top)")
+    with tabs[2]:
+        st.markdown("### Signature fragments causing matches (top)")
         sig_top = filtered.groupby(["Policy_Verdict", "Signature_Match"]).size().reset_index(name="Events")
         sig_top = sig_top.sort_values("Events", ascending=False).head(50)
         sig_grid = sig_top.copy()
@@ -5372,7 +5397,7 @@ def render_shadow_ai(parquet_root: Path):
         gb_sig.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
         gb_sig.configure_column("Signature_Match", header_name="Signature", minWidth=220, flex=1.8)
         gb_sig.configure_column("Events", minWidth=90)
-        render_shadow_aggrid(
+        sig_response = render_shadow_aggrid(
             sig_grid,
             gb_sig,
             key=f"shadow_ai_sig_grid_{selected_scope_key}",
@@ -5388,9 +5413,14 @@ def render_shadow_ai(parquet_root: Path):
                 "Use this view to tune noisy fragments in `ai_signatures.yaml`.",
             ],
         )
-
-        st.markdown("#### Suggested tuning (if noisy)")
-        st.write("- If many hits are DNS-only, enable `Ignore DNS-only events` and focus on HTTP/SSL evidence.")
-        st.write("- If one signature fragment dominates noisy matches, narrow or anchor it in `ai_signatures.yaml`.")
-        st.write("- Prefer HTTP host/uri and TLS SNI for stronger attribution; DNS is weaker evidence.")
+        export_sig = pd.DataFrame(sig_response.get("data", [])) if isinstance(sig_response, dict) else pd.DataFrame()
+        if export_sig.empty:
+            export_sig = sig_grid.copy()
+        st.download_button(
+            "Download CSV",
+            data=export_sig.to_csv(index=False).encode("utf-8"),
+            file_name=f"shadow_ai_signature_matches_{selected_scope_key}.csv",
+            mime="text/csv",
+            key=f"shadow_ai_sig_csv_{selected_scope_key}",
+        )
 
