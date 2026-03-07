@@ -4735,7 +4735,7 @@ def render_shadow_apps(parquet_root: Path):
 
             grid_key = f"shadow_audit_grid_{int(st.session_state.get('shadow_grid_nonce', 0))}"
 
-            st.caption("Click on any MAC Address to show device incidents dialog.")
+            st.caption("Click on any MAC address to show device app incidents dialog.")
             grid_response = AgGrid(
                 df_grid,
                 gridOptions=grid_options,

@@ -2270,6 +2270,7 @@ def render_shadow_sharing(parquet_root: Path):
     # -------------------------------------------------------------------------
     with tab_overview:
         st.markdown("#### Shadow Sharing Incidents")
+        st.caption("Click on any MAC address to show device sharing incidents dialog.")
         st.markdown("<div class='shadow-filter-shell shadow-filter-no-divider'>", unsafe_allow_html=True)
         search_q = st.text_input(
             "Search (MAC, Host, IP, Destination, Basis)",

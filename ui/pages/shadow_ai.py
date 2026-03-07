@@ -3229,6 +3229,13 @@ def _build_shadow_ai_mac_tab_frames(filtered: pd.DataFrame) -> Tuple[pd.DataFram
     mac_summary["Max_Risk"] = pd.to_numeric(mac_summary["Max_Risk"], errors="coerce").fillna(0).round(0).astype(int)
     mac_summary["Avg_Risk"] = pd.to_numeric(mac_summary["Avg_Risk"], errors="coerce").fillna(0).round(1)
     mac_summary["Max_Risk_Level"] = mac_summary["Max_Risk"].map(_risk_level_from_score_value).astype(str)
+    mac_summary["_risk_rank"] = (
+        mac_summary["Max_Risk_Level"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
+    )
+    mac_summary = mac_summary.sort_values(
+        ["_risk_rank", "Max_Risk", "Events", "Total_Upload_MB"],
+        ascending=[False, False, False, False],
+    ).drop(columns=["_risk_rank"], errors="ignore")
 
     # Keep Hostname non-empty in table output when host attribution is missing.
     if "Hostname" in mac_summary.columns:
@@ -3720,6 +3727,15 @@ def _new_grid_builder(df_grid: pd.DataFrame, page_size: int = 15) -> GridOptions
     return gb
 
 
+def _render_table_information(summary_line: str, detail_lines: List[str]) -> None:
+    with st.expander("Table information", expanded=False):
+        if str(summary_line or "").strip():
+            st.markdown(str(summary_line))
+        for line in detail_lines or []:
+            if str(line or "").strip():
+                st.markdown(str(line))
+
+
 def _close_shadow_ai_allow_dialog() -> None:
     st.session_state["shadow_ai_allow_dialog_open"] = False
     st.session_state.pop("shadow_ai_allow_candidate", None)
@@ -3765,10 +3781,6 @@ def _render_shadow_ai_mac_drilldown(
 ) -> None:
     """
     Device-scoped drilldown. Built to be accurate (MAC-locked) and fast to render.
-
-    Notes:
-      - We show a deduplicated view by default to avoid double-counting the same evidence row in the UI.
-      - Use the "Show raw duplicates" toggle if you need to see every matching row.
     """
     mac_events = mac_events.copy()
 
@@ -3798,8 +3810,15 @@ def _render_shadow_ai_mac_drilldown(
         return
 
     mac_key = re.sub(r"[^0-9A-Za-z_]+", "_", active_mac).strip("_") or "mac"
+    mac_series = (
+        mac_events.get("mac", pd.Series("", index=mac_events.index))
+        .astype(str)
+        .str.strip()
+    )
+    mac_series = mac_series[~mac_series.str.lower().isin({"", "nan", "none", "null", "-"})]
+    scope_mac_display = str(mac_series.iloc[0]).strip() if not mac_series.empty else active_mac
 
-    # --- optional dedupe for UI ---
+    # Dedup for UI to avoid duplicate evidence rows.
     dedupe_cols = [
         "ts", "AI_Provider", "Domain", "Evidence_Type", "Detail", "Destination",
         "id.orig_h", "Match_Field", "Signature_Match", "Matched_Value", "Detection_Source",
@@ -3807,31 +3826,8 @@ def _render_shadow_ai_mac_drilldown(
     dedupe_cols = [c for c in dedupe_cols if c in mac_events.columns]
     mac_events_unique = mac_events.drop_duplicates(subset=dedupe_cols, keep="first") if dedupe_cols else mac_events
 
-    show_raw = st.toggle("Show raw duplicates", value=False, key=f"shadow_ai_mac_show_raw_{selected_scope_key}_{mac_key}_{key_prefix}")
-    view_df = mac_events if show_raw else mac_events_unique
-
-    # --- search inside dialog (applies to Overview/Forensics/Event Log) ---
+    view_df = mac_events_unique
     base_view_df = view_df
-    scope_before_date_n = int(len(base_view_df))
-    ts_scope = pd.to_datetime(base_view_df.get("ts", pd.Series(pd.NaT, index=base_view_df.index)), errors="coerce")
-    ts_valid = ts_scope.dropna()
-    date_filtered_removed = 0
-    selected_start_day = None
-    selected_end_day = None
-    if not ts_valid.empty:
-        min_day = ts_valid.min().date()
-        max_day = ts_valid.max().date()
-        selected_date_range = st.date_input(
-            "Date range (this MAC)",
-            value=(min_day, max_day),
-            min_value=min_day,
-            max_value=max_day,
-            key=f"shadow_ai_mac_date_range_{selected_scope_key}_{mac_key}_{key_prefix}",
-        )
-        selected_start_day, selected_end_day = _coerce_date_range_selection(selected_date_range, min_day, max_day)
-        date_mask = ts_scope.dt.date.between(selected_start_day, selected_end_day)
-        base_view_df = base_view_df.loc[date_mask.fillna(False)].copy()
-        date_filtered_removed = int(max(0, scope_before_date_n - len(base_view_df)))
     base_n = int(len(base_view_df))
 
     _search_key = f"shadow_ai_mac_search_{selected_scope_key}_{mac_key}_{key_prefix}"
@@ -3880,21 +3876,13 @@ def _render_shadow_ai_mac_drilldown(
 
     raw_n = int(len(mac_events))
     dedup_n = int(len(mac_events_unique))
-    base_n_eff = int(len(base_view_df))
     view_n = int(len(view_df))
-    dup_removed = int(max(0, raw_n - dedup_n)) if not show_raw else 0
-    search_removed = int(max(0, base_n_eff - view_n))
+    dup_removed = int(max(0, raw_n - dedup_n))
+    search_removed = int(max(0, base_n - view_n))
 
     high_n = int(view_df["Severity"].isin(["CRITICAL", "HIGH"]).sum())
     providers_n = int(view_df["AI_Provider"].astype(str).replace({"": None, "nan": None}).dropna().nunique())
     upload_mb = _sum_upload_mb(view_df.get("Upload_Bytes", pd.Series(0, index=view_df.index)))
-
-    top_host = (
-        view_df["host_name"].astype(str).replace({"": None, "nan": None}).dropna().value_counts().head(1).index[0]
-        if "host_name" in view_df.columns and view_df["host_name"].astype(str).replace({"": None, "nan": None}).dropna().shape[0] > 0
-        else ""
-    )
-    uniq_ips = int(view_df["id.orig_h"].astype(str).replace({"": None, "nan": None}).dropna().nunique()) if "id.orig_h" in view_df.columns else 0
 
     d1, d2, d3, d4, d5 = st.columns(5, gap="small")
     d1.metric("Events (view)", f"{view_n:,}")
@@ -3903,24 +3891,13 @@ def _render_shadow_ai_mac_drilldown(
     d4.metric("High/Critical", f"{high_n:,}")
     d5.metric("Upload (MB)", f"{upload_mb:.2f}")
 
-    if dup_removed or date_filtered_removed or (search_applied and search_removed):
+    if dup_removed or (search_applied and search_removed):
         bits = []
         if dup_removed:
             bits.append(f"dedup removed {dup_removed:,} row(s)")
-        if date_filtered_removed:
-            bits.append(f"date filter removed {date_filtered_removed:,} row(s)")
         if search_applied and search_removed:
             bits.append(f"search filtered {search_removed:,} row(s)")
         st.caption(" | ".join(bits))
-
-    meta_line = f"MAC: `{active_mac}`"
-    if top_host:
-        meta_line += f" | Host: `{top_host}`"
-    if uniq_ips:
-        meta_line += f" | Unique IPs: **{uniq_ips:,}**"
-    if selected_start_day and selected_end_day:
-        meta_line += f" | Date range: **{selected_start_day} to {selected_end_day}**"
-    st.caption(meta_line)
 
     export_cols = [
         "ts", "mac", "host_name", "id.orig_h", "Severity", "Risk_Level", "Risk_Score", "Risk_Basis", "Critical_Reason",
@@ -3932,99 +3909,7 @@ def _render_shadow_ai_mac_drilldown(
     export_df = view_df[export_cols].copy() if export_cols else view_df.copy()
     if "ts" in export_df.columns:
         export_df["ts"] = pd.to_datetime(export_df["ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
-    csv_scope = "all_days"
-    if selected_start_day and selected_end_day:
-        csv_scope = f"{selected_start_day}_{selected_end_day}"
-    st.download_button(
-        "Download CSV (current MAC view)",
-        data=export_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"shadow_ai_mac_{mac_key}_{csv_scope}.csv",
-        mime="text/csv",
-        key=f"shadow_ai_mac_dialog_csv_{selected_scope_key}_{mac_key}_{key_prefix}",
-    )
-
-    st.markdown("#### AI services used by this MAC")
-    st.caption("Summary is based on the current view (page filters + duplicate toggle + dialog date range + dialog search).")
-
-    prov_src = view_df.copy()
-    prov_src["AI_Provider"] = prov_src["AI_Provider"].astype(str)
-    prov_src = prov_src[prov_src["AI_Provider"].str.strip().str.lower().replace({"nan": ""}) != ""].copy()
-
-    if prov_src.empty:
-        st.info("No AI providers found for this MAC in the current view.")
-    else:
-        def _mode_nonempty(s: pd.Series) -> str:
-            s = s.astype(str).replace({"nan": "", "None": ""}).fillna("")
-            s = s[s.str.strip() != ""]
-            if s.empty:
-                return ""
-            return str(s.value_counts().index[0])
-
-        def _nunique_nonempty(s: pd.Series) -> int:
-            s = s.astype(str).replace({"nan": "", "None": ""}).fillna("").map(lambda v: v.strip())
-            s = s[s != ""]
-            return int(s.nunique())
-
-        prov_src["_sev_rank"] = prov_src["Severity"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
-
-        prov_tbl = prov_src.groupby("AI_Provider", dropna=False).agg(
-            Events=("ts", "count"),
-            Domains=("Domain", _nunique_nonempty),
-            Upload_MB=("Upload_Bytes", _sum_upload_mb),
-            Avg_Risk=("Risk_Score", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).mean())),
-            Max_Risk=("Risk_Score", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).max())),
-            First_Seen=("ts", "min"),
-            Last_Seen=("ts", "max"),
-            Highest_Severity_Rank=("_sev_rank", "max"),
-            Top_Domain=("Domain", _mode_nonempty),
-            Top_Verdict=("Policy_Verdict", _mode_nonempty),
-        ).reset_index()
-
-        risk_basis_tbl = _build_group_risk_basis_frame(prov_src, ["AI_Provider"], out_col="Risk_Level_Basis")
-        if not risk_basis_tbl.empty:
-            prov_tbl = prov_tbl.merge(risk_basis_tbl, on=["AI_Provider"], how="left")
-
-        prov_tbl["Highest_Severity"] = prov_tbl["Highest_Severity_Rank"].map(SEVERITY_RANK_INV_MAP).fillna("")
-        prov_tbl = prov_tbl.drop(columns=["Highest_Severity_Rank"])
-        prov_tbl["Upload_MB"] = pd.to_numeric(prov_tbl["Upload_MB"], errors="coerce").fillna(0).round(2)
-        prov_tbl["Avg_Risk"] = pd.to_numeric(prov_tbl["Avg_Risk"], errors="coerce").fillna(0).round(1)
-        prov_tbl["Max_Risk"] = pd.to_numeric(prov_tbl["Max_Risk"], errors="coerce").fillna(0).round(0).astype(int)
-        prov_tbl["Max_Risk_Level"] = prov_tbl["Max_Risk"].map(_risk_level_from_score_value).astype(str)
-        prov_tbl["Risk_Level_Basis"] = prov_tbl.get("Risk_Level_Basis", pd.Series("", index=prov_tbl.index)).astype(str)
-        prov_tbl["Risk_Level_Basis"] = prov_tbl["Risk_Level_Basis"].replace({"nan": "", "None": ""})
-        prov_tbl.loc[prov_tbl["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
-
-        prov_tbl["First_Seen"] = pd.to_datetime(prov_tbl["First_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-        prov_tbl["Last_Seen"] = pd.to_datetime(prov_tbl["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-
-        prov_tbl = prov_tbl.sort_values(["Events", "Upload_MB"], ascending=False).head(60).copy()
-
-        prov_tbl.insert(0, "#", range(1, len(prov_tbl) + 1))
-
-        gb_prov = _new_grid_builder(prov_tbl, page_size=20)
-        gb_prov.configure_column("AI_Provider", header_name="AI Provider", minWidth=175, flex=1.25)
-        gb_prov.configure_column("Events", minWidth=90, flex=0.6)
-        gb_prov.configure_column("Domains", minWidth=90, flex=0.6)
-        gb_prov.configure_column("Upload_MB", header_name="Upload (MB)", minWidth=115, flex=0.7)
-        gb_prov.configure_column("Avg_Risk", header_name="Avg Risk", minWidth=95, flex=0.6, cellStyle=_risk_score_cellstyle())
-        gb_prov.configure_column("Max_Risk", header_name="Max Risk", minWidth=95, flex=0.6, cellStyle=_risk_score_cellstyle())
-        gb_prov.configure_column("Max_Risk_Level", header_name="Risk Level", minWidth=110, flex=0.7, cellStyle=_severity_cellstyle())
-        gb_prov.configure_column("Highest_Severity", header_name="Highest Sev", minWidth=115, flex=0.7, cellStyle=_severity_cellstyle())
-        gb_prov.configure_column("First_Seen", header_name="First Seen", minWidth=150, flex=0.95)
-        gb_prov.configure_column("Last_Seen", header_name="Last Seen", minWidth=150, flex=0.95)
-        gb_prov.configure_column("Top_Domain", header_name="Top Domain", minWidth=180, flex=1.25)
-        gb_prov.configure_column("Top_Verdict", header_name="Top Verdict", minWidth=125, flex=0.85, cellStyle=_policy_cellstyle())
-        gb_prov.configure_column("Risk_Level_Basis", header_name="Risk Level Basis", minWidth=300, flex=2.2)
-
-        render_shadow_aggrid(
-            prov_tbl,
-            gb_prov,
-            key=f"shadow_ai_mac_providers_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
-            height=280,
-            auto_fit_columns=False,
-        )
-
-    tabs = st.tabs(["Overview", "Forensics", "Event Log"])
+    tabs = st.tabs(["Overview", "Incident Rows"])
 
     with tabs[0]:
         chart_df = view_df
@@ -4100,84 +3985,113 @@ def _render_shadow_ai_mac_drilldown(
             st.plotly_chart(figd, width="stretch")
 
     with tabs[1]:
-        st.markdown("#### Priority incidents (this MAC)")
-        pri = view_df[
-            view_df["Severity"].isin(["CRITICAL", "HIGH"])
-            | view_df.get("Governance_Alert", pd.Series(False, index=view_df.index)).astype(bool)
-            | view_df.get("First_Seen_SaaS", pd.Series(False, index=view_df.index)).astype(bool)
-        ].copy()
+        st.markdown(f"#### AI services used ({scope_mac_display})")
+        st.caption("Summary is based on the current view (page filters + dialog search).")
 
-        if pri.empty:
-            st.success("No high-severity or governance incidents for this MAC in the current view.")
+        prov_src = view_df.copy()
+        prov_src["AI_Provider"] = prov_src["AI_Provider"].astype(str)
+        prov_src = prov_src[prov_src["AI_Provider"].str.strip().str.lower().replace({"nan": ""}) != ""].copy()
+
+        if prov_src.empty:
+            st.info("No AI providers found for this MAC in the current view.")
         else:
-            pri_cols = [
-                "ts", "Severity", "Policy_Verdict",
-                "AI_Provider", "Domain", "Evidence_Type",
-                "Upload_Bytes", "Risk_Score", "Detail", "Destination",
-                "Actor", "Actor_Type", "id.orig_h", "host_name", "user_agent",
-                "Behavior_Indicators", "Files_Log_Correlation", "Detection_Basis", "Policy_Basis", "Risk_Basis", "Critical_Reason",
-            ]
-            for c in pri_cols:
-                if c not in pri.columns:
-                    pri[c] = ""
-            pri_grid = pri[pri_cols].head(150).copy()
-            pri_grid.insert(0, "#", range(1, len(pri_grid) + 1))
-            pri_grid["ts"] = pd.to_datetime(pri_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-            pri_grid["Upload_Bytes"] = pd.to_numeric(pri_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+            def _mode_nonempty(s: pd.Series) -> str:
+                s = s.astype(str).replace({"nan": "", "None": ""}).fillna("")
+                s = s[s.str.strip() != ""]
+                if s.empty:
+                    return ""
+                return str(s.value_counts().index[0])
 
-            gb_pri = _new_grid_builder(pri_grid, page_size=20)
-            gb_pri.configure_column("ts", header_name="Time", minWidth=150, flex=1.0)
-            gb_pri.configure_column("Severity", minWidth=90, flex=0.7, cellStyle=_severity_cellstyle())
-            gb_pri.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.8, cellStyle=_policy_cellstyle())
-            gb_pri.configure_column("AI_Provider", header_name="Provider", minWidth=150, flex=1.1)
-            gb_pri.configure_column("Domain", minWidth=170, flex=1.2)
-            gb_pri.configure_column("Evidence_Type", header_name="Evidence", minWidth=120, flex=0.9)
-            gb_pri.configure_column("Upload_Bytes", header_name="Bytes", minWidth=95, flex=0.7)
-            gb_pri.configure_column("Risk_Score", header_name="Risk", minWidth=85, flex=0.6, cellStyle=_risk_score_cellstyle())
-            gb_pri.configure_column("Detail", minWidth=220, flex=1.8)
-            gb_pri.configure_column("Destination", minWidth=180, flex=1.4)
-            gb_pri.configure_column("Actor", header_name="Who", minWidth=160, flex=1.1)
-            gb_pri.configure_column("Actor_Type", header_name="Who Type", minWidth=105, flex=0.8)
-            gb_pri.configure_column("id.orig_h", header_name="IP", minWidth=125, flex=0.9)
-            gb_pri.configure_column("host_name", header_name="Host", minWidth=130, flex=0.9)
-            gb_pri.configure_column("user_agent", header_name="User Agent", minWidth=220, flex=1.7)
-            gb_pri.configure_column("Behavior_Indicators", header_name="Indicators", minWidth=160, flex=1.1)
-            gb_pri.configure_column("Files_Log_Correlation", header_name="files.log Corr", minWidth=125, flex=0.9)
-            gb_pri.configure_column("Detection_Basis", header_name="Detection Basis", minWidth=190, flex=1.4)
-            gb_pri.configure_column("Policy_Basis", header_name="Policy Basis", minWidth=160, flex=1.2)
-            gb_pri.configure_column("Risk_Basis", header_name="Risk Level Basis", minWidth=220, flex=1.6)
-            gb_pri.configure_column("Critical_Reason", header_name="Why Critical/High", minWidth=200, flex=1.4)
+            def _nunique_nonempty(s: pd.Series) -> int:
+                s = s.astype(str).replace({"nan": "", "None": ""}).fillna("").map(lambda v: v.strip())
+                s = s[s != ""]
+                return int(s.nunique())
+
+            prov_src["_sev_rank"] = prov_src["Severity"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
+
+            prov_tbl = prov_src.groupby("AI_Provider", dropna=False).agg(
+                Events=("ts", "count"),
+                Domains=("Domain", _nunique_nonempty),
+                Upload_MB=("Upload_Bytes", _sum_upload_mb),
+                Avg_Risk=("Risk_Score", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).mean())),
+                Max_Risk=("Risk_Score", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).max())),
+                First_Seen=("ts", "min"),
+                Last_Seen=("ts", "max"),
+                Highest_Severity_Rank=("_sev_rank", "max"),
+                Top_Domain=("Domain", _mode_nonempty),
+                Top_Verdict=("Policy_Verdict", _mode_nonempty),
+            ).reset_index()
+
+            risk_basis_tbl = _build_group_risk_basis_frame(prov_src, ["AI_Provider"], out_col="Risk_Level_Basis")
+            if not risk_basis_tbl.empty:
+                prov_tbl = prov_tbl.merge(risk_basis_tbl, on=["AI_Provider"], how="left")
+
+            prov_tbl["Highest_Severity"] = prov_tbl["Highest_Severity_Rank"].map(SEVERITY_RANK_INV_MAP).fillna("")
+            prov_tbl = prov_tbl.drop(columns=["Highest_Severity_Rank"])
+            prov_tbl["Upload_MB"] = pd.to_numeric(prov_tbl["Upload_MB"], errors="coerce").fillna(0).round(2)
+            prov_tbl["Avg_Risk"] = pd.to_numeric(prov_tbl["Avg_Risk"], errors="coerce").fillna(0).round(1)
+            prov_tbl["Max_Risk"] = pd.to_numeric(prov_tbl["Max_Risk"], errors="coerce").fillna(0).round(0).astype(int)
+            prov_tbl["Max_Risk_Level"] = prov_tbl["Max_Risk"].map(_risk_level_from_score_value).astype(str)
+            prov_tbl["_risk_rank"] = (
+                prov_tbl["Max_Risk_Level"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
+            )
+            prov_tbl["Risk_Level_Basis"] = prov_tbl.get("Risk_Level_Basis", pd.Series("", index=prov_tbl.index)).astype(str)
+            prov_tbl["Risk_Level_Basis"] = prov_tbl["Risk_Level_Basis"].replace({"nan": "", "None": ""})
+            prov_tbl.loc[prov_tbl["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
+
+            prov_tbl["First_Seen"] = pd.to_datetime(prov_tbl["First_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+            prov_tbl["Last_Seen"] = pd.to_datetime(prov_tbl["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
+
+            prov_tbl = prov_tbl.sort_values(
+                ["_risk_rank", "Max_Risk", "Events", "Upload_MB"],
+                ascending=[False, False, False, False],
+            ).head(60).copy()
+            prov_tbl = prov_tbl.drop(columns=["_risk_rank"], errors="ignore")
+            prov_tbl.insert(0, "#", range(1, len(prov_tbl) + 1))
+
+            gb_prov = _new_grid_builder(prov_tbl, page_size=20)
+            gb_prov.configure_column("AI_Provider", header_name="AI Provider", minWidth=175, flex=1.25)
+            gb_prov.configure_column("Events", minWidth=90, flex=0.6)
+            gb_prov.configure_column("Domains", minWidth=90, flex=0.6)
+            gb_prov.configure_column("Upload_MB", header_name="Upload (MB)", minWidth=115, flex=0.7)
+            gb_prov.configure_column("Avg_Risk", header_name="Avg Risk", minWidth=95, flex=0.6, cellStyle=_risk_score_cellstyle())
+            gb_prov.configure_column("Max_Risk", header_name="Max Risk", minWidth=95, flex=0.6, cellStyle=_risk_score_cellstyle())
+            gb_prov.configure_column("Max_Risk_Level", header_name="Risk Level", minWidth=110, flex=0.7, cellStyle=_severity_cellstyle())
+            gb_prov.configure_column("Highest_Severity", header_name="Highest Sev", minWidth=115, flex=0.7, cellStyle=_severity_cellstyle())
+            gb_prov.configure_column("First_Seen", header_name="First Seen", minWidth=150, flex=0.95)
+            gb_prov.configure_column("Last_Seen", header_name="Last Seen", minWidth=150, flex=0.95)
+            gb_prov.configure_column("Top_Domain", header_name="Top Domain", minWidth=180, flex=1.25)
+            gb_prov.configure_column("Top_Verdict", header_name="Top Verdict", minWidth=125, flex=0.85, cellStyle=_policy_cellstyle())
+            gb_prov.configure_column("Risk_Level_Basis", header_name="Risk Level Basis", minWidth=300, flex=2.2)
 
             render_shadow_aggrid(
-                pri_grid,
-                gb_pri,
-                key=f"shadow_ai_mac_priority_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
-                height=520,
+                prov_tbl,
+                gb_prov,
+                key=f"shadow_ai_mac_providers_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
+                height=280,
                 auto_fit_columns=False,
             )
-
-        st.markdown("#### Evidence breakdown (this MAC)")
-        ev = view_df["Evidence_Type"].astype(str).replace({"": None, "nan": None}).dropna()
-        if not ev.empty:
-            evc = ev.value_counts().head(10).reset_index()
-            evc.columns = ["Evidence", "Events"]
-            fige = px.bar(
-                evc.sort_values("Events", ascending=True),
-                x="Events",
-                y="Evidence",
-                orientation="h",
-                title="Top evidence types",
-                template=get_plotly_template(),
+            _render_table_information(
+                f"{len(prov_tbl):,} provider rows shown for this device.",
+                [
+                    "Rows are grouped by `AI_Provider` for the selected MAC and current dialog search.",
+                    "`Max_Risk_Level` and `Risk_Level_Basis` explain why each provider is ranked.",
+                    "`Top_Domain` and `Top_Verdict` summarize the dominant behavior per provider.",
+                ],
             )
-            style_plotly_figure(fige, height=320, show_legend=False)
-            fige.update_xaxes(title="Events")
-            fige.update_yaxes(title=None)
-            st.plotly_chart(fige, width="stretch")
 
-    with tabs[2]:
+        st.download_button(
+            "Download CSV",
+            data=export_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"shadow_ai_mac_{mac_key}_current.csv",
+            mime="text/csv",
+            key=f"shadow_ai_mac_dialog_csv_{selected_scope_key}_{mac_key}_{key_prefix}",
+        )
+
+        st.markdown(f"#### Incident rows ({scope_mac_display})")
         mac_event_cols = [
-            "ts", "Severity", "Policy_Verdict",
-            "AI_Provider", "Domain", "Evidence_Type",
+            "ts", "Severity", "Evidence_Type", "Policy_Verdict",
+            "AI_Provider", "Domain",
             "Detail", "Upload_Bytes", "Risk_Score", "Destination",
             "Matched_Value", "Match_Field", "Signature_Match",
             "Files_Log_Correlation", "Detection_Basis", "Policy_Basis", "Risk_Basis", "Critical_Reason",
@@ -4186,16 +4100,37 @@ def _render_shadow_ai_mac_drilldown(
         for c in mac_event_cols:
             if c not in view_df.columns:
                 view_df[c] = ""
-        mac_event_grid = view_df[mac_event_cols].head(DIALOG_MAX_ROWS).copy()
+        incident_view_df = view_df.copy()
+        incident_view_df["_sev_rank"] = (
+            incident_view_df["Severity"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
+        )
+        incident_view_df["_risk_sort"] = pd.to_numeric(
+            incident_view_df.get("Risk_Score", pd.Series(0, index=incident_view_df.index)),
+            errors="coerce",
+        ).fillna(0)
+        incident_view_df["_ts_sort"] = pd.to_datetime(
+            incident_view_df.get("ts", pd.Series(pd.NaT, index=incident_view_df.index)),
+            errors="coerce",
+        )
+        incident_view_df = incident_view_df.sort_values(
+            ["_sev_rank", "_risk_sort", "_ts_sort"],
+            ascending=[False, False, False],
+            kind="mergesort",
+        ).drop(columns=["_sev_rank", "_risk_sort", "_ts_sort"], errors="ignore")
+
+        incident_export_df = incident_view_df[mac_event_cols].copy()
+        incident_export_df["ts"] = pd.to_datetime(incident_export_df["ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+        incident_export_df["Upload_Bytes"] = pd.to_numeric(incident_export_df["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
+        mac_event_grid = incident_view_df[mac_event_cols].head(DIALOG_MAX_ROWS).copy()
         mac_event_grid.insert(0, "#", range(1, len(mac_event_grid) + 1))
         mac_event_grid["ts"] = pd.to_datetime(mac_event_grid["ts"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
         mac_event_grid["Upload_Bytes"] = pd.to_numeric(mac_event_grid["Upload_Bytes"], errors="coerce").fillna(0).astype(int)
-        if len(view_df) > DIALOG_MAX_ROWS:
-            st.caption(f"Showing latest {DIALOG_MAX_ROWS:,} rows in the event log.")
+        if len(incident_view_df) > DIALOG_MAX_ROWS:
+            st.caption(f"Showing top {DIALOG_MAX_ROWS:,} rows after risk-level sorting.")
 
         gb_events = _new_grid_builder(mac_event_grid, page_size=25)
         gb_events.configure_column("ts", header_name="Time", minWidth=150, flex=1.0)
-        gb_events.configure_column("Severity", minWidth=90, flex=0.7, cellStyle=_severity_cellstyle())
+        gb_events.configure_column("Severity", header_name="Risk Level", minWidth=105, flex=0.8, cellStyle=_severity_cellstyle())
         gb_events.configure_column("Policy_Verdict", header_name="Verdict", minWidth=105, flex=0.8, cellStyle=_policy_cellstyle())
         gb_events.configure_column("AI_Provider", header_name="Provider", minWidth=150, flex=1.1)
         gb_events.configure_column("Domain", minWidth=170, flex=1.2)
@@ -4224,6 +4159,21 @@ def _render_shadow_ai_mac_drilldown(
             key=f"shadow_ai_mac_events_grid_{selected_scope_key}_{mac_key}_{key_prefix}",
             height=560,
             auto_fit_columns=False,
+        )
+        _render_table_information(
+            f"{len(mac_event_grid):,} incident rows shown ({min(len(incident_view_df), DIALOG_MAX_ROWS):,} displayed from {len(incident_view_df):,} filtered rows).",
+            [
+                "Rows are event-level detections for this MAC after dedup + dialog search.",
+                "`Risk Level`, `Risk_Score`, `Evidence`, and `Detection_Basis` are the primary triage fields.",
+                "`Policy_Basis`, `Risk_Basis`, and `Critical_Reason` explain verdict and severity escalation.",
+            ],
+        )
+        st.download_button(
+            "Download CSV",
+            data=incident_export_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"shadow_ai_mac_{mac_key}_incident_rows.csv",
+            mime="text/csv",
+            key=f"shadow_ai_mac_events_csv_{selected_scope_key}_{mac_key}_{key_prefix}",
         )
 
 
@@ -4269,12 +4219,33 @@ def show_shadow_ai_allow_dialog() -> None:
             st.rerun()
 
 
-@st.dialog("MAC Drilldown - Shadow AI (Forensics)", width="large")
+@st.dialog("Device AI Incidents", width="large")
 def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: str) -> None:
     active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     if not active_mac:
         st.info("No MAC selected.")
         return
+
+    scoped = mac_scoped.copy() if isinstance(mac_scoped, pd.DataFrame) else pd.DataFrame()
+    scope_mac_series = (
+        scoped.get("mac", pd.Series("", index=scoped.index))
+        .astype(str)
+        .str.strip()
+    )
+    scope_mac_series = scope_mac_series[~scope_mac_series.str.lower().isin({"", "nan", "none", "null", "-"})]
+    scope_mac_display = str(scope_mac_series.iloc[0]).strip() if not scope_mac_series.empty else active_mac
+
+    host_series = (
+        scoped.get("host_name", pd.Series("", index=scoped.index))
+        .astype(str)
+        .str.strip()
+    )
+    host_series = host_series[~host_series.str.lower().isin({"", "unknown", "nan", "none", "null", "n/a", "-", "(empty)"})]
+    scope_hostname = str(host_series.value_counts(dropna=True).index[0]).strip() if not host_series.empty else "Unknown"
+    scope_date = str(st.session_state.get("shadow_ai_date_v4") or "All Available Dates").strip() or "All Available Dates"
+
+    def _safe_html(v: str) -> str:
+        return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     c_left, c_right = st.columns([1.0, 3.5])
     with c_left:
@@ -4282,7 +4253,15 @@ def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: s
             _close_shadow_ai_mac_dialog()
             st.rerun()
     with c_right:
-        st.caption(f"Scope locked to MAC `{active_mac}`")
+        st.markdown(
+            f"""
+            <div class='shadow-dialog-hero'>
+                <div class='shadow-dialog-title'>Scoped to:</div>
+                <div class='shadow-dialog-subtitle'>MAC <code>{_safe_html(scope_mac_display)}</code> | Hostname <code>{_safe_html(scope_hostname)}</code> | Date <code>{_safe_html(scope_date)}</code></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     _render_shadow_ai_mac_drilldown(
         mac_scoped,
@@ -4374,6 +4353,32 @@ def inject_shadow_ai_css():
         .shadow-scope-hint strong {
             font-size: 1.05rem;
             color: #e5eefc;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-hero {
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
+            border-radius: 12px;
+            padding: 0.58rem 0.76rem;
+            margin-bottom: 0.4rem;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-title {
+            color: #e7efff;
+            font-weight: 800;
+            letter-spacing: 0.02em;
+            font-size: 1rem;
+            line-height: 1.2;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-subtitle {
+            color: #b8cae6;
+            font-size: 0.8rem;
+            margin-top: 0.22rem;
+        }
+        div[data-testid="stDialog"] .shadow-dialog-subtitle code {
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            background: rgba(8, 20, 40, 0.78);
+            color: #dbeafe;
+            border-radius: 999px;
+            padding: 0.12rem 0.52rem;
         }
         .shadow-filter-shell [data-testid="stWidgetLabel"] p {
             font-size: 0.76rem;
@@ -4541,19 +4546,28 @@ def render_shadow_ai(parquet_root: Path):
     )
     st.markdown("<div class='shadow-detection-basis'>", unsafe_allow_html=True)
     with st.expander("Detection basis", expanded=False):
-        st.write(
-            "Events are generated when Zeek telemetry matches `ai_signatures.yaml` (HTTP host/uri, TLS SNI, DNS query) "
-            "or a configured local AI port (`conn id.resp_p`). Regex misses get fuzzy and host/domain heuristic fallback for known AI providers. "
-            "Remaining rows with explicit AI-like tokens/domains are labeled using heuristic provider names (domain/token based)."
+        st.markdown(
+            "Events are generated when Zeek telemetry matches `ai_signatures.yaml` "
+            "(HTTP host/uri, TLS SNI, DNS query) or configured local AI ports (`conn id.resp_p`). "
+            "If regex/fuzzy misses, generic fallback only maps domains when explicitly configured."
         )
-        st.write(
-            f"Behavior scoring includes first-seen SaaS detection over a {BASELINE_DAYS}-day baseline, "
-            f"large HTTPS POST uploads (>= {int(round(LARGE_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB), "
-            "conn.orig_ip_bytes correlation, files.log UID upload correlation, JSON-heavy API usage, high-frequency API bursts, and SMB->upload precursor checks."
+        st.markdown(
+            f"Risk score starts at **10** and adds weighted signals: HTTP (+20), POST (+20), "
+            f"upload >= {int(round(LARGE_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB (+40), "
+            f"upload >= {int(round(MEDIUM_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB (+20), "
+            "sensitive endpoint (+15), TLS/DNS/CONN evidence, automation, first-seen/governance, "
+            "files.log correlation, JSON-heavy/high-frequency API, and SMB->upload precursor."
         )
-        st.write(
-            "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, Policy_Basis, "
-            "Risk_Basis, Critical_Reason, Actor, Evidence_Type, Behavior_Indicators, First_Seen_SaaS, Files_Log_Correlation, Governance_Alert, and Confidence."
+        st.markdown(
+            "Risk level thresholds: **LOW < 30**, **MEDIUM >= 30**, **HIGH >= 60**, **CRITICAL >= 80**. "
+            "Grouped tables (provider/destination/device) compute Risk Level from each group's `Max_Risk` and sort "
+            "descending (**CRITICAL -> HIGH -> MEDIUM -> LOW**). "
+            "Overrides still apply for first-seen shadow AI and governance alerts."
+        )
+        st.markdown(
+            "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, "
+            "Policy_Basis, Risk_Basis, Critical_Reason, Actor, Evidence_Type, Behavior_Indicators, "
+            "First_Seen_SaaS, Files_Log_Correlation, Governance_Alert, and Confidence."
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -4800,8 +4814,6 @@ def render_shadow_ai(parquet_root: Path):
     # TAB: OVERVIEW
     # =============================================================================
     with tabs[0]:
-        st.markdown("### Posture Analysis")
-
         g1, g2 = st.columns([2, 1])
         with g1:
             render_mode = "webgl" if len(filtered) > 2000 else "auto"
@@ -4876,9 +4888,18 @@ def render_shadow_ai(parquet_root: Path):
         prov_grid["Avg_Risk"] = pd.to_numeric(prov_grid["Avg_Risk"], errors="coerce").fillna(0).round(1)
         prov_grid["Max_Risk"] = pd.to_numeric(prov_grid["Max_Risk"], errors="coerce").fillna(0).round(0).astype(int)
         prov_grid["Max_Risk_Level"] = prov_grid["Max_Risk"].map(_risk_level_from_score_value).astype(str)
+        prov_grid["_risk_rank"] = (
+            prov_grid["Max_Risk_Level"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
+        )
+        prov_grid = prov_grid.sort_values(
+            ["_risk_rank", "Max_Risk", "Events", "Total_Upload_MB"],
+            ascending=[False, False, False, False],
+        ).reset_index(drop=True)
+        prov_grid["#"] = range(1, len(prov_grid) + 1)
         prov_grid["Risk_Level_Basis"] = prov_grid.get("Risk_Level_Basis", pd.Series("", index=prov_grid.index)).astype(str)
         prov_grid["Risk_Level_Basis"] = prov_grid["Risk_Level_Basis"].replace({"nan": "", "None": ""})
         prov_grid.loc[prov_grid["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
+        prov_grid = prov_grid.drop(columns=["_risk_rank"], errors="ignore")
         prov_grid["Allowed"] = prov_grid["Policy_Verdict"].astype(str).str.lower().eq("allowed")
         prov_grid["_allow_key"] = (
             prov_grid["AI_Provider"].astype(str).str.strip().str.lower()
@@ -4937,6 +4958,14 @@ def render_shadow_ai(parquet_root: Path):
             wrap_shell=False,
             hide_top_border=True,
         )
+        _render_table_information(
+            f"{len(prov_grid):,} provider rows shown for the current page filters.",
+            [
+                "Rows are grouped by `AI_Provider` + `Policy_Verdict` in the selected scope.",
+                "`Allowed` is editable for Shadow AI rows and updates `authorized_providers` after confirmation.",
+                "`Max_Risk_Level` and `Risk_Level_Basis` explain prioritized providers.",
+            ],
+        )
 
         edited_prov = prov_response.get("data", None)
         if isinstance(edited_prov, pd.DataFrame):
@@ -4983,10 +5012,22 @@ def render_shadow_ai(parquet_root: Path):
     with tabs[1]:
         st.markdown("### Trend over time")
         tdf = filtered.copy()
-        tdf["day"] = _day_key(tdf["ts"])
+        ts_raw = tdf.get("ts", pd.Series(pd.NaT, index=tdf.index))
+        ts_trend = pd.to_datetime(ts_raw, errors="coerce")
+        invalid_ts_rows = int(ts_trend.isna().sum())
+        tdf = tdf.loc[ts_trend.notna()].copy()
+        ts_trend = ts_trend.loc[tdf.index]
+        if selected_date == "All Available Dates":
+            tdf["time_bucket"] = ts_trend.dt.floor("D")
+            trend_x_title = "Day"
+            trend_suffix = "day"
+        else:
+            tdf["time_bucket"] = ts_trend.dt.floor("h")
+            trend_x_title = "Hour"
+            trend_suffix = "hour"
 
-        # Events per day (all + shadow)
-        daily = tdf.groupby(["day", "Policy_Verdict"]).agg(
+        # Events per bucket (all + shadow)
+        daily = tdf.groupby(["time_bucket", "Policy_Verdict"]).agg(
             Events=("ts", "count"),
             Unique_MACs=("mac", lambda x: x.astype(str).replace({"": None}).dropna().nunique()),
             Upload_MB=("Upload_Bytes", _sum_upload_mb),
@@ -4994,51 +5035,61 @@ def render_shadow_ai(parquet_root: Path):
 
         if daily.empty:
             st.info("No trend data.")
+            if invalid_ts_rows > 0:
+                st.caption(f"Trend charts excluded {invalid_ts_rows:,} row(s) with invalid timestamps.")
         else:
+            if invalid_ts_rows > 0:
+                st.caption(f"Trend charts excluded {invalid_ts_rows:,} row(s) with invalid timestamps.")
+            if selected_date != "All Available Dates":
+                bucket_n = int(daily["time_bucket"].nunique())
+                if bucket_n <= 3:
+                    st.caption(
+                        "Few points is expected with single-day scope (hourly buckets) when current filters narrow results."
+                    )
             c_left, c_right = st.columns([1.2, 1.2])
             with c_left:
                 fig1 = px.line(
                     daily,
-                    x="day",
+                    x="time_bucket",
                     y="Events",
                     color="Policy_Verdict",
                     color_discrete_map=POLICY_COLORS,
-                    title="Events per day",
+                    title=f"Events per {trend_suffix}",
                     template=get_plotly_template(),
                     markers=True,
                 )
                 style_plotly_figure(fig1, height=360)
-                fig1.update_xaxes(title="Day")
+                fig1.update_xaxes(title=trend_x_title)
                 fig1.update_yaxes(title="Events")
                 st.plotly_chart(fig1, width="stretch")
 
             with c_right:
                 fig2 = px.line(
                     daily,
-                    x="day",
+                    x="time_bucket",
                     y="Unique_MACs",
                     color="Policy_Verdict",
                     color_discrete_map=POLICY_COLORS,
-                    title="Unique MACs per day",
+                    title=f"Unique MACs per {trend_suffix}",
                     template=get_plotly_template(),
                     markers=True,
                 )
                 style_plotly_figure(fig2, height=360)
-                fig2.update_xaxes(title="Day")
+                fig2.update_xaxes(title=trend_x_title)
                 fig2.update_yaxes(title="Unique MACs")
                 st.plotly_chart(fig2, width="stretch")
 
             fig3 = px.bar(
                 daily,
-                x="day",
+                x="time_bucket",
                 y="Upload_MB",
                 color="Policy_Verdict",
                 color_discrete_map=POLICY_COLORS,
-                title="Upload (MB) per day",
+                title=f"Upload (MB) per {trend_suffix}",
                 template=get_plotly_template(),
             )
             style_plotly_figure(fig3, height=360)
-            fig3.update_xaxes(title="Day")
+            fig3.update_xaxes(title=trend_x_title)
             fig3.update_yaxes(title="Upload MB")
             st.plotly_chart(fig3, width="stretch")
 
@@ -5070,9 +5121,17 @@ def render_shadow_ai(parquet_root: Path):
         dest_grid["Avg_Risk"] = pd.to_numeric(dest_grid["Avg_Risk"], errors="coerce").fillna(0).round(1)
         dest_grid["Max_Risk"] = pd.to_numeric(dest_grid["Max_Risk"], errors="coerce").fillna(0).round(0).astype(int)
         dest_grid["Max_Risk_Level"] = dest_grid["Max_Risk"].map(_risk_level_from_score_value).astype(str)
+        dest_grid["_risk_rank"] = (
+            dest_grid["Max_Risk_Level"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
+        )
+        dest_grid = dest_grid.sort_values(
+            ["_risk_rank", "Max_Risk", "Events", "Total_Upload_MB"],
+            ascending=[False, False, False, False],
+        ).reset_index(drop=True)
         dest_grid["Risk_Level_Basis"] = dest_grid.get("Risk_Level_Basis", pd.Series("", index=dest_grid.index)).astype(str)
         dest_grid["Risk_Level_Basis"] = dest_grid["Risk_Level_Basis"].replace({"nan": "", "None": ""})
         dest_grid.loc[dest_grid["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
+        dest_grid = dest_grid.drop(columns=["_risk_rank"], errors="ignore")
 
         gb_dest = _new_grid_builder(dest_grid, page_size=20)
         gb_dest.configure_column("AI_Provider", header_name="Provider", minWidth=150)
@@ -5087,7 +5146,7 @@ def render_shadow_ai(parquet_root: Path):
         gb_dest.configure_column("Max_Risk_Level", header_name="Risk Level", minWidth=110, cellStyle=_severity_cellstyle())
         gb_dest.configure_column("Evidence", minWidth=130)
         gb_dest.configure_column("Risk_Level_Basis", header_name="Risk Level Basis", minWidth=320, flex=2.2)
-        render_shadow_aggrid(
+        dest_response = render_shadow_aggrid(
             dest_grid,
             gb_dest,
             key=f"shadow_ai_dest_grid_{selected_scope_key}",
@@ -5095,81 +5154,31 @@ def render_shadow_ai(parquet_root: Path):
             wrap_shell=False,
             hide_top_border=True,
         )
-
-        http_only = filtered[_http_like_mask(filtered)].copy()
-        if not http_only.empty:
-            http_only["is_post"] = _http_post_mask(http_only)
-            post = http_only[http_only["is_post"]].copy()
-            post_fallback_used = False
-            if post.empty:
-                post_fallback = http_only[_to_upload_bytes_series(http_only.get("Upload_Bytes", pd.Series(0, index=http_only.index)), http_only.index).gt(0)].copy()
-                if not post_fallback.empty:
-                    post = post_fallback
-                    post_fallback_used = True
-
-            post_kpi1, post_kpi2, post_kpi3 = st.columns(3)
-            post_upload_mb = _sum_upload_mb(post.get("Upload_Bytes", pd.Series(0, index=post.index))) if not post.empty else 0.0
-            post_kpi1.metric("HTTP Events", int(len(http_only)))
-            post_kpi2.metric("POST Events", int(len(post)))
-            post_kpi3.metric("POST Upload (MB)", f"{post_upload_mb:.2f}")
-            if post_fallback_used:
-                st.caption("No explicit POST marker found; showing HTTP events with positive upload bytes.")
-            if post.empty:
-                st.info("No HTTP upload rows found after POST/upload checks for this scope.")
-
-            # top endpoints
-            post["endpoint"] = post.get("uri", pd.Series("", index=post.index)).astype(str).fillna("").str.split("?").str[0].str.strip()
-            endpoint_missing = post["endpoint"].eq("") | post["endpoint"].str.lower().isin(["nan", "none", "null", "-"])
-            if endpoint_missing.any():
-                dest_fallback = post.get("Destination", pd.Series("", index=post.index)).astype(str).fillna("").str.strip()
-                post.loc[endpoint_missing, "endpoint"] = dest_fallback.loc[endpoint_missing]
-            endpoint_missing = post["endpoint"].eq("") | post["endpoint"].str.lower().isin(["nan", "none", "null", "-"])
-            if endpoint_missing.any():
-                dom_fallback = post.get("Domain", pd.Series("", index=post.index)).astype(str).fillna("").str.strip()
-                post.loc[endpoint_missing, "endpoint"] = dom_fallback.loc[endpoint_missing]
-            post["endpoint"] = post["endpoint"].replace({"": "-", "nan": "-", "None": "-", "null": "-"})
-
-            top_end = post.groupby(["AI_Provider", "endpoint"]).agg(
-                Events=("ts", "count"),
-                Total_Upload_MB=("Upload_Bytes", _sum_upload_mb),
-                Avg_Risk=("Risk_Score", "mean"),
-                Max_Risk=("Risk_Score", "max"),
-                Max_Risk_Level=("Risk_Score", lambda x: _risk_level_from_score_value(float(pd.to_numeric(x, errors="coerce").fillna(0).max()))),
-                Last_Seen=("ts", "max"),
-            ).reset_index().sort_values(["Total_Upload_MB", "Events"], ascending=False)
-            end_basis = _build_group_risk_basis_frame(post, ["AI_Provider", "endpoint"], out_col="Risk_Level_Basis")
-            if not end_basis.empty:
-                top_end = top_end.merge(end_basis, on=["AI_Provider", "endpoint"], how="left")
-
-            top_end_grid = top_end.copy()
-            top_end_grid.insert(0, "#", range(1, len(top_end_grid) + 1))
-            top_end_grid["Last_Seen"] = pd.to_datetime(top_end_grid["Last_Seen"], errors="coerce").dt.strftime("%m-%d %H:%M:%S").fillna("")
-            top_end_grid["Total_Upload_MB"] = pd.to_numeric(top_end_grid["Total_Upload_MB"], errors="coerce").fillna(0).round(2)
-            top_end_grid["Avg_Risk"] = pd.to_numeric(top_end_grid["Avg_Risk"], errors="coerce").fillna(0).round(1)
-            top_end_grid["Max_Risk"] = pd.to_numeric(top_end_grid["Max_Risk"], errors="coerce").fillna(0).round(0).astype(int)
-            top_end_grid["Max_Risk_Level"] = top_end_grid.get("Max_Risk_Level", pd.Series("", index=top_end_grid.index)).astype(str).str.upper()
-            top_end_grid["Risk_Level_Basis"] = top_end_grid.get("Risk_Level_Basis", pd.Series("", index=top_end_grid.index)).astype(str)
-            top_end_grid["Risk_Level_Basis"] = top_end_grid["Risk_Level_Basis"].replace({"nan": "", "None": ""})
-            top_end_grid.loc[top_end_grid["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
-
-            gb_end = _new_grid_builder(top_end_grid, page_size=15)
-            gb_end.configure_column("AI_Provider", header_name="Provider", minWidth=150)
-            gb_end.configure_column("endpoint", header_name="Endpoint", minWidth=260, flex=1.8)
-            gb_end.configure_column("Events", width=95, flex=0.8)
-            gb_end.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=105)
-            gb_end.configure_column("Avg_Risk", header_name="Avg Risk", minWidth=95, cellStyle=_risk_score_cellstyle())
-            gb_end.configure_column("Max_Risk", header_name="Max Risk", minWidth=95, cellStyle=_risk_score_cellstyle())
-            gb_end.configure_column("Max_Risk_Level", header_name="Risk Level", minWidth=115, cellStyle=_severity_cellstyle())
-            gb_end.configure_column("Last_Seen", header_name="Last Seen", minWidth=145)
-            gb_end.configure_column("Risk_Level_Basis", header_name="Risk Level Basis", minWidth=320, flex=2.1)
-            render_shadow_aggrid(top_end_grid, gb_end, key=f"shadow_ai_top_end_grid_{selected_scope_key}", height=390)
+        _render_table_information(
+            f"{len(dest_grid):,} destination/domain rows shown.",
+            [
+                "Rows are grouped by `AI_Provider` + `Policy_Verdict` + `Domain`.",
+                "Sorting is risk-first (`CRITICAL -> HIGH -> MEDIUM -> LOW`) using `Max_Risk_Level` and `Max_Risk`.",
+                "`Unique_MACs`, `Events`, and `Total_Upload_MB` help identify broad vs high-volume exposure.",
+            ],
+        )
+        export_dest = pd.DataFrame(dest_response.get("data", [])) if isinstance(dest_response, dict) else pd.DataFrame()
+        if export_dest.empty:
+            export_dest = dest_grid.copy()
+        st.download_button(
+            "Download CSV",
+            data=export_dest.to_csv(index=False).encode("utf-8"),
+            file_name=f"shadow_ai_top_destinations_{selected_scope_key}.csv",
+            mime="text/csv",
+            key=f"shadow_ai_dest_csv_{selected_scope_key}",
+        )
 
     # =============================================================================
     # TAB: SHADOW AI BY MAC (with drilldown)
     # =============================================================================
     with tabs[3]:
-        st.markdown("### Device exposure (Shadow AI by MAC)")
-        st.caption("Uses current filters (Risk Level, Evidence Type, Search). Shows rows with resolved MAC only.")
+        st.markdown("### Shadow AI by MAC")
+        st.caption("Click on ony MAC address to show device AI incidents dialog")
 
         mac_cache_key = _shadow_ai_mac_tab_cache_key(
             selected_scope_key=selected_scope_key,
@@ -5273,6 +5282,24 @@ def render_shadow_ai(parquet_root: Path):
                 wrap_shell=False,
                 hide_top_border=True,
             )
+            _render_table_information(
+                f"{len(mac_grid):,} device rows shown with resolved MAC addresses.",
+                [
+                    "Rows are grouped by `mac` across the current page filters.",
+                    "Rows are risk-ranked (`CRITICAL -> HIGH -> MEDIUM -> LOW`) and clicking MAC opens the device dialog.",
+                    "`Top_Provider`, `Top_Domain`, and `Risk_Level_Basis` summarize exposure and why a device is prioritized.",
+                ],
+            )
+            export_mac = pd.DataFrame(mac_response.get("data", [])) if isinstance(mac_response, dict) else pd.DataFrame()
+            if export_mac.empty:
+                export_mac = mac_grid.copy()
+            st.download_button(
+                "Download CSV",
+                data=export_mac.to_csv(index=False).encode("utf-8"),
+                file_name=f"shadow_ai_by_mac_{selected_scope_key}.csv",
+                mime="text/csv",
+                key=f"shadow_ai_by_mac_csv_{selected_scope_key}",
+            )
 
             selected_mac = _extract_selected_mac(mac_response.get("selected_rows", None))
             if selected_mac:
@@ -5291,8 +5318,6 @@ def render_shadow_ai(parquet_root: Path):
             if active_mac not in mac_list and mac_list:
                 active_mac = mac_list[0]
                 st.session_state["shadow_ai_selected_mac"] = active_mac
-
-            st.caption(f"Click a MAC row to open drilldown dialog. Current MAC: `{active_mac}`")
 
             dialog_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
             if st.session_state.get("shadow_ai_mac_dialog_open") and dialog_mac:
@@ -5354,6 +5379,14 @@ def render_shadow_ai(parquet_root: Path):
             height=360,
             wrap_shell=False,
             hide_top_border=True,
+        )
+        _render_table_information(
+            f"{len(sig_grid):,} signature rows shown (top matches only).",
+            [
+                "Rows are grouped by `Policy_Verdict` + `Signature_Match`.",
+                "`Events` shows which signatures contribute most to detections in current filters.",
+                "Use this view to tune noisy fragments in `ai_signatures.yaml`.",
+            ],
         )
 
         st.markdown("#### Suggested tuning (if noisy)")
