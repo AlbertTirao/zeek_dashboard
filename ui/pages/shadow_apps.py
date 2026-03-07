@@ -4256,9 +4256,9 @@ def render_shadow_apps(parquet_root: Path):
         """
         SELECT
             COUNT(*) AS total,
-            SUM(CASE WHEN "App Status"='Authorized' THEN 1 ELSE 0 END) AS authorized,
-            SUM(CASE WHEN "App Status"='Unauthorized' THEN 1 ELSE 0 END) AS unauthorized,
-            SUM(CASE WHEN "Risk Level" IN ('Critical','High') THEN 1 ELSE 0 END) AS crit_high
+            COALESCE(SUM(CASE WHEN "App Status"='Authorized' THEN 1 ELSE 0 END), 0) AS authorized,
+            COALESCE(SUM(CASE WHEN "App Status"='Unauthorized' THEN 1 ELSE 0 END), 0) AS unauthorized,
+            COALESCE(SUM(CASE WHEN "Risk Level" IN ('Critical','High') THEN 1 ELSE 0 END), 0) AS crit_high
         FROM shadow_events
         """
     ).df()
