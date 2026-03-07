@@ -24,7 +24,6 @@ trusted_domains:
 - docker.io
 - docs.google.com
 - drive.google.com
-- drive.google.com
 - dropbox.com
 - fastly.com
 - force.com
@@ -36,6 +35,7 @@ trusted_domains:
 - googleapis.cn
 - googleusercontent.com
 - grafana.com
+- gvt1.com
 - hetzner.com
 - hub.docker.com
 - internal.example
