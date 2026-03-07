@@ -20,7 +20,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v28-http-bytes-risklevel-uis"
+CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-uis"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -2740,7 +2740,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
     except Exception:
         pass
 
-    # Enrich HTTP Upload_Bytes using conn.log orig_ip_bytes (same uid) for better large-upload detection.
+    # Enrich Upload_Bytes using conn.log orig_ip_bytes (same uid) when request payload bytes are missing.
     try:
         if isinstance(conn_uid_upload_map, pd.DataFrame) and not conn_uid_upload_map.empty and "uid" in final_df.columns:
             up_map = conn_uid_upload_map[["uid", "orig_ip_bytes"]].copy()
@@ -2753,14 +2753,19 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
             if not up_map.empty:
                 final_df["uid"] = final_df["uid"].astype(str)
                 final_df = final_df.merge(up_map, on="uid", how="left", suffixes=("", "_conn_up"))
-                conn_up = _to_upload_bytes_series(final_df.get("orig_ip_bytes", pd.Series(0, index=final_df.index)), final_df.index)
+                conn_col = "orig_ip_bytes_conn_up" if "orig_ip_bytes_conn_up" in final_df.columns else "orig_ip_bytes"
+                conn_up = _to_upload_bytes_series(final_df.get(conn_col, pd.Series(0, index=final_df.index)), final_df.index)
                 req_up = _to_upload_bytes_series(final_df.get("Upload_Bytes", pd.Series(0, index=final_df.index)), final_df.index)
-                src = final_df.get("Detection_Source", pd.Series("", index=final_df.index)).astype(str).str.upper()
-                http_mask = src.eq("HTTP")
-                # Prefer HTTP request_body_len payload when present; fallback to conn bytes when HTTP payload is missing.
+                # Prefer HTTP request_body_len payload when present; fallback to conn bytes for missing upload values.
                 merged_up = req_up.where(req_up.gt(0), conn_up)
-                final_df["Upload_Bytes"] = req_up.where(~http_mask, merged_up)
-                final_df = final_df.drop(columns=["orig_ip_bytes"], errors="ignore")
+                estimated_upload = req_up.le(0) & conn_up.gt(0)
+                final_df["Upload_Bytes"] = merged_up
+                if estimated_upload.any():
+                    det_basis = final_df.get("Detection_Basis", pd.Series("", index=final_df.index)).astype(str)
+                    det_basis = det_basis.replace({"nan": "", "None": ""})
+                    det_basis = _append_reason(det_basis, estimated_upload, "Upload bytes estimated from conn.orig_ip_bytes")
+                    final_df["Detection_Basis"] = det_basis
+                final_df = final_df.drop(columns=["orig_ip_bytes", "orig_ip_bytes_conn_up"], errors="ignore")
     except Exception:
         pass
 
@@ -4598,6 +4603,10 @@ def render_shadow_ai(parquet_root: Path):
         st.markdown(
             "`Unknown AI` heuristic hits are shown as `<domain> (unknown ai provider)` when traffic is AI-like "
             "but the provider is not explicitly mapped in `heuristic_domain_provider_map`."
+        )
+        st.markdown(
+            "Upload volume uses HTTP `request_body_len` when present, otherwise falls back to `conn.orig_ip_bytes` "
+            "(same `uid`) and appends `Upload bytes estimated from conn.orig_ip_bytes` to Detection Basis."
         )
         st.markdown(
             f"Risk score starts at **10** and adds weighted signals: HTTP (+20), POST (+20), "
