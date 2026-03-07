@@ -175,6 +175,9 @@ generic_name_patterns:
 - \bgenai\b
 - \bai\b
 - openai|anthropic|gemini|perplexity|manus|deepseek|copilot
+heuristic_domain_provider_map:
+  facebook.com: Meta AI
+  wps.com: WPS AI
 saas_allowlist_domains: []
 detection_settings:
   baseline_days: 30

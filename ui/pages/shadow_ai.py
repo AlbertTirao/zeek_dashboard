@@ -166,6 +166,7 @@ DEFAULT_GENERIC_NAME_PATTERNS = [
     r"\bai\b",
 ]
 DEFAULT_FILE_UPLOAD_EXTENSIONS = ["csv", "xlsx", "xls", "pdf", "zip", "json"]
+DEFAULT_HEURISTIC_DOMAIN_PROVIDER_MAP: Dict[str, str] = {}
 DEFAULT_DETECTION_SETTINGS = {
     "baseline_days": 30,
     "large_https_post_threshold_mb": 5.0,
@@ -185,6 +186,7 @@ def load_ai_signatures() -> Tuple[
     Dict[int, str],
     List[str],
     List[str],
+    Dict[str, str],
     Dict[str, float],
     List[str],
     int,
@@ -196,6 +198,7 @@ def load_ai_signatures() -> Tuple[
       - authorized_providers: [provider names]
       - generic_name_patterns: [regex fragments]
       - saas_allowlist_domains: [domain suffixes]
+      - heuristic_domain_provider_map: explicit root-domain -> provider label
       - detection_settings: threshold and baseline tuning
       - file_upload_extensions: [ext without dot]
     """
@@ -206,6 +209,7 @@ def load_ai_signatures() -> Tuple[
     local_ports = y.get("local_ai_ports", {}) or {}
     generic_name_patterns = y.get("generic_name_patterns", []) or DEFAULT_GENERIC_NAME_PATTERNS
     saas_allowlist_domains = y.get("saas_allowlist_domains", []) or []
+    heuristic_domain_provider_map_raw = y.get("heuristic_domain_provider_map", {}) or DEFAULT_HEURISTIC_DOMAIN_PROVIDER_MAP
     file_upload_extensions = y.get("file_upload_extensions", []) or DEFAULT_FILE_UPLOAD_EXTENSIONS
     det_raw = y.get("detection_settings", {}) or {}
 
@@ -216,6 +220,13 @@ def load_ai_signatures() -> Tuple[
         for x in saas_allowlist_domains
         if str(x).strip()
     ]
+    heuristic_domain_provider_map: Dict[str, str] = {}
+    if isinstance(heuristic_domain_provider_map_raw, dict):
+        for k, v in heuristic_domain_provider_map_raw.items():
+            dk = str(k).strip().lower().lstrip("*.").strip(".")
+            pv = _normalize_provider_name(v)
+            if dk and pv:
+                heuristic_domain_provider_map[dk] = pv
     file_upload_extensions = [str(x).strip().lower().lstrip(".") for x in file_upload_extensions if str(x).strip()]
 
     raw_ai: Dict[str, List[str]] = {}
@@ -300,6 +311,7 @@ def load_ai_signatures() -> Tuple[
         fixed_ports,
         generic_name_patterns,
         saas_allowlist_domains,
+        heuristic_domain_provider_map,
         detection_settings,
         file_upload_extensions,
         mtime_ns,
@@ -313,6 +325,7 @@ def load_ai_signatures() -> Tuple[
     LOCAL_AI_PORTS,
     GENERIC_NAME_PATTERNS,
     SAAS_ALLOWLIST_DOMAINS,
+    HEURISTIC_DOMAIN_PROVIDER_MAP,
     DETECTION_SETTINGS,
     FILE_UPLOAD_EXTENSIONS,
     SIG_MTIME_NS,
@@ -728,10 +741,10 @@ def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
     host = _to_domain_from_destination(raw)
     root_domain = _heuristic_root_domain(host)
     if root_domain:
-        canonical = _canonical_provider_from_hint(root_domain)
-        if canonical:
-            return canonical, f"heuristic-domain:{root_domain}"
-        return root_domain, f"heuristic-domain:{root_domain}"
+        explicit_provider = HEURISTIC_DOMAIN_PROVIDER_MAP.get(str(root_domain).strip().lower())
+        if explicit_provider:
+            return explicit_provider, f"heuristic-domain-config:{root_domain}"
+        return "Unknown AI (Heuristic)", f"heuristic-domain-unmapped:{root_domain}"
 
     norm = _normalize_fuzzy_text(raw)
     if not norm:
@@ -1070,11 +1083,11 @@ def _apply_date_scope(df: pd.DataFrame, date_str: str, *, mode: str = "local_aut
         df["ts"] = ts_a
         return df.loc[m_a].copy(), "local_auto"
 
-    # Tie or both zero -> prefer utc conversion but do not silently drop everything if both are zero
+    # Tie or both zero -> prefer utc conversion and keep strict selected-day scope.
     df = df.copy()
     df["ts"] = ts_b
     if cb == 0 and ca == 0:
-        return df, "auto_no_in_day"
+        return df.loc[m_b].copy(), "auto_no_in_day"
     return df.loc[m_b].copy(), "utc_auto_tie"
 
 def _clean_ip_series(s: pd.Series) -> pd.Series:
@@ -2810,6 +2823,8 @@ def _load_shadow_ai_data_uncached(parquet_root: Path, target_dates: Tuple[str, .
             known_for_date = []
         df_d = _build_one_date(parquet_root, str(d), known_for_date)
         if not df_d.empty:
+            df_d = df_d.copy()
+            df_d["_folder_date"] = str(d)
             frames.append(df_d)
 
     if not frames:
@@ -2820,7 +2835,8 @@ def _load_shadow_ai_data_uncached(parquet_root: Path, target_dates: Tuple[str, .
     out = _enforce_ai_only_rows(out)
     out = _attach_actor_identity_columns(out)
     try:
-        out = out.drop_duplicates()
+        dedupe_subset = [c for c in out.columns if c != "_folder_date"]
+        out = out.drop_duplicates(subset=dedupe_subset if dedupe_subset else None)
     except Exception:
         pass
 
@@ -4345,6 +4361,20 @@ def inject_shadow_ai_css():
             margin-top: 0.2rem;
             margin-bottom: 0.3rem;
         }
+        .shadow-scope-hint {
+            font-size: 0.9rem;
+            color: #c8d7ea;
+            margin-top: 0.35rem;
+            margin-bottom: 1rem;
+            padding: 0.36rem 0.62rem;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            background: linear-gradient(135deg, rgba(15,23,42,0.52), rgba(2,6,23,0.46));
+            border-radius: 10px;
+        }
+        .shadow-scope-hint strong {
+            font-size: 1.05rem;
+            color: #e5eefc;
+        }
         .shadow-filter-shell [data-testid="stWidgetLabel"] p {
             font-size: 0.76rem;
             letter-spacing: 0.05em;
@@ -4548,69 +4578,33 @@ def render_shadow_ai(parquet_root: Path):
         key="shadow_ai_date_v4",
     )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
-
-    provider_values = sorted(
-        set((RAW_AI_SIGNATURES or {}).keys())
-        | set(FUZZY_PROVIDER_ALIASES.keys())
-        | set(LOCAL_AI_PORTS.values())
+    scope_note_slot = st.empty()
+    search_q = st.text_input(
+        "Search (MAC, Host, Provider, IP, Detail, Basis)",
+        placeholder="Enter keywords...",
+        key="shadow_ai_filter_search_v2",
     )
-    port_signature_values = {f"port {p}" for p in sorted(LOCAL_AI_PORTS.keys())}
-    signature_values = sorted({frag for _, frags in (RAW_AI_SIGNATURES or {}).items() for frag in (frags or [])} | port_signature_values)
-    match_field_values = ["HTTP host/uri", "TLS SNI", "DNS query", "conn id.resp_p"]
+
     evidence_values = ["HTTP+POST", "HTTP+GET", "TLS SNI", "DNS query", "Local Port", "HTTP"]
 
+    # Removed user-facing filters for policy verdict/provider/match-field/signature-match.
+    selected_verdict = ["Shadow AI", "Allowed"]
+    provider_filter: List[str] = []
+    basis_field: List[str] = []
+    basis_sig: List[str] = []
+    only_selected_ai = False
+    min_upload_kb = 0.0
+
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([1.65, 1.45, 2.1])
+    c1, c2 = st.columns([1.2, 1.4])
     with c1:
-        selected_verdict = st.multiselect(
-            "Policy Verdict",
-            ["Shadow AI", "Allowed"],
-            default=["Shadow AI", "Allowed"],
-            key="shadow_ai_filter_verdict_v2",
-        )
-    with c2:
         selected_severity = st.multiselect(
-            "Severity",
+            "Risk Level",
             ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
             default=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
             key="shadow_ai_filter_severity_v2",
         )
-    with c3:
-        provider_filter = st.multiselect(
-            "Provider (Show Only)",
-            provider_values,
-            default=[],
-            placeholder="Select AI providers",
-            key="shadow_ai_filter_provider_v2",
-        )
-    only_selected_ai = False
-    min_upload_kb = 0.0
-
-    c5, c6, c7 = st.columns([1.6, 1.6, 2.2])
-    with c5:
-        basis_field = st.multiselect(
-            "Match Field",
-            match_field_values,
-            default=match_field_values,
-            key="shadow_ai_filter_field_v2",
-        )
-    with c6:
-        basis_sig = st.multiselect(
-            "Signature Match",
-            signature_values,
-            default=[],
-            placeholder="All signatures",
-            key="shadow_ai_filter_signature_v2",
-        )
-    with c7:
-        search_q = st.text_input(
-            "Search (MAC, Host, Provider, IP, Detail, Basis)",
-            placeholder="Enter keywords...",
-            key="shadow_ai_filter_search_v2",
-        )
-
-    c8 = st.columns([1])[0]
-    with c8:
+    with c2:
         evidence_filter = st.multiselect(
             "Evidence Type",
             evidence_values,
@@ -4625,7 +4619,9 @@ def render_shadow_ai(parquet_root: Path):
     # Scope behavior: always interpret selected day in Asia/Manila local time (with automatic boundary coverage)
     scope_mode = "local_auto"
 
-    # If selecting a single day, also load the previous folder date to cover UTC↔local boundaries.
+    # If selecting a single day, load selected folder plus adjacent folders.
+    # We then apply strict timestamp scope to selected day only.
+    adjacent_dates: List[str] = []
     if selected_date == "All Available Dates":
         target_dates = available_dates
     else:
@@ -4634,8 +4630,11 @@ def render_shadow_ai(parquet_root: Path):
             try:
                 d0 = datetime.strptime(str(target_dates[0]), "%Y-%m-%d").date()
                 prev = (d0 - timedelta(days=1)).strftime("%Y-%m-%d")
-                if prev in available_dates and prev not in target_dates:
-                    target_dates.append(prev)
+                nxt = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
+                for d in [prev, nxt]:
+                    if d in available_dates and d not in target_dates:
+                        target_dates.append(d)
+                        adjacent_dates.append(d)
             except Exception:
                 pass
     # Keep a hot in-session copy so search/filter/dialog reruns don't reload/unpickle.
@@ -4679,13 +4678,25 @@ def render_shadow_ai(parquet_root: Path):
     else:
         if selected_date != "All Available Dates" and selected_date and DATE_DIR_RE.match(str(selected_date)):
             scoped, scope_decision = _apply_date_scope(raw_df, str(selected_date), mode=scope_mode)
-            # If strict local-day scope yields nothing, fall back to showing raw folder contents.
-            if scoped.empty and scope_mode != "folder":
-                scoped, scope_decision = _apply_date_scope(raw_df, str(selected_date), mode="folder")
             df = scoped
         st.session_state["_shadow_ai_scoped_df_key_v1"] = scoped_key
         st.session_state["_shadow_ai_scoped_df_v1"] = df
         st.session_state["_shadow_ai_scoped_decision_v1"] = scope_decision
+
+    if selected_date != "All Available Dates" and selected_date and DATE_DIR_RE.match(str(selected_date)):
+        total_scope_rows = int(len(raw_df))
+        trimmed_rows = max(0, total_scope_rows - int(len(df)))
+        included_from_adjacent = 0
+        if adjacent_dates and "_folder_date" in df.columns:
+            try:
+                included_from_adjacent = int(df["_folder_date"].astype(str).isin(set(adjacent_dates)).sum())
+            except Exception:
+                included_from_adjacent = 0
+        if trimmed_rows > 0 or adjacent_dates:
+            scope_note_slot.caption(
+                f"Date scope note: excluded {trimmed_rows:,} rows because their timestamps were outside `{selected_date}`. "
+                f"Included {included_from_adjacent:,} rows from adjacent day folders (yesterday/tomorrow)."
+            )
 
 
     if df.empty:
@@ -4770,7 +4781,7 @@ def render_shadow_ai(parquet_root: Path):
     m5.metric("Unique Hosts", f"{unique_hosts:,}")
     m6.metric("Data Leakage", f"{total_leakage_mb:.2f} MB")
     st.markdown(
-        f"<div class='shadow-filter-hint'>Unique source IPs in scope: <strong>{unique_ips:,}</strong></div>",
+        f"<div class='shadow-filter-hint shadow-scope-hint'>Unique source IPs in scope: <strong>{unique_ips:,}</strong></div>",
         unsafe_allow_html=True,
     )
 
@@ -5085,12 +5096,8 @@ def render_shadow_ai(parquet_root: Path):
             hide_top_border=True,
         )
 
-        st.markdown("### POST/Upload focus (HTTP evidence)")
-        st.caption("HTTP scope uses detection source + method/evidence fallback to avoid missing valid upload rows.")
         http_only = filtered[_http_like_mask(filtered)].copy()
-        if http_only.empty:
-            st.info("No HTTP events in this view.")
-        else:
+        if not http_only.empty:
             http_only["is_post"] = _http_post_mask(http_only)
             post = http_only[http_only["is_post"]].copy()
             post_fallback_used = False
@@ -5162,7 +5169,7 @@ def render_shadow_ai(parquet_root: Path):
     # =============================================================================
     with tabs[3]:
         st.markdown("### Device exposure (Shadow AI by MAC)")
-        st.caption("Uses current filters (Policy Verdict, Severity, Provider). Shows rows with resolved MAC only.")
+        st.caption("Uses current filters (Risk Level, Evidence Type, Search). Shows rows with resolved MAC only.")
 
         mac_cache_key = _shadow_ai_mac_tab_cache_key(
             selected_scope_key=selected_scope_key,
@@ -5330,24 +5337,6 @@ def render_shadow_ai(parquet_root: Path):
             },
             sort_keys=False,
         ))
-
-        # show detection sources distribution
-        st.markdown("#### Detection sources distribution")
-        dist = filtered.groupby(["Policy_Verdict", "Detection_Source"]).size().reset_index(name="Events")
-        dist_grid = dist.copy()
-        dist_grid.insert(0, "#", range(1, len(dist_grid) + 1))
-        gb_dist = _new_grid_builder(dist_grid, page_size=10)
-        gb_dist.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
-        gb_dist.configure_column("Detection_Source", header_name="Source", minWidth=130)
-        gb_dist.configure_column("Events", minWidth=90)
-        render_shadow_aggrid(
-            dist_grid,
-            gb_dist,
-            key=f"shadow_ai_dist_grid_{selected_scope_key}",
-            height=290,
-            wrap_shell=False,
-            hide_top_border=True,
-        )
 
         st.markdown("#### Signature fragments causing matches (top)")
         sig_top = filtered.groupby(["Policy_Verdict", "Signature_Match"]).size().reset_index(name="Events")
