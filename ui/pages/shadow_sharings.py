@@ -2270,7 +2270,6 @@ def render_shadow_sharing(parquet_root: Path):
     # -------------------------------------------------------------------------
     with tab_overview:
         st.markdown("#### Shadow Sharing Incidents")
-        st.caption("Click on any MAC address to show device sharing incidents dialog.")
         st.markdown("<div class='shadow-filter-shell shadow-filter-no-divider'>", unsafe_allow_html=True)
         search_q = st.text_input(
             "Search (MAC, Host, IP, Destination, Basis)",
@@ -2293,6 +2292,7 @@ def render_shadow_sharing(parquet_root: Path):
                 key="shadow_sharing_sources",
             )
         st.markdown("</div>", unsafe_allow_html=True)
+        st.caption("Click on any MAC address to show device sharing incidents dialog.")
 
         if isinstance(dev_grid_table_cached, pd.DataFrame):
             dev_grid = dev_grid_table_cached.copy()
