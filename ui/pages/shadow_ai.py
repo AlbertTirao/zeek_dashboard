@@ -20,7 +20,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-uis"
+CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-ui"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -3033,6 +3033,22 @@ def _safe_value_counts_top(s: pd.Series) -> str:
     return str(vc.index[0]) if len(vc) else ""
 
 
+def _unique_mac_values_text(mac_series: pd.Series) -> str:
+    if mac_series is None:
+        return ""
+    mac_clean = (
+        mac_series.apply(normalize_mac)
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    mac_clean = mac_clean[mac_clean.ne("")]
+    if mac_clean.empty:
+        return ""
+    return ", ".join(sorted(pd.unique(mac_clean).tolist()))
+
+
 SEVERITY_RANK_MAP = {
     "SAFE": 0,
     "LOW": 1,
@@ -3542,6 +3558,17 @@ def _policy_cellstyle() -> JsCode:
         }
         """
     )
+
+
+def _unique_macs_display_text(count_value: object, mac_list_text: object) -> str:
+    try:
+        count_int = int(float(count_value))
+    except Exception:
+        count_int = 0
+    raw = str(mac_list_text or "").strip()
+    if not raw:
+        return str(count_int)
+    return f"{count_int} ({raw})"
 
 
 def _extract_selected_mac(selected_rows) -> Optional[str]:
@@ -4945,7 +4972,8 @@ def render_shadow_ai(parquet_root: Path):
         st.markdown("### Providers in View")
         prov_sum = filtered.groupby(["AI_Provider", "Policy_Verdict"]).agg(
             Events=("ts", "count"),
-            Unique_MACs=("mac", lambda x: x.astype(str).replace({"": None}).dropna().nunique()),
+            Unique_MACs=("mac", lambda x: x.apply(normalize_mac).fillna("").astype(str).replace({"": None}).dropna().nunique()),
+            _Unique_MAC_List=("mac", _unique_mac_values_text),
             Last_Seen=("ts", "max"),
             Total_Upload_MB=("Upload_Bytes", _sum_upload_mb),
             Avg_Risk=("Risk_Score", "mean"),
@@ -4974,6 +5002,17 @@ def render_shadow_ai(parquet_root: Path):
         prov_grid["Risk_Level_Basis"] = prov_grid["Risk_Level_Basis"].replace({"nan": "", "None": ""})
         prov_grid.loc[prov_grid["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
         prov_grid = prov_grid.drop(columns=["_risk_rank"], errors="ignore")
+        prov_grid["Unique_MACs_Display"] = [
+            _unique_macs_display_text(c, m)
+            for c, m in zip(
+                prov_grid.get("Unique_MACs", pd.Series(0, index=prov_grid.index)).tolist(),
+                prov_grid.get("_Unique_MAC_List", pd.Series("", index=prov_grid.index)).tolist(),
+            )
+        ]
+        if "Unique_MACs_Display" in prov_grid.columns and "Unique_MACs" in prov_grid.columns:
+            unique_idx = int(prov_grid.columns.get_loc("Unique_MACs"))
+            display_series = prov_grid.pop("Unique_MACs_Display")
+            prov_grid.insert(unique_idx, "Unique_MACs_Display", display_series)
         prov_grid["Allowed"] = prov_grid["Policy_Verdict"].astype(str).str.lower().eq("allowed")
         prov_grid["_allow_key"] = (
             prov_grid["AI_Provider"].astype(str).str.strip().str.lower()
@@ -5015,7 +5054,15 @@ def render_shadow_ai(parquet_root: Path):
             suppressMovable=True,
         )
         gb_prov.configure_column("Events", width=92, flex=0.8)
-        gb_prov.configure_column("Unique_MACs", header_name="Unique MACs", minWidth=110)
+        gb_prov.configure_column(
+            "Unique_MACs_Display",
+            header_name="Unique MACs",
+            width=220,
+            flex=0,
+            cellStyle={"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
+        )
+        gb_prov.configure_column("Unique_MACs", hide=True)
+        gb_prov.configure_column("_Unique_MAC_List", hide=True)
         gb_prov.configure_column("Last_Seen", header_name="Last Seen", minWidth=150)
         gb_prov.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=105)
         gb_prov.configure_column("Avg_Risk", header_name="Avg Risk", minWidth=95, cellStyle=_risk_score_cellstyle())
@@ -5026,7 +5073,7 @@ def render_shadow_ai(parquet_root: Path):
         prov_response = render_shadow_aggrid(
             prov_grid,
             gb_prov,
-            key=f"shadow_ai_provider_grid_{selected_scope_key}_{int(st.session_state.get('shadow_ai_provider_grid_nonce', 0))}",
+            key=f"shadow_ai_provider_grid_v2_{selected_scope_key}_{int(st.session_state.get('shadow_ai_provider_grid_nonce', 0))}",
             height=390,
             update_mode=GridUpdateMode.MODEL_CHANGED,
             wrap_shell=False,
@@ -5187,7 +5234,8 @@ def render_shadow_ai(parquet_root: Path):
 
         top_dest = ddf.groupby(["AI_Provider", "Policy_Verdict", "Domain"]).agg(
             Events=("ts", "count"),
-            Unique_MACs=("mac", lambda x: x.astype(str).replace({"": None}).dropna().nunique()),
+            Unique_MACs=("mac", lambda x: x.apply(normalize_mac).fillna("").astype(str).replace({"": None}).dropna().nunique()),
+            _Unique_MAC_List=("mac", _unique_mac_values_text),
             Last_Seen=("ts", "max"),
             Total_Upload_MB=("Upload_Bytes", _sum_upload_mb),
             Avg_Risk=("Risk_Score", "mean"),
@@ -5216,13 +5264,32 @@ def render_shadow_ai(parquet_root: Path):
         dest_grid["Risk_Level_Basis"] = dest_grid["Risk_Level_Basis"].replace({"nan": "", "None": ""})
         dest_grid.loc[dest_grid["Risk_Level_Basis"].str.strip().eq(""), "Risk_Level_Basis"] = "LOW (10): base score 10"
         dest_grid = dest_grid.drop(columns=["_risk_rank"], errors="ignore")
+        dest_grid["Unique_MACs_Display"] = [
+            _unique_macs_display_text(c, m)
+            for c, m in zip(
+                dest_grid.get("Unique_MACs", pd.Series(0, index=dest_grid.index)).tolist(),
+                dest_grid.get("_Unique_MAC_List", pd.Series("", index=dest_grid.index)).tolist(),
+            )
+        ]
+        if "Unique_MACs_Display" in dest_grid.columns and "Unique_MACs" in dest_grid.columns:
+            unique_idx = int(dest_grid.columns.get_loc("Unique_MACs"))
+            display_series = dest_grid.pop("Unique_MACs_Display")
+            dest_grid.insert(unique_idx, "Unique_MACs_Display", display_series)
 
         gb_dest = _new_grid_builder(dest_grid, page_size=20)
         gb_dest.configure_column("AI_Provider", header_name="Provider", minWidth=150)
         gb_dest.configure_column("Policy_Verdict", header_name="Verdict", minWidth=120, cellStyle=_policy_cellstyle())
         gb_dest.configure_column("Domain", minWidth=220, flex=1.6)
         gb_dest.configure_column("Events", width=95, flex=0.8)
-        gb_dest.configure_column("Unique_MACs", header_name="Unique MACs", minWidth=110)
+        gb_dest.configure_column(
+            "Unique_MACs_Display",
+            header_name="Unique MACs",
+            width=220,
+            flex=0,
+            cellStyle={"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
+        )
+        gb_dest.configure_column("Unique_MACs", hide=True)
+        gb_dest.configure_column("_Unique_MAC_List", hide=True)
         gb_dest.configure_column("Last_Seen", header_name="Last Seen", minWidth=145)
         gb_dest.configure_column("Total_Upload_MB", header_name="Upload MB", minWidth=105)
         gb_dest.configure_column("Avg_Risk", header_name="Avg Risk", minWidth=95, cellStyle=_risk_score_cellstyle())
@@ -5233,7 +5300,7 @@ def render_shadow_ai(parquet_root: Path):
         dest_response = render_shadow_aggrid(
             dest_grid,
             gb_dest,
-            key=f"shadow_ai_dest_grid_{selected_scope_key}",
+            key=f"shadow_ai_dest_grid_v2_{selected_scope_key}",
             height=455,
             wrap_shell=False,
             hide_top_border=True,
