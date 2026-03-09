@@ -20,7 +20,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-uis"
+CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-ui"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -3269,9 +3269,6 @@ def _build_shadow_ai_mac_tab_frames(filtered: pd.DataFrame) -> Tuple[pd.DataFram
         Top_Domain=("Domain", _safe_value_counts_top),
         Source_IP=("id.orig_h", _safe_value_counts_top),
         Top_Evidence=("Evidence_Type", _safe_value_counts_top),
-        Max_Severity=("Severity", lambda x: "CRITICAL" if (x == "CRITICAL").any()
-                     else ("HIGH" if (x == "HIGH").any()
-                           else ("MEDIUM" if (x == "MEDIUM").any() else "LOW"))),
     ).reset_index().sort_values(["Events", "Total_Upload_MB"], ascending=False)
 
     try:
@@ -4625,6 +4622,11 @@ def render_shadow_ai(parquet_root: Path):
             "(same `uid`) and appends `Upload bytes estimated from conn.orig_ip_bytes` to Detection Basis."
         )
         st.markdown(
+            "Upload **risk points** are intentionally applied to **HTTP** rows only. "
+            "Reason: HTTP has method/endpoint context (`POST`, URI patterns), while TLS/DNS/CONN bytes are transport-level "
+            "and can overstate exfiltration risk if scored the same way."
+        )
+        st.markdown(
             f"Risk score starts at **10** and adds weighted signals: HTTP (+20), POST (+20), "
             f"upload >= {int(round(LARGE_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB (+40), "
             f"upload >= {int(round(MEDIUM_UPLOAD_THRESHOLD_BYTES/(1024*1024)))}MB (+20), "
@@ -4636,6 +4638,10 @@ def render_shadow_ai(parquet_root: Path):
             "Grouped tables (provider/destination/device) compute Risk Level from each group's `Max_Risk` and sort "
             "descending (**CRITICAL -> HIGH -> MEDIUM -> LOW**). "
             "Overrides still apply for first-seen shadow AI and governance alerts."
+        )
+        st.markdown(
+            "Because grouped risk uses `Max_Risk` (worst event) instead of total bytes, a row can have higher "
+            "`Total_Upload_MB` but lower `Risk_Level` when its events lack stronger risk signals."
         )
         st.markdown(
             "Evidence columns include Match_Field, Signature_Match, Matched_Value, Detection_Basis, "
@@ -5321,7 +5327,6 @@ def render_shadow_ai(parquet_root: Path):
             gb_mac.configure_column("Top_Domain", header_name="Top Domain", minWidth=170)
             gb_mac.configure_column("Source_IP", header_name="IP", minWidth=120)
             gb_mac.configure_column("Top_Evidence", header_name="Top Evidence", minWidth=130)
-            gb_mac.configure_column("Max_Severity", header_name="Max Severity", minWidth=110, cellStyle=_severity_cellstyle())
             gb_mac.configure_column("Risk_Level_Basis", header_name="Risk Level Basis", minWidth=320, flex=2.2)
             gb_mac.configure_selection(selection_mode="single", use_checkbox=False)
             clickable_mac_style = JsCode(
