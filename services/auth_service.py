@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -37,6 +38,11 @@ except Exception:
     MySQLError = Exception
     MYSQL_ERRORCODE = None
 
+try:
+    import tomllib
+except Exception:
+    tomllib = None
+
 
 PBKDF2_ALG = "sha256"
 PBKDF2_ITERATIONS = 260_000
@@ -61,6 +67,7 @@ MONGO_TRANSIENT_WRITE_ERRORS = (
     NetworkTimeout,
     ServerSelectionTimeoutError,
 )
+_LOCAL_SECRETS_CACHE = None
 
 
 class DuplicateUsernameError(RuntimeError):
@@ -127,6 +134,10 @@ def validate_display_name_policy(name: str) -> str:
         raise ValueError("Name is required.")
     if len(clean_name) > 100:
         raise ValueError("Name must be 100 characters or fewer.")
+    if "@" in clean_name:
+        raise ValueError("Name must not be an e-mail address.")
+    if not any(ch.isalpha() for ch in clean_name):
+        raise ValueError("Name must include at least one letter.")
     return clean_name
 
 
@@ -137,14 +148,65 @@ def validate_password_policy(password: str) -> None:
         raise ValueError("Password must include at least one special character.")
 
 
+def _nested_lookup(mapping, path: str, default=None):
+    current = mapping
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def _load_local_streamlit_secrets() -> dict:
+    global _LOCAL_SECRETS_CACHE
+    if isinstance(_LOCAL_SECRETS_CACHE, dict):
+        return _LOCAL_SECRETS_CACHE
+
+    candidates = []
+    try:
+        candidates.append(Path(__file__).resolve().parents[1] / ".streamlit" / "secrets.toml")
+    except Exception:
+        pass
+    candidates.append(Path.cwd() / ".streamlit" / "secrets.toml")
+    candidates.append(Path.home() / ".streamlit" / "secrets.toml")
+
+    seen = set()
+    for path in candidates:
+        normalized = str(path).strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if not path.exists() or not path.is_file():
+            continue
+        if tomllib is None:
+            continue
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                _LOCAL_SECRETS_CACHE = parsed
+                return _LOCAL_SECRETS_CACHE
+        except Exception:
+            continue
+
+    _LOCAL_SECRETS_CACHE = {}
+    return _LOCAL_SECRETS_CACHE
+
+
 def _get_secret(path: str, default=None):
     try:
         current = st.secrets
         for part in path.split("."):
             if part not in current:
-                return default
+                current = None
+                break
             current = current[part]
-        return current
+        if current is not None:
+            return current
+    except Exception:
+        pass
+
+    try:
+        return _nested_lookup(_load_local_streamlit_secrets(), path, default=default)
     except Exception:
         return default
 
@@ -188,37 +250,93 @@ def get_auth_backend() -> str:
     return backend
 
 
+def _infer_smtp_host(username: str, from_email: str) -> Optional[str]:
+    source = normalize_username(username) or normalize_username(from_email)
+    if "@" not in source:
+        return None
+    domain = source.split("@", 1)[1].strip().lower()
+    known_hosts = {
+        "gmail.com": "smtp.gmail.com",
+        "googlemail.com": "smtp.gmail.com",
+        "outlook.com": "smtp.office365.com",
+        "hotmail.com": "smtp.office365.com",
+        "live.com": "smtp.office365.com",
+        "msn.com": "smtp.office365.com",
+        "yahoo.com": "smtp.mail.yahoo.com",
+        "yahoo.com.ph": "smtp.mail.yahoo.com",
+        "icloud.com": "smtp.mail.me.com",
+        "me.com": "smtp.mail.me.com",
+        "mac.com": "smtp.mail.me.com",
+    }
+    return known_hosts.get(domain)
+
+
 def _get_smtp_config() -> Optional[SmtpConfig]:
     host = _first_non_empty(
         [
             os.getenv("AUTH_SMTP_HOST"),
             os.getenv("SMTP_HOST"),
+            os.getenv("AUTH_SMTP_SERVER"),
+            os.getenv("SMTP_SERVER"),
+            os.getenv("MAIL_SERVER"),
             _get_secret("auth.smtp_host"),
             _get_secret("smtp_host"),
+            _get_secret("auth.smtp_server"),
+            _get_secret("smtp_server"),
+            _get_secret("AUTH_SMTP_HOST"),
+            _get_secret("SMTP_HOST"),
+            _get_secret("AUTH_SMTP_SERVER"),
+            _get_secret("SMTP_SERVER"),
         ]
     )
     username = _first_non_empty(
         [
             os.getenv("AUTH_SMTP_USERNAME"),
             os.getenv("SMTP_USERNAME"),
+            os.getenv("AUTH_SMTP_USER"),
+            os.getenv("SMTP_USER"),
+            os.getenv("MAIL_USERNAME"),
             _get_secret("auth.smtp_username"),
             _get_secret("smtp_username"),
+            _get_secret("auth.smtp_user"),
+            _get_secret("smtp_user"),
+            _get_secret("AUTH_SMTP_USERNAME"),
+            _get_secret("SMTP_USERNAME"),
+            _get_secret("AUTH_SMTP_USER"),
+            _get_secret("SMTP_USER"),
         ]
     )
     password = _first_non_empty(
         [
             os.getenv("AUTH_SMTP_PASSWORD"),
             os.getenv("SMTP_PASSWORD"),
+            os.getenv("AUTH_SMTP_PASS"),
+            os.getenv("SMTP_PASS"),
+            os.getenv("MAIL_PASSWORD"),
             _get_secret("auth.smtp_password"),
             _get_secret("smtp_password"),
+            _get_secret("auth.smtp_pass"),
+            _get_secret("smtp_pass"),
+            _get_secret("AUTH_SMTP_PASSWORD"),
+            _get_secret("SMTP_PASSWORD"),
+            _get_secret("AUTH_SMTP_PASS"),
+            _get_secret("SMTP_PASS"),
         ]
     )
     from_email = _first_non_empty(
         [
             os.getenv("AUTH_SMTP_FROM_EMAIL"),
             os.getenv("SMTP_FROM_EMAIL"),
+            os.getenv("AUTH_FROM_EMAIL"),
+            os.getenv("FROM_EMAIL"),
             _get_secret("auth.smtp_from_email"),
             _get_secret("smtp_from_email"),
+            _get_secret("auth.from_email"),
+            _get_secret("from_email"),
+            _get_secret("AUTH_SMTP_FROM_EMAIL"),
+            _get_secret("SMTP_FROM_EMAIL"),
+            _get_secret("AUTH_FROM_EMAIL"),
+            _get_secret("FROM_EMAIL"),
             username,
         ]
     )
@@ -231,6 +349,8 @@ def _get_smtp_config() -> Optional[SmtpConfig]:
             "Zeek Dashboard",
         ]
     )
+    if not host:
+        host = _infer_smtp_host(str(username or ""), str(from_email or ""))
     if not host or not from_email:
         return None
 
@@ -293,7 +413,8 @@ def _send_email(
     cfg = _get_smtp_config()
     if cfg is None:
         raise RuntimeError(
-            "SMTP is not configured. Set AUTH_SMTP_HOST, AUTH_SMTP_PORT, AUTH_SMTP_FROM_EMAIL, AUTH_SMTP_USERNAME, and AUTH_SMTP_PASSWORD."
+            "SMTP is not configured. Set AUTH_SMTP_HOST, AUTH_SMTP_USERNAME, and AUTH_SMTP_PASSWORD "
+            "(or [auth].smtp_host/smtp_username/smtp_password in .streamlit/secrets.toml)."
         )
 
     recipient = validate_username_policy(to_email)
@@ -1488,6 +1609,8 @@ def create_user(name: str, username: str, password: str, role: str, created_by: 
     clean_role = (role or "").strip().lower()
     if clean_role not in {"admin", "staff"}:
         raise ValueError("Role must be admin or staff.")
+    if normalize_display_name(password) == clean_name:
+        raise ValueError("Name must not match the password.")
     clean_created_by = normalize_username(created_by) or "system"
 
     now = datetime.now(timezone.utc)
@@ -1602,6 +1725,8 @@ def update_user(
     if password is not None:
         validate_password_policy(password)
         updates["password_hash"] = hash_password(password)
+        if "name" in updates and normalize_display_name(password) == str(updates.get("name", "")).strip():
+            raise ValueError("Name must not match the password.")
         if password_reset_required is None:
             updates["password_reset_required"] = True
     if password_reset_required is not None:

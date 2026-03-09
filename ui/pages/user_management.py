@@ -270,6 +270,39 @@ def _users_signature(users: list[dict]) -> str:
     return "||".join(parts)
 
 
+def _looks_like_credential_text(value: str) -> bool:
+    clean = str(value or "").strip()
+    if not clean:
+        return False
+    has_letter = any(ch.isalpha() for ch in clean)
+    has_digit = any(ch.isdigit() for ch in clean)
+    has_special = any((not ch.isalnum()) and (not ch.isspace()) for ch in clean)
+    return (not has_letter) and (has_digit or has_special)
+
+
+def _fallback_name_from_username(username: str) -> str:
+    clean_username = str(username or "").strip().lower()
+    if not clean_username:
+        return "Unspecified"
+    local = clean_username.split("@", 1)[0].strip()
+    if not local:
+        return "Unspecified"
+    local = local.replace(".", " ").replace("_", " ").replace("-", " ")
+    local = " ".join(local.split())
+    if not local:
+        return "Unspecified"
+    if any(ch.isalpha() for ch in local):
+        return local.title()
+    return local
+
+
+def _safe_display_name(raw_name: str, username: str) -> str:
+    clean_name = str(raw_name or "").strip()
+    if not clean_name or _looks_like_credential_text(clean_name):
+        return _fallback_name_from_username(username)
+    return clean_name
+
+
 def _um_table_height_for_rows(row_count: int) -> int:
     visible_rows = max(4, min(int(row_count or 0), 8))
     return 50 + (visible_rows * 54) + 4
@@ -503,7 +536,10 @@ def _render_edit_user_dialog(
             st.rerun()
         return
 
-    current_name = str(user_map[target].get("name", "") or "").strip()
+    stored_name = str(user_map[target].get("name", "") or "").strip()
+    current_name = _safe_display_name(stored_name, target)
+    if _looks_like_credential_text(stored_name):
+        st.warning("Stored display name looked like credentials. Set a proper name and save.")
 
     with st.form("um_edit_user_modal_form", clear_on_submit=False):
         new_name = st.text_input("Name", value=current_name, placeholder="Full name")
@@ -606,7 +642,7 @@ def render(current_username: str):
             placeholder="At least 8 characters and 1 special character",
             key="um_create_password",
         )
-        st.caption("Name is required. Only @gmail.com e-mail accounts are allowed.")
+        st.caption("Name is required and must include letters. Only @gmail.com e-mail accounts are allowed.")
         st.caption("The new user receives this e-mail and default password, then must verify OTP and change it on first login.")
         role_options = ["staff", "admin"]
         current_role = str(st.session_state.get("um_create_role", "staff") or "staff").strip().lower()
@@ -675,8 +711,8 @@ def render(current_username: str):
 
         table_rows = []
         for row in users:
-            display_name = str(row.get("name", "") or "").strip()
             username = str(row.get("username", "")).strip().lower()
+            display_name = _safe_display_name(str(row.get("name", "") or "").strip(), username)
             table_rows.append(
                 {
                     "Name": display_name,

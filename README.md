@@ -187,6 +187,28 @@ python scripts/migrate_auth_users_mongo_to_mysql.py
 streamlit run app.py
 ```
 
+### SMTP (Required for OTP E-mail)
+
+Add SMTP settings in `.streamlit/secrets.toml`:
+
+```toml
+[auth]
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+smtp_username = "your-sender@gmail.com"
+smtp_password = "your-16-char-app-password"
+smtp_from_email = "your-sender@gmail.com"
+smtp_from_name = "Zeek Dashboard"
+smtp_use_tls = true
+smtp_use_ssl = false
+```
+
+Quick check from project root:
+
+```bash
+python -c "from services import auth_service; print(auth_service._get_smtp_config())"
+```
+
 ## First Login
 
 1. On first startup, if `app_users` is empty, the app creates the bootstrap admin from `.streamlit/secrets.toml`.
