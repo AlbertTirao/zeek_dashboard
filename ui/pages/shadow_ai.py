@@ -20,7 +20,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-ui"
+CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-uis"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -3894,8 +3894,8 @@ def _render_shadow_ai_mac_drilldown(
 
     _search_key = f"shadow_ai_mac_search_{selected_scope_key}_{mac_key}_{key_prefix}"
     q = st.text_input(
-        "Search (this MAC)",
-        placeholder="provider, domain, detail, destination, IP, host, user-agent...",
+        "Search (provider, domain, detail, destination, IP, host, user-agent)",
+        placeholder="e.g. chatgpt.com",
         key=_search_key,
     )
 
@@ -4069,8 +4069,6 @@ def _render_shadow_ai_mac_drilldown(
                 s = s[s != ""]
                 return int(s.nunique())
 
-            prov_src["_sev_rank"] = prov_src["Severity"].astype(str).str.upper().map(SEVERITY_RANK_MAP).fillna(0).astype(int)
-
             prov_tbl = prov_src.groupby("AI_Provider", dropna=False).agg(
                 Events=("ts", "count"),
                 Domains=("Domain", _nunique_nonempty),
@@ -4079,7 +4077,6 @@ def _render_shadow_ai_mac_drilldown(
                 Max_Risk=("Risk_Score", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).max())),
                 First_Seen=("ts", "min"),
                 Last_Seen=("ts", "max"),
-                Highest_Severity_Rank=("_sev_rank", "max"),
                 Top_Domain=("Domain", _mode_nonempty),
                 Top_Verdict=("Policy_Verdict", _mode_nonempty),
             ).reset_index()
@@ -4088,8 +4085,6 @@ def _render_shadow_ai_mac_drilldown(
             if not risk_basis_tbl.empty:
                 prov_tbl = prov_tbl.merge(risk_basis_tbl, on=["AI_Provider"], how="left")
 
-            prov_tbl["Highest_Severity"] = prov_tbl["Highest_Severity_Rank"].map(SEVERITY_RANK_INV_MAP).fillna("")
-            prov_tbl = prov_tbl.drop(columns=["Highest_Severity_Rank"])
             prov_tbl["Upload_MB"] = pd.to_numeric(prov_tbl["Upload_MB"], errors="coerce").fillna(0).round(2)
             prov_tbl["Avg_Risk"] = pd.to_numeric(prov_tbl["Avg_Risk"], errors="coerce").fillna(0).round(1)
             prov_tbl["Max_Risk"] = pd.to_numeric(prov_tbl["Max_Risk"], errors="coerce").fillna(0).round(0).astype(int)
@@ -4119,7 +4114,6 @@ def _render_shadow_ai_mac_drilldown(
             gb_prov.configure_column("Avg_Risk", header_name="Avg Risk", minWidth=95, flex=0.6, cellStyle=_risk_score_cellstyle())
             gb_prov.configure_column("Max_Risk", header_name="Max Risk", minWidth=95, flex=0.6, cellStyle=_risk_score_cellstyle())
             gb_prov.configure_column("Max_Risk_Level", header_name="Risk Level", minWidth=110, flex=0.7, cellStyle=_severity_cellstyle())
-            gb_prov.configure_column("Highest_Severity", header_name="Highest Sev", minWidth=115, flex=0.7, cellStyle=_severity_cellstyle())
             gb_prov.configure_column("First_Seen", header_name="First Seen", minWidth=150, flex=0.95)
             gb_prov.configure_column("Last_Seen", header_name="Last Seen", minWidth=150, flex=0.95)
             gb_prov.configure_column("Top_Domain", header_name="Top Domain", minWidth=180, flex=1.25)
@@ -4601,7 +4595,7 @@ def render_shadow_ai(parquet_root: Path):
     st.session_state.setdefault("_shadow_ai_scoped_df_key_v1", None)
     st.session_state.setdefault("_shadow_ai_scoped_df_v1", None)
     st.session_state.setdefault("_shadow_ai_scoped_decision_v1", "all_dates")
-    st.markdown("### Shadow AI & Data Leakage Monitor")
+    st.markdown("### Shadow AI Incidents")
     st.markdown(
         "<div class='shadow-callout'>Correlates HTTP/SSL/DNS/CONN telemetry with signature and policy context to surface potential Shadow AI usage and leakage risk.</div>",
         unsafe_allow_html=True,
