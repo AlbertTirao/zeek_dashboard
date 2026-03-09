@@ -177,6 +177,7 @@ generic_name_patterns:
 - openai|anthropic|gemini|perplexity|manus|deepseek|copilot
 heuristic_domain_provider_map:
   facebook.com: Meta AI
+  meta.com: Meta AI
   wps.com: WPS AI
 saas_allowlist_domains: []
 detection_settings:

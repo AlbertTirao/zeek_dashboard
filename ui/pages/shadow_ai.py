@@ -20,7 +20,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-uis"
+CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-ui"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -685,6 +685,50 @@ def _is_generic_ai_like_text(raw_text: str) -> bool:
     if re.search(r"\bv1[\/ ](?:chat[\/ ]completions|responses|embeddings)\b", raw):
         return True
     return False
+
+
+def _generic_hint_text(raw_text: str) -> str:
+    """
+    Build a conservative text surface for generic hint regex matching.
+    We keep host + path and drop query/fragment noise (signed params, cache keys, etc.).
+    """
+    raw = str(raw_text or "").strip()
+    if not raw:
+        return ""
+
+    host = _to_domain_from_destination(raw)
+    path_hint = ""
+
+    if "://" in raw or raw.startswith("//"):
+        try:
+            parsed = urlparse(raw if "://" in raw else f"http:{raw}")
+            path_hint = str(parsed.path or "").strip()
+        except Exception:
+            path_hint = ""
+    else:
+        # Common HTTP combined text shape: "<host> <uri>"
+        parts = raw.split(None, 1)
+        if len(parts) >= 2:
+            path_hint = str(parts[1]).strip()
+        elif "/" in raw:
+            path_hint = "/" + str(raw).split("/", 1)[1]
+
+    path_hint = re.split(r"[?#]", path_hint, maxsplit=1)[0].strip()
+    if path_hint and not path_hint.startswith("/"):
+        path_hint = "/" + path_hint.lstrip("/")
+
+    hint = " ".join([x for x in [str(host or "").strip(), path_hint] if str(x).strip()])
+    return hint.strip().lower()
+
+
+def _has_generic_provider_hint(raw_text: str) -> bool:
+    hint_text = _generic_hint_text(raw_text)
+    if not hint_text:
+        return False
+    try:
+        return bool(GENERIC_PROVIDER_HINT_PATTERN.search(hint_text))
+    except Exception:
+        return False
 
 
 def _heuristic_root_domain(host: str) -> str:
@@ -1415,8 +1459,13 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
     if remaining.any():
         rem = text_series[remaining]
         if not rem.empty:
+            hint = pd.Series(False, index=rem.index)
             try:
-                hint = rem.str.contains(GENERIC_PROVIDER_HINT_PATTERN, na=False, regex=True)
+                hint_map = {
+                    raw_text: _has_generic_provider_hint(raw_text)
+                    for raw_text in rem.drop_duplicates().tolist()
+                }
+                hint = rem.map(hint_map).fillna(False)
             except Exception:
                 hint = pd.Series(False, index=rem.index)
             ai_like = rem.map(_is_generic_ai_like_text).fillna(False)
