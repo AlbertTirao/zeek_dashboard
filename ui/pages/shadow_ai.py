@@ -20,7 +20,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 # FAST LOAD / CACHE CONFIG (MATCH SHADOW APPS DIRECTORY PATTERN)
 # =============================================================================
 
-CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-ui"
+CACHE_VERSION = "shadow-ai-cache-v29-upload-fallback-risklevel-uis"
 CACHE_DIRNAME = "_shadow_cache_ai"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -673,8 +673,6 @@ def _is_generic_ai_like_text(raw_text: str) -> bool:
     norm = _normalize_fuzzy_text(raw)
     if not norm:
         return False
-    if _has_ai_signal_tokens(norm):
-        return True
     host = _to_domain_from_destination(raw)
     if host and str(host).strip().lower().rstrip(".").endswith(".ai"):
         return True
@@ -1381,8 +1379,8 @@ def _collect_files_upload_uids(files_paths: List[Path]) -> set[str]:
 
 def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     """
-    First matching provider wins via regex; remaining rows get fuzzy fallback,
-    then a conservative generic-AI heuristic fallback.
+    First matching provider wins via strict signatures; remaining rows use
+    host/domain heuristics, then a conservative generic-AI heuristic fallback.
 
     IMPORTANT (AI-only mode):
       - Generic fallback is only used when text has explicit AI signals (AI domain/token/path).
@@ -1407,38 +1405,7 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
                 sig[m] = raw_frag
                 remaining = provider.isna()
 
-    # 2) fuzzy alias fallback (only for texts that contain known AI alias tokens)
-    if remaining.any():
-        rem = text_series[remaining]
-        if not rem.empty:
-            try:
-                rem_hint = rem[rem.str.contains(FUZZY_HINT_PATTERN, na=False, regex=True)]
-            except Exception:
-                rem_hint = pd.Series([], dtype="object")
-            if not rem_hint.empty:
-                # Guard: only apply fuzzy to host-ish values (no whitespace, has dot/colon)
-                try:
-                    rem_hint = rem_hint[
-                        (~rem_hint.astype(str).str.contains(r"\s", regex=True, na=False))
-                        & (rem_hint.astype(str).str.contains(r"[\.:]", regex=True, na=False))
-                    ]
-                except Exception:
-                    pass
-                fuzzy_map: Dict[str, Tuple[str, str]] = {}
-                for raw_text in rem_hint.drop_duplicates().tolist():
-                    prov, fuzzy_sig = _fuzzy_provider_match(raw_text, min_score=FUZZY_MIN_SCORE)
-                    if prov != "Unknown":
-                        fuzzy_map[raw_text] = (prov, fuzzy_sig)
-
-                if fuzzy_map:
-                    for raw_text, (prov, fuzzy_sig) in fuzzy_map.items():
-                        m = remaining & text_series.eq(raw_text)
-                        if m.any():
-                            provider[m] = prov
-                            sig[m] = fuzzy_sig
-                            remaining = provider.isna()
-
-    # 3) host/domain heuristic provider fallback
+    # 2) host/domain heuristic provider fallback
     if remaining.any():
         rem = text_series[remaining]
         if not rem.empty:
@@ -1455,7 +1422,7 @@ def _assign_provider_and_signature(text_series: pd.Series) -> Tuple[pd.Series, p
                         sig[m] = host_sig
                         remaining = provider.isna()
 
-    # 4) generic AI heuristic fallback
+    # 3) generic AI heuristic fallback
     if remaining.any():
         rem = text_series[remaining]
         if not rem.empty:
@@ -4647,7 +4614,7 @@ def render_shadow_ai(parquet_root: Path):
         st.markdown(
             "Events are generated when Zeek telemetry matches `ai_signatures.yaml` "
             "(HTTP host/uri, TLS SNI, DNS query) or configured local AI ports (`conn id.resp_p`). "
-            "If regex/fuzzy misses, generic fallback only maps domains when explicitly configured."
+            "If strict signatures and host hints miss, generic fallback only maps domains when explicitly configured."
         )
         st.markdown(
             "`Unknown AI` heuristic hits are shown as `<domain> (unknown ai provider)` when traffic is AI-like "
