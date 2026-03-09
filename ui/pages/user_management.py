@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
 from datetime import datetime
+import time
 
 from services import auth_service
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
@@ -13,6 +14,53 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     GridOptionsBuilder = None
     GridUpdateMode = None
     JsCode = None
+
+
+UM_USERS_CACHE_ROWS_KEY = "um_users_cache_rows"
+UM_USERS_CACHE_AT_KEY = "um_users_cache_at"
+UM_USERS_CACHE_TTL_SECONDS = 8.0
+UM_CREATE_CLEAR_FIELDS_FLAG_KEY = "um_create_clear_fields"
+
+
+def _normalize_username(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _users_contains_username(rows: list[dict], username: str) -> bool:
+    target = _normalize_username(username)
+    if not target:
+        return False
+    for row in rows or []:
+        row_username = _normalize_username(str((row or {}).get("username", "") or ""))
+        if row_username == target:
+            return True
+    return False
+
+
+def _clone_users(rows) -> list[dict]:
+    out = []
+    for row in (rows or []):
+        if isinstance(row, dict):
+            out.append(dict(row))
+    return out
+
+
+def _set_cached_users(rows: list[dict]) -> None:
+    st.session_state[UM_USERS_CACHE_ROWS_KEY] = _clone_users(rows)
+    st.session_state[UM_USERS_CACHE_AT_KEY] = float(time.time())
+
+
+def _get_cached_users(*, force: bool = False) -> list[dict]:
+    now = float(time.time())
+    if not force:
+        cached_rows = st.session_state.get(UM_USERS_CACHE_ROWS_KEY)
+        cached_at = float(st.session_state.get(UM_USERS_CACHE_AT_KEY, 0.0) or 0.0)
+        if isinstance(cached_rows, list) and cached_at > 0 and (now - cached_at) <= UM_USERS_CACHE_TTL_SECONDS:
+            return _clone_users(cached_rows)
+
+    users = auth_service.list_users()
+    _set_cached_users(users)
+    return _clone_users(users)
 
 
 def _inject_user_management_css() -> None:
@@ -270,6 +318,10 @@ def _users_signature(users: list[dict]) -> str:
     return "||".join(parts)
 
 
+def _bump_user_table_version() -> None:
+    st.session_state["um_user_editor_version"] = int(st.session_state.get("um_user_editor_version", 0)) + 1
+
+
 def _looks_like_credential_text(value: str) -> bool:
     clean = str(value or "").strip()
     if not clean:
@@ -466,7 +518,7 @@ _UM_GRID_SIZE_CHANGED_JS = (
 
 @st.dialog("Delete User")
 def _render_delete_user_dialog(target_username: str, current_username: str) -> None:
-    users = auth_service.list_users()
+    users = _get_cached_users(force=False)
     user_map = {str(u.get("username", "")).strip().lower(): u for u in users}
     target = (target_username or "").strip().lower()
     current = (current_username or "").strip().lower()
@@ -508,6 +560,10 @@ def _render_delete_user_dialog(target_username: str, current_username: str) -> N
                 raise ValueError("At least one admin account must remain.")
 
             auth_service.delete_user(username=target)
+            refreshed_users = _get_cached_users(force=True)
+            if _users_contains_username(refreshed_users, target):
+                raise RuntimeError("Delete operation completed, but the account is still present. Please retry.")
+            _bump_user_table_version()
             st.session_state.pop("um_delete_target", None)
             st.success("User deleted successfully.")
             st.rerun()
@@ -524,7 +580,7 @@ def _render_edit_user_dialog(
     target_username: str,
     current_username: str,
 ) -> None:
-    users = auth_service.list_users()
+    users = _get_cached_users(force=False)
     user_map = {str(u.get("username", "")).strip().lower(): u for u in users}
     target = (target_username or "").strip().lower()
     current = (current_username or "").strip().lower()
@@ -556,12 +612,17 @@ def _render_edit_user_dialog(
         try:
             clean_new_name = " ".join(str(new_name or "").strip().split())
             clean_new_username = (new_username or "").strip().lower()
+            clean_new_password = new_password.strip() if new_password.strip() else None
             auth_service.update_user(
                 username=target,
                 name=clean_new_name,
                 new_username=clean_new_username,
-                password=(new_password.strip() if new_password.strip() else None),
+                password=clean_new_password,
             )
+            refreshed_users = _get_cached_users(force=True)
+            if not _users_contains_username(refreshed_users, clean_new_username):
+                raise RuntimeError("Update operation completed, but the account could not be loaded. Please retry.")
+            _bump_user_table_version()
 
             if target == current:
                 if "auth_user" in st.session_state and isinstance(st.session_state["auth_user"], dict):
@@ -585,7 +646,7 @@ def render(current_username: str):
         st.error("streamlit-aggrid is required for the Action column UI.")
         return
 
-    users = auth_service.list_users()
+    users = _get_cached_users(force=False)
 
     total_users = len(users)
     admin_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
@@ -632,8 +693,11 @@ def render(current_username: str):
         "<div class='um-card-sub'>Provision a new account with role-based access.</div>",
         unsafe_allow_html=True,
     )
+    if bool(st.session_state.pop(UM_CREATE_CLEAR_FIELDS_FLAG_KEY, False)):
+        for key in ("um_create_name", "um_create_username", "um_create_password", "um_create_role"):
+            st.session_state.pop(key, None)
 
-    with st.form("create_user_form", clear_on_submit=True):
+    with st.form("create_user_form", clear_on_submit=False):
         name = st.text_input("Name", placeholder="Full name", key="um_create_name")
         username = st.text_input("E-mail", placeholder="name@gmail.com", key="um_create_username")
         password = st.text_input(
@@ -663,6 +727,10 @@ def render(current_username: str):
                 role=clean_role,
                 created_by=current_username,
             )
+            refreshed_users = _get_cached_users(force=True)
+            if not _users_contains_username(refreshed_users, clean_username):
+                raise RuntimeError("User creation succeeded, but the new account could not be loaded from the database.")
+            _bump_user_table_version()
             email_warning = ""
             try:
                 auth_service.send_new_user_credentials_email(
@@ -689,6 +757,8 @@ def render(current_username: str):
                     ),
                     "detail": "",
                 }
+            # Keep failed submissions intact; clear fields safely on next rerun.
+            st.session_state[UM_CREATE_CLEAR_FIELDS_FLAG_KEY] = True
             st.rerun()
         except Exception as e:
             st.error(str(e))
@@ -785,13 +855,13 @@ def render(current_username: str):
         grid_response = AgGrid(
             editor_df,
             gridOptions=grid_options,
-            update_mode=GridUpdateMode.MODEL_CHANGED,
+            update_mode=GridUpdateMode.VALUE_CHANGED,
             data_return_mode=DataReturnMode.AS_INPUT,
             server_sync_strategy="server_wins",
             theme=ag_theme,
             custom_css=ag_css,
             height=_um_table_height_for_rows(len(editor_df)),
-            reload_data=True,
+            reload_data=False,
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=True,
             key=grid_component_key,
@@ -871,6 +941,8 @@ def render(current_username: str):
                         username=username,
                         role=new_role,
                     )
+                _get_cached_users(force=True)
+                _bump_user_table_version()
                 st.rerun()
         except Exception as e:
             st.error(str(e))

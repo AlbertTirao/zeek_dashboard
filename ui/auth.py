@@ -1040,7 +1040,7 @@ def require_authentication() -> None:
                             label_visibility="collapsed",
                         )
                         st.caption(
-                            "After credentials are verified, an OTP is sent to your e-mail and expires in 1 minute."
+                            "If your account is still on a default password, an OTP is sent to your e-mail and expires in 1 minute."
                         )
                         credentials_submitted = st.form_submit_button("LOG IN", width="stretch")
                 elif stage == LOGIN_STAGE_OTP:
@@ -1124,6 +1124,18 @@ def require_authentication() -> None:
             st.stop()
 
         requires_password_reset = bool(getattr(user, "password_reset_required", False))
+        if not requires_password_reset:
+            try:
+                final_user = complete_login_after_otp(user.username)
+            except Exception as e:
+                st.error("Login service is unavailable.")
+                st.caption("Check AUTH_MONGODB_URI / MONGODB_URI and database connectivity.")
+                st.code(str(e))
+                st.stop()
+            if final_user is None:
+                st.error("User account is not available for login.")
+                st.stop()
+            _complete_authenticated_session(final_user)
 
         st.session_state[LOGIN_PENDING_USER_SESSION_KEY] = {
             "name": user.name,
