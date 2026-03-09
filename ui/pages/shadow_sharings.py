@@ -449,7 +449,7 @@ def inject_shadow_sharing_css():
         }
 
         .shadow-callout {
-            border: 1px solid var(--panel-border);
+            border: 0;
             background: var(--panel-bg);
             border-radius: 10px;
             padding: 0.5rem 0.72rem;
@@ -1796,7 +1796,11 @@ def render_shadow_sharing(parquet_root: Path):
         origin = None
 
     st.markdown("### Shadow Sharing Incidents")
-    st.caption("Incidents roll up conn/ssl/http/files evidence into 5-minute windows and score confidence (HIGH/PROBABLE/WEAK).")
+    st.markdown(
+        "<div class='shadow-callout'>Correlates CONN/SSL/HTTP/files telemetry into 5-minute incident windows and scores confidence "
+        "(HIGH/PROBABLE/WEAK).</div>",
+        unsafe_allow_html=True,
+    )
     with st.expander("Detection basis", expanded=False):
         st.markdown(_confidence_score_explainer_text())
 

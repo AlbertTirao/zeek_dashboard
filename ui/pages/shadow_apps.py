@@ -688,6 +688,15 @@ def inject_shadow_apps_css():
             margin-bottom: 0.3rem;
         }
 
+        .shadow-callout {
+            border: 0;
+            background: var(--panel-bg);
+            border-radius: 10px;
+            padding: 0.5rem 0.72rem;
+            font-size: 0.84rem;
+            margin-bottom: 0.45rem;
+        }
+
         .shadow-scope-hint {
             font-size: 0.9rem;
             color: #c8d7ea;
@@ -4179,9 +4188,10 @@ def render_shadow_apps(parquet_root: Path):
 
     risk_policy = load_risk_policy()
     st.markdown("### Shadow App Incidents")
-    st.caption(
-        "Incidents correlate conn/http/ssl/dns/files/software telemetry and score risk confidence "
-        "for unauthorized app activity (Critical/High/Medium/Low/Safe)."
+    st.markdown(
+        "<div class='shadow-callout'>Correlates CONN/HTTP/SSL/DNS/files/software telemetry with risk-policy and behavior context "
+        "to score confidence for unauthorized app activity (Critical/High/Medium/Low/Safe).</div>",
+        unsafe_allow_html=True,
     )
     with st.expander("Detection basis", expanded=False):
         st.markdown(
