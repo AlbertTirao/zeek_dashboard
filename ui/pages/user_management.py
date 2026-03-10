@@ -20,6 +20,7 @@ UM_USERS_CACHE_ROWS_KEY = "um_users_cache_rows"
 UM_USERS_CACHE_AT_KEY = "um_users_cache_at"
 UM_USERS_CACHE_TTL_SECONDS = 8.0
 UM_CREATE_CLEAR_FIELDS_FLAG_KEY = "um_create_clear_fields"
+UM_CREATE_FORM_KEYS = ("um_create_name", "um_create_username", "um_create_password", "um_create_role")
 
 
 def _normalize_username(value: str) -> str:
@@ -172,6 +173,81 @@ def _inject_user_management_css() -> None:
             margin-bottom: 10px;
         }
 
+        .st-key-um_add_user_btn {
+            display: flex;
+            align-items: flex-start;
+            justify-content: flex-end;
+            margin-top: 2px;
+        }
+
+        .st-key-um_add_user_btn button {
+            min-height: 44px;
+            border-radius: 13px !important;
+            border: 1px solid rgba(148, 163, 184, 0.44) !important;
+            background: linear-gradient(135deg, #0A1428 0%, #1E2A44 100%) !important;
+            color: #E6F0FF !important;
+            font-weight: 800 !important;
+            letter-spacing: 0.01em;
+            box-shadow: 0 12px 30px rgba(2, 6, 23, 0.62);
+            transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+        }
+
+        .st-key-um_add_user_btn button:hover {
+            transform: translateY(-1px);
+            filter: brightness(1.09);
+            box-shadow: 0 16px 34px rgba(2, 6, 23, 0.72);
+        }
+
+        .st-key-um_add_user_btn button:active {
+            transform: translateY(0px);
+        }
+
+        .st-key-um_create_submit_btn button {
+            border: 1px solid rgba(148, 163, 184, 0.44) !important;
+            background: linear-gradient(135deg, #0A1428 0%, #1E2A44 100%) !important;
+            color: #E6F0FF !important;
+            font-weight: 800 !important;
+            box-shadow: 0 11px 26px rgba(2, 6, 23, 0.55);
+        }
+
+        .st-key-um_create_submit_btn button:hover {
+            filter: brightness(1.08);
+        }
+
+        .um-create-dialog-hero {
+            border: 1px solid rgba(125, 211, 252, 0.26);
+            background: linear-gradient(135deg, rgba(14,165,233,0.12), rgba(37,99,235,0.10));
+            border-radius: 14px;
+            padding: 0.72rem 0.86rem 0.74rem 0.86rem;
+            margin-bottom: 0.55rem;
+        }
+
+        .um-create-dialog-title {
+            font-size: 16px;
+            font-weight: 800;
+            color: #ECF8FF;
+            line-height: 1.1;
+            letter-spacing: 0.01em;
+        }
+
+        .um-create-dialog-sub {
+            margin-top: 0.2rem;
+            font-size: 12px;
+            line-height: 1.4;
+            color: rgba(220, 237, 255, 0.85);
+        }
+
+        .um-create-dialog-hint {
+            margin-top: 0.45rem;
+            padding: 0.56rem 0.66rem;
+            border-radius: 11px;
+            border: 1px solid rgba(125, 211, 252, 0.18);
+            background: rgba(8, 20, 40, 0.55);
+            font-size: 11px;
+            line-height: 1.42;
+            color: #D8EAFE;
+        }
+
         /* --- Table container (match Devices grid-card) --- */
         .um-table-shell {
             border: 1px solid rgba(148, 163, 184, 0.24);
@@ -224,10 +300,10 @@ def _inject_user_management_css() -> None:
         }
 
         div[data-testid="stDialog"] .block-container {
-            padding-top: 0.45rem !important;
-            padding-bottom: 0.55rem !important;
-            padding-left: 0.25rem !important;
-            padding-right: 0.25rem !important;
+            padding-top: 0.62rem !important;
+            padding-bottom: 0.72rem !important;
+            padding-left: 0.48rem !important;
+            padding-right: 0.48rem !important;
             max-width: 100% !important;
         }
 
@@ -638,81 +714,64 @@ def _render_edit_user_dialog(
         st.rerun()
 
 
-def render(current_username: str):
-    _inject_user_management_css()
-    inject_traffic_style_header_css()
-
-    if AgGrid is None:
-        st.error("streamlit-aggrid is required for the Action column UI.")
-        return
-
-    users = _get_cached_users(force=False)
-
-    total_users = len(users)
-    admin_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
-    staff_count = sum(1 for u in users if str(u.get("role", "")).lower() == "staff")
-
-    updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    render_traffic_style_header(
-        title="User Management",
-        subtitle="Admin-only controls for account provisioning and access governance",
-        chip_label="Identity Access",
-        updated_txt=updated_txt,
-    )
-
-    create_feedback = st.session_state.pop("um_create_feedback", None)
-    if isinstance(create_feedback, dict):
-        feedback_level = str(create_feedback.get("level", "") or "").strip().lower()
-        feedback_message = str(create_feedback.get("message", "") or "").strip()
-        feedback_detail = str(create_feedback.get("detail", "") or "").strip()
-        if feedback_message:
-            if feedback_level == "success":
-                st.success(feedback_message)
-            elif feedback_level == "warning":
-                st.warning(feedback_message)
-            elif feedback_level == "error":
-                st.error(feedback_message)
-            else:
-                st.info(feedback_message)
-        if feedback_detail:
-            st.caption(feedback_detail)
-
-    m1, m2, m3 = st.columns(3, gap="large")
-    with m1:
-        _render_metric_card("Total Accounts", str(total_users), "All users in the authentication store")
-    with m2:
-        _render_metric_card("Admins", str(admin_count), "Privileged administrators")
-    with m3:
-        _render_metric_card("Staff", str(staff_count), "Operational dashboard users")
-
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='um-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='um-card-title'>Create User</div>", unsafe_allow_html=True)
+@st.dialog("Add User", width="large")
+def _render_create_user_dialog(current_username: str) -> None:
     st.markdown(
-        "<div class='um-card-sub'>Provision a new account with role-based access.</div>",
+        """
+        <div class="um-create-dialog-hero">
+            <div class="um-create-dialog-title">Create New Account</div>
+            <div class="um-create-dialog-sub">
+                Add a user, assign role access, and send login credentials in one step.
+            </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
-    if bool(st.session_state.pop(UM_CREATE_CLEAR_FIELDS_FLAG_KEY, False)):
-        for key in ("um_create_name", "um_create_username", "um_create_password", "um_create_role"):
-            st.session_state.pop(key, None)
 
-    with st.form("create_user_form", clear_on_submit=False):
-        name = st.text_input("Name", placeholder="Full name", key="um_create_name")
-        username = st.text_input("E-mail", placeholder="name@gmail.com", key="um_create_username")
-        password = st.text_input(
-            "Password",
-            type="password",
-            placeholder="At least 8 characters and 1 special character",
-            key="um_create_password",
+    role_options = ["staff", "admin"]
+    current_role = str(st.session_state.get("um_create_role", "staff") or "staff").strip().lower()
+    role_index = role_options.index(current_role) if current_role in role_options else 0
+
+    with st.form("um_create_user_modal_form", clear_on_submit=False):
+        a1, a2 = st.columns(2, gap="medium")
+        with a1:
+            name = st.text_input("Full Name", placeholder="e.g. Jordan Reyes", key="um_create_name")
+        with a2:
+            username = st.text_input("Email Address", placeholder="name@gmail.com", key="um_create_username")
+
+        a3, a4 = st.columns([1.35, 1.0], gap="medium")
+        with a3:
+            password = st.text_input(
+                "Temporary Password",
+                type="password",
+                placeholder="At least 8 characters and 1 special character",
+                key="um_create_password",
+            )
+        with a4:
+            role = st.selectbox("Role", options=role_options, index=role_index, key="um_create_role")
+
+        st.markdown(
+            """
+            <div class="um-create-dialog-hint">
+                Name must be valid, only <b>@gmail.com</b> addresses are allowed, and the user must verify OTP and
+                change this password during first login.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.caption("Name is required and must include letters. Only @gmail.com e-mail accounts are allowed.")
-        st.caption("The new user receives this e-mail and default password, then must verify OTP and change it on first login.")
-        role_options = ["staff", "admin"]
-        current_role = str(st.session_state.get("um_create_role", "staff") or "staff").strip().lower()
-        role_index = role_options.index(current_role) if current_role in role_options else 0
-        role = st.selectbox("Role", options=role_options, index=role_index, key="um_create_role")
-        submit_create = st.form_submit_button("Create User", width="stretch", type="primary")
+        b1, b2 = st.columns(2, gap="small")
+        with b1:
+            submit_create = st.form_submit_button(
+                "+ Create User",
+                width="stretch",
+                type="primary",
+                key="um_create_submit_btn",
+            )
+        with b2:
+            cancel_create = st.form_submit_button("Cancel", width="stretch")
+
+    if cancel_create:
+        st.rerun()
 
     if submit_create:
         try:
@@ -757,20 +816,78 @@ def render(current_username: str):
                     ),
                     "detail": "",
                 }
-            # Keep failed submissions intact; clear fields safely on next rerun.
+
             st.session_state[UM_CREATE_CLEAR_FIELDS_FLAG_KEY] = True
             st.rerun()
         except Exception as e:
             st.error(str(e))
 
-    st.markdown("</div>", unsafe_allow_html=True)
+
+def render(current_username: str):
+    _inject_user_management_css()
+    inject_traffic_style_header_css()
+
+    if AgGrid is None:
+        st.error("streamlit-aggrid is required for the Action column UI.")
+        return
+
+    users = _get_cached_users(force=False)
+
+    total_users = len(users)
+    admin_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
+    staff_count = sum(1 for u in users if str(u.get("role", "")).lower() == "staff")
+
+    updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    render_traffic_style_header(
+        title="User Management",
+        subtitle="Admin-only controls for account provisioning and access governance",
+        chip_label="Identity Access",
+        updated_txt=updated_txt,
+    )
+
+    create_feedback = st.session_state.pop("um_create_feedback", None)
+    if isinstance(create_feedback, dict):
+        feedback_level = str(create_feedback.get("level", "") or "").strip().lower()
+        feedback_message = str(create_feedback.get("message", "") or "").strip()
+        feedback_detail = str(create_feedback.get("detail", "") or "").strip()
+        if feedback_message:
+            if feedback_level == "success":
+                st.success(feedback_message)
+            elif feedback_level == "warning":
+                st.warning(feedback_message)
+            elif feedback_level == "error":
+                st.error(feedback_message)
+            else:
+                st.info(feedback_message)
+        if feedback_detail:
+            st.caption(feedback_detail)
+
+    if bool(st.session_state.pop(UM_CREATE_CLEAR_FIELDS_FLAG_KEY, False)):
+        for key in UM_CREATE_FORM_KEYS:
+            st.session_state.pop(key, None)
+
+    m1, m2, m3 = st.columns(3, gap="large")
+    with m1:
+        _render_metric_card("Total Accounts", str(total_users), "All users in the authentication store")
+    with m2:
+        _render_metric_card("Admins", str(admin_count), "Privileged administrators")
+    with m3:
+        _render_metric_card("Staff", str(staff_count), "Operational dashboard users")
+
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
     st.markdown("<div class='um-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='um-card-title'>Accounts</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='um-card-sub'>Live user directory with role and login history.</div>",
-        unsafe_allow_html=True,
-    )
+    h1, h2 = st.columns([4.9, 1.1], gap="medium")
+    with h1:
+        st.markdown("<div class='um-card-title'>Accounts</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='um-card-sub'>Live user directory with role and login history.</div>",
+            unsafe_allow_html=True,
+        )
+    with h2:
+        open_create_dialog = st.button("+ Add User", key="um_add_user_btn", width="stretch", type="primary")
+        if open_create_dialog:
+            _render_create_user_dialog(current_username)
 
     if users:
         current_users_signature = _users_signature(users)

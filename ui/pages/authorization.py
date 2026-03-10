@@ -240,6 +240,44 @@ def inject_custom_css():
             text-align: left;
         }
 
+        /* User Management-style add buttons */
+        .st-key-btn_import_mac,
+        .st-key-btn_import_domain,
+        .st-key-ban_add_btn {
+            display: flex;
+            align-items: flex-start;
+            justify-content: flex-end;
+            margin-top: 1px;
+        }
+
+        .st-key-btn_import_mac button,
+        .st-key-btn_import_domain button,
+        .st-key-ban_add_btn button {
+            min-height: 44px;
+            border-radius: 13px !important;
+            border: 1px solid rgba(148, 163, 184, 0.44) !important;
+            background: linear-gradient(135deg, #0A1428 0%, #1E2A44 100%) !important;
+            color: #E6F0FF !important;
+            font-weight: 800 !important;
+            letter-spacing: 0.01em;
+            box-shadow: 0 12px 30px rgba(2, 6, 23, 0.62);
+            transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+        }
+
+        .st-key-btn_import_mac button:hover,
+        .st-key-btn_import_domain button:hover,
+        .st-key-ban_add_btn button:hover {
+            transform: translateY(-1px);
+            filter: brightness(1.09);
+            box-shadow: 0 16px 34px rgba(2, 6, 23, 0.72);
+        }
+
+        .st-key-btn_import_mac button:active,
+        .st-key-btn_import_domain button:active,
+        .st-key-ban_add_btn button:active {
+            transform: translateY(0px);
+        }
+
         /* Spacing */
         .block-container {
             padding-top: 0.2rem !important;
@@ -877,7 +915,7 @@ def render_device_manager(device_list: list[dict], filepath: Path):
             key="device_quick_add"
         )
     with col_btn:
-        if st.button("Add Device", key="btn_import_mac", type="primary"):
+        if st.button("+ Add Device", key="btn_import_mac", type="primary", width="stretch"):
             entries = [x for x in re.split(r"[,\s\n]+", (new_text or "")) if x.strip()]
             entries = [normalize_mac(x) for x in entries]
             entries = [m for m in entries if m and _mac_is_valid(m)]
@@ -1122,7 +1160,7 @@ def render_domain_manager(domain_rows: list[dict], filepath: Path):
     with col_input:
         new_domain = st.text_input("Add Domain", placeholder="example.com", label_visibility="collapsed", key="dom_add")
     with col_btn:
-        if st.button("Add", key="btn_import_domain"):
+        if st.button("+ Add Domain", key="btn_import_domain", type="primary", width="stretch"):
             entries = [x.strip().lower() for x in re.split(r"[,\s\n]+", (new_domain or "")) if x.strip()]
             entries = [d for d in entries if _domain_is_valid(d)]
 
@@ -1358,7 +1396,7 @@ def render_banning_list(ban_file: Path):
             key="ban_add_input"
         )
     with col_btn:
-        if st.button("Enter", type="primary", key="ban_add_btn"):
+        if st.button("+ Add MAC", type="primary", key="ban_add_btn", width="stretch"):
             entries = [x for x in re.split(r"[,\s\n]+", (new_text or "")) if x.strip()]
             entries = [normalize_mac(x) for x in entries]
             entries = [m for m in entries if m and _mac_is_valid(m)]
