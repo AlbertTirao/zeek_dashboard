@@ -20,6 +20,67 @@ import requests
 import streamlit as st
 import yaml
 
+DEFAULT_ROW_LIMIT_OPTIONS: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000)
+
+
+def _closest_row_option(options: list[int], target: int) -> int:
+    if not options:
+        return max(int(target or 1), 1)
+    safe_target = max(int(target or options[0]), 1)
+    return min(options, key=lambda value: abs(int(value) - safe_target))
+
+
+def _normalize_row_limit_options(total_rows: int, options: tuple[int, ...]) -> list[int]:
+    out = sorted({int(x) for x in options if int(x) > 0})
+    if not out:
+        out = [100, 250, 500, 1000]
+    if total_rows > 0 and total_rows not in out:
+        out.append(int(total_rows))
+        out = sorted(set(out))
+    return out
+
+
+def row_limit_selector(
+    *,
+    key_prefix: str,
+    total_rows: int,
+    label: str = "Rows shown",
+    default_limit: int = 500,
+    options: tuple[int, ...] = DEFAULT_ROW_LIMIT_OPTIONS,
+) -> int:
+    row_options = _normalize_row_limit_options(int(total_rows or 0), options)
+    state_key = f"{key_prefix}_row_limit"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = _closest_row_option(row_options, default_limit)
+
+    current = _closest_row_option(row_options, int(st.session_state.get(state_key, default_limit)))
+    if int(st.session_state.get(state_key, default_limit)) != current:
+        st.session_state[state_key] = current
+
+    index = row_options.index(current) if current in row_options else 0
+    chosen = st.selectbox(label, options=row_options, index=index, key=state_key)
+    try:
+        return max(int(chosen), 1)
+    except Exception:
+        return max(int(current), 1)
+
+
+def cap_dataframe_rows(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    try:
+        safe_limit = max(int(limit), 1)
+    except Exception:
+        safe_limit = 500
+    return df.head(safe_limit).copy()
+
+
+def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
+    if int(total_rows) > int(shown_rows):
+        st.caption(f"Showing {shown_rows:,} of {total_rows:,} rows. Narrow filters or increase row limit for more.")
+    else:
+        st.caption(f"Showing {shown_rows:,} rows.")
+
 if TYPE_CHECKING:
     from st_aggrid import GridOptionsBuilder as GridOptionsBuilderType
 else:
@@ -2169,7 +2230,15 @@ def render_shadow_aggrid(
     if not HAS_AGGRID:
         if wrap_shell:
             st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-        st.dataframe(df, use_container_width=True, hide_index=True, height=height)
+        fallback_limit = row_limit_selector(
+            key_prefix=f"{key}_fallback",
+            total_rows=len(df),
+            label="Rows shown",
+            default_limit=500,
+        )
+        fallback_df = cap_dataframe_rows(df, fallback_limit)
+        render_rows_caption(total_rows=len(df), shown_rows=len(fallback_df))
+        st.dataframe(fallback_df, use_container_width=True, hide_index=True, height=height)
         if wrap_shell:
             st.markdown("</div>", unsafe_allow_html=True)
         return None
@@ -2199,8 +2268,6 @@ def render_shadow_aggrid(
     default_col_def["suppressMenu"] = False
     filter_params = dict(default_col_def.get("filterParams") or {})
     filter_params.setdefault("excelMode", "windows")
-    filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
-    filter_params.setdefault("closeOnApply", True)
     filter_params.setdefault("suppressMiniFilter", False)
     default_col_def["filterParams"] = filter_params
     grid_options["defaultColDef"] = default_col_def
@@ -2222,8 +2289,6 @@ def render_shadow_aggrid(
             col_def.setdefault("suppressMenu", False)
             cfp = dict(col_def.get("filterParams") or {})
             cfp.setdefault("excelMode", "windows")
-            cfp.setdefault("buttons", ["apply", "clear", "cancel"])
-            cfp.setdefault("closeOnApply", True)
             cfp.setdefault("suppressMiniFilter", False)
             col_def["filterParams"] = cfp
         grid_options["columnDefs"] = col_defs
@@ -2836,7 +2901,7 @@ def render_anonymization_network(parquet_root: Path):
     ip2, _, ip2_sig = load_ip2proxy_lookup()
 
     q = st.text_input(
-        "Search (IP Host Provider Reason UID MAC Hostname)",
+        "Search (IP Host Provider Reason UID MAC)",
         placeholder="Enter keywords...",
         key="anonym_net_q",
     ).strip().lower()
@@ -2887,22 +2952,50 @@ def render_anonymization_network(parquet_root: Path):
     cat_opts = sorted(view["Category"].dropna().astype(str).unique().tolist())
     source_opts = sorted([x for x in view["Detection_Source"].dropna().astype(str).unique().tolist() if x])
 
+    conf_options = ["High", "Medium", "Low"]
+    st.session_state.setdefault("anonym_net_q_applied", "")
+    st.session_state.setdefault("anonym_net_conf_applied", list(conf_options))
+    st.session_state.setdefault("anonym_net_source_applied", list(source_opts))
+    st.session_state.setdefault("anonym_net_cat_applied", list(cat_opts))
+
+    st.session_state["anonym_net_conf_applied"] = [x for x in st.session_state.get("anonym_net_conf_applied", []) if x in conf_options] or list(conf_options)
+    st.session_state["anonym_net_source_applied"] = [x for x in st.session_state.get("anonym_net_source_applied", []) if x in source_opts] or list(source_opts)
+    st.session_state["anonym_net_cat_applied"] = [x for x in st.session_state.get("anonym_net_cat_applied", []) if x in cat_opts] or list(cat_opts)
+
     st.markdown("<div class='shadow-filter-shell shadow-filter-shell-primary'>", unsafe_allow_html=True)
+    q = st.text_input(
+        "Search (IP Host Provider Reason UID MAC)",
+        placeholder="Enter keywords...",
+        key="anonym_net_q_applied",
+    ).strip().lower()
     c6, c7 = st.columns([1.0, 1.0])
     with c6:
         conf_filter = st.multiselect(
             "Confidence",
-            ["High", "Medium", "Low"],
-            default=["High", "Medium", "Low"],
-            key="anonym_net_conf",
+            conf_options,
+            default=st.session_state.get("anonym_net_conf_applied", conf_options),
+            key="anonym_net_conf_applied",
         )
     with c7:
-        source_filter = st.multiselect("Source", source_opts, default=source_opts, key="anonym_net_source_filter")
+        source_filter = st.multiselect(
+            "Source",
+            source_opts,
+            default=st.session_state.get("anonym_net_source_applied", source_opts),
+            key="anonym_net_source_applied",
+        )
+    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+    cat_filter = st.multiselect(
+        "Category",
+        cat_opts,
+        default=st.session_state.get("anonym_net_cat_applied", cat_opts),
+        key="anonym_net_cat_applied",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    cat_filter = st.multiselect("Category", cat_opts, default=cat_opts, key="anonym_net_cat")
-    st.markdown("</div>", unsafe_allow_html=True)
+    conf_filter = [x for x in (conf_filter or []) if x in conf_options]
+    source_filter = [x for x in (source_filter or []) if x in source_opts]
+    cat_filter = [x for x in (cat_filter or []) if x in cat_opts]
 
     if conf_filter:
         view = view[view["Confidence"].isin(conf_filter)].copy()
@@ -3025,6 +3118,13 @@ def render_anonymization_network(parquet_root: Path):
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
                 wrap_shell=False,
                 hide_top_border=True,
+                grid_options_overrides={
+                    "rowSelection": "single",
+                    "suppressRowClickSelection": True,
+                    "suppressRowDeselection": True,
+                    "suppressCopyRowsToClipboard": True,
+                    "copyHeadersToClipboard": False,
+                },
             )
             _render_table_information(
                 f"{len(soc_table):,} destination/reason rows shown.",
@@ -3045,11 +3145,19 @@ def render_anonymization_network(parquet_root: Path):
                 key=f"anonym_net_soc_csv_{date_sel}",
             )
         else:
+            soc_limit = row_limit_selector(
+                key_prefix=f"anonym_net_soc_fallback_{date_sel}",
+                total_rows=len(soc_table),
+                label="Rows shown",
+                default_limit=500,
+            )
+            soc_view = cap_dataframe_rows(soc_table, soc_limit)
+            render_rows_caption(total_rows=len(soc_table), shown_rows=len(soc_view))
             st.dataframe(
-                soc_table,
+                soc_view,
                 use_container_width=True,
                 hide_index=True,
-                height=min(450, 84 + 34 * max(len(soc_table), 1)),
+                height=min(450, 84 + 34 * max(len(soc_view), 1)),
             )
             _render_table_information(
                 f"{len(soc_table):,} destination/reason rows shown.",
@@ -3301,7 +3409,6 @@ def render_anonymization_network(parquet_root: Path):
         _cfg("resp_ip_bytes", header_name="download bytes", type=["numericColumn"], minWidth=162, cellStyle={"textAlign": "right"})
         _cfg("total_bytes", header_name="total bytes", type=["numericColumn"], minWidth=132, cellStyle={"textAlign": "right"})
         _cfg("duration", header_name="duration s", type=["numericColumn"], minWidth=124, cellStyle={"textAlign": "right"})
-        gb.configure_selection("single", use_checkbox=False)
         table_response = render_shadow_aggrid(
             table,
             gb,
@@ -3310,6 +3417,13 @@ def render_anonymization_network(parquet_root: Path):
             update_mode=GridUpdateMode.SELECTION_CHANGED,
             wrap_shell=False,
             hide_top_border=True,
+            grid_options_overrides={
+                "rowSelection": "single",
+                "suppressRowClickSelection": True,
+                "suppressRowDeselection": True,
+                "suppressCopyRowsToClipboard": True,
+                "copyHeadersToClipboard": False,
+            },
         )
     else:
         render_shadow_aggrid(

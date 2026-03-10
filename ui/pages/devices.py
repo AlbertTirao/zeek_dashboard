@@ -113,6 +113,92 @@ def _path_stat_sig(path: Path | None) -> tuple[float, int]:
         return (0.0, 0)
 
 
+def _duckdb_read_parquet_columns(path: Path, columns: tuple[str, ...]) -> pd.DataFrame:
+    """
+    Read only requested columns from one parquet file using DuckDB projection pushdown.
+    Falls back to pandas column projection when DuckDB is unavailable.
+    """
+    if path is None or not path.exists():
+        return pd.DataFrame()
+    wanted = tuple(str(c) for c in (columns or tuple()) if str(c).strip())
+    if not wanted:
+        return pd.DataFrame()
+
+    try:
+        import duckdb
+
+        con = duckdb.connect(database=":memory:")
+        try:
+            schema_df = con.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)",
+                [str(path)],
+            ).df()
+            available = {str(c) for c in schema_df.get("column_name", pd.Series(dtype="object")).tolist()}
+            selected = [c for c in wanted if c in available]
+            if not selected:
+                return pd.DataFrame()
+            select_sql = ", ".join(f'"{c}"' for c in selected)
+            return con.execute(
+                f"SELECT {select_sql} FROM read_parquet(?)",
+                [str(path)],
+            ).df()
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception:
+        try:
+            return pd.read_parquet(path, columns=list(wanted))
+        except Exception:
+            return pd.DataFrame()
+
+
+def _duckdb_read_parquet_union_columns(paths: list[Path], columns: tuple[str, ...]) -> pd.DataFrame:
+    """
+    Read only requested columns across multiple parquet files using DuckDB projection pushdown.
+    """
+    valid_paths = [str(p) for p in (paths or []) if isinstance(p, Path) and p.exists()]
+    if not valid_paths:
+        return pd.DataFrame()
+
+    wanted = tuple(str(c) for c in (columns or tuple()) if str(c).strip())
+    if not wanted:
+        return pd.DataFrame()
+
+    try:
+        import duckdb
+
+        con = duckdb.connect(database=":memory:")
+        try:
+            schema_df = con.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
+                [valid_paths],
+            ).df()
+            available = {str(c) for c in schema_df.get("column_name", pd.Series(dtype="object")).tolist()}
+            selected = [c for c in wanted if c in available]
+            if not selected:
+                return pd.DataFrame()
+            select_sql = ", ".join(f'"{c}"' for c in selected)
+            return con.execute(
+                f"SELECT {select_sql} FROM read_parquet(?, union_by_name=true)",
+                [valid_paths],
+            ).df()
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception:
+        dfs = []
+        for p in valid_paths:
+            try:
+                dfs.append(pd.read_parquet(Path(p), columns=list(wanted)))
+            except Exception:
+                continue
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
 def _resolve_known_hosts_for_day(parquet_root: Path, day_str: str) -> Path | None:
     for d, p in iter_date_dirs(parquet_root):
         if d == day_str:
@@ -238,10 +324,7 @@ def load_active_today_macs_from_parquet(
     kh = _resolve_known_hosts_for_day(parquet_root, today_str)
     if kh is None:
         return set()
-    try:
-        df = pd.read_parquet(kh)
-    except Exception:
-        return set()
+    df = _duckdb_read_parquet_columns(kh, ("mac",))
     if "mac" not in df.columns:
         return set()
     macs = df["mac"].map(normalize_mac).dropna()
@@ -264,10 +347,10 @@ def load_active_today_inventory_from_parquet(
     if kh is None:
         return pd.DataFrame()
 
-    try:
-        df = pd.read_parquet(kh)
-    except Exception:
-        return pd.DataFrame()
+    df = _duckdb_read_parquet_columns(
+        kh,
+        ("mac", "ts", "host", "id.orig_h", "client_addr", "ip", "addr"),
+    )
 
     if df.empty or "mac" not in df.columns:
         return pd.DataFrame()
@@ -482,8 +565,8 @@ def load_visual_metrics_from_parquet(
     inventory_sig: tuple[tuple[str, float, int], ...],
 ):
     _ = inventory_sig
-    known_hosts_all = []
-    dhcp_all = []
+    known_host_paths: list[Path] = []
+    dhcp_paths: list[Path] = []
     if not parquet_root.exists():
         return pd.DataFrame(), pd.DataFrame()
 
@@ -491,12 +574,18 @@ def load_visual_metrics_from_parquet(
         kh = day_dir / "known_hosts.parquet"
         dh = day_dir / "dhcp.parquet"
         if kh.exists():
-            known_hosts_all.append(pd.read_parquet(kh))
+            known_host_paths.append(kh)
         if dh.exists():
-            dhcp_all.append(pd.read_parquet(dh))
+            dhcp_paths.append(dh)
 
-    known_hosts = pd.concat(known_hosts_all, ignore_index=True) if known_hosts_all else pd.DataFrame()
-    dhcp = pd.concat(dhcp_all, ignore_index=True) if dhcp_all else pd.DataFrame()
+    known_hosts = _duckdb_read_parquet_union_columns(
+        known_host_paths,
+        ("mac", "ts", "host", "id.orig_h", "client_addr", "ip", "addr"),
+    )
+    dhcp = _duckdb_read_parquet_union_columns(
+        dhcp_paths,
+        ("mac", "client_addr", "host_name", "domain"),
+    )
     return known_hosts, dhcp
 
 
@@ -763,10 +852,7 @@ def get_device_activity(
         if not kh.exists():
             return candidates
 
-        try:
-            kh_df = pd.read_parquet(kh)
-        except Exception:
-            return candidates
+        kh_df = _duckdb_read_parquet_columns(kh, ("mac", "host"))
 
         if kh_df.empty or "mac" not in kh_df.columns or "host" not in kh_df.columns:
             return candidates
@@ -793,7 +879,14 @@ def get_device_activity(
                 continue
 
             try:
-                df = pd.read_parquet(pq_file)
+                read_cols = ["ts", "mac", "id.orig_h", "host", detail_col]
+                if service == "HTTP":
+                    read_cols.append("uri")
+                elif service == "DNS":
+                    read_cols.append("qtype_name")
+                elif service == "SSL":
+                    read_cols.append("version")
+                df = _duckdb_read_parquet_columns(pq_file, tuple(read_cols))
                 if df.empty or "ts" not in df.columns:
                     continue
 
@@ -1646,8 +1739,32 @@ def active_today_popup(
     inv["last_seen_today"] = _coerce_ts_any(inv["last_seen_today"])
     inv["last_seen_today_str"] = inv["last_seen_today"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
+    active_search_state_key = "active_search_applied"
+    active_search_draft_key = "active_search_draft"
+    if active_search_state_key not in st.session_state:
+        st.session_state[active_search_state_key] = ""
+    if active_search_draft_key not in st.session_state:
+        st.session_state[active_search_draft_key] = st.session_state[active_search_state_key]
+
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
-    q = st.text_input("Search MAC:", value="", placeholder="aa:bb:cc:dd:ee:ff", key="active_search").strip().lower()
+    with st.form("active_devices_search_form", clear_on_submit=False):
+        st.text_input(
+            "Search MAC:",
+            placeholder="aa:bb:cc:dd:ee:ff",
+            key=active_search_draft_key,
+        )
+        active_form_col1, active_form_col2, _ = st.columns([1.0, 1.0, 4.0])
+        with active_form_col1:
+            apply_active_search = st.form_submit_button("Apply Search", use_container_width=True)
+        with active_form_col2:
+            clear_active_search = st.form_submit_button("Clear", use_container_width=True)
+    if clear_active_search:
+        st.session_state[active_search_state_key] = ""
+        st.session_state[active_search_draft_key] = ""
+        st.rerun()
+    if apply_active_search:
+        st.session_state[active_search_state_key] = str(st.session_state.get(active_search_draft_key, "") or "").strip().lower()
+    q = str(st.session_state.get(active_search_state_key, "") or "").strip().lower()
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown(
         "<div class='dialog-note'>Tip: Click a <b>MAC Address</b> cell to open forensics for that device.</div>",
@@ -1764,46 +1881,112 @@ def device_list_popup(
 
     # Toolbar
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
-    t1, t2, t3, t4, t5 = st.columns([2.0, 1.15, 1.15, 1.8, 0.9], vertical_alignment="bottom")
+    scope_key = status_type.lower()
+    mac_state_key = f"popup_mac_search_applied_{scope_key}"
+    date_mode_state_key = f"popup_list_mode_applied_{scope_key}"
+    history_mode_state_key = f"popup_list_history_mode_applied_{scope_key}"
+    spec_date_state_key = f"popup_list_spec_date_applied_{scope_key}"
 
-    with t1:
-        mac_query = st.text_input(
-            "Search MAC:",
-            value="",
-            placeholder="aa:bb:cc:dd:ee:ff",
-            key=f"popup_mac_search_{status_type.lower()}",
-        ).strip().lower()
+    mac_draft_key = f"popup_mac_search_draft_{scope_key}"
+    date_mode_draft_key = f"popup_list_mode_draft_{scope_key}"
+    history_mode_draft_key = f"popup_list_history_mode_draft_{scope_key}"
+    spec_date_draft_key = f"popup_list_spec_date_draft_{scope_key}"
 
-    with t2:
-        date_filter_mode = st.selectbox(
-            "Time Range:",
-            ["Last 7 Days", "Last 30 Days", "Specific Date", "All Time"],
-            index=0,
-            key=f"popup_list_mode_{status_type.lower()}",
-        )
+    date_mode_options = ["Last 7 Days", "Last 30 Days", "Specific Date", "All Time"]
+    history_mode_options = ["Hide", "Last 7 Days", "All"]
 
-    with t3:
-        history_filter_mode = st.selectbox(
-            "History:",
-            ["Hide", "Last 7 Days", "All"],
-            index=0,
-            key=f"popup_list_history_mode_{status_type.lower()}",
-        )
+    if mac_state_key not in st.session_state:
+        st.session_state[mac_state_key] = ""
+    if st.session_state.get(date_mode_state_key) not in date_mode_options:
+        st.session_state[date_mode_state_key] = "Last 7 Days"
+    if st.session_state.get(history_mode_state_key) not in history_mode_options:
+        st.session_state[history_mode_state_key] = "Hide"
+    if available_dates_for_filter:
+        if st.session_state.get(spec_date_state_key) not in available_dates_for_filter:
+            st.session_state[spec_date_state_key] = available_dates_for_filter[0]
+    else:
+        st.session_state[spec_date_state_key] = None
 
-    with t4:
-        if date_filter_mode == "Specific Date":
-            if available_dates_for_filter:
-                spec_date = st.selectbox(
-                    "Date:",
-                    available_dates_for_filter,
-                    key=f"popup_list_spec_date_{status_type.lower()}",
-                )
+    if mac_draft_key not in st.session_state:
+        st.session_state[mac_draft_key] = st.session_state[mac_state_key]
+    if st.session_state.get(date_mode_draft_key) not in date_mode_options:
+        st.session_state[date_mode_draft_key] = st.session_state[date_mode_state_key]
+    if st.session_state.get(history_mode_draft_key) not in history_mode_options:
+        st.session_state[history_mode_draft_key] = st.session_state[history_mode_state_key]
+    if available_dates_for_filter:
+        if st.session_state.get(spec_date_draft_key) not in available_dates_for_filter:
+            st.session_state[spec_date_draft_key] = st.session_state[spec_date_state_key]
+    else:
+        st.session_state[spec_date_draft_key] = None
+
+    with st.form(f"devices_list_filters_form_{scope_key}", clear_on_submit=False):
+        t1, t2, t3, t4, t5 = st.columns([2.0, 1.15, 1.15, 1.8, 0.9], vertical_alignment="bottom")
+        with t1:
+            st.text_input(
+                "Search MAC:",
+                placeholder="aa:bb:cc:dd:ee:ff",
+                key=mac_draft_key,
+            )
+        with t2:
+            st.selectbox(
+                "Time Range:",
+                date_mode_options,
+                key=date_mode_draft_key,
+            )
+        with t3:
+            st.selectbox(
+                "History:",
+                history_mode_options,
+                key=history_mode_draft_key,
+            )
+        with t4:
+            draft_date_mode = str(st.session_state.get(date_mode_draft_key, "Last 7 Days") or "Last 7 Days")
+            if draft_date_mode == "Specific Date":
+                if available_dates_for_filter:
+                    st.selectbox(
+                        "Date:",
+                        available_dates_for_filter,
+                        key=spec_date_draft_key,
+                    )
+                else:
+                    st.caption("No dates available.")
             else:
-                spec_date = None
-                st.caption("No dates available.")
+                st.markdown("<div style='height: 2.55rem;'></div>", unsafe_allow_html=True)
+        with t5:
+            apply_filters = st.form_submit_button("Apply", use_container_width=True)
+            clear_filters = st.form_submit_button("Reset", use_container_width=True)
+
+    if clear_filters:
+        st.session_state[mac_state_key] = ""
+        st.session_state[mac_draft_key] = ""
+        st.session_state[date_mode_state_key] = "Last 7 Days"
+        st.session_state[date_mode_draft_key] = "Last 7 Days"
+        st.session_state[history_mode_state_key] = "Hide"
+        st.session_state[history_mode_draft_key] = "Hide"
+        if available_dates_for_filter:
+            st.session_state[spec_date_state_key] = available_dates_for_filter[0]
+            st.session_state[spec_date_draft_key] = available_dates_for_filter[0]
         else:
-            spec_date = None
-            st.markdown("<div style='height: 2.55rem;'></div>", unsafe_allow_html=True)
+            st.session_state[spec_date_state_key] = None
+            st.session_state[spec_date_draft_key] = None
+        st.rerun()
+
+    if apply_filters:
+        st.session_state[mac_state_key] = str(st.session_state.get(mac_draft_key, "") or "").strip().lower()
+        mode_choice = str(st.session_state.get(date_mode_draft_key, "Last 7 Days") or "Last 7 Days")
+        st.session_state[date_mode_state_key] = mode_choice if mode_choice in date_mode_options else "Last 7 Days"
+        history_choice = str(st.session_state.get(history_mode_draft_key, "Hide") or "Hide")
+        st.session_state[history_mode_state_key] = history_choice if history_choice in history_mode_options else "Hide"
+        if st.session_state[date_mode_state_key] == "Specific Date" and available_dates_for_filter:
+            picked_date = st.session_state.get(spec_date_draft_key)
+            st.session_state[spec_date_state_key] = picked_date if picked_date in available_dates_for_filter else available_dates_for_filter[0]
+        else:
+            st.session_state[spec_date_state_key] = None
+
+    mac_query = str(st.session_state.get(mac_state_key, "") or "").strip().lower()
+    date_filter_mode = str(st.session_state.get(date_mode_state_key, "Last 7 Days") or "Last 7 Days")
+    history_filter_mode = str(st.session_state.get(history_mode_state_key, "Hide") or "Hide")
+    spec_date = st.session_state.get(spec_date_state_key)
 
     def _norm_token(x: str) -> str:
         return "".join(ch for ch in (x or "").lower() if ch.isalnum())
@@ -1922,7 +2105,8 @@ def device_list_popup(
     inventory.insert(0, "#", pd.RangeIndex(start=1, stop=len(inventory) + 1, step=1))
     inventory["#"] = pd.to_numeric(inventory["#"], errors="coerce").fillna(0).astype(int)
 
-    with t5:
+    dl_col1, _ = st.columns([1.0, 5.0])
+    with dl_col1:
         csv_bytes = inventory.drop(columns=["sort_dt"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download",

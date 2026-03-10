@@ -20,7 +20,7 @@ authorized_macs:
   vendor: Super Micro Computer, Inc.
   date_modified: '2026-02-12 12:37:33'
 - mac: 02:35:19:a6:ce:46
-  ip: 192.168.201.100
+  ip: 192.168.201.172
   hostname: Irene-s
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -105,7 +105,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 46:1d:f6:9c:b3:e1
-  ip: 192.168.201.149
+  ip: 192.168.201.170
   hostname: JE-s-A06
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -125,7 +125,7 @@ authorized_macs:
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
 - mac: 72:88:84:63:71:0c
-  ip: 192.168.201.88
+  ip: 192.168.201.41
   hostname: B-n4rY-RM6
   vendor: ''
   date_modified: '2026-02-23 16:52:39'
@@ -155,7 +155,7 @@ authorized_macs:
   vendor: ASKEY COMPUTER CORP
   date_modified: '2026-02-23 16:34:22'
 - mac: be:18:78:9d:3f:b1
-  ip: 192.168.201.156
+  ip: 192.168.201.174
   hostname: Auggys-Phone
   vendor: ''
   date_modified: '2026-02-12 12:37:33'
@@ -205,7 +205,7 @@ authorized_macs:
   vendor: TP-LINK TECHNOLOGIES CO.,LTD.
   date_modified: '2026-02-12 12:37:33'
 - mac: ea:93:6d:86:5e:cd
-  ip: 192.168.201.152
+  ip: 192.168.201.169
   hostname: Infinix-SMART-8
   vendor: ''
   date_modified: '2026-02-12 12:37:33'

@@ -2,6 +2,7 @@ import streamlit as st
 from pathlib import Path
 import pandas as pd
 import datetime
+import duckdb
 import yaml
 import re
 import requests
@@ -9,6 +10,67 @@ import time
 import inspect
 from uuid import uuid4
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
+
+DEFAULT_ROW_LIMIT_OPTIONS: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000)
+
+
+def _closest_row_option(options: list[int], target: int) -> int:
+    if not options:
+        return max(int(target or 1), 1)
+    safe_target = max(int(target or options[0]), 1)
+    return min(options, key=lambda value: abs(int(value) - safe_target))
+
+
+def _normalize_row_limit_options(total_rows: int, options: tuple[int, ...]) -> list[int]:
+    out = sorted({int(x) for x in options if int(x) > 0})
+    if not out:
+        out = [100, 250, 500, 1000]
+    if total_rows > 0 and total_rows not in out:
+        out.append(int(total_rows))
+        out = sorted(set(out))
+    return out
+
+
+def row_limit_selector(
+    *,
+    key_prefix: str,
+    total_rows: int,
+    label: str = "Rows shown",
+    default_limit: int = 500,
+    options: tuple[int, ...] = DEFAULT_ROW_LIMIT_OPTIONS,
+) -> int:
+    row_options = _normalize_row_limit_options(int(total_rows or 0), options)
+    state_key = f"{key_prefix}_row_limit"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = _closest_row_option(row_options, default_limit)
+
+    current = _closest_row_option(row_options, int(st.session_state.get(state_key, default_limit)))
+    if int(st.session_state.get(state_key, default_limit)) != current:
+        st.session_state[state_key] = current
+
+    index = row_options.index(current) if current in row_options else 0
+    chosen = st.selectbox(label, options=row_options, index=index, key=state_key)
+    try:
+        return max(int(chosen), 1)
+    except Exception:
+        return max(int(current), 1)
+
+
+def cap_dataframe_rows(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    try:
+        safe_limit = max(int(limit), 1)
+    except Exception:
+        safe_limit = 500
+    return df.head(safe_limit).copy()
+
+
+def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
+    if int(total_rows) > int(shown_rows):
+        st.caption(f"Showing {shown_rows:,} of {total_rows:,} rows. Narrow filters or increase row limit for more.")
+    else:
+        st.caption(f"Showing {shown_rows:,} rows.")
 
 # -----------------------------
 # Timezone Configuration
@@ -411,6 +473,76 @@ def iter_date_dirs(parquet_root: Path):
             yield d, p
 
 
+def _duckdb_read_parquet_columns(path: Path, columns: tuple[str, ...]) -> pd.DataFrame:
+    if path is None or not path.exists():
+        return pd.DataFrame()
+    wanted = tuple(str(c) for c in (columns or tuple()) if str(c).strip())
+    if not wanted:
+        return pd.DataFrame()
+    con = duckdb.connect(database=":memory:")
+    try:
+        schema_df = con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)",
+            [str(path)],
+        ).df()
+        available = {str(c) for c in schema_df.get("column_name", pd.Series(dtype="object")).tolist()}
+        selected = [c for c in wanted if c in available]
+        if not selected:
+            return pd.DataFrame()
+        select_sql = ", ".join(f'"{c}"' for c in selected)
+        return con.execute(
+            f"SELECT {select_sql} FROM read_parquet(?)",
+            [str(path)],
+        ).df()
+    except Exception:
+        try:
+            return pd.read_parquet(path, columns=list(wanted))
+        except Exception:
+            return pd.DataFrame()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _duckdb_read_parquet_union_columns(paths: list[Path], columns: tuple[str, ...]) -> pd.DataFrame:
+    valid_paths = [str(p) for p in (paths or []) if isinstance(p, Path) and p.exists()]
+    if not valid_paths:
+        return pd.DataFrame()
+    wanted = tuple(str(c) for c in (columns or tuple()) if str(c).strip())
+    if not wanted:
+        return pd.DataFrame()
+    con = duckdb.connect(database=":memory:")
+    try:
+        schema_df = con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)",
+            [valid_paths],
+        ).df()
+        available = {str(c) for c in schema_df.get("column_name", pd.Series(dtype="object")).tolist()}
+        selected = [c for c in wanted if c in available]
+        if not selected:
+            return pd.DataFrame()
+        select_sql = ", ".join(f'"{c}"' for c in selected)
+        return con.execute(
+            f"SELECT {select_sql} FROM read_parquet(?, union_by_name=true)",
+            [valid_paths],
+        ).df()
+    except Exception:
+        dfs = []
+        for p in valid_paths:
+            try:
+                dfs.append(pd.read_parquet(Path(p), columns=list(wanted)))
+            except Exception:
+                continue
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def _coerce_ts_any(series: pd.Series) -> pd.Series:
     """Robust timestamp coercion (seconds/ms/us/ns, datetime, string)."""
     if series is None or len(series) == 0:
@@ -687,8 +819,8 @@ def get_mac_vendor(mac: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=30)
 def get_latest_network_info() -> pd.DataFrame:
-    known_hosts_all = []
-    dhcp_all = []
+    known_host_paths: list[Path] = []
+    dhcp_paths: list[Path] = []
 
     if not PARQUET_ROOT.exists():
         return pd.DataFrame()
@@ -701,18 +833,18 @@ def get_latest_network_info() -> pd.DataFrame:
         kh = day_dir / "known_hosts.parquet"
         dh = day_dir / "dhcp.parquet"
         if kh.exists():
-            try:
-                known_hosts_all.append(pd.read_parquet(kh))
-            except Exception:
-                pass
+            known_host_paths.append(kh)
         if dh.exists():
-            try:
-                dhcp_all.append(pd.read_parquet(dh))
-            except Exception:
-                pass
+            dhcp_paths.append(dh)
 
-    known_hosts = pd.concat(known_hosts_all, ignore_index=True) if known_hosts_all else pd.DataFrame()
-    dhcp = pd.concat(dhcp_all, ignore_index=True) if dhcp_all else pd.DataFrame()
+    known_hosts = _duckdb_read_parquet_union_columns(
+        known_host_paths,
+        ("mac", "ts", "host", "id.orig_h", "client_addr", "ip", "addr"),
+    )
+    dhcp = _duckdb_read_parquet_union_columns(
+        dhcp_paths,
+        ("mac", "client_addr", "host_name"),
+    )
 
     if known_hosts.empty or "mac" not in known_hosts.columns:
         return pd.DataFrame()
@@ -946,7 +1078,31 @@ def render_device_manager(device_list: list[dict], filepath: Path):
 
     st.divider()
 
-    search_query = st.text_input("Search Devices", placeholder="Search MAC / IP / Hostname..", label_visibility="collapsed")
+    device_search_state_key = "device_search_applied"
+    device_search_draft_key = "device_search_draft"
+    if device_search_state_key not in st.session_state:
+        st.session_state[device_search_state_key] = ""
+    if device_search_draft_key not in st.session_state:
+        st.session_state[device_search_draft_key] = st.session_state[device_search_state_key]
+    with st.form("device_search_form", clear_on_submit=False):
+        st.text_input(
+            "Search Devices",
+            placeholder="Search MAC / IP / Hostname..",
+            label_visibility="collapsed",
+            key=device_search_draft_key,
+        )
+        s_col1, s_col2, _ = st.columns([1.0, 1.0, 4.0])
+        with s_col1:
+            apply_search = st.form_submit_button("Apply Search", use_container_width=True)
+        with s_col2:
+            clear_search = st.form_submit_button("Clear", use_container_width=True)
+    if clear_search:
+        st.session_state[device_search_state_key] = ""
+        st.session_state[device_search_draft_key] = ""
+        st.rerun()
+    if apply_search:
+        st.session_state[device_search_state_key] = str(st.session_state.get(device_search_draft_key, "") or "").strip()
+    search_query = str(st.session_state.get(device_search_state_key, "") or "").strip()
 
     # Build DF from state
     rows = st.session_state.device_rows_state
@@ -1184,12 +1340,31 @@ def render_domain_manager(domain_rows: list[dict], filepath: Path):
 
     st.divider()
 
-    search_query = st.text_input(
-        "Search Whitelist",
-        placeholder="Filter domains...",
-        label_visibility="collapsed",
-        key="dom_search"
-    ).strip().lower()
+    domain_search_state_key = "dom_search_applied"
+    domain_search_draft_key = "dom_search_draft"
+    if domain_search_state_key not in st.session_state:
+        st.session_state[domain_search_state_key] = ""
+    if domain_search_draft_key not in st.session_state:
+        st.session_state[domain_search_draft_key] = st.session_state[domain_search_state_key]
+    with st.form("domain_search_form", clear_on_submit=False):
+        st.text_input(
+            "Search Whitelist",
+            placeholder="Filter domains...",
+            label_visibility="collapsed",
+            key=domain_search_draft_key,
+        )
+        d_col1, d_col2, _ = st.columns([1.0, 1.0, 4.0])
+        with d_col1:
+            apply_domain_search = st.form_submit_button("Apply Search", use_container_width=True)
+        with d_col2:
+            clear_domain_search = st.form_submit_button("Clear", use_container_width=True)
+    if clear_domain_search:
+        st.session_state[domain_search_state_key] = ""
+        st.session_state[domain_search_draft_key] = ""
+        st.rerun()
+    if apply_domain_search:
+        st.session_state[domain_search_state_key] = str(st.session_state.get(domain_search_draft_key, "") or "").strip().lower()
+    search_query = str(st.session_state.get(domain_search_state_key, "") or "").strip().lower()
 
     df = pd.DataFrame(st.session_state.domain_rows_state)
     if df.empty:
@@ -1420,12 +1595,31 @@ def render_banning_list(ban_file: Path):
 
     st.divider()
 
-    search_query = st.text_input(
-        "Search Banned MACs",
-        placeholder="Search MAC Address..",
-        label_visibility="collapsed",
-        key="ban_search"
-    ).strip().lower()
+    ban_search_state_key = "ban_search_applied"
+    ban_search_draft_key = "ban_search_draft"
+    if ban_search_state_key not in st.session_state:
+        st.session_state[ban_search_state_key] = ""
+    if ban_search_draft_key not in st.session_state:
+        st.session_state[ban_search_draft_key] = st.session_state[ban_search_state_key]
+    with st.form("ban_search_form", clear_on_submit=False):
+        st.text_input(
+            "Search Banned MACs",
+            placeholder="Search MAC Address..",
+            label_visibility="collapsed",
+            key=ban_search_draft_key,
+        )
+        b_col1, b_col2, _ = st.columns([1.0, 1.0, 4.0])
+        with b_col1:
+            apply_ban_search = st.form_submit_button("Apply Search", use_container_width=True)
+        with b_col2:
+            clear_ban_search = st.form_submit_button("Clear", use_container_width=True)
+    if clear_ban_search:
+        st.session_state[ban_search_state_key] = ""
+        st.session_state[ban_search_draft_key] = ""
+        st.rerun()
+    if apply_ban_search:
+        st.session_state[ban_search_state_key] = str(st.session_state.get(ban_search_draft_key, "") or "").strip().lower()
+    search_query = str(st.session_state.get(ban_search_state_key, "") or "").strip().lower()
 
     df = pd.DataFrame(st.session_state.ban_rows_state)
     if df.empty:
@@ -1595,9 +1789,17 @@ def render(mac_file: Path):
         history_df = load_history(mac_file)
         if not history_df.empty:
             hist_show = _with_row_numbers(history_df)
+            row_limit = row_limit_selector(
+                key_prefix="auth_audit_log",
+                total_rows=len(hist_show),
+                label="Rows shown",
+                default_limit=500,
+            )
+            hist_view = cap_dataframe_rows(hist_show, row_limit)
+            render_rows_caption(total_rows=len(hist_show), shown_rows=len(hist_view))
             _open_shadow_table_shell()
             _st_dataframe(
-                hist_show,
+                hist_view,
                 width="stretch",
                 height=500,
                 column_config={"#": st.column_config.NumberColumn("#", width="small")}

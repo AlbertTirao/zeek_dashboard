@@ -6,6 +6,13 @@ import pandas as pd
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 
+def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
+    if int(total_rows) > int(shown_rows):
+        st.caption(f"Showing {shown_rows:,} of {total_rows:,} rows. Narrow filters or increase row limit for more.")
+    else:
+        st.caption(f"Showing {shown_rows:,} rows.")
+
+
 # -------------------------
 # Shadow UI Styling
 # -------------------------
@@ -280,6 +287,7 @@ def _parse_datetime_range(search_term: str):
 # -------------------------
 # Search / Load Logs via DuckDB
 # -------------------------
+@st.cache_data(show_spinner=False, ttl=120)
 def query_parquet_log(
     parquet_root: Path,
     selected_date: str,
@@ -395,24 +403,78 @@ def render(parquet_root: Path):
         st.info(f"No logs found for {selected_date}")
         return
 
+    log_applied_key = "zeek_log_type_applied"
+    search_applied_key = "zeek_log_search_applied"
+    row_limit_applied_key = "zeek_row_limit_applied"
+    log_draft_key = "zeek_log_type_draft"
+    search_draft_key = "zeek_log_search_draft"
+    row_limit_draft_key = "zeek_row_limit_draft"
+    row_limit_options = [200, 500, 1000, 2000, 5000, 10000]
+
+    if st.session_state.get(log_applied_key) not in log_types:
+        st.session_state[log_applied_key] = log_types[0]
+    if row_limit_applied_key not in st.session_state:
+        st.session_state[row_limit_applied_key] = 1000
+    if int(st.session_state.get(row_limit_applied_key, 1000)) not in row_limit_options:
+        st.session_state[row_limit_applied_key] = 1000
+
+    if st.session_state.get(log_draft_key) not in log_types:
+        st.session_state[log_draft_key] = st.session_state[log_applied_key]
+    if search_draft_key not in st.session_state:
+        st.session_state[search_draft_key] = str(st.session_state.get(search_applied_key, "") or "")
+    if int(st.session_state.get(row_limit_draft_key, st.session_state[row_limit_applied_key])) not in row_limit_options:
+        st.session_state[row_limit_draft_key] = int(st.session_state[row_limit_applied_key])
+
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    filter_col1, filter_col2 = st.columns([1.1, 1.6])
-    with filter_col1:
-        selected_log = st.selectbox("Log Type", log_types, key="zeek_log_type_select")
-    with filter_col2:
-        search_term = st.text_input(
-            "Search (all columns)",
-            "",
-            placeholder="IP, domain, uid, ts, or any value...",
-            key="zeek_log_search",
-        )
+    with st.form("zeek_logs_filters_form", clear_on_submit=False):
+        filter_col1, filter_col2, filter_col3 = st.columns([1.0, 1.45, 0.8])
+        with filter_col1:
+            st.selectbox("Log Type", log_types, key=log_draft_key)
+        with filter_col2:
+            st.text_input(
+                "Search (all columns)",
+                placeholder="IP, domain, uid, ts, or any value...",
+                key=search_draft_key,
+            )
+        with filter_col3:
+            st.selectbox(
+                "Rows",
+                options=row_limit_options,
+                key=row_limit_draft_key,
+            )
+        form_btn_col1, form_btn_col2, _ = st.columns([0.75, 0.75, 2.5])
+        with form_btn_col1:
+            apply_filters = st.form_submit_button("Apply Filters", use_container_width=True)
+        with form_btn_col2:
+            reset_filters = st.form_submit_button("Reset", use_container_width=True)
+
+    if reset_filters:
+        st.session_state[log_applied_key] = log_types[0]
+        st.session_state[search_applied_key] = ""
+        st.session_state[row_limit_applied_key] = 1000
+        st.session_state[log_draft_key] = log_types[0]
+        st.session_state[search_draft_key] = ""
+        st.session_state[row_limit_draft_key] = 1000
+        st.rerun()
+
+    if apply_filters:
+        chosen_log = st.session_state.get(log_draft_key, log_types[0])
+        st.session_state[log_applied_key] = chosen_log if chosen_log in log_types else log_types[0]
+        st.session_state[search_applied_key] = str(st.session_state.get(search_draft_key, "") or "").strip()
+        chosen_limit = int(st.session_state.get(row_limit_draft_key, 1000) or 1000)
+        st.session_state[row_limit_applied_key] = chosen_limit if chosen_limit in row_limit_options else 1000
+
+    selected_log = str(st.session_state.get(log_applied_key, log_types[0]) or log_types[0])
+    search_term = str(st.session_state.get(search_applied_key, "") or "")
+    row_limit = int(st.session_state.get(row_limit_applied_key, 1000) or 1000)
+
     st.markdown(
         f"<div class='shadow-filter-hint'>Log: <strong>{selected_log}</strong> | Search: <strong>{'On' if search_term.strip() else 'Off'}</strong> | Datetime: <strong>YYYY-MM-DD[ HH[:MM[:SS[.ffffff]]]]</strong></div>",
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    df_display = query_parquet_log(parquet_root, selected_date, selected_log, search_term)
+    df_display = query_parquet_log(parquet_root, selected_date, selected_log, search_term, limit=row_limit)
 
     if df_display.empty:
         if search_term and search_term.strip():
@@ -422,7 +484,9 @@ def render(parquet_root: Path):
         return
 
     st.write(f"### {selected_log}.log")
-    st.caption(f"{len(df_display):,} rows matched.")
+    render_rows_caption(total_rows=len(df_display), shown_rows=len(df_display))
+    if len(df_display) >= row_limit:
+        st.caption(f"Query is capped at {row_limit:,} rows for responsiveness.")
 
     df_display = df_display.reset_index(drop=True)
     df_display.index = df_display.index + 1

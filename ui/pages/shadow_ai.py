@@ -3704,8 +3704,6 @@ def render_shadow_aggrid(
 
     filter_params = dict(default_col_def.get("filterParams") or {})
     filter_params.setdefault("excelMode", "windows")
-    filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
-    filter_params.setdefault("closeOnApply", True)
     filter_params.setdefault("suppressMiniFilter", False)
     default_col_def["filterParams"] = filter_params
 
@@ -3729,8 +3727,6 @@ def render_shadow_aggrid(
             col_def.setdefault("suppressMenu", False)
             cfp = dict(col_def.get("filterParams") or {})
             cfp.setdefault("excelMode", "windows")
-            cfp.setdefault("buttons", ["apply", "clear", "cancel"])
-            cfp.setdefault("closeOnApply", True)
             cfp.setdefault("suppressMiniFilter", False)
             col_def["filterParams"] = cfp
         grid_options["columnDefs"] = col_defs
@@ -3865,6 +3861,8 @@ def _close_shadow_ai_mac_dialog(*, preserve_last_selected: bool = True) -> None:
     active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     st.session_state["shadow_ai_mac_dialog_open"] = False
     st.session_state["shadow_ai_mac_dialog_mac"] = None
+    st.session_state.pop("_shadow_ai_mac_dialog_scoped_key_v1", None)
+    st.session_state.pop("_shadow_ai_mac_dialog_scoped_df_v1", None)
     # Always clear last_selected so the next click (even same MAC) can re-open.
     st.session_state["shadow_ai_mac_dialog_last_selected"] = None
     if preserve_last_selected and active_mac:
@@ -3983,15 +3981,19 @@ def _render_shadow_ai_mac_drilldown(
     search_removed = int(max(0, base_n - view_n))
 
     high_n = int(view_df["Severity"].isin(["CRITICAL", "HIGH"]).sum())
-    providers_n = int(view_df["AI_Provider"].astype(str).replace({"": None, "nan": None}).dropna().nunique())
+    verdict_series = view_df.get("Policy_Verdict", pd.Series("", index=view_df.index)).astype(str).str.strip().str.lower()
+    shadow_ai_n = int(verdict_series.eq("shadow ai").sum())
+    dest_series = view_df.get("Destination", pd.Series("", index=view_df.index)).astype(str).str.strip()
+    dest_series = dest_series[~dest_series.str.lower().isin({"", "unknown", "nan", "none", "null", "-", "(empty)"})]
+    destinations_n = int(dest_series.nunique())
     upload_mb = _sum_upload_mb(view_df.get("Upload_Bytes", pd.Series(0, index=view_df.index)))
 
-    d1, d2, d3, d4, d5 = st.columns(5, gap="small")
-    d1.metric("Events (view)", f"{view_n:,}")
-    d2.metric("Raw events", f"{raw_n:,}")
-    d3.metric("Providers", f"{providers_n:,}")
-    d4.metric("High/Critical", f"{high_n:,}")
-    d5.metric("Upload (MB)", f"{upload_mb:.2f}")
+    d1, d2, d3, d4 = st.columns(4, gap="small")
+    d1.metric("Events", f"{view_n:,}")
+    d2.metric("Unique Destinations", f"{destinations_n:,}")
+    d3.metric("Unauthorized", f"{shadow_ai_n:,}")
+    d4.metric("Critical / High", f"{high_n:,}")
+    st.caption(f"Upload volume in current view: {upload_mb:.2f} MB")
 
     if dup_removed or (search_applied and search_removed):
         bits = []
@@ -4011,9 +4013,21 @@ def _render_shadow_ai_mac_drilldown(
     export_df = view_df[export_cols].copy() if export_cols else view_df.copy()
     if "ts" in export_df.columns:
         export_df["ts"] = pd.to_datetime(export_df["ts"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
-    tabs = st.tabs(["Overview", "Incident Rows"])
+    dialog_tab_options = ["Overview", "Incident Rows"]
+    dialog_tab_key = f"shadow_ai_dialog_tab_{selected_scope_key}_{mac_key}_{key_prefix}"
+    if st.session_state.get(dialog_tab_key) not in dialog_tab_options:
+        st.session_state[dialog_tab_key] = dialog_tab_options[0]
+    st.markdown("<div class='shadow-tab-selector'>", unsafe_allow_html=True)
+    dialog_tab = st.radio(
+        "",
+        dialog_tab_options,
+        horizontal=True,
+        label_visibility="collapsed",
+        key=dialog_tab_key,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with tabs[0]:
+    if dialog_tab == "Overview":
         chart_df = view_df
         if len(chart_df) > DIALOG_TIMELINE_MAX_POINTS:
             chart_df = chart_df.head(DIALOG_TIMELINE_MAX_POINTS).copy()
@@ -4086,7 +4100,7 @@ def _render_shadow_ai_mac_drilldown(
             figd.update_yaxes(title=None)
             st.plotly_chart(figd, width="stretch")
 
-    with tabs[1]:
+    if dialog_tab == "Incident Rows":
         st.markdown(f"#### AI services used ({scope_mac_display})")
         st.caption("Summary is based on the current view (page filters + dialog search).")
 
@@ -4315,7 +4329,7 @@ def show_shadow_ai_allow_dialog() -> None:
             st.rerun()
 
 
-@st.dialog("Device AI Incidents", width="large")
+@st.dialog("Device AI Incidents", width="large", dismissible=False)
 def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: str) -> None:
     active_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     if not active_mac:
@@ -4343,7 +4357,34 @@ def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: s
     def _safe_html(v: str) -> str:
         return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    c_left, c_right = st.columns([1.0, 3.5])
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] > div[role="dialog"] {
+            width: min(95vw, 1500px) !important;
+            max-width: min(95vw, 1500px) !important;
+        }
+        div[data-testid="stDialog"] div[role="dialog"] .stDialogContent {
+            padding-left: 1.25rem !important;
+            padding-right: 1.25rem !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stMarkdownContainer"] h4 {
+            color: #dbeafe;
+            letter-spacing: 0.01em;
+        }
+        div[role="dialog"] button[aria-label="Close"],
+        div[role="dialog"] button[title="Close"],
+        div[data-testid="stDialog"] button[aria-label="Close"],
+        div[data-testid="stDialog"] button[title="Close"] {
+            display: none !important;
+            visibility: hidden !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c_left, c_right = st.columns([1.0, 6.0])
     with c_left:
         if st.button("Close", width="stretch", type="primary", key=f"shadow_ai_mac_dlg_close_{selected_scope_key}"):
             _close_shadow_ai_mac_dialog()
@@ -4515,6 +4556,14 @@ def inject_shadow_ai_css():
             flex-direction: column;
             justify-content: space-between;
         }
+        div[data-testid="stDialog"] [data-testid="stMetric"] {
+            background: rgba(15, 23, 42, 0.52);
+            border: 1px solid rgba(56, 189, 248, 0.32);
+            min-height: 115px;
+            height: 115px;
+            border-radius: 12px;
+            padding: 0.55rem 0.75rem;
+        }
         [data-testid="stMetric"] > div {
             height: 100%;
             display: grid;
@@ -4563,6 +4612,31 @@ def inject_shadow_ai_css():
             background: rgba(255,255,255,0.08);
             border-color: rgba(255,255,255,0.2);
             font-weight: 700;
+        }
+        .shadow-tab-selector [role="radiogroup"] {
+            gap: 0.45rem;
+            margin-bottom: 0.35rem;
+        }
+        .shadow-tab-selector label {
+            border: 1px solid var(--panel-border);
+            border-radius: 999px;
+            background: rgba(255,255,255,0.03);
+            padding: 0.38rem 0.88rem;
+            font-size: 0.86rem;
+            height: auto;
+            display: flex;
+            align-items: center;
+        }
+        .shadow-tab-selector label:has(input:checked) {
+            background: rgba(255,255,255,0.08);
+            border-color: rgba(255,255,255,0.2);
+            font-weight: 700;
+        }
+        .shadow-tab-selector input[type="radio"] {
+            display: none;
+        }
+        .shadow-tab-selector label > div {
+            margin: 0;
         }
         div[data-testid="stDialog"] [data-testid="stDialogCloseButton"],
         div[data-testid="stDialog"] button[aria-label="Close"] {
@@ -4621,6 +4695,8 @@ def _shadow_ai_bust_ui_caches() -> None:
         "_shadow_ai_scoped_decision_v1",
         "_shadow_ai_filtered_cache_v1",
         "_shadow_ai_mac_tab_cache_v1",
+        "_shadow_ai_mac_dialog_scoped_key_v1",
+        "_shadow_ai_mac_dialog_scoped_df_v1",
     ]:
         st.session_state.pop(k, None)
     # Close any pending dialog so rerun doesn't double-open it
@@ -4631,9 +4707,8 @@ def _shadow_ai_bust_ui_caches() -> None:
     _bump_shadow_ai_provider_grid_nonce()
 
 
-    # Full refresh (re-read yaml/signatures and rebuild caches)
+    # Full refresh for data caches only; keep resource caches warm.
     st.cache_data.clear()
-    st.cache_resource.clear()
 
 
 # =============================================================================
@@ -4646,6 +4721,8 @@ def render_shadow_ai(parquet_root: Path):
     st.session_state.setdefault("shadow_ai_mac_dialog_open", False)
     st.session_state.setdefault("shadow_ai_mac_dialog_mac", None)
     st.session_state.setdefault("shadow_ai_mac_dialog_last_selected", None)
+    st.session_state.setdefault("_shadow_ai_mac_dialog_scoped_key_v1", None)
+    st.session_state.setdefault("_shadow_ai_mac_dialog_scoped_df_v1", None)
     st.session_state.setdefault("shadow_ai_mac_grid_nonce", 0)
     st.session_state.setdefault("shadow_ai_provider_grid_nonce", 0)
     st.session_state.setdefault("shadow_ai_allow_dialog_open", False)
@@ -4724,11 +4801,6 @@ def render_shadow_ai(parquet_root: Path):
     )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
     scope_note_slot = st.empty()
-    search_q = st.text_input(
-        "Search (MAC, Host, Provider, IP, Detail, Basis)",
-        placeholder="Enter keywords...",
-        key="shadow_ai_filter_search_v2",
-    )
 
     evidence_values = ["HTTP+POST", "HTTP+GET", "TLS SNI", "DNS query", "Local Port", "HTTP"]
 
@@ -4740,26 +4812,51 @@ def render_shadow_ai(parquet_root: Path):
     only_selected_ai = False
     min_upload_kb = 0.0
 
+    st.session_state.setdefault("shadow_ai_search_applied_v2", "")
+    st.session_state.setdefault("shadow_ai_severity_applied_v2", ["CRITICAL", "HIGH", "MEDIUM", "LOW"])
+    st.session_state.setdefault("shadow_ai_evidence_applied_v2", [])
+
+    severity_options = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    applied_severity = [str(x).upper() for x in st.session_state.get("shadow_ai_severity_applied_v2", []) if str(x).upper() in severity_options]
+    if not applied_severity:
+        applied_severity = list(severity_options)
+        st.session_state["shadow_ai_severity_applied_v2"] = list(applied_severity)
+    applied_evidence = [str(x) for x in st.session_state.get("shadow_ai_evidence_applied_v2", []) if str(x) in evidence_values]
+    if applied_evidence != list(st.session_state.get("shadow_ai_evidence_applied_v2", [])):
+        st.session_state["shadow_ai_evidence_applied_v2"] = list(applied_evidence)
+
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+    search_q = st.text_input(
+        "Search (MAC, Host, Provider, IP, Detail, Basis)",
+        placeholder="Enter keywords...",
+        key="shadow_ai_search_applied_v2",
+    )
     c1, c2 = st.columns([1.2, 1.4])
     with c1:
         selected_severity = st.multiselect(
             "Risk Level",
-            ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-            default=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-            key="shadow_ai_filter_severity_v2",
+            severity_options,
+            key="shadow_ai_severity_applied_v2",
         )
     with c2:
         evidence_filter = st.multiselect(
             "Evidence Type",
             evidence_values,
-            default=[],
             placeholder="All evidence",
-            key="shadow_ai_filter_evidence_v2",
+            key="shadow_ai_evidence_applied_v2",
         )
     only_resolved_mac = False
     ignore_dns_only = False
     st.markdown("</div>", unsafe_allow_html=True)
+
+    search_q = str(search_q or "").strip()
+    selected_severity = [str(x).upper() for x in (selected_severity or []) if str(x).upper() in severity_options]
+    if not selected_severity:
+        selected_severity = list(severity_options)
+        st.session_state["shadow_ai_severity_applied_v2"] = list(selected_severity)
+    evidence_filter = [str(x) for x in (evidence_filter or []) if str(x) in evidence_values]
+    if evidence_filter != list(st.session_state.get("shadow_ai_evidence_applied_v2", [])):
+        st.session_state["shadow_ai_evidence_applied_v2"] = list(evidence_filter)
 
     # Scope behavior: always interpret selected day in Asia/Manila local time (with automatic boundary coverage)
     scope_mode = "local_auto"
@@ -4890,23 +4987,35 @@ def render_shadow_ai(parquet_root: Path):
 
     if st.session_state.get("shadow_ai_allow_dialog_open") and st.session_state.get("shadow_ai_allow_candidate"):
         show_shadow_ai_allow_dialog()
+        st.stop()
 
     dialog_mac_pending = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
     if st.session_state.get("shadow_ai_mac_dialog_open") and dialog_mac_pending:
-        mac_cache_state = st.session_state.get("_shadow_ai_mac_tab_cache_v1", {})
-        if isinstance(mac_cache_state, dict) and mac_cache_state.get("key") == filter_cache_key:
-            mac_view_for_dialog = mac_cache_state.get("mac_view", pd.DataFrame())
-            mac_summary_for_dialog = mac_cache_state.get("mac_summary", pd.DataFrame())
-        else:
-            mac_view_for_dialog, mac_summary_for_dialog = _build_shadow_ai_mac_tab_frames(filtered)
-            st.session_state["_shadow_ai_mac_tab_cache_v1"] = {
-                "key": filter_cache_key,
-                "mac_view": mac_view_for_dialog,
-                "mac_summary": mac_summary_for_dialog,
-            }
+        dialog_scoped_key = (filter_cache_key, dialog_mac_pending)
+        cached_scoped_key = st.session_state.get("_shadow_ai_mac_dialog_scoped_key_v1")
+        cached_scoped_df = st.session_state.get("_shadow_ai_mac_dialog_scoped_df_v1")
 
-        scoped_dialog = mac_view_for_dialog.loc[mac_view_for_dialog["mac"].eq(dialog_mac_pending)].copy() if not mac_view_for_dialog.empty else pd.DataFrame()
-        st.session_state["shadow_ai_mac_dialog_open"] = False
+        if cached_scoped_key == dialog_scoped_key and isinstance(cached_scoped_df, pd.DataFrame):
+            scoped_dialog = cached_scoped_df.copy()
+        else:
+            mac_cache_state = st.session_state.get("_shadow_ai_mac_tab_cache_v1", {})
+            if isinstance(mac_cache_state, dict) and mac_cache_state.get("key") == filter_cache_key:
+                mac_view_for_dialog = mac_cache_state.get("mac_view", pd.DataFrame())
+                mac_summary_for_dialog = mac_cache_state.get("mac_summary", pd.DataFrame())
+            else:
+                mac_view_for_dialog, mac_summary_for_dialog = _build_shadow_ai_mac_tab_frames(filtered)
+                st.session_state["_shadow_ai_mac_tab_cache_v1"] = {
+                    "key": filter_cache_key,
+                    "mac_view": mac_view_for_dialog,
+                    "mac_summary": mac_summary_for_dialog,
+                }
+            scoped_dialog = (
+                mac_view_for_dialog.loc[mac_view_for_dialog["mac"].eq(dialog_mac_pending)].copy()
+                if not mac_view_for_dialog.empty
+                else pd.DataFrame()
+            )
+            st.session_state["_shadow_ai_mac_dialog_scoped_key_v1"] = dialog_scoped_key
+            st.session_state["_shadow_ai_mac_dialog_scoped_df_v1"] = scoped_dialog
         show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
         st.stop()
 
@@ -4933,16 +5042,23 @@ def render_shadow_ai(parquet_root: Path):
     # -----------------------------------------------------------------------------
     # TABS: SOC dashboards
     # -----------------------------------------------------------------------------
-    tabs = st.tabs([
-        "Overview",
-        "Trends",
-        "Shadow AI Incidents",
-    ])
+    main_tab_options = ["Overview", "Trends", "Shadow AI Incidents"]
+    if st.session_state.get("shadow_ai_main_tab") not in main_tab_options:
+        st.session_state["shadow_ai_main_tab"] = main_tab_options[0]
+    st.markdown("<div class='shadow-tab-selector'>", unsafe_allow_html=True)
+    active_tab = st.radio(
+        "",
+        main_tab_options,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="shadow_ai_main_tab",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # =============================================================================
     # TAB: OVERVIEW
     # =============================================================================
-    with tabs[0]:
+    if active_tab == "Overview":
         g1, g2 = st.columns([2, 1])
         with g1:
             render_mode = "webgl" if len(filtered) > 2000 else "auto"
@@ -5168,7 +5284,7 @@ def render_shadow_ai(parquet_root: Path):
     # =============================================================================
     # TAB: TRENDS
     # =============================================================================
-    with tabs[1]:
+    if active_tab == "Trends":
         st.markdown("### Trend over time")
         tdf = filtered.copy()
         ts_raw = tdf.get("ts", pd.Series(pd.NaT, index=tdf.index))
@@ -5249,7 +5365,7 @@ def render_shadow_ai(parquet_root: Path):
     # =============================================================================
     # TAB: SHADOW AI INCIDENTS (Top Destinations)
     # =============================================================================
-    with tabs[2]:
+    if active_tab == "Shadow AI Incidents":
         st.markdown("### Top destinations/domains")
         ddf = filtered.copy()
         ddf["Domain"] = ddf["Domain"].astype(str).fillna("")
@@ -5349,7 +5465,7 @@ def render_shadow_ai(parquet_root: Path):
     # =============================================================================
     # TAB: SHADOW AI INCIDENTS (Shadow AI by MAC)
     # =============================================================================
-    with tabs[2]:
+    if active_tab == "Shadow AI Incidents":
         st.markdown("### Shadow AI by MAC")
         st.caption("Click on ony MAC address to show device AI incidents dialog")
 
@@ -5481,9 +5597,20 @@ def render_shadow_ai(parquet_root: Path):
                     st.session_state["shadow_ai_mac_dialog_last_selected"] = selected_mac
                     st.session_state["shadow_ai_mac_dialog_mac"] = selected_mac
                     st.session_state["shadow_ai_mac_dialog_open"] = True
-                    st.rerun()
+                    st.session_state["_shadow_ai_mac_dialog_scoped_key_v1"] = (mac_cache_key, selected_mac)
+                    if isinstance(mac_view, pd.DataFrame) and not mac_view.empty:
+                        scoped_dialog = mac_view.loc[
+                            mac_view["mac"].eq(selected_mac)
+                        ].copy()
+                    else:
+                        scoped_dialog = pd.DataFrame()
+                    st.session_state["_shadow_ai_mac_dialog_scoped_df_v1"] = scoped_dialog
+                    show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
+                    st.stop()
             else:
                 st.session_state["shadow_ai_mac_dialog_last_selected"] = None
+                st.session_state.pop("_shadow_ai_mac_dialog_scoped_key_v1", None)
+                st.session_state.pop("_shadow_ai_mac_dialog_scoped_df_v1", None)
 
             mac_list = [str(x).strip().lower() for x in mac_summary["mac"].tolist() if str(x).strip()]
             active_mac = str(st.session_state.get("shadow_ai_selected_mac") or st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
@@ -5491,16 +5618,10 @@ def render_shadow_ai(parquet_root: Path):
                 active_mac = mac_list[0]
                 st.session_state["shadow_ai_selected_mac"] = active_mac
 
-            dialog_mac = str(st.session_state.get("shadow_ai_mac_dialog_mac") or "").strip().lower()
-            if st.session_state.get("shadow_ai_mac_dialog_open") and dialog_mac:
-                st.session_state["shadow_ai_mac_dialog_open"] = False
-                scoped_dialog = mac_view.loc[mac_view["mac"].eq(dialog_mac)].copy()
-                show_shadow_ai_mac_dialog(scoped_dialog, selected_scope_key=selected_scope_key)
-
     # =============================================================================
     # TAB: SHADOW AI INCIDENTS (Signature Matches)
     # =============================================================================
-    with tabs[2]:
+    if active_tab == "Shadow AI Incidents":
         st.markdown("### Signature fragments causing matches (top)")
         sig_top = filtered.groupby(["Policy_Verdict", "Signature_Match"]).size().reset_index(name="Events")
         sig_top = sig_top.sort_values("Events", ascending=False).head(50)

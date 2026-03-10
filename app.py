@@ -2,6 +2,7 @@
 import time
 import queue
 import logging
+import importlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -22,7 +23,6 @@ from services import auth_service
 
 from ui.auth import require_authentication, current_user, clear_persistent_auth_session
 from ui.sidebar import render_sidebar
-from ui.pages import analytics, devices, zeek_logs, alerts, authorization, user_management
 
 
 # =====================================================
@@ -162,10 +162,9 @@ def _poll_background_sync():
         if not WARMUP_FLAG.exists():
             WARMUP_FLAG.touch()
 
-        # Important: pages use both st.cache_data and st.cache_resource.
-        # Clear both so freshly-synced parquet is reflected immediately.
+        # Fresh sync should invalidate data caches only.
+        # Keep resource caches (connections/clients) warm for faster rerenders.
         st.cache_data.clear()
-        st.cache_resource.clear()
         st.session_state["_parquet_sync_token"] = int(st.session_state.get("_parquet_sync_token", 0)) + 1
         APP_LOGGER.info(f"✅ Sync finished ({updated} logs updated)")
         st.rerun()
@@ -251,6 +250,19 @@ if st.session_state.get("current_page") == "Logout":
 if st.session_state.current_page not in menu_options:
     st.session_state.current_page = menu_options[0]
 
+# Keep the sidebar on the current page when any dialog is open.
+def _is_any_dialog_open() -> bool:
+    if st.session_state.get("active_dialog"):
+        return True
+    for key, value in st.session_state.items():
+        if "dialog_open" in str(key) and bool(value):
+            return True
+    return False
+
+dialog_open = _is_any_dialog_open()
+if dialog_open and st.session_state.get("current_page"):
+    st.session_state.sidebar_page = st.session_state.current_page
+
 # Render sidebar ONCE
 selected_page = render_sidebar(
     auto_refresh_interval=AUTO_REFRESH_INTERVAL,
@@ -262,34 +274,43 @@ selected_page = render_sidebar(
 if selected_page == "Logout":
     perform_logout()
 
-st.session_state.current_page = selected_page
+if dialog_open and st.session_state.get("current_page"):
+    st.session_state.sidebar_page = st.session_state.current_page
+else:
+    st.session_state.current_page = selected_page
 
 
 def render_current_page():
     page = st.session_state.current_page
 
     if page == "Device Inspection":
+        devices = importlib.import_module("ui.pages.devices")
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
     elif page == "Traffic Monitoring":
+        analytics = importlib.import_module("ui.pages.analytics")
         analytics.render(PARQUET_DIR)
 
     elif page == "Zeek Logs":
+        zeek_logs = importlib.import_module("ui.pages.zeek_logs")
         zeek_logs.render(PARQUET_DIR)
 
     elif page == "Alerts":
+        alerts = importlib.import_module("ui.pages.alerts")
         alerts.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
     elif page == "Authorization":
         if auth_user["role"] != "admin":
             st.error("Admin role is required for this page.")
             return
+        authorization = importlib.import_module("ui.pages.authorization")
         authorization.render(AUTHORIZED_MACS_FILE)
 
     elif page == "User Management":
         if auth_user["role"] != "admin":
             st.error("Admin role is required for this page.")
             return
+        user_management = importlib.import_module("ui.pages.user_management")
         user_management.render(current_username=auth_user["username"])
 
 

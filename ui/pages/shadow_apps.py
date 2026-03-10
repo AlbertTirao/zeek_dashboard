@@ -14,6 +14,67 @@ import yaml
 
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 
+DEFAULT_ROW_LIMIT_OPTIONS: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000)
+
+
+def _closest_row_option(options: list[int], target: int) -> int:
+    if not options:
+        return max(int(target or 1), 1)
+    safe_target = max(int(target or options[0]), 1)
+    return min(options, key=lambda value: abs(int(value) - safe_target))
+
+
+def _normalize_row_limit_options(total_rows: int, options: tuple[int, ...]) -> list[int]:
+    out = sorted({int(x) for x in options if int(x) > 0})
+    if not out:
+        out = [100, 250, 500, 1000]
+    if total_rows > 0 and total_rows not in out:
+        out.append(int(total_rows))
+        out = sorted(set(out))
+    return out
+
+
+def row_limit_selector(
+    *,
+    key_prefix: str,
+    total_rows: int,
+    label: str = "Rows shown",
+    default_limit: int = 500,
+    options: tuple[int, ...] = DEFAULT_ROW_LIMIT_OPTIONS,
+) -> int:
+    row_options = _normalize_row_limit_options(int(total_rows or 0), options)
+    state_key = f"{key_prefix}_row_limit"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = _closest_row_option(row_options, default_limit)
+
+    current = _closest_row_option(row_options, int(st.session_state.get(state_key, default_limit)))
+    if int(st.session_state.get(state_key, default_limit)) != current:
+        st.session_state[state_key] = current
+
+    index = row_options.index(current) if current in row_options else 0
+    chosen = st.selectbox(label, options=row_options, index=index, key=state_key)
+    try:
+        return max(int(chosen), 1)
+    except Exception:
+        return max(int(current), 1)
+
+
+def cap_dataframe_rows(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    try:
+        safe_limit = max(int(limit), 1)
+    except Exception:
+        safe_limit = 500
+    return df.head(safe_limit).copy()
+
+
+def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
+    if int(total_rows) > int(shown_rows):
+        st.caption(f"Showing {shown_rows:,} of {total_rows:,} rows. Narrow filters or increase row limit for more.")
+    else:
+        st.caption(f"Showing {shown_rows:,} rows.")
+
 # =============================================================================
 # PERFORMANCE STRATEGY (FAST LOAD)
 # =============================================================================
@@ -588,8 +649,6 @@ def _apply_shadow_grid_filter_sort(grid_options: dict) -> dict:
 
     filter_params = dict(default_col_def.get("filterParams") or {})
     filter_params.setdefault("excelMode", "windows")
-    filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
-    filter_params.setdefault("closeOnApply", True)
     filter_params.setdefault("suppressMiniFilter", False)
     default_col_def["filterParams"] = filter_params
 
@@ -2870,8 +2929,17 @@ def show_inventory_app_dialog(conn):
             port_summary["Port"],
             "Unknown / Missing",
         )
+        port_df = port_summary[["Port", "Events", "Upload_MB", "Download_MB", "Last_Seen"]].copy()
+        port_limit = row_limit_selector(
+            key_prefix=f"shadow_apps_port_summary_{str(sel_app or 'app').lower()}",
+            total_rows=len(port_df),
+            label="Rows shown",
+            default_limit=250,
+        )
+        port_view = cap_dataframe_rows(port_df, port_limit)
+        render_rows_caption(total_rows=len(port_df), shown_rows=len(port_view))
         st.dataframe(
-            port_summary[["Port", "Events", "Upload_MB", "Download_MB", "Last_Seen"]],
+            port_view,
             use_container_width=True,
             hide_index=True,
         )
@@ -2944,7 +3012,15 @@ def show_inventory_app_dialog(conn):
         st.caption(
             f"Top observed cause: {top_reason['Risk Level']} - {top_reason['Risk Reason']} ({int(top_reason['Events']):,} events)."
         )
-        st.dataframe(reason_df, width="stretch", hide_index=True)
+        reason_limit = row_limit_selector(
+            key_prefix=f"shadow_apps_reason_{str(sel_app or 'app').lower()}",
+            total_rows=len(reason_df),
+            label="Rows shown",
+            default_limit=200,
+        )
+        reason_view = cap_dataframe_rows(reason_df, reason_limit)
+        render_rows_caption(total_rows=len(reason_df), shown_rows=len(reason_view))
+        st.dataframe(reason_view, width="stretch", hide_index=True)
     else:
         st.info("No risk reason details available for this application.")
 
@@ -4269,7 +4345,15 @@ def render_shadow_apps(parquet_root: Path):
             unsafe_allow_html=True,
         )
         ref_df = build_risk_policy_reference(risk_policy)
-        st.dataframe(ref_df, width="stretch", hide_index=True)
+        ref_limit = row_limit_selector(
+            key_prefix="shadow_apps_risk_reference",
+            total_rows=len(ref_df),
+            label="Rows shown",
+            default_limit=250,
+        )
+        ref_view = cap_dataframe_rows(ref_df, ref_limit)
+        render_rows_caption(total_rows=len(ref_df), shown_rows=len(ref_view))
+        st.dataframe(ref_view, width="stretch", hide_index=True)
         if risk_policy:
             st.caption(
                 f"Policy source: `{RISK_POLICY_FILE.name}`. Update that file to tune ports/log sources/status defaults."
@@ -4326,10 +4410,13 @@ def render_shadow_apps(parquet_root: Path):
     # --- render dialog only when allowed for this rerun ---
     if st.session_state.get("shadow_allow_dialog_open") and st.session_state.get("shadow_allow_candidate"):
         show_inventory_allow_dialog()
+        st.stop()
     elif st.session_state.get("shadow_app_detail_dialog_open") and st.session_state.get("shadow_app_detail_context"):
         show_inventory_app_dialog(conn)
+        st.stop()
     elif st.session_state.get("shadow_dialog_open") and st.session_state.get("shadow_dialog_mac") and origin in ("grid", "dialog"):
         show_forensics_dialog(conn)
+        st.stop()
 
     # Metrics
     stats = conn.execute(
@@ -4424,30 +4511,51 @@ def render_shadow_apps(parquet_root: Path):
     with tab_main:
         st.markdown("### Shadow App Incidents")
 
+        src_df_audit = _sql_fetch_df(conn, "SELECT DISTINCT source_log FROM shadow_events ORDER BY 1")
+        audit_sources = src_df_audit["source_log"].dropna().tolist() if not src_df_audit.empty else []
+
+        search_state_key = "audit_search_applied"
+        risk_state_key = "audit_risk_filter_applied"
+        source_state_key = "audit_source_filter_applied"
+
+        if search_state_key not in st.session_state:
+            st.session_state[search_state_key] = ""
+        if not isinstance(st.session_state.get(risk_state_key), list):
+            st.session_state[risk_state_key] = list(RISK_OPTIONS)
+        st.session_state[risk_state_key] = [x for x in st.session_state[risk_state_key] if x in RISK_OPTIONS] or list(RISK_OPTIONS)
+
+        if not isinstance(st.session_state.get(source_state_key), list):
+            st.session_state[source_state_key] = list(audit_sources)
+        if audit_sources:
+            st.session_state[source_state_key] = [x for x in st.session_state[source_state_key] if x in audit_sources] or list(audit_sources)
+        else:
+            st.session_state[source_state_key] = []
+
         st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-        search_query_audit = st.text_input(
+        st.text_input(
             "Search (MAC, Hostname, IP, Destination, App/Software)",
             placeholder="e.g., 192.168.1.14",
-            key="audit_search",
-        ).strip()
+            key=search_state_key,
+        )
         bottom_filter_col1, bottom_filter_col2 = st.columns([2.2, 2.2])
         with bottom_filter_col1:
             audit_risk_filter = risk_multiselect(
                 "Risk Level",
-                key="audit_risk_filter",
-                default=RISK_OPTIONS,
+                key=risk_state_key,
+                default=list(st.session_state[risk_state_key]),
             )
         with bottom_filter_col2:
-            # Pull available sources from the data (for the selected day already loaded into shadow_events)
-            src_df_audit = _sql_fetch_df(conn, "SELECT DISTINCT source_log FROM shadow_events ORDER BY 1")
-            audit_sources = src_df_audit["source_log"].dropna().tolist() if not src_df_audit.empty else []
             audit_source_filter = st.multiselect(
                 "Source Logs",
                 audit_sources,
-                default=audit_sources,   # default = all
-                key="audit_source_filter",
+                default=list(st.session_state[source_state_key]),
+                key=source_state_key,
             )
         st.markdown("</div>", unsafe_allow_html=True)
+
+        search_query_audit = str(st.session_state.get(search_state_key, "") or "").strip()
+        audit_risk_filter = [x for x in (audit_risk_filter or []) if x in RISK_OPTIONS]
+        audit_source_filter = [x for x in (audit_source_filter or []) if x in audit_sources]
 
         where = []
         params = []
@@ -4877,7 +4985,8 @@ def render_shadow_apps(parquet_root: Path):
                     st.session_state["shadow_dialog_mac"] = selected_mac
                     st.session_state["shadow_dialog_open"] = True
                     st.session_state["shadow_dialog_origin"] = "grid"
-                    st.rerun()
+                    show_forensics_dialog(conn)
+                    st.stop()
             else:
                 st.session_state["shadow_last_selected_mac"] = None
 

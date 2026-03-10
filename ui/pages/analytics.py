@@ -1,12 +1,9 @@
 # ui/pages/analytics.py
 from datetime import datetime
+import importlib
 
 import streamlit as st
 from pathlib import Path
-from .shadow_apps import render_shadow_apps
-from .shadow_sharings import render_shadow_uploads
-from .shadow_ai import render_shadow_ai
-from .anonymization_network import render_anonymization_network
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
 
@@ -132,18 +129,27 @@ def render(parquet_root: Path):
         updated_txt=updated_txt,
     )
 
+    section_options = ["Shadow Apps", "Shadow Sharings", "Shadow AI", "Anonymization Network"]
+    if st.session_state.get("traffic_monitoring_section") not in section_options:
+        st.session_state["traffic_monitoring_section"] = section_options[0]
+
     section = st.radio(
         "",
-        ["Shadow Apps", "Shadow Sharings", "Shadow AI", "Anonymization Network"],
+        section_options,
         horizontal=True,
         label_visibility="collapsed",
+        key="traffic_monitoring_section",
     )
 
     if section == "Shadow Apps":
+        render_shadow_apps = importlib.import_module("ui.pages.shadow_apps").render_shadow_apps
         render_shadow_apps(parquet_root)
     elif section == "Shadow Sharings":
+        render_shadow_uploads = importlib.import_module("ui.pages.shadow_sharings").render_shadow_uploads
         render_shadow_uploads(parquet_root)
     elif section == "Shadow AI":
+        render_shadow_ai = importlib.import_module("ui.pages.shadow_ai").render_shadow_ai
         render_shadow_ai(parquet_root)
     elif section == "Anonymization Network":
+        render_anonymization_network = importlib.import_module("ui.pages.anonymization_network").render_anonymization_network
         render_anonymization_network(parquet_root)

@@ -15,6 +15,67 @@ import streamlit as st
 import yaml
 from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
 
+DEFAULT_ROW_LIMIT_OPTIONS: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000)
+
+
+def _closest_row_option(options: list[int], target: int) -> int:
+    if not options:
+        return max(int(target or 1), 1)
+    safe_target = max(int(target or options[0]), 1)
+    return min(options, key=lambda value: abs(int(value) - safe_target))
+
+
+def _normalize_row_limit_options(total_rows: int, options: tuple[int, ...]) -> list[int]:
+    out = sorted({int(x) for x in options if int(x) > 0})
+    if not out:
+        out = [100, 250, 500, 1000]
+    if total_rows > 0 and total_rows not in out:
+        out.append(int(total_rows))
+        out = sorted(set(out))
+    return out
+
+
+def row_limit_selector(
+    *,
+    key_prefix: str,
+    total_rows: int,
+    label: str = "Rows shown",
+    default_limit: int = 500,
+    options: tuple[int, ...] = DEFAULT_ROW_LIMIT_OPTIONS,
+) -> int:
+    row_options = _normalize_row_limit_options(int(total_rows or 0), options)
+    state_key = f"{key_prefix}_row_limit"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = _closest_row_option(row_options, default_limit)
+
+    current = _closest_row_option(row_options, int(st.session_state.get(state_key, default_limit)))
+    if int(st.session_state.get(state_key, default_limit)) != current:
+        st.session_state[state_key] = current
+
+    index = row_options.index(current) if current in row_options else 0
+    chosen = st.selectbox(label, options=row_options, index=index, key=state_key)
+    try:
+        return max(int(chosen), 1)
+    except Exception:
+        return max(int(current), 1)
+
+
+def cap_dataframe_rows(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    try:
+        safe_limit = max(int(limit), 1)
+    except Exception:
+        safe_limit = 500
+    return df.head(safe_limit).copy()
+
+
+def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
+    if int(total_rows) > int(shown_rows):
+        st.caption(f"Showing {shown_rows:,} of {total_rows:,} rows. Narrow filters or increase row limit for more.")
+    else:
+        st.caption(f"Showing {shown_rows:,} rows.")
+
 # --- Optional vendor lookup (fallback) ---
 try:
     from mac_vendor_lookup import MacLookup  # pip install mac-vendor-lookup
@@ -1905,21 +1966,55 @@ def _render_alerts_ui(
         source_values = sorted({str(v).strip() for v in table["Source"].dropna().astype(str) if str(v).strip()})
         source_options.extend(source_values)
 
-    toolbar_col1, toolbar_col2, toolbar_col3 = st.columns([2.2, 1.2, 1.1], vertical_alignment="bottom")
-    with toolbar_col1:
-        search_query = st.text_input(
-            "Search table",
-            value="",
-            placeholder="MAC, IP, host, vendor",
-            key=f"alerts_table_search_{view.lower()}",
-        ).strip()
-    with toolbar_col2:
-        selected_source = st.selectbox(
-            "Source",
-            options=source_options,
-            index=0,
-            key=f"alerts_table_source_{view.lower()}",
-        )
+    view_key = view.lower()
+    search_state_key = f"alerts_table_search_applied_{view_key}"
+    source_state_key = f"alerts_table_source_applied_{view_key}"
+    search_draft_key = f"alerts_table_search_draft_{view_key}"
+    source_draft_key = f"alerts_table_source_draft_{view_key}"
+
+    if search_state_key not in st.session_state:
+        st.session_state[search_state_key] = ""
+    if source_state_key not in st.session_state or st.session_state[source_state_key] not in source_options:
+        st.session_state[source_state_key] = "All Sources"
+
+    if search_draft_key not in st.session_state:
+        st.session_state[search_draft_key] = str(st.session_state.get(search_state_key, "") or "")
+    if source_draft_key not in st.session_state or st.session_state[source_draft_key] not in source_options:
+        st.session_state[source_draft_key] = st.session_state[source_state_key]
+
+    with st.form(f"alerts_table_filters_form_{view_key}", clear_on_submit=False):
+        toolbar_col1, toolbar_col2, toolbar_col3, toolbar_col4 = st.columns([2.0, 1.15, 0.95, 0.9], vertical_alignment="bottom")
+        with toolbar_col1:
+            st.text_input(
+                "Search table",
+                placeholder="MAC, IP, host, vendor",
+                key=search_draft_key,
+            )
+        with toolbar_col2:
+            st.selectbox(
+                "Source",
+                options=source_options,
+                key=source_draft_key,
+            )
+        with toolbar_col3:
+            apply_filters = st.form_submit_button("Apply Filters", use_container_width=True)
+        with toolbar_col4:
+            reset_filters = st.form_submit_button("Reset", use_container_width=True)
+
+    if reset_filters:
+        st.session_state[search_state_key] = ""
+        st.session_state[source_state_key] = "All Sources"
+        st.session_state[search_draft_key] = ""
+        st.session_state[source_draft_key] = "All Sources"
+        st.rerun()
+
+    if apply_filters:
+        st.session_state[search_state_key] = str(st.session_state.get(search_draft_key, "") or "").strip()
+        src_choice = str(st.session_state.get(source_draft_key, "All Sources") or "All Sources")
+        st.session_state[source_state_key] = src_choice if src_choice in source_options else "All Sources"
+
+    search_query = str(st.session_state.get(search_state_key, "") or "").strip()
+    selected_source = str(st.session_state.get(source_state_key, "All Sources") or "All Sources")
 
     filtered_table = table.copy()
 
@@ -1948,7 +2043,8 @@ def _render_alerts_ui(
             )
             filtered_table = filtered_table[mask]
 
-    with toolbar_col3:
+    dl_col1, dl_col2 = st.columns([1.0, 4.0], vertical_alignment="bottom")
+    with dl_col1:
         csv_bytes = filtered_table.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download CSV",
@@ -1963,13 +2059,22 @@ def _render_alerts_ui(
         st.info("No records matched the current filters.")
         return
 
+    with dl_col2:
+        row_limit = row_limit_selector(
+            key_prefix=f"alerts_table_{view_key}",
+            total_rows=len(filtered_table),
+            label="Rows shown",
+            default_limit=500,
+        )
+    shown_table = cap_dataframe_rows(filtered_table, row_limit)
     st.markdown(
-        f"<div class='alerts-table-meta'>Showing <b>{len(filtered_table)}</b> of <b>{len(table)}</b> rows.</div>",
+        f"<div class='alerts-table-meta'>Showing <b>{len(shown_table)}</b> of <b>{len(filtered_table)}</b> filtered rows ({len(table):,} total before filters).</div>",
         unsafe_allow_html=True,
     )
+    render_rows_caption(total_rows=len(filtered_table), shown_rows=len(shown_table))
     st.markdown("<div class='alerts-table-shell'>", unsafe_allow_html=True)
     st.dataframe(
-        filtered_table.style.map(style_status, subset=["Status"]),
+        shown_table.style.map(style_status, subset=["Status"]),
         width="stretch",
         hide_index=True,
         column_config={

@@ -344,8 +344,6 @@ def render_shadow_aggrid(
     default_col_def["menuTabs"] = ["filterMenuTab", "generalMenuTab"]
     filter_params = dict(default_col_def.get("filterParams") or {})
     filter_params.setdefault("excelMode", "windows")
-    filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
-    filter_params.setdefault("closeOnApply", True)
     filter_params.setdefault("suppressMiniFilter", False)
     default_col_def["filterParams"] = filter_params
     grid_options["defaultColDef"] = default_col_def
@@ -602,6 +600,11 @@ def inject_shadow_sharing_css():
             justify-content: space-between;
         }
 
+        div[data-testid="stDialog"] [data-testid="stMetric"] {
+            border-color: rgba(56, 189, 248, 0.32);
+            background: rgba(15, 23, 42, 0.52);
+        }
+
         [data-testid="stMetricLabel"] p {
             font-size: 0.75rem;
             letter-spacing: 0.06em;
@@ -693,6 +696,8 @@ def _close_shadow_sharing_dialog() -> None:
     st.session_state.pop("shadow_sharing_dialog_base_df", None)
     st.session_state.pop("shadow_sharing_dialog_base_key", None)
     st.session_state.pop("shadow_sharing_dialog_incidents_df", None)
+    st.session_state.pop("shadow_sharing_dialog_scope_key", None)
+    st.session_state.pop("shadow_sharing_dialog_scope_label", None)
     st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
 
 
@@ -706,6 +711,8 @@ def _invalidate_shadow_sharing_frontend_cache() -> None:
         "shadow_sharing_dialog_base_df",
         "shadow_sharing_dialog_base_key",
         "shadow_sharing_dialog_incidents_df",
+        "shadow_sharing_dialog_scope_key",
+        "shadow_sharing_dialog_scope_label",
     ]:
         st.session_state.pop(key, None)
     st.session_state["shadow_sharing_grid_nonce"] = int(st.session_state.get("shadow_sharing_grid_nonce", 0)) + 1
@@ -1581,15 +1588,16 @@ def show_shadow_sharing_device_dialog(
         """
         <style>
         div[data-testid="stDialog"] > div[role="dialog"] {
-            width: min(95vw, 1450px) !important;
-            max-width: min(95vw, 1450px) !important;
-            border: 1px solid rgba(148, 163, 184, 0.35);
-            background: linear-gradient(180deg, rgba(3,10,23,0.96), rgba(2,8,20,0.97));
+            width: min(95vw, 1500px) !important;
+            max-width: min(95vw, 1500px) !important;
         }
         div[data-testid="stDialog"] div[role="dialog"] .stDialogContent {
-            padding-left: 1.05rem !important;
-            padding-right: 1.05rem !important;
-            padding-bottom: 0.8rem !important;
+            padding-left: 1.25rem !important;
+            padding-right: 1.25rem !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stMarkdownContainer"] h4 {
+            color: #dbeafe;
+            letter-spacing: 0.01em;
         }
         div[role="dialog"] button[aria-label="Close"],
         div[role="dialog"] button[title="Close"],
@@ -1597,47 +1605,6 @@ def show_shadow_sharing_device_dialog(
         div[data-testid="stDialog"] button[title="Close"] {
             display: none !important;
             visibility: hidden !important;
-        }
-        div[data-testid="stDialog"] .shadow-dialog-hero {
-            border: 1px solid rgba(148, 163, 184, 0.28);
-            background: linear-gradient(135deg, rgba(15,23,42,0.66), rgba(2,6,23,0.62));
-            border-radius: 12px;
-            padding: 0.58rem 0.76rem;
-            margin-bottom: 0.4rem;
-        }
-        div[data-testid="stDialog"] .shadow-dialog-title {
-            color: #e7efff;
-            font-weight: 800;
-            letter-spacing: 0.02em;
-            font-size: 1rem;
-            line-height: 1.2;
-        }
-        div[data-testid="stDialog"] .shadow-dialog-subtitle {
-            color: #b8cae6;
-            font-size: 0.8rem;
-            margin-top: 0.22rem;
-        }
-        div[data-testid="stDialog"] .shadow-dialog-subtitle code {
-            border: 1px solid rgba(148, 163, 184, 0.3);
-            background: rgba(8, 20, 40, 0.78);
-            color: #dbeafe;
-            border-radius: 999px;
-            padding: 0.12rem 0.52rem;
-        }
-        div[data-testid="stDialog"] .shadow-dialog-chips {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.42rem;
-            margin: 0.05rem 0 0.5rem 0;
-        }
-        div[data-testid="stDialog"] .shadow-dialog-chip {
-            border: 1px solid rgba(148, 163, 184, 0.28);
-            background: rgba(255,255,255,0.04);
-            border-radius: 999px;
-            padding: 0.21rem 0.58rem;
-            font-size: 0.72rem;
-            color: #c7d6eb;
-            line-height: 1.1;
         }
         </style>
         """,
@@ -1670,7 +1637,7 @@ def show_shadow_sharing_device_dialog(
             mac_hostname = str(h2.value_counts(dropna=True).index[0]).strip()
     mac_hostname = mac_hostname or "Unknown"
 
-    top = st.columns([1.0, 5.0])
+    top = st.columns([1.0, 6.0])
     with top[0]:
         if st.button("Close", width="stretch", type="primary", key=f"shadow_sharing_dlg_close_{selected_scope_key}_{mac_key}"):
             _close_shadow_sharing_dialog()
@@ -1712,15 +1679,28 @@ def show_shadow_sharing_device_dialog(
     if not popup_source_options:
         popup_source_options = ["conn", "http", "ssl", "dns", "files"]
 
-    total_outbound_mb = float(pd.to_numeric(base_raw_grid_rows["Outbound_MB"], errors="coerce").fillna(0).sum())
-    unapproved = int((base_raw_grid_rows["Allowed_Domain"] == False).sum())  # noqa: E712
-    high_conf = int((base_raw_grid_rows["Confidence"] == "HIGH").sum())
+    dest_series = (
+        base_raw_grid_rows.get("Domain", pd.Series("", index=base_raw_grid_rows.index))
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({"": None, "nan": None, "none": None, "null": None, "-": None, "(empty)": None})
+    )
+    unique_destinations = int(dest_series.dropna().nunique()) if not dest_series.empty else 0
+    unauthorized = int((base_raw_grid_rows["Allowed_Domain"] == False).sum())  # noqa: E712
+    critical_high = int(
+        base_raw_grid_rows.get("Confidence", pd.Series("", index=base_raw_grid_rows.index))
+        .astype(str)
+        .str.upper()
+        .isin(["HIGH"])
+        .sum()
+    )
 
     dm1, dm2, dm3, dm4 = st.columns(4)
-    dm1.metric("Scoped Incidents", f"{len(base_raw_grid_rows):,}")
-    dm2.metric("Unapproved", unapproved, delta="Investigate" if unapproved > 0 else "Clear", delta_color="inverse")
-    dm3.metric("Outbound Volume", f"{total_outbound_mb:.2f} MB")
-    dm4.metric("High Confidence", f"{high_conf:,}")
+    dm1.metric("Events", f"{len(base_raw_grid_rows):,}")
+    dm2.metric("Unique Destinations", f"{unique_destinations:,}")
+    dm3.metric("Unauthorized", f"{unauthorized:,}")
+    dm4.metric("Critical / High", f"{critical_high:,}")
 
     with st.container():
         st.markdown(f"#### Shadow Sharing Incidents ({target_mac})")
@@ -1879,6 +1859,8 @@ def render_shadow_sharing(parquet_root: Path):
     st.session_state.setdefault("shadow_sharing_dialog_base_df", None)
     st.session_state.setdefault("shadow_sharing_dialog_base_key", None)
     st.session_state.setdefault("shadow_sharing_dialog_incidents_df", None)
+    st.session_state.setdefault("shadow_sharing_dialog_scope_key", None)
+    st.session_state.setdefault("shadow_sharing_dialog_scope_label", None)
     st.session_state.setdefault("shadow_sharing_grid_nonce", 0)
     st.session_state.setdefault("shadow_sharing_allow_dialog_open", False)
     st.session_state.setdefault("shadow_sharing_allow_candidate", None)
@@ -1888,8 +1870,11 @@ def render_shadow_sharing(parquet_root: Path):
 
     origin = st.session_state.pop("shadow_sharing_dialog_origin", None)
     if st.session_state.get("shadow_sharing_dialog_open") and origin not in ("grid", "dialog"):
-        _close_shadow_sharing_dialog()
-        origin = None
+        cached_base = st.session_state.get("shadow_sharing_dialog_base_df")
+        cached_incidents = st.session_state.get("shadow_sharing_dialog_incidents_df")
+        if not (isinstance(cached_base, pd.DataFrame) and isinstance(cached_incidents, pd.DataFrame)):
+            _close_shadow_sharing_dialog()
+            origin = None
 
     st.markdown("### Shadow Sharing Incidents")
     st.markdown(
@@ -1912,6 +1897,29 @@ def render_shadow_sharing(parquet_root: Path):
         on_change=_on_scope_change,
     )
     selected_scope_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(selected_date))
+
+    dialog_mac_pending = str(st.session_state.get("shadow_sharing_dialog_mac") or "").strip().lower()
+    cached_base = st.session_state.get("shadow_sharing_dialog_base_df")
+    cached_incidents = st.session_state.get("shadow_sharing_dialog_incidents_df")
+    cached_scope_key = st.session_state.get("shadow_sharing_dialog_scope_key") or selected_scope_key
+    cached_scope_label = st.session_state.get("shadow_sharing_dialog_scope_label") or str(selected_date)
+    if st.session_state.get("shadow_sharing_allow_dialog_open") and st.session_state.get("shadow_sharing_allow_candidate"):
+        show_shadow_sharing_allow_dialog()
+        st.stop()
+    if (
+        st.session_state.get("shadow_sharing_dialog_open")
+        and dialog_mac_pending
+        and isinstance(cached_base, pd.DataFrame)
+        and isinstance(cached_incidents, pd.DataFrame)
+    ):
+        st.session_state["shadow_sharing_dialog_origin"] = "dialog"
+        show_shadow_sharing_device_dialog(
+            cached_base,
+            cached_incidents,
+            selected_scope_key=str(cached_scope_key),
+            selected_scope_label=str(cached_scope_label),
+        )
+        st.stop()
 
     feedback = st.session_state.pop("shadow_sharing_whitelist_feedback", None)
     if isinstance(feedback, dict):
@@ -2099,21 +2107,27 @@ def render_shadow_sharing(parquet_root: Path):
     overview_incidents = build_shadow_sharing_incidents(overview_filtered)
     overview_incidents = _filter_incidents_nonzero_outbound(overview_incidents)
 
-    search_q = str(st.session_state.get("shadow_sharing_search_q", "")).strip()
+    st.session_state.setdefault("shadow_sharing_search_applied", "")
+    st.session_state.setdefault("shadow_sharing_conf_applied", ["WEAK", "PROBABLE", "HIGH"])
+    st.session_state.setdefault("shadow_sharing_sources_applied", source_options)
+
+    search_q = str(st.session_state.get("shadow_sharing_search_applied", "")).strip()
     confidence_default = ["WEAK", "PROBABLE", "HIGH"]
-    confidence_state = st.session_state.get("shadow_sharing_conf_levels", confidence_default)
+    confidence_state = st.session_state.get("shadow_sharing_conf_applied", confidence_default)
     if not isinstance(confidence_state, list):
         confidence_state = confidence_default
     selected_conf_levels = [str(x).upper() for x in confidence_state if str(x).upper() in confidence_default]
     if not selected_conf_levels:
         selected_conf_levels = confidence_default
+    st.session_state["shadow_sharing_conf_applied"] = list(selected_conf_levels)
 
-    source_state = st.session_state.get("shadow_sharing_sources", source_options)
+    source_state = st.session_state.get("shadow_sharing_sources_applied", source_options)
     if not isinstance(source_state, list):
         source_state = source_options
     selected_sources = [str(x) for x in source_state if str(x) in source_options]
     if source_options and not selected_sources:
         selected_sources = source_options
+    st.session_state["shadow_sharing_sources_applied"] = list(selected_sources)
 
     filter_cache_key = _shadow_sharing_filter_cache_key(
         selected_scope_key=selected_scope_key,
@@ -2176,6 +2190,49 @@ def render_shadow_sharing(parquet_root: Path):
     # Keep overview (metrics/charts) independent from table-only filters.
     table_filtered = filtered.copy() if isinstance(filtered, pd.DataFrame) else pd.DataFrame()
     table_filtered_incidents = filtered_incidents.copy() if isinstance(filtered_incidents, pd.DataFrame) else pd.DataFrame()
+
+    dialog_mac_pending = str(st.session_state.get("shadow_sharing_dialog_mac") or "").strip().lower()
+    dialog_cache_key = (str(selected_scope_key), dialog_mac_pending, filter_cache_key)
+
+    if st.session_state.get("shadow_sharing_allow_dialog_open") and st.session_state.get("shadow_sharing_allow_candidate"):
+        show_shadow_sharing_allow_dialog()
+        st.stop()
+
+    if st.session_state.get("shadow_sharing_dialog_open") and dialog_mac_pending and origin in ("grid", "dialog"):
+        cached_dialog_key = st.session_state.get("shadow_sharing_dialog_base_key")
+        cached_dialog_base = st.session_state.get("shadow_sharing_dialog_base_df")
+        cached_dialog_incidents = st.session_state.get("shadow_sharing_dialog_incidents_df")
+
+        if (
+            cached_dialog_key == dialog_cache_key
+            and isinstance(cached_dialog_base, pd.DataFrame)
+            and isinstance(cached_dialog_incidents, pd.DataFrame)
+        ):
+            dialog_base_df = cached_dialog_base
+            dialog_incidents_df = cached_dialog_incidents
+        else:
+            if isinstance(table_filtered, pd.DataFrame) and "mac" in table_filtered.columns:
+                mac_mask = table_filtered["mac"].astype(str).str.strip().str.lower().eq(dialog_mac_pending)
+                dialog_base_df = table_filtered.loc[mac_mask].copy()
+            else:
+                dialog_base_df = pd.DataFrame()
+            if isinstance(table_filtered_incidents, pd.DataFrame) and "mac" in table_filtered_incidents.columns:
+                inc_mask = table_filtered_incidents["mac"].astype(str).str.strip().str.lower().eq(dialog_mac_pending)
+                dialog_incidents_df = table_filtered_incidents.loc[inc_mask].copy()
+            else:
+                dialog_incidents_df = pd.DataFrame()
+            st.session_state["shadow_sharing_dialog_base_key"] = dialog_cache_key
+            st.session_state["shadow_sharing_dialog_base_df"] = dialog_base_df
+            st.session_state["shadow_sharing_dialog_incidents_df"] = dialog_incidents_df
+
+        show_shadow_sharing_device_dialog(
+            dialog_base_df,
+            dialog_incidents_df,
+            selected_scope_key=selected_scope_key,
+            selected_scope_label=str(selected_date),
+        )
+        st.stop()
+
     filtered = overview_filtered
     filtered_incidents = overview_incidents
 
@@ -2371,27 +2428,35 @@ def render_shadow_sharing(parquet_root: Path):
     with tab_overview:
         st.markdown("#### Shadow Sharing Incidents")
         st.markdown("<div class='shadow-filter-shell shadow-filter-no-divider'>", unsafe_allow_html=True)
-        search_q = st.text_input(
+        st.text_input(
             "Search (MAC, Host, IP, Destination, Basis)",
             placeholder="e.g., 192.168.1.14",
-            key="shadow_sharing_search_q",
-        ).strip()
+            key="shadow_sharing_search_applied",
+        )
         c1, c2 = st.columns([1.4, 2.2])
         with c1:
             selected_conf_levels = st.multiselect(
                 "Confidence Level",
                 ["WEAK", "PROBABLE", "HIGH"],
-                default=selected_conf_levels,
-                key="shadow_sharing_conf_levels",
+                key="shadow_sharing_conf_applied",
             )
         with c2:
             selected_sources = st.multiselect(
                 "Source Logs",
                 source_options,
-                default=selected_sources,
-                key="shadow_sharing_sources",
+                key="shadow_sharing_sources_applied",
             )
         st.markdown("</div>", unsafe_allow_html=True)
+
+        selected_conf_levels = [str(x).upper() for x in (selected_conf_levels or []) if str(x).upper() in ["WEAK", "PROBABLE", "HIGH"]]
+        if not selected_conf_levels:
+            selected_conf_levels = ["WEAK", "PROBABLE", "HIGH"]
+            st.session_state["shadow_sharing_conf_applied"] = list(selected_conf_levels)
+        selected_sources = [str(x) for x in (selected_sources or []) if str(x) in source_options]
+        if source_options and not selected_sources:
+            selected_sources = list(source_options)
+            st.session_state["shadow_sharing_sources_applied"] = list(selected_sources)
+
         st.caption("Click on any MAC address to show device sharing incidents dialog.")
 
         if isinstance(dev_grid_table_cached, pd.DataFrame):
@@ -2453,9 +2518,33 @@ def render_shadow_sharing(parquet_root: Path):
                     st.session_state["shadow_sharing_dialog_mac"] = selected_mac
                     st.session_state["shadow_sharing_dialog_open"] = True
                     st.session_state["shadow_sharing_dialog_origin"] = "grid"
-                    st.rerun()
+                    dialog_preload_key = (str(selected_scope_key), selected_mac, filter_cache_key)
+                    if isinstance(table_filtered, pd.DataFrame) and "mac" in table_filtered.columns:
+                        dialog_base_mask = table_filtered["mac"].astype(str).str.strip().str.lower().eq(selected_mac)
+                        dialog_base_df = table_filtered.loc[dialog_base_mask].copy()
+                    else:
+                        dialog_base_df = pd.DataFrame()
+                    if isinstance(table_filtered_incidents, pd.DataFrame) and "mac" in table_filtered_incidents.columns:
+                        dialog_inc_mask = table_filtered_incidents["mac"].astype(str).str.strip().str.lower().eq(selected_mac)
+                        dialog_incidents_df = table_filtered_incidents.loc[dialog_inc_mask].copy()
+                    else:
+                        dialog_incidents_df = pd.DataFrame()
+                    st.session_state["shadow_sharing_dialog_base_df"] = dialog_base_df
+                    st.session_state["shadow_sharing_dialog_incidents_df"] = dialog_incidents_df
+                    st.session_state["shadow_sharing_dialog_base_key"] = dialog_preload_key
+                    st.session_state["shadow_sharing_dialog_scope_key"] = str(selected_scope_key)
+                    st.session_state["shadow_sharing_dialog_scope_label"] = str(selected_date)
+                    show_shadow_sharing_device_dialog(
+                        dialog_base_df,
+                        dialog_incidents_df,
+                        selected_scope_key=selected_scope_key,
+                        selected_scope_label=str(selected_date),
+                    )
+                    st.stop()
             else:
                 st.session_state["shadow_sharing_last_selected_mac"] = None
+                st.session_state.pop("shadow_sharing_dialog_base_df", None)
+                st.session_state.pop("shadow_sharing_dialog_base_key", None)
                 st.session_state.pop("shadow_sharing_dialog_incidents_df", None)
 
             has_mac_rows = dev_grid["mac"].astype(str).str.strip().replace({"": None, "nan": None, "none": None}).dropna().nunique() > 0
@@ -2479,17 +2568,6 @@ def render_shadow_sharing(parquet_root: Path):
                 mime="text/csv",
                 key=f"shadow_sharing_incidents_csv_{selected_scope_key}",
             )
-
-    if st.session_state.get("shadow_sharing_allow_dialog_open") and st.session_state.get("shadow_sharing_allow_candidate"):
-        show_shadow_sharing_allow_dialog()
-    elif st.session_state.get("shadow_sharing_dialog_open") and st.session_state.get("shadow_sharing_dialog_mac") and origin in ("grid", "dialog"):
-        show_shadow_sharing_device_dialog(
-            table_filtered,
-            table_filtered_incidents,
-            selected_scope_key=selected_scope_key,
-            selected_scope_label=str(selected_date),
-        )
-
 
 # Backward compatibility if your app imports render_shadow_uploads
 def render_shadow_uploads(parquet_root: Path):
