@@ -4325,7 +4325,7 @@ def show_shadow_ai_mac_dialog(mac_scoped: pd.DataFrame, *, selected_scope_key: s
     )
     host_series = host_series[~host_series.str.lower().isin({"", "unknown", "nan", "none", "null", "n/a", "-", "(empty)"})]
     scope_hostname = str(host_series.value_counts(dropna=True).index[0]).strip() if not host_series.empty else "Unknown"
-    scope_date = str(st.session_state.get("shadow_ai_date_v4") or "All Available Dates").strip() or "All Available Dates"
+    scope_date = str(st.session_state.get("shadow_ai_date_v4") or "Unknown").strip() or "Unknown"
 
     def _safe_html(v: str) -> str:
         return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -4681,7 +4681,7 @@ def render_shadow_ai(parquet_root: Path):
         st.warning("No logs found.")
         return
 
-    date_options = ["All Available Dates"] + available_dates
+    date_options = available_dates
     today_str = datetime.now().strftime("%Y-%m-%d")
     default_scope = today_str if today_str in available_dates else available_dates[0]
     default_index = date_options.index(default_scope) if default_scope in date_options else 0
@@ -4736,21 +4736,18 @@ def render_shadow_ai(parquet_root: Path):
     # If selecting a single day, load selected folder plus adjacent folders.
     # We then apply strict timestamp scope to selected day only.
     adjacent_dates: List[str] = []
-    if selected_date == "All Available Dates":
-        target_dates = available_dates
-    else:
-        target_dates = [selected_date] if selected_date else []
-        if target_dates:
-            try:
-                d0 = datetime.strptime(str(target_dates[0]), "%Y-%m-%d").date()
-                prev = (d0 - timedelta(days=1)).strftime("%Y-%m-%d")
-                nxt = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
-                for d in [prev, nxt]:
-                    if d in available_dates and d not in target_dates:
-                        target_dates.append(d)
-                        adjacent_dates.append(d)
-            except Exception:
-                pass
+    target_dates = [selected_date] if selected_date else []
+    if target_dates:
+        try:
+            d0 = datetime.strptime(str(target_dates[0]), "%Y-%m-%d").date()
+            prev = (d0 - timedelta(days=1)).strftime("%Y-%m-%d")
+            nxt = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
+            for d in [prev, nxt]:
+                if d in available_dates and d not in target_dates:
+                    target_dates.append(d)
+                    adjacent_dates.append(d)
+        except Exception:
+            pass
     # Keep a hot in-session copy so search/filter/dialog reruns don't reload/unpickle.
     st.session_state.setdefault("_shadow_ai_cache_bust_v1", 0)
     cache_bust = int(st.session_state.get("_shadow_ai_cache_bust_v1", 0))
@@ -4781,23 +4778,23 @@ def render_shadow_ai(parquet_root: Path):
 
     # Apply display scope for a single selected day (keeps UI accurate without rebuilding caches)
     raw_df = df
-    scope_decision = "all_dates"
+    scope_decision = "single_date"
     scoped_key = (scope_df_key, str(selected_date), str(scope_mode))
     if (
         st.session_state.get("_shadow_ai_scoped_df_key_v1") == scoped_key
         and isinstance(st.session_state.get("_shadow_ai_scoped_df_v1"), pd.DataFrame)
     ):
         df = st.session_state.get("_shadow_ai_scoped_df_v1")
-        scope_decision = str(st.session_state.get("_shadow_ai_scoped_decision_v1", "all_dates"))
+        scope_decision = str(st.session_state.get("_shadow_ai_scoped_decision_v1", "single_date"))
     else:
-        if selected_date != "All Available Dates" and selected_date and DATE_DIR_RE.match(str(selected_date)):
+        if selected_date and DATE_DIR_RE.match(str(selected_date)):
             scoped, scope_decision = _apply_date_scope(raw_df, str(selected_date), mode=scope_mode)
             df = scoped
         st.session_state["_shadow_ai_scoped_df_key_v1"] = scoped_key
         st.session_state["_shadow_ai_scoped_df_v1"] = df
         st.session_state["_shadow_ai_scoped_decision_v1"] = scope_decision
 
-    if selected_date != "All Available Dates" and selected_date and DATE_DIR_RE.match(str(selected_date)):
+    if selected_date and DATE_DIR_RE.match(str(selected_date)):
         total_scope_rows = int(len(raw_df))
         trimmed_rows = max(0, total_scope_rows - int(len(df)))
         included_from_adjacent = 0
@@ -5148,14 +5145,9 @@ def render_shadow_ai(parquet_root: Path):
         invalid_ts_rows = int(ts_trend.isna().sum())
         tdf = tdf.loc[ts_trend.notna()].copy()
         ts_trend = ts_trend.loc[tdf.index]
-        if selected_date == "All Available Dates":
-            tdf["time_bucket"] = ts_trend.dt.floor("D")
-            trend_x_title = "Day"
-            trend_suffix = "day"
-        else:
-            tdf["time_bucket"] = ts_trend.dt.floor("h")
-            trend_x_title = "Hour"
-            trend_suffix = "hour"
+        tdf["time_bucket"] = ts_trend.dt.floor("h")
+        trend_x_title = "Hour"
+        trend_suffix = "hour"
 
         # Events per bucket (all + shadow)
         daily = tdf.groupby(["time_bucket", "Policy_Verdict"]).agg(
@@ -5171,12 +5163,11 @@ def render_shadow_ai(parquet_root: Path):
         else:
             if invalid_ts_rows > 0:
                 st.caption(f"Trend charts excluded {invalid_ts_rows:,} row(s) with invalid timestamps.")
-            if selected_date != "All Available Dates":
-                bucket_n = int(daily["time_bucket"].nunique())
-                if bucket_n <= 3:
-                    st.caption(
-                        "Few points is expected with single-day scope (hourly buckets) when current filters narrow results."
-                    )
+            bucket_n = int(daily["time_bucket"].nunique())
+            if bucket_n <= 3:
+                st.caption(
+                    "Few points is expected with single-day scope (hourly buckets) when current filters narrow results."
+                )
             c_left, c_right = st.columns([1.2, 1.2])
             with c_left:
                 fig1 = px.line(
