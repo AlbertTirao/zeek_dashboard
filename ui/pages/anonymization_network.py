@@ -1913,6 +1913,20 @@ def get_aggrid_theme_and_css():
         ".ag-paging-row-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
         ".ag-paging-page-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
         ".ag-pagination": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-paging-page-size": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-page-size": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+            "outline": "none !important",
+        },
+        ".ag-paging-panel .ag-page-size option": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-select, .ag-paging-panel .ag-picker-field-wrapper": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
     }
     return theme, custom_css
 
@@ -2639,7 +2653,7 @@ def render_anonymization_network(parquet_root: Path):
                 headerHeight=42,
                 animateRows=False,
             )
-            gb_soc.configure_pagination(paginationAutoPageSize=False, paginationPageSize=25)
+            gb_soc.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
             gb_soc.configure_column("Source_IP", header_name="source ip", minWidth=128)
             gb_soc.configure_column("MAC", header_name="mac", minWidth=120)
             gb_soc.configure_column("Top_Category", header_name="category", cellStyle=_category_cellstyle(), minWidth=110, maxWidth=140)
@@ -2936,7 +2950,7 @@ def render_anonymization_network(parquet_root: Path):
             headerHeight=42,
             animateRows=False,
         )
-        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=25)
+        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
 
         def _cfg(col: str, **kwargs):
             if col in table.columns:
