@@ -3092,15 +3092,6 @@ def render_anonymization_network(parquet_root: Path):
         key=f"anonym_net_csv_{date_sel}",
     )
 
-    with st.expander("Response Playbook", expanded=False):
-        st.markdown("Audience: SOC analysts / incident responders (end users), not developers.")
-        st.markdown("- Allowlist corporate VPN egress IPs, approved proxies, and approved tooling to reduce false positives.")
-        st.markdown("- Block/contain unapproved anonymization destinations and high-risk ports when policy requires.")
-        st.markdown("- Trigger SIEM/notice workflows for repeated high-confidence non-allowlisted hits.")
-        st.markdown("- Investigate host/user context and validate intent (developer, pentest, remote access).")
-        st.markdown("- Prioritize endpoint response when anonymization hits align with sustained outbound volume spikes.")
-
-
 def render_shadow_tunnels(parquet_root: Path):
     # Backward-compatible alias.
     render_anonymization_network(parquet_root)
