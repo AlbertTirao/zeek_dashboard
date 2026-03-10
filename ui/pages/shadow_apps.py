@@ -27,6 +27,7 @@ CACHE_VERSION = "shadow-cache-v14-risk-engine-escalation"
 WHITELIST_FILE = Path(__file__).resolve().parents[2] / "whitelist_domains.yaml"
 RISK_POLICY_FILE = Path(__file__).resolve().parents[2] / "risk_policy.yaml"
 CACHE_DIRNAME = "_shadow_cache_apps"
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 RISK_SCORE = {"Safe": 0, "Low": 1, "Medium": 2, "High": 3, "Critical": 4}
 SCORE_TO_RISK = {v: k for k, v in RISK_SCORE.items()}
@@ -846,33 +847,71 @@ POLICY_ALLOWED_SOURCE_LOGS = {str(x).strip().upper() for x in LOG_TYPES if str(x
 @st.cache_data(show_spinner=False)
 def list_available_dates(parquet_root: Path):
     """
-    Only return real day folders (YYYY-MM-DD) and EXCLUDE _shadow_cache_apps.
+    Return canonical date keys from real day folders:
+    - YYYY-MM-DD
+    - date=YYYY-MM-DD
+    Excludes cache folders.
     """
     if not parquet_root.exists():
         return []
 
-    out = []
-    for d in parquet_root.iterdir():
-        if not d.is_dir():
-            continue
-        if d.name == CACHE_DIRNAME:
-            continue
-        try:
-            _dt.strptime(d.name, "%Y-%m-%d")
-            out.append(d.name)
-        except ValueError:
-            continue
-
+    out = list(_date_dir_map(parquet_root).keys())
     return sorted(out, reverse=True)
+
+
+def _extract_date_from_dirname(name: str) -> str | None:
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    if DATE_DIR_RE.match(raw):
+        return raw
+    if raw.startswith("date="):
+        tail = raw.split("date=", 1)[1].strip()
+        if DATE_DIR_RE.match(tail):
+            return tail
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def _date_dir_map(parquet_root: Path) -> dict[str, str]:
+    root = Path(parquet_root)
+    out: dict[str, str] = {}
+    if not root.exists():
+        return out
+    try:
+        for d in root.iterdir():
+            if not d.is_dir():
+                continue
+            dn = str(d.name or "").strip()
+            if not dn or dn == CACHE_DIRNAME or dn.startswith("_"):
+                continue
+            key = _extract_date_from_dirname(dn)
+            if key:
+                out.setdefault(key, str(d))
+    except Exception:
+        return out
+
+    return out
 
 
 @st.cache_data(show_spinner=False)
 def collect_parquet_files(parquet_root: Path, target_dates: tuple):
+    date_map = _date_dir_map(parquet_root)
     dhcp_files = []
     known_hosts_files = []
     log_files = []
     for d in target_dates:
-        d_path = parquet_root / d
+        d_key = str(d or "").strip()
+        if not d_key:
+            continue
+        mapped = date_map.get(d_key)
+        if mapped:
+            d_path = Path(mapped)
+        else:
+            d_path = parquet_root / d_key
+            if not d_path.exists():
+                alt = parquet_root / f"date={d_key}"
+                d_path = alt if alt.exists() else d_path
         if not d_path.exists():
             continue
 

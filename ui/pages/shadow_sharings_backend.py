@@ -623,16 +623,66 @@ def fingerprint_client(ua: str) -> str:
 # File discovery
 # -----------------------------------------------------------------------------
 
+def _extract_date_token(value: str) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if DATE_DIR_RE.match(raw):
+        return raw
+    if raw.startswith("date="):
+        tail = raw.split("date=", 1)[1].strip()
+        if DATE_DIR_RE.match(tail):
+            return tail
+    return None
+
+
 @st.cache_data(show_spinner=False)
 def get_available_dates(parquet_root: Path) -> List[str]:
     parquet_root = Path(parquet_root)
     if not parquet_root.exists():
         return []
-    out: List[str] = []
-    for p in parquet_root.iterdir():
-        if p.is_dir() and DATE_DIR_RE.match(p.name):
-            out.append(p.name)
-    return sorted(out, reverse=True)
+    return sorted(_date_dir_map(parquet_root).keys(), reverse=True)
+
+
+@st.cache_data(show_spinner=False)
+def _date_dir_map(parquet_root: Path) -> Dict[str, str]:
+    parquet_root = Path(parquet_root)
+    out: Dict[str, str] = {}
+    if not parquet_root.exists():
+        return out
+    try:
+        for p in parquet_root.iterdir():
+            if not p.is_dir():
+                continue
+            d = _extract_date_token(p.name)
+            if not d:
+                continue
+            out.setdefault(str(d), str(p))
+    except Exception:
+        return out
+    return out
+
+
+def _resolve_date_dir(parquet_root: Path, date_str: str) -> Optional[Path]:
+    root = Path(parquet_root)
+    d = str(date_str or "").strip()
+    if not d:
+        return None
+
+    mapped = _date_dir_map(root).get(d)
+    if mapped:
+        p = Path(mapped)
+        if p.exists() and p.is_dir():
+            return p
+
+    direct = root / d
+    if direct.exists() and direct.is_dir():
+        return direct
+
+    alt = root / f"date={d}"
+    if alt.exists() and alt.is_dir():
+        return alt
+    return None
 
 
 def _collect_known_files_uncached(parquet_root: Path) -> List[Path]:
@@ -723,7 +773,10 @@ def _target_logs_signature_cached(parquet_root_str: str, target_dates: Tuple[str
     for d in target_dates or ():
         if not d or not DATE_DIR_RE.match(str(d)):
             continue
-        buckets = _collect_date_files(root / str(d))
+        date_dir = _resolve_date_dir(root, str(d))
+        if date_dir is None:
+            continue
+        buckets = _collect_date_files(date_dir)
         for key in ["http", "ssl", "dns", "conn", "files", "dhcp"]:
             scan_paths.extend(buckets.get(key) or [])
 
@@ -1656,7 +1709,9 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
       - Destination naming uses http.host -> ssl.server_name -> conn.id.resp_h (no DNS answer fallback)
       - Keep dns.log rows separately for lookup visibility and context
     """
-    date_dir = Path(parquet_root) / date_str
+    date_dir = _resolve_date_dir(Path(parquet_root), date_str)
+    if date_dir is None:
+        return pd.DataFrame()
     buckets = _collect_date_files(date_dir)
 
     files_sig = {
@@ -1680,7 +1735,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
             df_cached = pd.read_parquet(cpath)
             if not df_cached.empty:
                 df_cached = _ensure_ts_datetime(df_cached)
-                return df_cached.sort_values("ts", ascending=False)
+                return df_cached
         except Exception:
             pass
 
