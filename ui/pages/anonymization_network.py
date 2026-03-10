@@ -2534,6 +2534,105 @@ def load_scored_scope(files: List[str]) -> pd.DataFrame:
     return _load_scored_scope_cached(sig)
 
 
+def _dhcp_sig_key(parquet_root: Path, date_str: str) -> Tuple[Tuple[str, int, int], ...]:
+    date_dir = Path(parquet_root) / str(date_str)
+    rows: List[Tuple[str, int, int]] = []
+    for p in sorted(date_dir.rglob("dhcp*.parquet")):
+        try:
+            st_ = p.stat()
+            rows.append((str(p.resolve()), int(st_.st_mtime_ns), int(st_.st_size)))
+        except Exception:
+            continue
+    return tuple(rows)
+
+
+@st.cache_data(show_spinner=False)
+def _load_hostname_lookup_cached(dhcp_sig: Tuple[Tuple[str, int, int], ...]) -> pd.DataFrame:
+    if not dhcp_sig:
+        return pd.DataFrame(columns=["id.orig_h", "mac", "hostname"])
+    paths = [Path(str(row[0])) for row in dhcp_sig if row and str(row[0]).strip()]
+    if not paths:
+        return pd.DataFrame(columns=["id.orig_h", "mac", "hostname"])
+
+    raw = _duck_read(paths)
+    cols = ["ts", "client_addr", "assigned_addr", "mac", "host_name", "client_fqdn"]
+    d = raw.copy() if raw is not None else pd.DataFrame()
+    for col in cols:
+        if col not in d.columns:
+            d[col] = ""
+    d = d[cols].copy()
+    d = _to_datetime(d, "ts")
+    d["client_addr"] = _clean(d["client_addr"]).map(_normalize_ip)
+    d["assigned_addr"] = _clean(d["assigned_addr"]).map(_normalize_ip)
+    d["mac"] = _clean(d["mac"]).str.lower()
+    d["host_name"] = _clean(d["host_name"]).str.strip()
+    d["client_fqdn"] = _clean(d["client_fqdn"]).str.strip().str.strip(".")
+    d["hostname"] = d["host_name"].where(d["host_name"].ne(""), d["client_fqdn"])
+    d["id.orig_h"] = d["assigned_addr"].where(d["assigned_addr"].ne(""), d["client_addr"])
+    d = d[(d["id.orig_h"].ne("")) & (d["hostname"].ne(""))].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["id.orig_h", "mac", "hostname"])
+
+    d = d.sort_values("ts", ascending=False)
+    out = (
+        d.drop_duplicates(subset=["id.orig_h", "mac"], keep="first")[["id.orig_h", "mac", "hostname"]]
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def _enrich_hostname(view: pd.DataFrame, *, parquet_root: Path, date_str: str) -> pd.DataFrame:
+    if view is None or view.empty:
+        return view
+    out = view.copy()
+    if "id.orig_h" not in out.columns:
+        out["id.orig_h"] = ""
+    if "mac" not in out.columns:
+        out["mac"] = ""
+    out["id.orig_h"] = _clean(out["id.orig_h"]).map(_normalize_ip)
+    out["mac"] = _clean(out["mac"]).str.lower()
+    out["hostname"] = _clean(out.get("hostname", pd.Series("", index=out.index, dtype="object")))
+
+    lookup = _load_hostname_lookup_cached(_dhcp_sig_key(parquet_root, date_str))
+    if lookup is None or lookup.empty:
+        return out
+    lookup = lookup.copy()
+    lookup["id.orig_h"] = _clean(lookup["id.orig_h"]).map(_normalize_ip)
+    lookup["mac"] = _clean(lookup["mac"]).str.lower()
+    lookup["hostname"] = _clean(lookup["hostname"])
+
+    pair_lookup = lookup.drop_duplicates(subset=["id.orig_h", "mac"], keep="first")
+    out = out.merge(
+        pair_lookup.rename(columns={"hostname": "__hostname_pair"}),
+        on=["id.orig_h", "mac"],
+        how="left",
+    )
+    out["hostname"] = out["hostname"].where(out["hostname"].ne(""), _clean(out["__hostname_pair"]))
+    out = out.drop(columns=["__hostname_pair"], errors="ignore")
+
+    ip_lookup = lookup[["id.orig_h", "hostname"]].drop_duplicates(subset=["id.orig_h"], keep="first")
+    out = out.merge(
+        ip_lookup.rename(columns={"hostname": "__hostname_ip"}),
+        on="id.orig_h",
+        how="left",
+    )
+    out["hostname"] = out["hostname"].where(out["hostname"].ne(""), _clean(out["__hostname_ip"]))
+    out = out.drop(columns=["__hostname_ip"], errors="ignore")
+
+    mac_lookup = (
+        lookup[lookup["mac"].ne("")][["mac", "hostname"]]
+        .drop_duplicates(subset=["mac"], keep="first")
+    )
+    out = out.merge(
+        mac_lookup.rename(columns={"hostname": "__hostname_mac"}),
+        on="mac",
+        how="left",
+    )
+    out["hostname"] = out["hostname"].where(out["hostname"].ne(""), _clean(out["__hostname_mac"]))
+    out = out.drop(columns=["__hostname_mac"], errors="ignore")
+    return out
+
+
 def _top_reason_list(reasons: pd.Series, limit: int = 3) -> str:
     counts: Dict[str, int] = {}
     for raw in reasons.fillna("").astype(str):
@@ -2569,10 +2668,12 @@ def build_soc_rollup(df: pd.DataFrame) -> pd.DataFrame:
         first_seen = pd.to_datetime(g["ts"], errors="coerce").min()
         last_seen = pd.to_datetime(g["ts"], errors="coerce").max()
         dst_hosts = _clean(g["Destination_Host"]).replace("", pd.NA).dropna()
+        hostname = _first_nonempty(_clean(g.get("hostname", pd.Series("", index=g.index, dtype="object"))))
         rows.append(
             {
                 "Source_IP": _clean(pd.Series([src_ip])).iloc[0],
                 "MAC": _clean(pd.Series([mac])).str.lower().iloc[0],
+                "Hostname": hostname,
                 "Top_Category": str(top.get("Category", "")),
                 "Confidence": str(top.get("Confidence", "")),
                 "Top_Score": int(pd.to_numeric(top.get("Risk_Score", 0), errors="coerce") or 0),
@@ -2678,7 +2779,7 @@ def render_anonymization_network(parquet_root: Path):
     ip2, _, ip2_sig = load_ip2proxy_lookup()
 
     q = st.text_input(
-        "Search (IP Host Provider Reason UID MAC)",
+        "Search (IP Host Provider Reason UID MAC Hostname)",
         placeholder="Enter keywords...",
         key="anonym_net_q",
     ).strip().lower()
@@ -2706,6 +2807,7 @@ def render_anonymization_network(parquet_root: Path):
     scored["event_date"] = pd.to_datetime(scored["ts"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
 
     view = scored.copy()
+    view = _enrich_hostname(view, parquet_root=parquet_root, date_str=str(date_sel))
     view["Detection_Source"] = _derive_detection_source(view)
 
     cat_opts = sorted(view["Category"].dropna().astype(str).unique().tolist())
@@ -2738,6 +2840,7 @@ def render_anonymization_network(parquet_root: Path):
         blob = (
             view["id.orig_h"].astype(str) + " " + view["id.resp_h"].astype(str) + " " + view["Destination_Host"].astype(str)
             + " " + view["ip2proxy_provider"].astype(str) + " " + view["Reason"].astype(str) + " " + view["uid"].astype(str) + " " + view["mac"].astype(str)
+            + " " + view["hostname"].astype(str)
         ).str.lower()
         view = view[blob.str.contains(re.escape(q), na=False)].copy()
 
@@ -2800,6 +2903,10 @@ def render_anonymization_network(parquet_root: Path):
             soc_table[col] = pd.to_numeric(soc_table[col], errors="coerce").fillna(0).round(2)
         soc_table = _drop_empty_rows(soc_table)
         soc_table, soc_hidden_cols = _drop_empty_columns(soc_table)
+        if "Hostname" not in soc_table.columns:
+            insert_at = soc_table.columns.get_loc("MAC") + 1 if "MAC" in soc_table.columns else len(soc_table.columns)
+            soc_table.insert(insert_at, "Hostname", "")
+            soc_hidden_cols = [c for c in soc_hidden_cols if c != "Hostname"]
         if soc_hidden_cols:
             st.caption("Hidden empty columns: " + ", ".join(soc_hidden_cols))
         if soc_table.empty:
@@ -2820,21 +2927,22 @@ def render_anonymization_network(parquet_root: Path):
                 animateRows=False,
             )
             gb_soc.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-            gb_soc.configure_column("Source_IP", header_name="source ip", minWidth=128)
-            gb_soc.configure_column("MAC", header_name="mac", minWidth=120)
-            gb_soc.configure_column("Top_Category", header_name="category", cellStyle=_category_cellstyle(), minWidth=110, maxWidth=140)
-            gb_soc.configure_column("Confidence", header_name="confidence", cellStyle=_confidence_cellstyle(), minWidth=108, maxWidth=130)
-            gb_soc.configure_column("Top_Score", header_name="top score", type=["numericColumn"], minWidth=96, maxWidth=116)
-            gb_soc.configure_column("Events", header_name="events", type=["numericColumn"], minWidth=88, maxWidth=108)
-            gb_soc.configure_column("Top_Reasons", header_name="top reasons", minWidth=260, flex=1.4)
-            gb_soc.configure_column("Top_Destinations", header_name="top destinations", minWidth=250, flex=1.2)
-            gb_soc.configure_column("First_Seen", header_name="first seen", minWidth=160)
-            gb_soc.configure_column("Last_Seen", header_name="last seen", minWidth=160)
-            gb_soc.configure_column("Upload_MB", header_name="upload mb", type=["numericColumn"], minWidth=110, maxWidth=125)
-            gb_soc.configure_column("Download_MB", header_name="download mb", type=["numericColumn"], minWidth=115, maxWidth=130)
-            gb_soc.configure_column("Duration_s", header_name="duration s", type=["numericColumn"], minWidth=105, maxWidth=120)
-            gb_soc.configure_column("Distinct_Dst_IPs", header_name="distinct dst ips", type=["numericColumn"], minWidth=130, maxWidth=150)
-            gb_soc.configure_column("Distinct_Dst_Hosts", header_name="distinct dst hosts", type=["numericColumn"], minWidth=145, maxWidth=165)
+            gb_soc.configure_column("Source_IP", header_name="source ip", minWidth=150)
+            gb_soc.configure_column("MAC", header_name="mac", minWidth=126)
+            gb_soc.configure_column("Hostname", header_name="hostname", minWidth=170, flex=0.9)
+            gb_soc.configure_column("Top_Category", header_name="category", cellStyle=_category_cellstyle(), minWidth=124)
+            gb_soc.configure_column("Confidence", header_name="confidence", cellStyle=_confidence_cellstyle(), minWidth=124)
+            gb_soc.configure_column("Top_Score", header_name="top score", type=["numericColumn"], minWidth=110)
+            gb_soc.configure_column("Events", header_name="events", type=["numericColumn"], minWidth=96)
+            gb_soc.configure_column("Top_Reasons", header_name="top reasons", minWidth=320, flex=1.5)
+            gb_soc.configure_column("Top_Destinations", header_name="top destinations", minWidth=300, flex=1.3)
+            gb_soc.configure_column("First_Seen", header_name="first seen", minWidth=176)
+            gb_soc.configure_column("Last_Seen", header_name="last seen", minWidth=176)
+            gb_soc.configure_column("Upload_MB", header_name="upload mb", type=["numericColumn"], minWidth=136)
+            gb_soc.configure_column("Download_MB", header_name="download mb", type=["numericColumn"], minWidth=146)
+            gb_soc.configure_column("Duration_s", header_name="duration s", type=["numericColumn"], minWidth=122)
+            gb_soc.configure_column("Distinct_Dst_IPs", header_name="distinct dst ips", type=["numericColumn"], minWidth=162)
+            gb_soc.configure_column("Distinct_Dst_Hosts", header_name="distinct dst hosts", type=["numericColumn"], minWidth=176)
             soc_response = render_shadow_aggrid(
                 soc_table,
                 gb_soc,
@@ -2847,8 +2955,9 @@ def render_anonymization_network(parquet_root: Path):
             _render_table_information(
                 f"{len(soc_table):,} destination/reason rows shown.",
                 [
-                    "Rows are grouped by `Source_IP` + `MAC` and summarize `Top_Destinations` and `Top_Reasons`.",
-                    "`Top_Score`, `Confidence`, and `Events` help prioritize which devices to triage first.",
+                    "Rows are grouped by `Source_IP` + `MAC` with `Hostname` enrichment from DHCP host_name/client_fqdn when available.",
+                    "`Top_Destinations` and `Top_Reasons` are aggregated highlights; `Top_Score`/`Confidence`/`Events` prioritize triage order.",
+                    "`Upload_MB`, `Download_MB`, and `Duration_s` are grouped totals for the selected dataset scope.",
                 ],
             )
             export_soc = pd.DataFrame(soc_response.get("data", [])) if isinstance(soc_response, dict) else pd.DataFrame()
@@ -2871,8 +2980,9 @@ def render_anonymization_network(parquet_root: Path):
             _render_table_information(
                 f"{len(soc_table):,} destination/reason rows shown.",
                 [
-                    "Rows are grouped by `Source_IP` + `MAC` and summarize `Top_Destinations` and `Top_Reasons`.",
-                    "`Top_Score`, `Confidence`, and `Events` help prioritize which devices to triage first.",
+                    "Rows are grouped by `Source_IP` + `MAC` with `Hostname` enrichment from DHCP host_name/client_fqdn when available.",
+                    "`Top_Destinations` and `Top_Reasons` are aggregated highlights; `Top_Score`/`Confidence`/`Events` prioritize triage order.",
+                    "`Upload_MB`, `Download_MB`, and `Duration_s` are grouped totals for the selected dataset scope.",
                 ],
             )
             st.download_button(
@@ -2893,6 +3003,7 @@ def render_anonymization_network(parquet_root: Path):
         "Category",
         "id.orig_h",
         "mac",
+        "hostname",
         "id.resp_h",
         "id.resp_p",
         "Destination_Host",
@@ -3057,6 +3168,10 @@ def render_anonymization_network(parquet_root: Path):
     # Final strict cleanup on base display columns first.
     table = _drop_empty_rows(table)
     table, hidden_cols = _drop_empty_columns(table)
+    if "hostname" not in table.columns:
+        insert_at = table.columns.get_loc("mac") + 1 if "mac" in table.columns else len(table.columns)
+        table.insert(insert_at, "hostname", "")
+        hidden_cols = [c for c in hidden_cols if c != "hostname"]
     table = _drop_empty_rows(table)
     if hidden_cols:
         st.caption("Hidden empty columns: " + ", ".join(hidden_cols))
@@ -3089,28 +3204,29 @@ def render_anonymization_network(parquet_root: Path):
             if col in table.columns:
                 gb.configure_column(col, **kwargs)
 
-        _cfg("uid", header_name="uid", minWidth=148)
-        _cfg("event_data", header_name="event_data", minWidth=118, maxWidth=136)
-        _cfg("ts", header_name="ts", minWidth=165)
-        _cfg("Confidence", header_name="confidence", cellStyle=_confidence_cellstyle(), minWidth=108, maxWidth=132)
-        _cfg("Detection_Source", header_name="source", minWidth=98, maxWidth=122)
-        _cfg("Category", header_name="category", cellStyle=_category_cellstyle(), minWidth=108, maxWidth=132)
-        _cfg("id.orig_h", header_name="source ip", minWidth=126)
-        _cfg("mac", header_name="mac", minWidth=118)
-        _cfg("id.resp_h", header_name="destination ip", minWidth=128)
-        _cfg("id.resp_p", header_name="dst port", type=["numericColumn"], minWidth=92, maxWidth=108, cellStyle={"textAlign": "right"})
-        _cfg("Destination_Host", header_name="destination host/sni", minWidth=210, flex=1.3)
-        _cfg("http_method", header_name="http methods", minWidth=112, maxWidth=132)
-        _cfg("ssl_server_name", header_name="ssl_servername", minWidth=190, flex=1.1)
-        _cfg("ip2proxy_proxy_type", header_name="ip2proxy_proxy_type", minWidth=145, maxWidth=170)
-        _cfg("ip2proxy_provider", header_name="ip2proxy_providors", minWidth=180, flex=1.1)
-        _cfg("vpn_indicator", header_name="vpn indicators", minWidth=130, maxWidth=165)
-        _cfg("dns_keyword_query", header_name="dns_keyword_query", minWidth=210, flex=1.0)
-        _cfg("tunnel_type", header_name="tunnel_type", minWidth=130, maxWidth=170)
-        _cfg("orig_ip_bytes", header_name="orig_ip_bytes", type=["numericColumn"], minWidth=120, maxWidth=140, cellStyle={"textAlign": "right"})
-        _cfg("resp_ip_bytes", header_name="resp_ip_bytes", type=["numericColumn"], minWidth=120, maxWidth=140, cellStyle={"textAlign": "right"})
-        _cfg("total_bytes", header_name="total_bytes", type=["numericColumn"], minWidth=115, maxWidth=140, cellStyle={"textAlign": "right"})
-        _cfg("duration", header_name="durations", type=["numericColumn"], minWidth=100, maxWidth=120, cellStyle={"textAlign": "right"})
+        _cfg("uid", header_name="uid", minWidth=168)
+        _cfg("event_data", header_name="event date", minWidth=124)
+        _cfg("ts", header_name="timestamp", minWidth=184)
+        _cfg("Confidence", header_name="confidence", cellStyle=_confidence_cellstyle(), minWidth=126)
+        _cfg("Detection_Source", header_name="detection source", minWidth=168)
+        _cfg("Category", header_name="category", cellStyle=_category_cellstyle(), minWidth=124)
+        _cfg("id.orig_h", header_name="source ip", minWidth=142)
+        _cfg("mac", header_name="mac", minWidth=130)
+        _cfg("hostname", header_name="hostname", minWidth=170, flex=0.8)
+        _cfg("id.resp_h", header_name="destination ip", minWidth=148)
+        _cfg("id.resp_p", header_name="dst port", type=["numericColumn"], minWidth=106, cellStyle={"textAlign": "right"})
+        _cfg("Destination_Host", header_name="destination host/sni", minWidth=240, flex=1.3)
+        _cfg("http_method", header_name="http method", minWidth=130)
+        _cfg("ssl_server_name", header_name="ssl server name", minWidth=220, flex=1.1)
+        _cfg("ip2proxy_proxy_type", header_name="ip2proxy type", minWidth=170)
+        _cfg("ip2proxy_provider", header_name="ip2proxy provider", minWidth=210, flex=1.1)
+        _cfg("vpn_indicator", header_name="vpn indicator", minWidth=156)
+        _cfg("dns_keyword_query", header_name="dns keyword query", minWidth=240, flex=1.0)
+        _cfg("tunnel_type", header_name="tunnel type", minWidth=156)
+        _cfg("orig_ip_bytes", header_name="upload bytes", type=["numericColumn"], minWidth=146, cellStyle={"textAlign": "right"})
+        _cfg("resp_ip_bytes", header_name="download bytes", type=["numericColumn"], minWidth=162, cellStyle={"textAlign": "right"})
+        _cfg("total_bytes", header_name="total bytes", type=["numericColumn"], minWidth=132, cellStyle={"textAlign": "right"})
+        _cfg("duration", header_name="duration s", type=["numericColumn"], minWidth=124, cellStyle={"textAlign": "right"})
         gb.configure_selection("single", use_checkbox=False)
         table_response = render_shadow_aggrid(
             table,
@@ -3136,7 +3252,9 @@ def render_anonymization_network(parquet_root: Path):
         f"{len(table):,} incident rows shown for the selected dataset scope.",
         [
             "Rows are event-level Proxy/VPN/Tor incidents after dedup and current filters/search.",
+            "`hostname` is enriched from DHCP host_name/client_fqdn using Source IP and MAC when available.",
             "Sorting is risk-first (`Risk_Score`, then `ts`) and capped to the top 100 unique events.",
+            "Column headers are autosized and can be resized; export uses the currently filtered/sorted table view.",
         ],
     )
     export_table = pd.DataFrame(table_response.get("data", [])) if isinstance(table_response, dict) else pd.DataFrame()
