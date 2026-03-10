@@ -48,9 +48,9 @@ DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Fast-load cache strategy aligned with Shadow Apps.
-CACHE_VERSION = "anonymization-network-cache-v3-fastload"
+CACHE_VERSION = "anonymization-network-cache-v4-dns-correlation"
 CACHE_DIRNAME = "_shadow_cache_anonymization_network"
-CACHE_SCORE_VERSION = "anonymization-network-score-v4-vpn-detect"
+CACHE_SCORE_VERSION = "anonymization-network-score-v5-fp-tuning"
 
 HTTP_TIMEOUT = 20
 
@@ -88,6 +88,13 @@ VPN_EXPECTED_PROTO = {
     1701: "udp",
     1723: "tcp",
 }
+WEAK_VPN_INDICATORS = {"tls_no_host"}
+VPN_INDICATOR_STRONG_SCORE = 90
+VPN_INDICATOR_WEAK_SCORE = 15
+PROXY_GATEWAY_MIN_HOSTS = 12
+PROXY_GATEWAY_SCORE = 10
+DNS_KEYWORD_SCORE = 10
+DNS_CORRELATION_WINDOW_SECONDS = 15 * 60
 
 VPN_HOST_KEYWORDS = (
     "vpn",
@@ -203,7 +210,7 @@ def _compile_keyword_regex(tokens: Sequence[str]) -> re.Pattern[str]:
 VPN_HOST_RE = _compile_keyword_regex(VPN_HOST_KEYWORDS)
 PROXY_HOST_RE = _compile_keyword_regex(PROXY_HOST_KEYWORDS)
 TOR_HOST_RE = re.compile(
-    r"(?:torproject\.org|onionoo\.torproject\.org|check\.torproject\.org|\.onion\b|tor\b)",
+    r"(?:torproject\.org|onionoo\.torproject\.org|check\.torproject\.org|\.onion\b)",
     re.IGNORECASE,
 )
 
@@ -479,6 +486,61 @@ def _normalize_missing_text(value: object) -> str:
 
 def _clean(s: pd.Series) -> pd.Series:
     return s.fillna("").astype(str).map(_normalize_missing_text)
+
+
+_HOST_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
+_HOST_PORT_RE = re.compile(r":\d+$")
+_MULTIPART_PUBLIC_SUFFIXES = {
+    "co.uk",
+    "org.uk",
+    "gov.uk",
+    "ac.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "com.sg",
+    "com.hk",
+    "com.ph",
+    "net.ph",
+    "org.ph",
+    "co.jp",
+}
+
+
+def _normalize_host_value(value: object) -> str:
+    s = _normalize_missing_text(value).lower().strip().strip(".")
+    if not s:
+        return ""
+    s = _HOST_SCHEME_RE.sub("", s)
+    s = s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip().strip(".")
+    if not s:
+        return ""
+    if s.startswith("[") and "]" in s:
+        s = s[1 : s.find("]")]
+    elif s.count(":") == 1:
+        host_part, port_part = s.rsplit(":", 1)
+        if port_part.isdigit():
+            s = host_part
+    if s.count(":") <= 1:
+        s = _HOST_PORT_RE.sub("", s)
+    s = s.strip().strip(".")
+    return s
+
+
+def _domain_key(value: object) -> str:
+    host = _normalize_host_value(value)
+    if not host:
+        return ""
+    ip_s = _normalize_ip(host)
+    if ip_s:
+        return ip_s
+    labels = [p for p in host.split(".") if p]
+    if len(labels) <= 1:
+        return host
+    suffix2 = ".".join(labels[-2:])
+    if len(labels) >= 3 and suffix2 in _MULTIPART_PUBLIC_SUFFIXES:
+        return ".".join(labels[-3:])
+    return suffix2
 
 
 def _nonempty_col_mask(df: pd.DataFrame, col: str) -> bool:
@@ -1355,12 +1417,14 @@ def _prepare_dns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "id.orig_h",
+                "dns_domain_key",
                 "dns_keyword_hit",
                 "dns_proxy_hit",
                 "dns_vpn_hit",
                 "dns_tor_hit",
                 "dns_keyword_count",
                 "dns_keyword_query",
+                "dns_keyword_ts",
             ]
         )
 
@@ -1368,22 +1432,39 @@ def _prepare_dns(df: pd.DataFrame) -> pd.DataFrame:
     d["dns_vpn_hit"] = d["query"].str.contains(VPN_HOST_RE, regex=True, na=False)
     d["dns_tor_hit"] = d["query"].str.contains(TOR_HOST_RE, regex=True, na=False)
     d["dns_keyword_hit"] = d["dns_proxy_hit"] | d["dns_vpn_hit"] | d["dns_tor_hit"]
+    d["dns_domain_key"] = d["query"].map(_domain_key)
+    d = d[d["dns_domain_key"].ne("")].copy()
+    if d.empty:
+        return pd.DataFrame(
+            columns=[
+                "id.orig_h",
+                "dns_domain_key",
+                "dns_keyword_hit",
+                "dns_proxy_hit",
+                "dns_vpn_hit",
+                "dns_tor_hit",
+                "dns_keyword_count",
+                "dns_keyword_query",
+                "dns_keyword_ts",
+            ]
+        )
     keyword_latest = (
         d[d["dns_keyword_hit"]]
         .sort_values("ts", ascending=False)
-        .drop_duplicates(subset=["id.orig_h"], keep="first")[["id.orig_h", "query"]]
-        .rename(columns={"query": "dns_keyword_query"})
+        .drop_duplicates(subset=["id.orig_h", "dns_domain_key"], keep="first")[["id.orig_h", "dns_domain_key", "query", "ts"]]
+        .rename(columns={"query": "dns_keyword_query", "ts": "dns_keyword_ts"})
     )
-    agg = d.groupby("id.orig_h", as_index=False).agg(
+    agg = d.groupby(["id.orig_h", "dns_domain_key"], as_index=False).agg(
         dns_keyword_hit=("dns_keyword_hit", "max"),
         dns_proxy_hit=("dns_proxy_hit", "max"),
         dns_vpn_hit=("dns_vpn_hit", "max"),
         dns_tor_hit=("dns_tor_hit", "max"),
         dns_keyword_count=("dns_keyword_hit", "sum"),
     )
-    agg = agg.merge(keyword_latest, on="id.orig_h", how="left")
+    agg = agg.merge(keyword_latest, on=["id.orig_h", "dns_domain_key"], how="left")
     agg["dns_keyword_count"] = pd.to_numeric(agg["dns_keyword_count"], errors="coerce").fillna(0).astype(int)
     agg["dns_keyword_query"] = _clean(agg["dns_keyword_query"])
+    agg = _to_datetime(agg, "dns_keyword_ts")
     return agg
 
 
@@ -1453,8 +1534,29 @@ def _build_one_date(parquet_root: Path, date_str: str, files_sig: Dict[str, List
     out = conn.merge(http, on="uid", how="left")
     out = out.merge(ssl, on="uid", how="left")
     out = out.merge(vpn, on="uid", how="left")
+
+    # Build destination host before DNS merge so DNS evidence can be correlated per destination domain.
+    for col in ["http_host", "ssl_server_name", "vpn_host"]:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = _clean(out[col]).str.lower().str.strip(".")
+    out["Destination_Host"] = out["http_host"]
+    m = out["Destination_Host"].eq("")
+    out.loc[m, "Destination_Host"] = out.loc[m, "ssl_server_name"]
+    m = out["Destination_Host"].eq("")
+    out.loc[m, "Destination_Host"] = out.loc[m, "vpn_host"]
+    m = out["Destination_Host"].eq("")
+    out.loc[m, "Destination_Host"] = out.loc[m, "id.resp_h"]
+    out["dest_domain_key"] = out["Destination_Host"].map(_domain_key)
+
     if not dns.empty:
-        out = out.merge(dns, on="id.orig_h", how="left")
+        out = out.merge(
+            dns,
+            how="left",
+            left_on=["id.orig_h", "dest_domain_key"],
+            right_on=["id.orig_h", "dns_domain_key"],
+        )
+        out = out.drop(columns=["dns_domain_key"], errors="ignore")
     if not tunnel_uid.empty:
         out = out.merge(tunnel_uid, on="uid", how="left")
     if not tunnel_pair.empty:
@@ -1480,6 +1582,10 @@ def _build_one_date(parquet_root: Path, date_str: str, files_sig: Dict[str, List
         if col not in out.columns:
             out[col] = ""
         out[col] = _clean(out[col])
+
+    if "dns_keyword_ts" not in out.columns:
+        out["dns_keyword_ts"] = pd.NaT
+    out = _to_datetime(out, "dns_keyword_ts")
 
     for col in ["dns_keyword_hit", "dns_proxy_hit", "dns_vpn_hit", "dns_tor_hit"]:
         if col not in out.columns:
@@ -1508,6 +1614,7 @@ def _build_one_date(parquet_root: Path, date_str: str, files_sig: Dict[str, List
         pd.to_numeric(out["orig_ip_bytes"], errors="coerce").fillna(0)
         + pd.to_numeric(out["resp_ip_bytes"], errors="coerce").fillna(0)
     )
+    out = out.drop(columns=["dest_domain_key"], errors="ignore")
     out = out.sort_values("ts", ascending=False).reset_index(drop=True)
 
     try:
@@ -1589,7 +1696,14 @@ def score_events(
 
     vpn_port_score, vpn_port_reason = compute_vpn_port_score_with_proto(out["id.resp_p"], out["proto"])
     vpn_port = vpn_port_score.gt(0)
-    vpn_indicator = compute_vpn_indicator_match(out["vpn_indicator"], UNKNOWN)
+    vpn_indicator_raw = _clean(out["vpn_indicator"]).str.lower()
+    vpn_indicator_any = vpn_indicator_raw.ne("") & ~vpn_indicator_raw.isin(UNKNOWN)
+    vpn_indicator_weak = vpn_indicator_any & vpn_indicator_raw.isin(WEAK_VPN_INDICATORS)
+    vpn_indicator_strong = vpn_indicator_any & ~vpn_indicator_weak
+    vpn_indicator_score = (
+        vpn_indicator_strong.astype(int) * int(VPN_INDICATOR_STRONG_SCORE)
+        + vpn_indicator_weak.astype(int) * int(VPN_INDICATOR_WEAK_SCORE)
+    )
     vpn_keyword = compute_vpn_keyword_match(out["Destination_Host"], out["ssl_server_name"], out["vpn_host"])
     tunnel_encap = out["tunnel_hit"].fillna(False).astype(bool)
     tls_tunnel_like = (
@@ -1598,13 +1712,21 @@ def score_events(
         & out["total_bytes"].ge(float(TLS_TUNNEL_MIN_BYTES))
         & out["duration"].ge(float(TLS_TUNNEL_MIN_DURATION))
     )
+    dns_keyword_ts = pd.to_datetime(out["dns_keyword_ts"], errors="coerce") if "dns_keyword_ts" in out.columns else pd.Series(pd.NaT, index=out.index)
+    conn_ts = pd.to_datetime(out["ts"], errors="coerce")
+    dns_recent = (
+        dns_keyword_ts.notna()
+        & conn_ts.notna()
+        & (conn_ts - dns_keyword_ts).abs().dt.total_seconds().le(float(DNS_CORRELATION_WINDOW_SECONDS))
+    )
+    dns_query_recent = _clean(out["dns_keyword_query"]).where(dns_recent, "")
 
     tor_port = out["id.resp_p"].isin(TOR_PORTS)
-    tor_keyword = compute_tor_keyword_match(out["Destination_Host"], out["dns_keyword_query"])
+    tor_keyword = compute_tor_keyword_match(out["Destination_Host"], dns_query_recent)
 
-    dns_proxy = out["dns_proxy_hit"].fillna(False).astype(bool)
-    dns_vpn = out["dns_vpn_hit"].fillna(False).astype(bool)
-    dns_tor = out["dns_tor_hit"].fillna(False).astype(bool)
+    dns_proxy = out["dns_proxy_hit"].fillna(False).astype(bool) & dns_recent
+    dns_vpn = out["dns_vpn_hit"].fillna(False).astype(bool) & dns_recent
+    dns_tor = out["dns_tor_hit"].fillna(False).astype(bool) & dns_recent
     dns_any = dns_proxy | dns_vpn | dns_tor
 
     host_key = _clean(out["Destination_Host"])
@@ -1614,7 +1736,8 @@ def score_events(
         .groupby(["id.orig_h", "id.resp_h"], dropna=False)["dest_key"]
         .transform(lambda s: s[s.astype(str).str.strip().ne("")].nunique())
     )
-    proxy_gateway = proxy_spread.ge(4)
+    proxy_gateway_raw = proxy_spread.ge(int(PROXY_GATEWAY_MIN_HOSTS))
+    proxy_gateway = proxy_gateway_raw & (proxy_keyword | proxy_port | proxy_feed_ip | proxy_feed_pair | connect_tunnel)
 
     pair_volume = (
         out.groupby(["id.orig_h", "id.resp_h"], as_index=False)["total_bytes"]
@@ -1645,14 +1768,18 @@ def score_events(
     reason = _append_reason(reason, proxy_port, "proxy_port: destination port in {3128,8080,8000,8888,1080} (+25)")
     proxy_score = proxy_score + proxy_keyword.astype(int) * 20
     reason = _append_reason(reason, proxy_keyword, "proxy_keyword: proxy/vpn/tunnel host pattern (+20)")
-    proxy_score = proxy_score + proxy_gateway.astype(int) * 20
-    reason = _append_reason(reason, proxy_gateway, "proxy_gateway: many destination domains behind one destination IP (+20)")
+    proxy_score = proxy_score + proxy_gateway.astype(int) * int(PROXY_GATEWAY_SCORE)
+    reason = _append_reason(
+        reason,
+        proxy_gateway,
+        f"proxy_gateway: destination IP fronts >={int(PROXY_GATEWAY_MIN_HOSTS)} hostnames with corroborating proxy evidence (+{int(PROXY_GATEWAY_SCORE)})",
+    )
     proxy_score = proxy_score + proxy_feed_pair.astype(int) * 30
     reason = _append_reason(reason, proxy_feed_pair, "proxy_feed_pair: open proxy IP:PORT feed match (+30)")
     proxy_score = proxy_score + proxy_feed_ip.astype(int) * 20
     reason = _append_reason(reason, proxy_feed_ip, "proxy_feed_ip: open proxy IP feed match (+20)")
-    proxy_score = proxy_score + dns_proxy.astype(int) * 20
-    reason = _append_reason(reason, dns_proxy, "dns_proxy_keyword: DNS query matched proxy keyword (+20)")
+    proxy_score = proxy_score + dns_proxy.astype(int) * int(DNS_KEYWORD_SCORE)
+    reason = _append_reason(reason, dns_proxy, f"dns_proxy_keyword: recent DNS query matched proxy keyword (+{int(DNS_KEYWORD_SCORE)})")
     proxy_score = proxy_score + ip2_pub.astype(int) * 65
     reason = _append_reason_series(
         reason,
@@ -1666,11 +1793,22 @@ def score_events(
         vpn_port_reason + " (+" + vpn_port_score.astype(int).astype(str) + ")",
     )
     reason = _append_reason_series(reason, vpn_port, vpn_port_reason_scored)
-    vpn_score = vpn_score + vpn_indicator.astype(int) * 90
+    vpn_score = vpn_score + vpn_indicator_score.astype(int)
     reason = _append_reason_series(
         reason,
-        vpn_indicator,
-        pd.Series("vpn_vendor_hit: vpn_detect_v2 indicator " + out["vpn_indicator"].astype(str) + " (+90)", index=out.index),
+        vpn_indicator_strong,
+        pd.Series(
+            "vpn_vendor_hit: vpn_detect_v2 indicator " + out["vpn_indicator"].astype(str) + f" (+{int(VPN_INDICATOR_STRONG_SCORE)})",
+            index=out.index,
+        ),
+    )
+    reason = _append_reason_series(
+        reason,
+        vpn_indicator_weak,
+        pd.Series(
+            "vpn_indicator_weak: vpn_detect_v2 indicator " + out["vpn_indicator"].astype(str) + f" (+{int(VPN_INDICATOR_WEAK_SCORE)})",
+            index=out.index,
+        ),
     )
     vpn_score = vpn_score + tunnel_encap.astype(int) * 70
     reason = _append_reason_series(
@@ -1691,8 +1829,8 @@ def score_events(
     reason = _append_reason(reason, vpn_stable_large, "vpn_stable_large: stable 1-3 large tunnel destinations (+35)")
     vpn_score = vpn_score + vpn_keyword.astype(int) * 20
     reason = _append_reason(reason, vpn_keyword, "vpn_keyword: host/SNI suggests VPN infrastructure (+20)")
-    vpn_score = vpn_score + dns_vpn.astype(int) * 20
-    reason = _append_reason(reason, dns_vpn, "dns_vpn_keyword: DNS query matched VPN keyword (+20)")
+    vpn_score = vpn_score + dns_vpn.astype(int) * int(DNS_KEYWORD_SCORE)
+    reason = _append_reason(reason, dns_vpn, f"dns_vpn_keyword: recent DNS query matched VPN keyword (+{int(DNS_KEYWORD_SCORE)})")
     vpn_score = vpn_score + ip2_vpn.astype(int) * 75
     reason = _append_reason_series(
         reason,
@@ -1706,8 +1844,8 @@ def score_events(
     reason = _append_reason(reason, tor_port, "tor_port: destination port in {9001,9030} (+35)")
     tor_score = tor_score + tor_keyword.astype(int) * 20
     reason = _append_reason(reason, tor_keyword, "tor_keyword: destination/DNS indicates Tor infra (+20)")
-    tor_score = tor_score + dns_tor.astype(int) * 20
-    reason = _append_reason(reason, dns_tor, "dns_tor_keyword: DNS query matched torproject/onion keyword (+20)")
+    tor_score = tor_score + dns_tor.astype(int) * int(DNS_KEYWORD_SCORE)
+    reason = _append_reason(reason, dns_tor, f"dns_tor_keyword: recent DNS query matched torproject/onion keyword (+{int(DNS_KEYWORD_SCORE)})")
     tor_score = tor_score + ip2_tor.astype(int) * 85
     reason = _append_reason_series(
         reason,
@@ -1717,7 +1855,7 @@ def score_events(
 
     strong_masks = [
         connect_tunnel,
-        vpn_indicator,
+        vpn_indicator_strong,
         tunnel_encap,
         tor_relay,
         ip2_vpn,
@@ -1736,22 +1874,37 @@ def score_events(
         vpn_stable_large,
         tor_port,
         tor_keyword,
+        vpn_indicator_weak,
         dns_any,
     ]
+    flow_local_weak = (
+        proxy_port
+        | proxy_keyword
+        | proxy_gateway
+        | proxy_feed_pair
+        | proxy_feed_ip
+        | vpn_port
+        | vpn_keyword
+        | tls_tunnel_like
+        | vpn_stable_large
+        | tor_port
+        | tor_keyword
+        | vpn_indicator_weak
+    )
     strong_count = sum(mask.astype(int) for mask in strong_masks)
     weak_count = sum(mask.astype(int) for mask in weak_masks)
     evidence_count = strong_count + weak_count
 
-    # Do not suppress tiny flows when vpn_detect_v2 already provided strong VPN evidence.
-    tiny_suppressed = out["total_bytes"].lt(float(MIN_FLOW_BYTES)) & ~connect_tunnel & ~tor_relay & ~vpn_indicator
-    weak_suppressed = strong_count.eq(0) & weak_count.lt(2)
+    # Do not suppress tiny flows when there is strong VPN evidence.
+    tiny_suppressed = out["total_bytes"].lt(float(MIN_FLOW_BYTES)) & ~connect_tunnel & ~tor_relay & ~vpn_indicator_strong
+    weak_suppressed = strong_count.eq(0) & (weak_count.lt(3) | ~flow_local_weak)
     suppress_mask = tiny_suppressed | weak_suppressed
     if bool(suppress_mask.any()):
         proxy_score.loc[suppress_mask] = 0
         vpn_score.loc[suppress_mask] = 0
         tor_score.loc[suppress_mask] = 0
     reason = _append_reason(reason, tiny_suppressed, "suppressed: tiny flow < 50KB without CONNECT/Tor relay evidence")
-    reason = _append_reason(reason, weak_suppressed, "suppressed: fewer than two weak signals and no strong signal")
+    reason = _append_reason(reason, weak_suppressed, "suppressed: requires >=3 weak signals and at least one flow-local weak signal when no strong signal exists")
 
     score_frame = pd.DataFrame({"Proxy": proxy_score, "VPN": vpn_score, "Tor": tor_score}, index=out.index)
     risk_score = score_frame.max(axis=1).astype(int)
@@ -2496,12 +2649,13 @@ def render_anonymization_network(parquet_root: Path):
         st.markdown("- `http.method == CONNECT` => `proxy_explicit` (+80)")
         st.markdown("- Proxy ports `{3128,8080,8000,8888,1080}` => `proxy_port` (+25)")
         st.markdown("- VPN ports `{1194,51820,500,4500,1701,1723}` => `vpn_port` (+45)")
-        st.markdown("- `vpn_detect_v2` hit => `vpn_vendor_hit` (+90)")
+        st.markdown("- `vpn_detect_v2` indicators: strong indicators => `vpn_vendor_hit` (+90); `tls_no_host` => weak (+15)")
         st.markdown("- `tunnel.log` correlation hit => `tunnel_encap` (+70)")
         st.markdown("- 443/TLS with no SNI + high bytes + long duration => `tls_tunnel_like` (+35)")
         st.markdown("- Destination in Tor relay set => `tor_relay_ip` (+95)")
-        st.markdown("- Tor/VPN/Proxy DNS keyword hit => +20 weak signal")
-        st.markdown("- False-positive controls: suppress tiny flows `<50KB` unless CONNECT/Tor relay, and require >=2 weak signals when no strong signal exists")
+        st.markdown("- `proxy_gateway` => destination IP fronts `>=12` hostnames with corroborating proxy evidence (+10)")
+        st.markdown("- Tor/VPN/Proxy DNS keyword hit (recent correlated DNS only) => +10 weak signal")
+        st.markdown("- False-positive controls: suppress tiny flows `<50KB` unless CONNECT/Tor relay/strong VPN hit, and require >=3 weak signals with >=1 flow-local weak signal when no strong signal exists")
         st.markdown("- Confidence thresholds: `>=90 High`, `60-89 Medium`, `35-59 Low`")
         st.info(
             "Optional local `IP2Proxy` lookup (`data/ip2proxy_lookup.parquet` or env `IP2PROXY_LOOKUP_FILE`) is used as supporting enrichment."
