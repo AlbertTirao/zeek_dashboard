@@ -2468,24 +2468,16 @@ def render_anonymization_network(parquet_root: Path):
     )
     st.markdown("<div class='shadow-detection-basis'>", unsafe_allow_html=True)
     with st.expander("Detection basis", expanded=False):
-        st.markdown(
-            "Detections are produced from correlated Zeek telemetry (`conn/http/ssl/dns/tunnel/vpn_detect_v2`) with "
-            "feed-backed Tor/proxy enrichment and local VPN/provider inference."
-        )
-        st.markdown(
-            "Primary scoring signals include explicit proxy behavior (`http.method == CONNECT`, proxy ports), VPN/Tor "
-            "indicators (`vpn_detect_v2`, VPN ports, Tor relay hits), and tunnel-like transport behavior "
-            "(TLS no-SNI + sustained transfer + duration)."
-        )
-        st.markdown(
-            "Weak DNS keyword evidence for Tor/VPN/Proxy is retained as supporting context and combined with stronger "
-            "signals to avoid over-scoring isolated matches."
-        )
-        st.markdown(
-            "False-positive controls suppress tiny flows (`<50KB`) unless strong indicators exist, and require multiple "
-            "weak indicators when strong evidence is absent."
-        )
-        st.markdown("Confidence thresholds: `>=90 High`, `60-89 Medium`, `35-59 Low`.")
+        st.markdown("- `http.method == CONNECT` => `proxy_explicit` (+80)")
+        st.markdown("- Proxy ports `{3128,8080,8000,8888,1080}` => `proxy_port` (+25)")
+        st.markdown("- VPN ports `{1194,51820,500,4500,1701,1723}` => `vpn_port` (+45)")
+        st.markdown("- `vpn_detect_v2` hit => `vpn_vendor_hit` (+90)")
+        st.markdown("- `tunnel.log` correlation hit => `tunnel_encap` (+70)")
+        st.markdown("- 443/TLS with no SNI + high bytes + long duration => `tls_tunnel_like` (+35)")
+        st.markdown("- Destination in Tor relay set => `tor_relay_ip` (+95)")
+        st.markdown("- Tor/VPN/Proxy DNS keyword hit => +20 weak signal")
+        st.markdown("- False-positive controls: suppress tiny flows `<50KB` unless CONNECT/Tor relay, and require >=2 weak signals when no strong signal exists")
+        st.markdown("- Confidence thresholds: `>=90 High`, `60-89 Medium`, `35-59 Low`")
         st.info(
             "Optional local `IP2Proxy` lookup (`data/ip2proxy_lookup.parquet` or env `IP2PROXY_LOOKUP_FILE`) is used as supporting enrichment."
         )
