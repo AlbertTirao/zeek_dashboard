@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -1239,6 +1240,35 @@ def get_available_dates(parquet_root: Path) -> List[str]:
         if p.is_dir() and DATE_DIR_RE.match(p.name):
             out.append(p.name)
     return sorted(out, reverse=True)
+
+
+def _resolve_target_dates_with_adjacent(selected_date: str, available_dates: List[str]) -> Tuple[List[str], List[str]]:
+    target_dates: List[str] = [str(selected_date)] if str(selected_date).strip() else []
+    adjacent_dates: List[str] = []
+    if not target_dates:
+        return target_dates, adjacent_dates
+    try:
+        d0 = datetime.strptime(str(target_dates[0]), "%Y-%m-%d").date()
+        prev = (d0 - timedelta(days=1)).strftime("%Y-%m-%d")
+        nxt = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
+        for d in [prev, nxt]:
+            if d in set(available_dates or []) and d not in target_dates:
+                target_dates.append(d)
+                adjacent_dates.append(d)
+    except Exception:
+        pass
+    return target_dates, adjacent_dates
+
+
+def _apply_selected_date_scope(df: pd.DataFrame, selected_date: str) -> Tuple[pd.DataFrame, int]:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df, 0
+    out = _to_datetime(df.copy(), "ts")
+    ts = pd.to_datetime(out.get("ts", pd.Series(pd.NaT, index=out.index)), errors="coerce")
+    in_scope = ts.dt.strftime("%Y-%m-%d").fillna("").eq(str(selected_date))
+    scoped = out.loc[in_scope].copy()
+    trimmed_rows = max(int(len(out)) - int(len(scoped)), 0)
+    return scoped, trimmed_rows
 
 
 def _collect_date_files(date_dir: Path) -> Dict[str, List[Path]]:
@@ -2516,12 +2546,38 @@ def _scored_sig(files: List[str]) -> Tuple[Tuple[str, int, int], ...]:
     return tuple(rows)
 
 
+def _folder_date_from_scored_cache_path(path: Path) -> str:
+    try:
+        for part in path.parts:
+            s = str(part)
+            if s.startswith("date="):
+                d = s.split("=", 1)[1].strip()
+                if DATE_DIR_RE.match(d):
+                    return d
+    except Exception:
+        pass
+    return ""
+
+
 @st.cache_data(show_spinner=False)
 def _load_scored_scope_cached(sig: Tuple[Tuple[str, int, int], ...]) -> pd.DataFrame:
-    paths = [Path(row[0]) for row in sig]
-    if not paths:
+    frames: List[pd.DataFrame] = []
+    for row in sig:
+        if not row:
+            continue
+        p = Path(str(row[0]))
+        try:
+            dfi = pd.read_parquet(p)
+        except Exception:
+            continue
+        if dfi is None or dfi.empty:
+            continue
+        dfi = dfi.copy()
+        dfi["_folder_date"] = _folder_date_from_scored_cache_path(p)
+        frames.append(dfi)
+    if not frames:
         return pd.DataFrame()
-    df = _duck_read(paths)
+    df = pd.concat(frames, ignore_index=True)
     if df is None or df.empty:
         return pd.DataFrame()
     return _to_datetime(df, "ts")
@@ -2774,6 +2830,7 @@ def render_anonymization_network(parquet_root: Path):
     if date_sel_state not in dates:
         date_sel_state = dates[0]
     date_sel = st.selectbox("Dataset Scope", dates, index=dates.index(date_sel_state), key="anonym_net_date")
+    scope_note_slot = st.empty()
 
     feeds = load_feeds(parquet_root, date_sel, force=False)
     ip2, _, ip2_sig = load_ip2proxy_lookup()
@@ -2784,7 +2841,7 @@ def render_anonymization_network(parquet_root: Path):
         key="anonym_net_q",
     ).strip().lower()
 
-    target_dates = [date_sel]
+    target_dates, adjacent_dates = _resolve_target_dates_with_adjacent(str(date_sel), dates)
 
     ensure_scored_cache(
         parquet_root,
@@ -2803,7 +2860,24 @@ def render_anonymization_network(parquet_root: Path):
     if scored.empty:
         st.info("No scored events.")
         return
-    scored = _to_datetime(scored, "ts")
+
+    raw_scored = _to_datetime(scored.copy(), "ts")
+    scored, trimmed_rows = _apply_selected_date_scope(raw_scored, str(date_sel))
+    included_from_adjacent = 0
+    if adjacent_dates and "_folder_date" in scored.columns:
+        try:
+            included_from_adjacent = int(scored["_folder_date"].astype(str).isin(set(adjacent_dates)).sum())
+        except Exception:
+            included_from_adjacent = 0
+    scope_note_slot.caption(
+        f"Date scope note: excluded {int(trimmed_rows):,} rows because their timestamps were outside `{date_sel}`. "
+        f"Included {int(included_from_adjacent):,} rows from adjacent day folders (yesterday/tomorrow)."
+    )
+
+    if scored.empty:
+        st.info("No scored events within selected date scope.")
+        return
+
     scored["event_date"] = pd.to_datetime(scored["ts"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
 
     view = scored.copy()
