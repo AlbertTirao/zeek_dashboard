@@ -34,7 +34,10 @@ except Exception:
     HAS_AGGRID = False
 
     class _GridUpdateModeFallback:
+        NO_UPDATE = "NO_UPDATE"
         SELECTION_CHANGED = "SELECTION_CHANGED"
+        MODEL_CHANGED = "MODEL_CHANGED"
+        VALUE_CHANGED = "VALUE_CHANGED"
 
     GridUpdateMode = _GridUpdateModeFallback()  # type: ignore
 
@@ -516,6 +519,29 @@ def _drop_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
         else:
             keep_mask = keep_mask | _clean(s).ne("")
     return df[keep_mask].copy()
+
+
+def _drop_empty_rows_and_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = _drop_empty_rows(df)
+    base_cols = [str(c) for c in out.columns]
+    preserve_cols = [
+        c
+        for c in base_cols
+        if c in {"#", "_row_id", "Allow", "Allowlisted"} or c.startswith("_allow_")
+    ]
+    candidate_cols = [c for c in base_cols if c not in preserve_cols]
+    if candidate_cols:
+        candidate_df = out[candidate_cols].copy()
+        candidate_df, _ = _drop_empty_columns(candidate_df)
+        keep_set = set(candidate_df.columns).union(set(preserve_cols))
+    else:
+        keep_set = set(preserve_cols)
+    keep_cols = [c for c in base_cols if c in keep_set]
+    out = out[keep_cols].copy() if keep_cols else out.iloc[:, 0:0].copy()
+    out = _drop_empty_rows(out)
+    return out
 
 
 def _first_nonempty(s: pd.Series) -> str:
@@ -1927,24 +1953,44 @@ def render_shadow_aggrid(
     gb: GridOptionsBuilderType,
     *,
     key: str,
-    height: int = 500,
-    update_mode=GridUpdateMode.SELECTION_CHANGED,
+    height: int = 430,
+    update_mode=GridUpdateMode.NO_UPDATE,
+    wrap_shell: bool = True,
+    hide_top_border: bool = False,
+    grid_options_overrides: Optional[Dict[str, object]] = None,
+    auto_fit_columns: bool = True,
 ):
     if not HAS_AGGRID:
-        st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
+        if wrap_shell:
+            st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
         st.dataframe(df, use_container_width=True, hide_index=True, height=height)
-        st.markdown("</div>", unsafe_allow_html=True)
+        if wrap_shell:
+            st.markdown("</div>", unsafe_allow_html=True)
         return None
 
+    df = _drop_empty_rows_and_columns(df)
     grid_options = gb.build()
-    row_count = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+
+    visible_fields = {str(c) for c in df.columns}
+    col_defs_raw = list(grid_options.get("columnDefs") or [])
+    if col_defs_raw and visible_fields:
+        pruned_col_defs = []
+        for col_def in col_defs_raw:
+            if not isinstance(col_def, dict):
+                continue
+            field = str(col_def.get("field") or col_def.get("colId") or "")
+            if field and field not in visible_fields:
+                continue
+            pruned_col_defs.append(col_def)
+        grid_options["columnDefs"] = pruned_col_defs
+
     default_col_def = dict(grid_options.get("defaultColDef") or {})
     default_col_def["sortable"] = True
     default_col_def["filter"] = "agSetColumnFilter"
     default_col_def["floatingFilter"] = False
     default_col_def.setdefault("minWidth", 96)
-    default_col_def.setdefault("cellStyle", {"textAlign": "left"})
     default_col_def["menuTabs"] = ["filterMenuTab", "generalMenuTab"]
+    default_col_def["suppressMenu"] = False
     filter_params = dict(default_col_def.get("filterParams") or {})
     filter_params.setdefault("excelMode", "windows")
     filter_params.setdefault("buttons", ["apply", "clear", "cancel"])
@@ -1952,64 +1998,92 @@ def render_shadow_aggrid(
     filter_params.setdefault("suppressMiniFilter", False)
     default_col_def["filterParams"] = filter_params
     grid_options["defaultColDef"] = default_col_def
-    # Keep column menu (three dots) always visible.
-    grid_options["suppressMenuHide"] = True
+    grid_options["suppressMenuHide"] = False
     grid_options["enableCellTextSelection"] = True
     grid_options["ensureDomOrder"] = True
     grid_options["enableRtl"] = False
-    grid_options["suppressColumnVirtualisation"] = bool(row_count <= 2000)
-    grid_options.setdefault("pagination", True)
-    grid_options.setdefault("paginationAutoPageSize", False)
-    grid_options.setdefault("paginationPageSize", 25)
-    grid_options.setdefault("paginationPageSizeSelector", [25, 50, 100])
+    grid_options["suppressColumnVirtualisation"] = True
 
-    autosize_js = JsCode(
-        """
-        function(params) {
-            setTimeout(function() {
-                if (!params || !params.columnApi) return;
-                const cols = params.columnApi.getAllColumns ? params.columnApi.getAllColumns() : [];
-                const colIds = cols.map(function(c) { return c.getColId ? c.getColId() : c.colId; }).filter(Boolean);
-                if (!colIds.length) return;
-                try { params.columnApi.autoSizeColumns(colIds, false); } catch (e) {}
-                try { if (params.api && params.api.sizeColumnsToFit) params.api.sizeColumnsToFit(); } catch (e) {}
-            }, 0);
-        }
-        """
-    )
-    if row_count <= 2000:
-        grid_options["onFirstDataRendered"] = autosize_js
-        grid_options["onGridSizeChanged"] = autosize_js
-    else:
-        grid_options.pop("onFirstDataRendered", None)
-        grid_options.pop("onGridSizeChanged", None)
+    col_defs = list(grid_options.get("columnDefs") or [])
+    if col_defs:
+        for col_def in col_defs:
+            if not isinstance(col_def, dict):
+                continue
+            col_def.setdefault("sortable", True)
+            col_def.setdefault("filter", "agSetColumnFilter")
+            col_def.setdefault("floatingFilter", False)
+            col_def.setdefault("menuTabs", ["filterMenuTab", "generalMenuTab"])
+            col_def.setdefault("suppressMenu", False)
+            cfp = dict(col_def.get("filterParams") or {})
+            cfp.setdefault("excelMode", "windows")
+            cfp.setdefault("buttons", ["apply", "clear", "cancel"])
+            cfp.setdefault("closeOnApply", True)
+            cfp.setdefault("suppressMiniFilter", False)
+            col_def["filterParams"] = cfp
+        grid_options["columnDefs"] = col_defs
+
+    if auto_fit_columns:
+        autofit_js = JsCode(
+            """
+            function(params) {
+                setTimeout(function() {
+                    if (!params) return;
+                    if (params.columnApi) {
+                        const cols = params.columnApi.getAllColumns ? params.columnApi.getAllColumns() : [];
+                        const colIds = cols.map(function(c) { return c.getColId ? c.getColId() : c.colId; }).filter(Boolean);
+                        if (colIds.length) {
+                            try { params.columnApi.autoSizeColumns(colIds, false); } catch (e) {}
+                        }
+                    }
+                }, 0);
+            }
+            """
+        )
+        grid_options["onFirstDataRendered"] = autofit_js
+        grid_options["onGridSizeChanged"] = autofit_js
+    if grid_options_overrides:
+        grid_options.update(grid_options_overrides)
 
     ag_theme, ag_css = get_aggrid_theme_and_css()
     table_css = dict(ag_css)
+    root_wrapper_style = {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"}
+    if hide_top_border:
+        root_wrapper_style["border-top"] = "0 !important"
     table_css.update(
         {
-            ".ag-root-wrapper": {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"},
-            ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E", "direction": "ltr !important"},
-            ".ag-header-cell, .ag-header-group-cell": {
-                "background-color": "#10213E",
-                "color": "#EAF2FF",
-                "border-right": "1px solid #2A466E",
-                "direction": "ltr !important",
+            ".ag-root-wrapper": root_wrapper_style,
+            ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E"},
+            ".ag-header-cell, .ag-header-group-cell": {"background-color": "#10213E", "color": "#EAF2FF", "border-right": "1px solid #2A466E"},
+            ".ag-header-cell-menu-button": {
+                "opacity": "1 !important",
+                "display": "flex !important",
+                "align-items": "center",
+                "color": "#BFD7FF !important",
             },
-            ".ag-header-cell-label": {"white-space": "nowrap", "justify-content": "flex-start !important", "text-align": "left !important"},
-            ".ag-cell": {"background-color": "#061120", "color": "#EAF2FF", "border-color": "#13233D", "text-align": "left !important"},
+            ".ag-header-cell-menu-button:hover": {"color": "#FFFFFF !important"},
             ".ag-row-odd": {"background-color": "#07162A"},
             ".ag-row-even": {"background-color": "#0A1C33"},
             ".ag-row-hover": {"background-color": "#13305A"},
             ".ag-row-selected": {"background-color": "#1B3F75"},
+            ".ag-menu, .ag-popup-child": {
+                "background-color": "#0A1730 !important",
+                "color": "#EAF2FF !important",
+                "border": "1px solid #2D456C !important",
+            },
+            ".ag-set-filter-list, .ag-virtual-list-viewport": {
+                "background-color": "#071224 !important",
+                "color": "#EAF2FF !important",
+            },
+            ".ag-input-field-input, .ag-text-field-input": {
+                "background-color": "#071224 !important",
+                "color": "#EAF2FF !important",
+                "border": "1px solid #2D456C !important",
+            },
         }
     )
 
-    st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-    data_sig = _grid_data_signature(df)
-    sig_key = f"_anonymization_network_grid_sig::{key}"
-    reload_data = st.session_state.get(sig_key) != data_sig
-    st.session_state[sig_key] = data_sig
+    if wrap_shell:
+        st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
     grid_response = AgGrid(
         df,
         gridOptions=grid_options,
@@ -2020,12 +2094,22 @@ def render_shadow_aggrid(
         custom_css=table_css,
         allow_unsafe_jscode=True,
         enable_enterprise_modules=True,
-        fit_columns_on_grid_load=False,
-        reload_data=reload_data,
+        fit_columns_on_grid_load=auto_fit_columns,
+        reload_data=False,
         key=key,
     )
-    st.markdown("</div>", unsafe_allow_html=True)
+    if wrap_shell:
+        st.markdown("</div>", unsafe_allow_html=True)
     return grid_response
+
+
+def _render_table_information(summary_line: str, detail_lines: List[str]) -> None:
+    with st.expander("Table information", expanded=False):
+        if str(summary_line or "").strip():
+            st.markdown(str(summary_line))
+        for line in detail_lines or []:
+            if str(line or "").strip():
+                st.markdown(str(line))
 
 
 def style_plotly_figure(fig, *, height: int = 360, show_legend: bool = True):
@@ -2072,6 +2156,10 @@ def inject_anonymization_network_css():
             margin-bottom: 0.45rem;
             box-shadow: none;
         }
+        .shadow-filter-shell-primary {
+            border-top: 0;
+            padding-top: 0;
+        }
         .shadow-detection-basis [data-testid="stExpander"] {
             border: 0 !important;
             box-shadow: none !important;
@@ -2081,36 +2169,8 @@ def inject_anonymization_network_css():
             border: 0 !important;
             background: transparent !important;
         }
-        .shadow-filter-shell-primary {
-            border-top: 0;
-            padding-top: 0;
-        }
-        [data-testid="stExpander"] {
-            border: 0 !important;
-            box-shadow: none !important;
-            background: transparent !important;
-        }
-        [data-testid="stExpander"] details {
-            border: 0 !important;
-            box-shadow: none !important;
-            background: transparent !important;
-        }
-        [data-testid="stExpander"] details > summary {
-            border: 0 !important;
-            border-bottom: 0 !important;
-            box-shadow: none !important;
-        }
         [data-testid="stExpander"] details > div[role="region"] {
             border-top: 0 !important;
-            box-shadow: none !important;
-        }
-        [data-testid="stExpander"] details > div {
-            border: 0 !important;
-            box-shadow: none !important;
-        }
-        [data-testid="stElementContainer"] {
-            border: 0 !important;
-            box-shadow: none !important;
         }
         [data-testid="stVerticalBlockBorderWrapper"] {
             border: 0 !important;
@@ -2160,40 +2220,50 @@ def inject_anonymization_network_css():
             flex-direction: column;
             justify-content: space-between;
         }
+        [data-testid="stMetric"] > div {
+            height: 100%;
+            display: grid;
+            grid-template-rows: auto auto minmax(1.1rem, auto);
+            align-content: start;
+            row-gap: 0.1rem;
+        }
+        [data-testid="stMetricDelta"] {
+            min-height: 1.1rem;
+            line-height: 1.1rem;
+            display: inline-flex !important;
+            width: auto !important;
+            max-width: max-content !important;
+            align-self: flex-start !important;
+        }
+        [data-testid="stMetricDelta"] > div {
+            width: auto !important;
+            max-width: max-content !important;
+        }
+        [data-testid="stMetricDelta"] p {
+            margin: 0 !important;
+        }
         [data-testid="stMetricLabel"] p {
             font-size: 0.75rem;
             letter-spacing: 0.06em;
             text-transform: uppercase;
             font-weight: 600;
         }
-        .ag-theme-alpine .ag-root-wrapper,
-        .ag-theme-alpine-dark .ag-root-wrapper,
-        .ag-theme-alpine .ag-root-wrapper-body,
-        .ag-theme-alpine-dark .ag-root-wrapper-body,
-        .ag-theme-alpine .ag-center-cols-clipper,
-        .ag-theme-alpine-dark .ag-center-cols-clipper {
-            background: rgba(6, 17, 32, 0.95) !important;
+        .shadow-table-shell .ag-menu,
+        .shadow-table-shell .ag-popup-child,
+        .shadow-table-shell .ag-theme-alpine .ag-menu,
+        .shadow-table-shell .ag-theme-alpine-dark .ag-menu,
+        .shadow-table-shell .ag-theme-alpine .ag-popup-child,
+        .shadow-table-shell .ag-theme-alpine-dark .ag-popup-child {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border: 1px solid #2D456C !important;
         }
-        .ag-theme-alpine .ag-menu,
-        .ag-theme-alpine-dark .ag-menu,
-        .ag-theme-alpine .ag-popup-child,
-        .ag-theme-alpine-dark .ag-popup-child,
-        .ag-theme-alpine .ag-filter,
-        .ag-theme-alpine-dark .ag-filter,
-        .ag-theme-alpine .ag-set-filter-list,
-        .ag-theme-alpine-dark .ag-set-filter-list {
+        .shadow-table-shell .ag-set-filter-list,
+        .shadow-table-shell .ag-virtual-list-viewport,
+        .shadow-table-shell .ag-theme-alpine .ag-set-filter-list,
+        .shadow-table-shell .ag-theme-alpine-dark .ag-set-filter-list {
             background: #071224 !important;
             color: #EAF2FF !important;
-            border-color: #2E4E7A !important;
-        }
-        .ag-theme-alpine .ag-header-cell-menu-button,
-        .ag-theme-alpine-dark .ag-header-cell-menu-button,
-        .ag-theme-alpine .ag-header-cell-filter-button,
-        .ag-theme-alpine-dark .ag-header-cell-filter-button {
-            opacity: 1 !important;
-            visibility: visible !important;
-            display: inline-flex !important;
-            color: #FFFFFF !important;
         }
         </style>
         """,
@@ -2384,16 +2454,24 @@ def render_anonymization_network(parquet_root: Path):
     )
     st.markdown("<div class='shadow-detection-basis'>", unsafe_allow_html=True)
     with st.expander("Detection basis", expanded=False):
-        st.markdown("- `http.method == CONNECT` => `proxy_explicit` (+80)")
-        st.markdown("- Proxy ports `{3128,8080,8000,8888,1080}` => `proxy_port` (+25)")
-        st.markdown("- VPN ports `{1194,51820,500,4500,1701,1723}` => `vpn_port` (+45)")
-        st.markdown("- `vpn_detect_v2` hit => `vpn_vendor_hit` (+90)")
-        st.markdown("- `tunnel.log` correlation hit => `tunnel_encap` (+70)")
-        st.markdown("- 443/TLS with no SNI + high bytes + long duration => `tls_tunnel_like` (+35)")
-        st.markdown("- Destination in Tor relay set => `tor_relay_ip` (+95)")
-        st.markdown("- Tor/VPN/Proxy DNS keyword hit => +20 weak signal")
-        st.markdown("- False-positive controls: suppress tiny flows `<50KB` unless CONNECT/Tor relay, and require >=2 weak signals when no strong signal exists")
-        st.markdown("- Confidence thresholds: `>=90 High`, `60-89 Medium`, `35-59 Low`")
+        st.markdown(
+            "Detections are produced from correlated Zeek telemetry (`conn/http/ssl/dns/tunnel/vpn_detect_v2`) with "
+            "feed-backed Tor/proxy enrichment and local VPN/provider inference."
+        )
+        st.markdown(
+            "Primary scoring signals include explicit proxy behavior (`http.method == CONNECT`, proxy ports), VPN/Tor "
+            "indicators (`vpn_detect_v2`, VPN ports, Tor relay hits), and tunnel-like transport behavior "
+            "(TLS no-SNI + sustained transfer + duration)."
+        )
+        st.markdown(
+            "Weak DNS keyword evidence for Tor/VPN/Proxy is retained as supporting context and combined with stronger "
+            "signals to avoid over-scoring isolated matches."
+        )
+        st.markdown(
+            "False-positive controls suppress tiny flows (`<50KB`) unless strong indicators exist, and require multiple "
+            "weak indicators when strong evidence is absent."
+        )
+        st.markdown("Confidence thresholds: `>=90 High`, `60-89 Medium`, `35-59 Low`.")
         st.info(
             "Optional local `IP2Proxy` lookup (`data/ip2proxy_lookup.parquet` or env `IP2PROXY_LOOKUP_FILE`) is used as supporting enrichment."
         )
@@ -2409,30 +2487,17 @@ def render_anonymization_network(parquet_root: Path):
     date_sel_state = str(st.session_state.get("anonym_net_date", dates[0]))
     if date_sel_state not in dates:
         date_sel_state = dates[0]
+    date_sel = st.selectbox("Dataset Scope", dates, index=dates.index(date_sel_state), key="anonym_net_date")
 
-    feeds = load_feeds(parquet_root, date_sel_state, force=False)
+    feeds = load_feeds(parquet_root, date_sel, force=False)
     ip2, _, ip2_sig = load_ip2proxy_lookup()
     allowlist, _ = load_anonymization_allowlist()
 
     q = st.text_input(
-        "Search",
-        value="",
-        placeholder="ip, host, provider, reason, uid, mac",
+        "Search (IP Host Provider Reason UID MAC)",
+        placeholder="Enter keywords...",
         key="anonym_net_q",
     ).strip().lower()
-
-    st.markdown("<div class='shadow-filter-shell shadow-filter-shell-primary'>", unsafe_allow_html=True)
-    c1, c2 = st.columns([1.35, 1.2])
-    with c1:
-        date_sel = st.selectbox("Date", dates, index=dates.index(date_sel_state), key="anonym_net_date")
-    with c2:
-        conf_filter = st.multiselect(
-            "Confidence",
-            ["High", "Medium", "Low"],
-            default=["High", "Medium", "Low"],
-            key="anonym_net_conf",
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
 
     target_dates = [date_sel]
 
@@ -2458,29 +2523,38 @@ def render_anonymization_network(parquet_root: Path):
     scored["Allowlisted"] = compute_allowlist_mask(scored, allowlist)
 
     view = scored.copy()
-    if conf_filter:
-        view = view[view["Confidence"].isin(conf_filter)].copy()
     view["Detection_Source"] = _derive_detection_source(view)
 
     cat_opts = sorted(view["Category"].dropna().astype(str).unique().tolist())
     source_opts = sorted([x for x in view["Detection_Source"].dropna().astype(str).unique().tolist() if x])
-    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+
+    st.markdown("<div class='shadow-filter-shell shadow-filter-shell-primary'>", unsafe_allow_html=True)
     c6, c7 = st.columns([1.0, 1.0])
     with c6:
-        cat_filter = st.multiselect("Category", cat_opts, default=cat_opts, key="anonym_net_cat")
+        conf_filter = st.multiselect(
+            "Confidence",
+            ["High", "Medium", "Low"],
+            default=["High", "Medium", "Low"],
+            key="anonym_net_conf",
+        )
     with c7:
         source_filter = st.multiselect("Source", source_opts, default=source_opts, key="anonym_net_source_filter")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    if cat_filter:
-        view = view[view["Category"].isin(cat_filter)].copy()
+    st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
+    cat_filter = st.multiselect("Category", cat_opts, default=cat_opts, key="anonym_net_cat")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if conf_filter:
+        view = view[view["Confidence"].isin(conf_filter)].copy()
     if source_filter:
         view = view[view["Detection_Source"].isin(source_filter)].copy()
+    if cat_filter:
+        view = view[view["Category"].isin(cat_filter)].copy()
     if q:
         blob = (
             view["id.orig_h"].astype(str) + " " + view["id.resp_h"].astype(str) + " " + view["Destination_Host"].astype(str)
             + " " + view["ip2proxy_provider"].astype(str) + " " + view["Reason"].astype(str) + " " + view["uid"].astype(str) + " " + view["mac"].astype(str)
-            + " " + view["Detection_Source"].astype(str)
         ).str.lower()
         view = view[blob.str.contains(re.escape(q), na=False)].copy()
 
@@ -2499,21 +2573,57 @@ def render_anonymization_network(parquet_root: Path):
         st.warning("No events match current filters.")
         return
 
+    chart1, chart2 = st.columns(2)
+    with chart1:
+        cat_frame = (
+            view.groupby("Category", dropna=False)
+            .size()
+            .reset_index(name="Events")
+            .sort_values("Events", ascending=False)
+        )
+        fig_cat = px.bar(
+            cat_frame,
+            x="Category",
+            y="Events",
+            color="Category",
+            title="Events By Category",
+        )
+        style_plotly_figure(fig_cat, height=350, show_legend=False)
+        st.plotly_chart(fig_cat, use_container_width=True)
+    with chart2:
+        src_frame = (
+            view.groupby("id.orig_h", dropna=False)["Risk_Score"]
+            .max()
+            .reset_index()
+            .rename(columns={"id.orig_h": "Source_IP", "Risk_Score": "Max_Risk_Score"})
+            .sort_values("Max_Risk_Score", ascending=False)
+            .head(10)
+        )
+        fig_src = px.bar(
+            src_frame,
+            x="Source_IP",
+            y="Max_Risk_Score",
+            title="Top Source IP (Max Risk)",
+            color="Max_Risk_Score",
+            color_continuous_scale="Reds",
+        )
+        style_plotly_figure(fig_src, height=350, show_legend=False)
+        st.plotly_chart(fig_src, use_container_width=True)
+
     soc_rollup = build_soc_rollup(view)
     if not soc_rollup.empty:
-        st.markdown("#### SOC Device View")
+        st.markdown("#### Top destinations/reasons")
         soc_table = soc_rollup.copy()
         for col in ["Top_Score", "Events", "Distinct_Dst_IPs", "Distinct_Dst_Hosts"]:
             soc_table[col] = pd.to_numeric(soc_table[col], errors="coerce").fillna(0).astype(int)
         for col in ["Upload_MB", "Download_MB", "Duration_s"]:
             soc_table[col] = pd.to_numeric(soc_table[col], errors="coerce").fillna(0).round(2)
-        # Remove empty SOC rows/columns before rendering.
         soc_table = _drop_empty_rows(soc_table)
         soc_table, soc_hidden_cols = _drop_empty_columns(soc_table)
         if soc_hidden_cols:
-            st.caption("SOC hidden empty columns: " + ", ".join(soc_hidden_cols))
+            st.caption("Hidden empty columns: " + ", ".join(soc_hidden_cols))
         if soc_table.empty:
-            st.info("SOC Device View has no non-empty rows after cleanup.")
+            st.info("Top destinations/reasons has no non-empty rows after cleanup.")
         elif HAS_AGGRID and GridOptionsBuilder is not None:
             gb_soc = GridOptionsBuilder.from_dataframe(soc_table)
             gb_soc.configure_default_column(
@@ -2545,12 +2655,31 @@ def render_anonymization_network(parquet_root: Path):
             gb_soc.configure_column("Duration_s", header_name="duration s", type=["numericColumn"], minWidth=105, maxWidth=120)
             gb_soc.configure_column("Distinct_Dst_IPs", header_name="distinct dst ips", type=["numericColumn"], minWidth=130, maxWidth=150)
             gb_soc.configure_column("Distinct_Dst_Hosts", header_name="distinct dst hosts", type=["numericColumn"], minWidth=145, maxWidth=165)
-            render_shadow_aggrid(
+            soc_response = render_shadow_aggrid(
                 soc_table,
                 gb_soc,
                 key=f"anonym_net_soc_table_{date_sel}",
                 height=_table_height_for_rows(len(soc_table), min_px=290, max_px=520),
                 update_mode=GridUpdateMode.SELECTION_CHANGED,
+                wrap_shell=False,
+                hide_top_border=True,
+            )
+            _render_table_information(
+                f"{len(soc_table):,} destination/reason rows shown.",
+                [
+                    "Rows are grouped by `Source_IP` + `MAC` and summarize `Top_Destinations` and `Top_Reasons`.",
+                    "`Top_Score`, `Confidence`, and `Events` help prioritize which devices to triage first.",
+                ],
+            )
+            export_soc = pd.DataFrame(soc_response.get("data", [])) if isinstance(soc_response, dict) else pd.DataFrame()
+            if export_soc.empty:
+                export_soc = soc_table.copy()
+            st.download_button(
+                "Download CSV",
+                data=export_soc.to_csv(index=False).encode("utf-8"),
+                file_name=f"anonymization_top_destinations_reasons_{date_sel}.csv",
+                mime="text/csv",
+                key=f"anonym_net_soc_csv_{date_sel}",
             )
         else:
             st.dataframe(
@@ -2559,45 +2688,20 @@ def render_anonymization_network(parquet_root: Path):
                 hide_index=True,
                 height=min(450, 84 + 34 * max(len(soc_table), 1)),
             )
-
-    chart1, chart2 = st.columns(2)
-    with chart1:
-        cat_frame = (
-            view.groupby(["Category", "Confidence"], dropna=False)
-            .size()
-            .reset_index(name="Events")
-            .sort_values("Events", ascending=False)
-        )
-        fig_cat = px.bar(
-            cat_frame,
-            x="Category",
-            y="Events",
-            color="Confidence",
-            barmode="group",
-            title="Events By Category / Confidence",
-            color_discrete_map={"High": "#ef4444", "Medium": "#f59e0b", "Low": "#22c55e", "Informational": "#64748b"},
-        )
-        style_plotly_figure(fig_cat, height=350)
-        st.plotly_chart(fig_cat, use_container_width=True)
-    with chart2:
-        src_frame = (
-            view.groupby("id.orig_h", dropna=False)["Risk_Score"]
-            .max()
-            .reset_index()
-            .rename(columns={"id.orig_h": "Source_IP", "Risk_Score": "Max_Risk_Score"})
-            .sort_values("Max_Risk_Score", ascending=False)
-            .head(10)
-        )
-        fig_src = px.bar(
-            src_frame,
-            x="Source_IP",
-            y="Max_Risk_Score",
-            title="Top Source IP (Max Risk)",
-            color="Max_Risk_Score",
-            color_continuous_scale="Reds",
-        )
-        style_plotly_figure(fig_src, height=350, show_legend=False)
-        st.plotly_chart(fig_src, use_container_width=True)
+            _render_table_information(
+                f"{len(soc_table):,} destination/reason rows shown.",
+                [
+                    "Rows are grouped by `Source_IP` + `MAC` and summarize `Top_Destinations` and `Top_Reasons`.",
+                    "`Top_Score`, `Confidence`, and `Events` help prioritize which devices to triage first.",
+                ],
+            )
+            st.download_button(
+                "Download CSV",
+                data=soc_table.to_csv(index=False).encode("utf-8"),
+                file_name=f"anonymization_top_destinations_reasons_{date_sel}.csv",
+                mime="text/csv",
+                key=f"anonym_net_soc_csv_{date_sel}",
+            )
 
     view["event_data"] = view["event_date"]
     show_cols = [
@@ -2605,8 +2709,8 @@ def render_anonymization_network(parquet_root: Path):
         "event_data",
         "ts",
         "Confidence",
-        "Category",
         "Detection_Source",
+        "Category",
         "id.orig_h",
         "mac",
         "id.resp_h",
@@ -2760,7 +2864,6 @@ def render_anonymization_network(parquet_root: Path):
 
     top_n = 100
     view_sorted = view_sorted.sort_values(["Risk_Score", "ts"], ascending=[False, False]).head(top_n).copy()
-    st.caption(f"Showing top {len(view_sorted):,} unique events (highest risk and most recent).")
 
     table = view_sorted.reindex(columns=show_cols).copy()
     table["id.resp_p"] = pd.to_numeric(table["id.resp_p"], errors="coerce").fillna(0).astype(int)
@@ -2814,6 +2917,9 @@ def render_anonymization_network(parquet_root: Path):
         for k, v in zip(table["_allow_key"].tolist(), table["Allow"].tolist())
     }
 
+    st.markdown("#### Proxy/VPN/Tor Incidents")
+    st.caption(f"Showing top {len(view_sorted):,} unique events (highest risk and most recent).")
+
     table_response = None
     if HAS_AGGRID and GridOptionsBuilder is not None:
         gb = GridOptionsBuilder.from_dataframe(table)
@@ -2854,8 +2960,8 @@ def render_anonymization_network(parquet_root: Path):
         _cfg("event_data", header_name="event_data", minWidth=118, maxWidth=136)
         _cfg("ts", header_name="ts", minWidth=165)
         _cfg("Confidence", header_name="confidence", cellStyle=_confidence_cellstyle(), minWidth=108, maxWidth=132)
-        _cfg("Category", header_name="category", cellStyle=_category_cellstyle(), minWidth=108, maxWidth=132)
         _cfg("Detection_Source", header_name="source", minWidth=98, maxWidth=122)
+        _cfg("Category", header_name="category", cellStyle=_category_cellstyle(), minWidth=108, maxWidth=132)
         _cfg("id.orig_h", header_name="source ip", minWidth=126)
         _cfg("mac", header_name="mac", minWidth=118)
         _cfg("id.resp_h", header_name="destination ip", minWidth=128)
@@ -2897,6 +3003,8 @@ def render_anonymization_network(parquet_root: Path):
             key=f"anonym_net_table_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
             height=_table_height_for_rows(len(table), min_px=320, max_px=640),
             update_mode=(GridUpdateMode.VALUE_CHANGED | GridUpdateMode.MODEL_CHANGED),
+            wrap_shell=False,
+            hide_top_border=True,
         )
     else:
         render_shadow_aggrid(
@@ -2905,6 +3013,8 @@ def render_anonymization_network(parquet_root: Path):
             key=f"anonym_net_table_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
             height=_table_height_for_rows(len(table), min_px=320, max_px=640),
             update_mode=GridUpdateMode.SELECTION_CHANGED,
+            wrap_shell=False,
+            hide_top_border=True,
         )
 
     if HAS_AGGRID and isinstance(table_response, dict):
@@ -2946,18 +3056,30 @@ def render_anonymization_network(parquet_root: Path):
                 )
                 st.rerun()
 
-    st.download_button(
-        "Download CSV",
-        data=table.drop(
+    _render_table_information(
+        f"{len(table):,} incident rows shown for the selected dataset scope.",
+        [
+            "Rows are event-level Proxy/VPN/Tor incidents after dedup and current filters/search.",
+            "`Allow` is editable for non-allowlisted rows and writes to the allowlist after confirmation.",
+            "Sorting is risk-first (`Risk_Score`, then `ts`) and capped to the top 100 unique events.",
+        ],
+    )
+    export_table = pd.DataFrame(table_response.get("data", [])) if isinstance(table_response, dict) else pd.DataFrame()
+    if export_table.empty:
+        export_table = table.drop(
             columns=["Allow", "_allow_key", "_allow_src_ip", "_allow_src_mac", "_allow_dst_ip", "_allow_dst_host"],
             errors="ignore",
-        ).to_csv(index=False).encode("utf-8"),
+        ).copy()
+    st.download_button(
+        "Download CSV",
+        data=export_table.to_csv(index=False).encode("utf-8"),
         file_name=f"anonymization_network_{date_sel}.csv",
         mime="text/csv",
-        key="anonym_net_csv",
+        key=f"anonym_net_csv_{date_sel}",
     )
 
     with st.expander("Response Playbook", expanded=False):
+        st.markdown("Audience: SOC analysts / incident responders (end users), not developers.")
         st.markdown("- Allowlist corporate VPN egress IPs, approved proxies, and approved tooling to reduce false positives.")
         st.markdown("- Block/contain unapproved anonymization destinations and high-risk ports when policy requires.")
         st.markdown("- Trigger SIEM/notice workflows for repeated high-confidence non-allowlisted hits.")
