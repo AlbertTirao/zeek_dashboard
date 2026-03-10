@@ -526,11 +526,7 @@ def _drop_empty_rows_and_columns(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = _drop_empty_rows(df)
     base_cols = [str(c) for c in out.columns]
-    preserve_cols = [
-        c
-        for c in base_cols
-        if c in {"#", "_row_id", "Allow", "Allowlisted"} or c.startswith("_allow_")
-    ]
+    preserve_cols = [c for c in base_cols if c in {"#", "_row_id"}]
     candidate_cols = [c for c in base_cols if c not in preserve_cols]
     if candidate_cols:
         candidate_df = out[candidate_cols].copy()
@@ -1927,6 +1923,19 @@ def get_aggrid_theme_and_css():
             "border": "1px solid #2D456C !important",
         },
         ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-standard-button, .ag-button, button.ag-standard-button, .ag-filter-apply-panel button": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-standard-button:hover, .ag-button:hover, .ag-filter-apply-panel button:hover": {
+            "background-color": "#13305A !important",
+            "color": "#FFFFFF !important",
+            "border": "1px solid #3B5C8F !important",
+        },
+        ".ag-standard-button span, .ag-button span, .ag-filter-apply-panel button span": {
+            "color": "#EAF2FF !important",
+        },
     }
     return theme, custom_css
 
@@ -2279,6 +2288,24 @@ def inject_anonymization_network_css():
             background: #071224 !important;
             color: #EAF2FF !important;
         }
+        .ag-theme-alpine .ag-standard-button,
+        .ag-theme-alpine-dark .ag-standard-button,
+        .ag-theme-alpine .ag-button,
+        .ag-theme-alpine-dark .ag-button,
+        .ag-theme-alpine .ag-filter-apply-panel button,
+        .ag-theme-alpine-dark .ag-filter-apply-panel button {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border: 1px solid #2D456C !important;
+        }
+        .ag-theme-alpine .ag-standard-button span,
+        .ag-theme-alpine-dark .ag-standard-button span,
+        .ag-theme-alpine .ag-button span,
+        .ag-theme-alpine-dark .ag-button span,
+        .ag-theme-alpine .ag-filter-apply-panel button span,
+        .ag-theme-alpine-dark .ag-filter-apply-panel button span {
+            color: #EAF2FF !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2457,8 +2484,6 @@ def _derive_detection_source(df: pd.DataFrame) -> pd.Series:
 
 def render_anonymization_network(parquet_root: Path):
     inject_anonymization_network_css()
-    st.session_state.setdefault("anonym_net_allow_dialog_open", False)
-    st.session_state.setdefault("anonym_net_allow_candidate", None)
     st.session_state.setdefault("anonym_net_table_nonce", 0)
     st.markdown("### Anonymization Network (Proxy / VPN / Tor)")
     st.markdown(
@@ -2497,7 +2522,6 @@ def render_anonymization_network(parquet_root: Path):
 
     feeds = load_feeds(parquet_root, date_sel, force=False)
     ip2, _, ip2_sig = load_ip2proxy_lookup()
-    allowlist, _ = load_anonymization_allowlist()
 
     q = st.text_input(
         "Search (IP Host Provider Reason UID MAC)",
@@ -2526,7 +2550,6 @@ def render_anonymization_network(parquet_root: Path):
         return
     scored = _to_datetime(scored, "ts")
     scored["event_date"] = pd.to_datetime(scored["ts"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    scored["Allowlisted"] = compute_allowlist_mask(scored, allowlist)
 
     view = scored.copy()
     view["Detection_Source"] = _derive_detection_source(view)
@@ -2571,9 +2594,6 @@ def render_anonymization_network(parquet_root: Path):
     m4.metric("VPN", f"{int(view['Category'].astype(str).str.contains('VPN', case=False, na=False).sum()):,}")
     m5.metric("Tor", f"{int(view['Category'].astype(str).str.contains('Tor', case=False, na=False).sum()):,}")
     m6.metric("High Evidence", f"{int(view['High_Confidence_Evidence'].fillna(False).astype(bool).sum()):,}")
-
-    if st.session_state.get("anonym_net_allow_dialog_open") and st.session_state.get("anonym_net_allow_candidate"):
-        show_anonymization_allow_dialog()
 
     if view.empty:
         st.warning("No events match current filters.")
@@ -2890,39 +2910,6 @@ def render_anonymization_network(parquet_root: Path):
         st.warning("No non-empty events to display after cleanup.")
         return
 
-    # Add actionable allowlist controls after cleanup so action columns are never auto-dropped.
-    allowlisted_src = (
-        view_sorted.get("Allowlisted", pd.Series(False, index=view_sorted.index))
-        .fillna(False)
-        .astype(bool)
-    )
-    allow_key_src = view_sorted.get("event_fingerprint", pd.Series("", index=view_sorted.index)).fillna("").astype(str)
-    allow_key_src = allow_key_src.where(allow_key_src.str.strip().ne(""), view_sorted.index.astype(str))
-    src_ip_src = _clean(view_sorted.get("id.orig_h", pd.Series("", index=view_sorted.index))).map(_normalize_ip)
-    src_mac_src = _clean(view_sorted.get("mac", pd.Series("", index=view_sorted.index))).str.lower()
-    dst_ip_src = _clean(view_sorted.get("id.resp_h", pd.Series("", index=view_sorted.index))).map(_normalize_ip)
-    dst_host_src = _clean(view_sorted.get("Destination_Host", pd.Series("", index=view_sorted.index))).str.lower().str.strip(".")
-
-    allowlisted_col = allowlisted_src.reindex(table.index).fillna(False).astype(bool)
-    allow_col = allowlisted_col.copy()
-    if "Destination_Host" in table.columns:
-        insert_at = int(table.columns.get_loc("Destination_Host")) + 1
-        table.insert(insert_at, "Allowlisted", allowlisted_col)
-        table.insert(insert_at + 1, "Allow", allow_col)
-    else:
-        table["Allowlisted"] = allowlisted_col
-        table["Allow"] = allow_col
-    table["_allow_key"] = allow_key_src.reindex(table.index).fillna("").astype(str)
-    table["_allow_src_ip"] = src_ip_src.reindex(table.index).fillna("").astype(str)
-    table["_allow_src_mac"] = src_mac_src.reindex(table.index).fillna("").astype(str)
-    table["_allow_dst_ip"] = dst_ip_src.reindex(table.index).fillna("").astype(str)
-    table["_allow_dst_host"] = dst_host_src.reindex(table.index).fillna("").astype(str)
-
-    original_allow_map = {
-        str(k): _coerce_checkbox_bool(v)
-        for k, v in zip(table["_allow_key"].tolist(), table["Allow"].tolist())
-    }
-
     st.markdown("#### Proxy/VPN/Tor Incidents")
     st.caption(f"Showing top {len(view_sorted):,} unique events (highest risk and most recent).")
 
@@ -2948,20 +2935,6 @@ def render_anonymization_network(parquet_root: Path):
             if col in table.columns:
                 gb.configure_column(col, **kwargs)
 
-        allow_editable = JsCode(
-            """
-            function(params) {
-                const already = !!(params.data && params.data.Allowlisted);
-                if (already) return false;
-                const srcIp = (params.data && params.data._allow_src_ip ? params.data._allow_src_ip : '').toString().trim();
-                const srcMac = (params.data && params.data._allow_src_mac ? params.data._allow_src_mac : '').toString().trim();
-                const dstIp = (params.data && params.data._allow_dst_ip ? params.data._allow_dst_ip : '').toString().trim();
-                const dstHost = (params.data && params.data._allow_dst_host ? params.data._allow_dst_host : '').toString().trim();
-                return !!(srcIp || srcMac || dstIp || dstHost);
-            }
-            """
-        )
-
         _cfg("uid", header_name="uid", minWidth=148)
         _cfg("event_data", header_name="event_data", minWidth=118, maxWidth=136)
         _cfg("ts", header_name="ts", minWidth=165)
@@ -2973,19 +2946,6 @@ def render_anonymization_network(parquet_root: Path):
         _cfg("id.resp_h", header_name="destination ip", minWidth=128)
         _cfg("id.resp_p", header_name="dst port", type=["numericColumn"], minWidth=92, maxWidth=108, cellStyle={"textAlign": "right"})
         _cfg("Destination_Host", header_name="destination host/sni", minWidth=210, flex=1.3)
-        _cfg("Allowlisted", header_name="allowlisted", minWidth=108, maxWidth=126, cellRenderer="agCheckboxCellRenderer", editable=False, filter=False)
-        _cfg(
-            "Allow",
-            header_name="allow",
-            width=86,
-            editable=allow_editable,
-            cellRenderer="agCheckboxCellRenderer",
-            cellEditor="agCheckboxCellEditor",
-            singleClickEdit=True,
-            filter=False,
-            sortable=False,
-            suppressMovable=True,
-        )
         _cfg("http_method", header_name="http methods", minWidth=112, maxWidth=132)
         _cfg("ssl_server_name", header_name="ssl_servername", minWidth=190, flex=1.1)
         _cfg("ip2proxy_proxy_type", header_name="ip2proxy_proxy_type", minWidth=145, maxWidth=170)
@@ -2997,24 +2957,19 @@ def render_anonymization_network(parquet_root: Path):
         _cfg("resp_ip_bytes", header_name="resp_ip_bytes", type=["numericColumn"], minWidth=120, maxWidth=140, cellStyle={"textAlign": "right"})
         _cfg("total_bytes", header_name="total_bytes", type=["numericColumn"], minWidth=115, maxWidth=140, cellStyle={"textAlign": "right"})
         _cfg("duration", header_name="durations", type=["numericColumn"], minWidth=100, maxWidth=120, cellStyle={"textAlign": "right"})
-        _cfg("_allow_key", hide=True)
-        _cfg("_allow_src_ip", hide=True)
-        _cfg("_allow_src_mac", hide=True)
-        _cfg("_allow_dst_ip", hide=True)
-        _cfg("_allow_dst_host", hide=True)
         gb.configure_selection("single", use_checkbox=False)
         table_response = render_shadow_aggrid(
             table,
             gb,
             key=f"anonym_net_table_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
             height=_table_height_for_rows(len(table), min_px=320, max_px=640),
-            update_mode=(GridUpdateMode.VALUE_CHANGED | GridUpdateMode.MODEL_CHANGED),
+            update_mode=GridUpdateMode.SELECTION_CHANGED,
             wrap_shell=False,
             hide_top_border=True,
         )
     else:
         render_shadow_aggrid(
-            table.drop(columns=["Allow", "_allow_key", "_allow_src_ip", "_allow_src_mac", "_allow_dst_ip", "_allow_dst_host"], errors="ignore"),
+            table,
             gb=None,  # type: ignore[arg-type]
             key=f"anonym_net_table_{date_sel}_{int(st.session_state.get('anonym_net_table_nonce', 0))}",
             height=_table_height_for_rows(len(table), min_px=320, max_px=640),
@@ -3023,59 +2978,16 @@ def render_anonymization_network(parquet_root: Path):
             hide_top_border=True,
         )
 
-    if HAS_AGGRID and isinstance(table_response, dict):
-        edited = table_response.get("data", None)
-        if isinstance(edited, pd.DataFrame):
-            edited_df = edited.copy()
-        elif isinstance(edited, list):
-            edited_df = pd.DataFrame(edited)
-        else:
-            edited_df = pd.DataFrame()
-
-        if (
-            not edited_df.empty
-            and "Allow" in edited_df.columns
-            and "_allow_key" in edited_df.columns
-            and not st.session_state.get("anonym_net_allow_dialog_open")
-        ):
-            edited_df["Allow"] = edited_df["Allow"].apply(_coerce_checkbox_bool)
-            edited_df["Allowlisted"] = edited_df.get("Allowlisted", False)
-            edited_df["Allowlisted"] = edited_df["Allowlisted"].apply(_coerce_checkbox_bool)
-            edited_df["_was_allowed"] = edited_df["_allow_key"].astype(str).map(
-                lambda k: bool(original_allow_map.get(k, False))
-            )
-            newly_allowed = edited_df[
-                (edited_df["Allow"])
-                & (~edited_df["_was_allowed"])
-                & (~edited_df["Allowlisted"])
-            ]
-            if not newly_allowed.empty:
-                pick = newly_allowed.iloc[0]
-                _open_anonymization_allow_dialog(
-                    {
-                        "_allow_key": str(pick.get("_allow_key", "")),
-                        "source_ip": str(pick.get("_allow_src_ip", "")),
-                        "source_mac": str(pick.get("_allow_src_mac", "")),
-                        "destination_ip": str(pick.get("_allow_dst_ip", "")),
-                        "destination_host": str(pick.get("_allow_dst_host", "")),
-                    }
-                )
-                st.rerun()
-
     _render_table_information(
         f"{len(table):,} incident rows shown for the selected dataset scope.",
         [
             "Rows are event-level Proxy/VPN/Tor incidents after dedup and current filters/search.",
-            "`Allow` is editable for non-allowlisted rows and writes to the allowlist after confirmation.",
             "Sorting is risk-first (`Risk_Score`, then `ts`) and capped to the top 100 unique events.",
         ],
     )
     export_table = pd.DataFrame(table_response.get("data", [])) if isinstance(table_response, dict) else pd.DataFrame()
     if export_table.empty:
-        export_table = table.drop(
-            columns=["Allow", "_allow_key", "_allow_src_ip", "_allow_src_mac", "_allow_dst_ip", "_allow_dst_host"],
-            errors="ignore",
-        ).copy()
+        export_table = table.copy()
     st.download_button(
         "Download CSV",
         data=export_table.to_csv(index=False).encode("utf-8"),

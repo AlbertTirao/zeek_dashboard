@@ -164,6 +164,33 @@ def get_aggrid_theme_and_css():
         ".ag-row-even": {"background-color": "#050E1D"},
         ".ag-row-hover": {"background-color": "#0F203D"},
         ".ag-row-selected": {"background-color": "#1E3A5F"},
+        ".ag-theme-alpine .ag-menu, .ag-theme-alpine-dark .ag-menu": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-theme-alpine .ag-popup-child, .ag-theme-alpine-dark .ag-popup-child": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-theme-alpine .ag-set-filter-list, .ag-theme-alpine-dark .ag-set-filter-list": {
+            "background-color": "#071224 !important",
+            "color": "#EAF2FF !important",
+        },
+        ".ag-theme-alpine .ag-filter-toolpanel-header, .ag-theme-alpine-dark .ag-filter-toolpanel-header": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+        },
+        ".ag-theme-alpine .ag-input-field-input, .ag-theme-alpine-dark .ag-input-field-input": {
+            "background-color": "#071224 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-theme-alpine .ag-checkbox-input-wrapper, .ag-theme-alpine-dark .ag-checkbox-input-wrapper": {
+            "background-color": "#071224 !important",
+            "border": "1px solid #2D456C !important",
+        },
         ".ag-floating-filter-body input": {
             "background-color": "#0A1730 !important",
             "color": "#EAEAEA !important",
@@ -188,6 +215,19 @@ def get_aggrid_theme_and_css():
             "border": "1px solid #2D456C !important",
         },
         ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-standard-button, .ag-button, button.ag-standard-button, .ag-filter-apply-panel button": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-standard-button:hover, .ag-button:hover, .ag-filter-apply-panel button:hover": {
+            "background-color": "#13305A !important",
+            "color": "#FFFFFF !important",
+            "border": "1px solid #3B5C8F !important",
+        },
+        ".ag-standard-button span, .ag-button span, .ag-filter-apply-panel button span": {
+            "color": "#EAF2FF !important",
+        },
     }
     return theme, custom_css
 
@@ -363,6 +403,13 @@ def render_shadow_aggrid(
                 "border-right": "1px solid #2A466E",
                 "direction": "ltr !important",
             },
+            ".ag-header-cell-menu-button": {
+                "opacity": "1 !important",
+                "display": "flex !important",
+                "align-items": "center",
+                "color": "#BFD7FF !important",
+            },
+            ".ag-header-cell-menu-button:hover": {"color": "#FFFFFF !important"},
             ".ag-header-cell-label": {
                 "white-space": "nowrap",
                 "justify-content": "flex-start !important",
@@ -385,6 +432,20 @@ def render_shadow_aggrid(
             ".ag-row-even": {"background-color": "#0A1C33"},
             ".ag-row-hover": {"background-color": "#13305A"},
             ".ag-row-selected": {"background-color": "#1B3F75"},
+            ".ag-menu, .ag-popup-child": {
+                "background-color": "#0A1730 !important",
+                "color": "#EAF2FF !important",
+                "border": "1px solid #2D456C !important",
+            },
+            ".ag-set-filter-list, .ag-virtual-list-viewport": {
+                "background-color": "#071224 !important",
+                "color": "#EAF2FF !important",
+            },
+            ".ag-input-field-input, .ag-text-field-input": {
+                "background-color": "#071224 !important",
+                "color": "#EAF2FF !important",
+                "border": "1px solid #2D456C !important",
+            },
         }
     )
     if hide_scrollbar_buttons:
@@ -578,6 +639,41 @@ def inject_shadow_sharing_css():
             background: rgba(255,255,255,0.08);
             border-color: rgba(255,255,255,0.2);
             font-weight: 700;
+        }
+        .shadow-table-shell .ag-menu,
+        .shadow-table-shell .ag-popup-child,
+        .shadow-table-shell .ag-theme-alpine .ag-menu,
+        .shadow-table-shell .ag-theme-alpine-dark .ag-menu,
+        .shadow-table-shell .ag-theme-alpine .ag-popup-child,
+        .shadow-table-shell .ag-theme-alpine-dark .ag-popup-child {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border: 1px solid #2D456C !important;
+        }
+        .shadow-table-shell .ag-set-filter-list,
+        .shadow-table-shell .ag-virtual-list-viewport,
+        .shadow-table-shell .ag-theme-alpine .ag-set-filter-list,
+        .shadow-table-shell .ag-theme-alpine-dark .ag-set-filter-list {
+            background: #071224 !important;
+            color: #EAF2FF !important;
+        }
+        .ag-theme-alpine .ag-standard-button,
+        .ag-theme-alpine-dark .ag-standard-button,
+        .ag-theme-alpine .ag-button,
+        .ag-theme-alpine-dark .ag-button,
+        .ag-theme-alpine .ag-filter-apply-panel button,
+        .ag-theme-alpine-dark .ag-filter-apply-panel button {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border: 1px solid #2D456C !important;
+        }
+        .ag-theme-alpine .ag-standard-button span,
+        .ag-theme-alpine-dark .ag-standard-button span,
+        .ag-theme-alpine .ag-button span,
+        .ag-theme-alpine-dark .ag-button span,
+        .ag-theme-alpine .ag-filter-apply-panel button span,
+        .ag-theme-alpine-dark .ag-filter-apply-panel button span {
+            color: #EAF2FF !important;
         }
         </style>
         """,

@@ -3496,6 +3496,19 @@ def get_aggrid_theme_and_css():
             "border": "1px solid #2D456C !important",
         },
         ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-standard-button, .ag-button, button.ag-standard-button, .ag-filter-apply-panel button": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-standard-button:hover, .ag-button:hover, .ag-filter-apply-panel button:hover": {
+            "background-color": "#13305A !important",
+            "color": "#FFFFFF !important",
+            "border": "1px solid #3B5C8F !important",
+        },
+        ".ag-standard-button span, .ag-button span, .ag-filter-apply-panel button span": {
+            "color": "#EAF2FF !important",
+        },
     }
     return theme, custom_css
 
@@ -4570,6 +4583,24 @@ def inject_shadow_ai_css():
         .shadow-table-shell .ag-theme-alpine .ag-set-filter-list,
         .shadow-table-shell .ag-theme-alpine-dark .ag-set-filter-list {
             background: #071224 !important;
+            color: #EAF2FF !important;
+        }
+        .ag-theme-alpine .ag-standard-button,
+        .ag-theme-alpine-dark .ag-standard-button,
+        .ag-theme-alpine .ag-button,
+        .ag-theme-alpine-dark .ag-button,
+        .ag-theme-alpine .ag-filter-apply-panel button,
+        .ag-theme-alpine-dark .ag-filter-apply-panel button {
+            background: #0A1730 !important;
+            color: #EAF2FF !important;
+            border: 1px solid #2D456C !important;
+        }
+        .ag-theme-alpine .ag-standard-button span,
+        .ag-theme-alpine-dark .ag-standard-button span,
+        .ag-theme-alpine .ag-button span,
+        .ag-theme-alpine-dark .ag-button span,
+        .ag-theme-alpine .ag-filter-apply-panel button span,
+        .ag-theme-alpine-dark .ag-filter-apply-panel button span {
             color: #EAF2FF !important;
         }
         </style>
