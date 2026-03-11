@@ -1,9 +1,11 @@
 trusted_domains:
+- 1d.tlu.dl.delivery.mp.microsoft.com
 - _spotify-connect._tcp.local
 - acme-v02.api.letsencrypt.org
 - akamai.com
 - amazonaws.com
 - api.cloudflare.com
+- apple.com
 - asana.com
 - atlassian.net
 - auth0.com
@@ -20,6 +22,7 @@ trusted_domains:
 - datadoghq.com
 - digicert.com
 - digitalocean.com
+- discord.com
 - docker.com
 - docker.io
 - docs.google.com

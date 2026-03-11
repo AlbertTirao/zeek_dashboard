@@ -795,7 +795,7 @@ def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
         explicit_provider = HEURISTIC_DOMAIN_PROVIDER_MAP.get(str(root_domain).strip().lower())
         if explicit_provider:
             return explicit_provider, f"heuristic-domain-config:{root_domain}"
-        return _unknown_ai_provider_label(root_domain), f"heuristic-domain-unmapped:{root_domain}"
+        return _unknown_ai_provider_label(root_domain), f"heuristic-domain-unmapped: {root_domain}"
 
     norm = _normalize_fuzzy_text(raw)
     if not norm:

@@ -167,6 +167,7 @@ local_ai_ports:
   5678: n8n
 authorized_providers:
 - OpenAI / ChatGPT
+- WPS AI
 generic_name_patterns:
 - \bgpt\b
 - \bcopilot\b
