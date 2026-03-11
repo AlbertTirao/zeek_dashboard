@@ -141,6 +141,9 @@ ai_signatures:
   Manus:
   - manus\.im
   - manus\.ai
+  OpenClaw:
+  - openclaw\.ai
+  - openclaw\.com
   n8n:
   - n8n\.io
   - n8n\.cloud
@@ -168,6 +171,7 @@ local_ai_ports:
 authorized_providers:
 - OpenAI / ChatGPT
 - WPS AI
+- kaik.ai (unknown ai provider)
 generic_name_patterns:
 - \bgpt\b
 - \bcopilot\b

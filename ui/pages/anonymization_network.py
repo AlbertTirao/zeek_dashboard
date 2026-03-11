@@ -2900,12 +2900,6 @@ def render_anonymization_network(parquet_root: Path):
     feeds = load_feeds(parquet_root, date_sel, force=False)
     ip2, _, ip2_sig = load_ip2proxy_lookup()
 
-    q = st.text_input(
-        "Search (IP Host Provider Reason UID MAC)",
-        placeholder="Enter keywords...",
-        key="anonym_net_q",
-    ).strip().lower()
-
     target_dates, adjacent_dates = _resolve_target_dates_with_adjacent(str(date_sel), dates)
 
     ensure_scored_cache(
@@ -3355,14 +3349,14 @@ def render_anonymization_network(parquet_root: Path):
         table.insert(insert_at, "hostname", "")
         hidden_cols = [c for c in hidden_cols if c != "hostname"]
     table = _drop_empty_rows(table)
-    if hidden_cols:
-        st.caption("Hidden empty columns: " + ", ".join(hidden_cols))
     if table.empty:
         st.warning("No non-empty events to display after cleanup.")
         return
 
     st.markdown("#### Proxy/VPN/Tor Incidents")
     st.caption(f"Showing top {len(view_sorted):,} unique events (highest risk and most recent).")
+    if hidden_cols:
+        st.caption("Hidden empty columns: " + ", ".join(hidden_cols))
 
     table_response = None
     if HAS_AGGRID and GridOptionsBuilder is not None:

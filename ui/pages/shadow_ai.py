@@ -607,6 +607,60 @@ def _build_fuzzy_hint_pattern(alias_choices: List[str]) -> re.Pattern:
 FUZZY_HINT_PATTERN = _build_fuzzy_hint_pattern(FUZZY_ALIAS_CHOICES)
 
 
+def refresh_shadow_ai_runtime_state() -> None:
+    """
+    Refresh in-memory signature/policy globals after ai_signatures.yaml updates.
+    """
+    global AUTHORIZED_PROVIDERS, RAW_AI_SIGNATURES, AI_SIGNATURES
+    global LOCAL_AI_PORTS, GENERIC_NAME_PATTERNS, SAAS_ALLOWLIST_DOMAINS
+    global HEURISTIC_DOMAIN_PROVIDER_MAP, DETECTION_SETTINGS, FILE_UPLOAD_EXTENSIONS
+    global SIG_MTIME_NS, AUTHORIZED_SET, KNOWN_AI_PROVIDER_SET
+    global BASELINE_DAYS, LARGE_UPLOAD_THRESHOLD_BYTES, MEDIUM_UPLOAD_THRESHOLD_BYTES
+    global HIGH_FREQUENCY_CALLS_PER_HOUR, JSON_POST_CALLS_PER_HOUR
+    global SMALL_REQUEST_MAX_BYTES, SMB_WINDOW_MINUTES
+    global MASTER_PATTERN, GENERIC_PROVIDER_HINT_PATTERN
+    global FUZZY_PROVIDER_ALIASES, FUZZY_ALIAS_TO_PROVIDER, FUZZY_ALIAS_CHOICES, FUZZY_HINT_PATTERN
+
+    try:
+        load_ai_signatures.clear()
+    except Exception:
+        pass
+
+    (
+        AUTHORIZED_PROVIDERS,
+        RAW_AI_SIGNATURES,
+        AI_SIGNATURES,
+        LOCAL_AI_PORTS,
+        GENERIC_NAME_PATTERNS,
+        SAAS_ALLOWLIST_DOMAINS,
+        HEURISTIC_DOMAIN_PROVIDER_MAP,
+        DETECTION_SETTINGS,
+        FILE_UPLOAD_EXTENSIONS,
+        SIG_MTIME_NS,
+    ) = load_ai_signatures()
+
+    AUTHORIZED_SET = {str(x).strip().lower() for x in AUTHORIZED_PROVIDERS if str(x).strip()}
+    KNOWN_AI_PROVIDER_SET = (
+        {str(k).strip().lower() for k in (RAW_AI_SIGNATURES or {}).keys() if str(k).strip()}
+        | {str(v).strip().lower() for v in (LOCAL_AI_PORTS or {}).values() if str(v).strip()}
+    )
+
+    BASELINE_DAYS = int(DETECTION_SETTINGS.get("baseline_days", 30))
+    LARGE_UPLOAD_THRESHOLD_BYTES = int(float(DETECTION_SETTINGS.get("large_https_post_threshold_mb", 5.0)) * 1024 * 1024)
+    MEDIUM_UPLOAD_THRESHOLD_BYTES = int(float(DETECTION_SETTINGS.get("medium_https_post_threshold_mb", 1.0)) * 1024 * 1024)
+    HIGH_FREQUENCY_CALLS_PER_HOUR = int(DETECTION_SETTINGS.get("high_frequency_calls_per_hour", 50))
+    JSON_POST_CALLS_PER_HOUR = int(DETECTION_SETTINGS.get("json_post_calls_per_hour", 20))
+    SMALL_REQUEST_MAX_BYTES = int(DETECTION_SETTINGS.get("small_request_max_kb", 64) * 1024)
+    SMB_WINDOW_MINUTES = int(DETECTION_SETTINGS.get("smb_window_minutes", 5))
+
+    MASTER_PATTERN = _build_master_pattern(AI_SIGNATURES)
+    GENERIC_PROVIDER_HINT_PATTERN = _build_provider_hint_pattern(GENERIC_NAME_PATTERNS)
+    FUZZY_PROVIDER_ALIASES = _build_fuzzy_provider_aliases(RAW_AI_SIGNATURES)
+    FUZZY_ALIAS_TO_PROVIDER = _build_fuzzy_alias_lookup(FUZZY_PROVIDER_ALIASES)
+    FUZZY_ALIAS_CHOICES = sorted(FUZZY_ALIAS_TO_PROVIDER.keys())
+    FUZZY_HINT_PATTERN = _build_fuzzy_hint_pattern(FUZZY_ALIAS_CHOICES)
+
+
 def _fuzzy_candidates_from_text(raw_text: str) -> List[str]:
     norm = _normalize_fuzzy_text(raw_text)
     if not norm:
@@ -794,7 +848,7 @@ def _heuristic_provider_name_from_generic(raw_text: str) -> Tuple[str, str]:
     if root_domain:
         explicit_provider = HEURISTIC_DOMAIN_PROVIDER_MAP.get(str(root_domain).strip().lower())
         if explicit_provider:
-            return explicit_provider, f"heuristic-domain-config:{root_domain}"
+            return explicit_provider, f"heuristic-domain-config: {root_domain}"
         return _unknown_ai_provider_label(root_domain), f"heuristic-domain-unmapped: {root_domain}"
 
     norm = _normalize_fuzzy_text(raw)
@@ -4316,12 +4370,13 @@ def show_shadow_ai_allow_dialog() -> None:
         ):
             ok, message = add_provider_to_authorized(provider_raw)
             if ok:
+                refresh_shadow_ai_runtime_state()
                 _close_shadow_ai_allow_dialog()
                 _shadow_ai_bust_ui_caches()
-                _bump_shadow_ai_provider_grid_nonce()
                 st.success(message)
                 st.rerun()
-            st.error(message)
+            else:
+                st.error(message)
     with c2:
         if st.button("Cancel", use_container_width=True, key="shadow_ai_allow_cancel_btn"):
             _close_shadow_ai_allow_dialog()
