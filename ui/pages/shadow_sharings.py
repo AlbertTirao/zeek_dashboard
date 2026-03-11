@@ -1878,7 +1878,7 @@ def render_shadow_sharing(parquet_root: Path):
 
     st.markdown("### Shadow Sharing Incidents")
     st.markdown(
-        "<div class='shadow-callout'>Correlates CONN/SSL/HTTP/files telemetry into 5-minute incident windows and scores confidence "
+        "<div class='shadow-callout'>Correlates CONN/SSL/HTTP/FILES telemetry into 5-minute incident windows and scores confidence "
         "(HIGH/PROBABLE/WEAK).</div>",
         unsafe_allow_html=True,
     )
