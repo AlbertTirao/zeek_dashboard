@@ -313,6 +313,65 @@ def _coerce_ts_any(series: pd.Series) -> pd.Series:
             return parsed_num
 
 
+ROLLING_TIME_WINDOWS_DAYS = {
+    "Last 7 Days": 7,
+    "Last 30 Days": 30,
+}
+
+
+def _filter_df_by_time_mode(
+    df: pd.DataFrame,
+    ts_col: str,
+    mode: str,
+    selected_date: str | None = None,
+) -> pd.DataFrame:
+    """
+    Alerts-aligned time scope filter:
+    - Last 7 Days / Last 30 Days: rolling cutoff from current time
+    - Specific Date: [start_of_day, next_day)
+    - All Time: no time restriction
+    """
+    if df is None:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if ts_col not in out.columns:
+        return out if mode == "All Time" else out.iloc[0:0]
+
+    out[ts_col] = _coerce_ts_any(out[ts_col])
+
+    if mode == "All Time":
+        return out
+
+    out = out[out[ts_col].notna()]
+    if out.empty:
+        return out
+
+    tz = getattr(out[ts_col].dtype, "tz", None)
+    is_tz_aware = tz is not None
+    now = pd.Timestamp.now(tz=tz) if is_tz_aware else pd.Timestamp.now()
+
+    if mode in ROLLING_TIME_WINDOWS_DAYS:
+        cutoff = now - pd.Timedelta(days=ROLLING_TIME_WINDOWS_DAYS[mode])
+        return out[out[ts_col] >= cutoff]
+
+    if mode == "Specific Date" and selected_date:
+        try:
+            start_naive = datetime.strptime(selected_date, "%Y-%m-%d")
+        except Exception:
+            return out.iloc[0:0]
+        if is_tz_aware:
+            start = pd.Timestamp(start_naive).tz_localize(tz)
+            end = start + pd.Timedelta(days=1)
+        else:
+            start = pd.Timestamp(start_naive)
+            end = start + pd.Timedelta(days=1)
+        return out[(out[ts_col] >= start) & (out[ts_col] < end)]
+
+    cutoff = now - pd.Timedelta(days=ROLLING_TIME_WINDOWS_DAYS["Last 7 Days"])
+    return out[out[ts_col] >= cutoff]
+
+
 @st.cache_data(show_spinner=False)
 def load_active_today_macs_from_parquet(
     parquet_root: Path,
@@ -713,6 +772,113 @@ def load_alerts_latest_inventory_rows(
         .reset_index(drop=True)
     )
     return out
+
+
+@st.cache_data(show_spinner=False)
+def load_device_inventory_history_rows(
+    parquet_root: Path,
+    alert_cache_sig: tuple[tuple[str, float, int], ...],
+    inventory_sig: tuple[tuple[str, float, int], ...],
+) -> pd.DataFrame:
+    """
+    Historical inventory rows used for accurate time-range filtering in Device dialogs.
+    Returns event-level rows: mac, host, host_name, ts.
+    """
+    _ = inventory_sig
+    base_cols = ["mac", "host", "host_name", "ts"]
+
+    cache_files = list(_list_alert_event_cache_files(parquet_root, alert_cache_sig))
+    if cache_files:
+        try:
+            import duckdb
+
+            con = duckdb.connect(database=":memory:")
+            rows = con.execute(
+                """
+                WITH ev AS (
+                  SELECT
+                    try_cast(ts_dt AS timestamp) AS ts_dt,
+                    cast(mac_norm AS varchar) AS mac_norm,
+                    COALESCE(
+                      NULLIF(NULLIF(cast(ip AS varchar), ''), 'nan'),
+                      NULLIF(NULLIF(cast(host AS varchar), ''), 'nan'),
+                      '-'
+                    ) AS host
+                  FROM read_parquet(?, union_by_name=true)
+                  WHERE mac_norm IS NOT NULL
+                    AND try_cast(ts_dt AS timestamp) IS NOT NULL
+                ),
+                ranked AS (
+                  SELECT
+                    ts_dt,
+                    mac_norm,
+                    host,
+                    date_trunc('day', ts_dt) AS day_key,
+                    row_number() OVER (
+                      PARTITION BY mac_norm, date_trunc('day', ts_dt)
+                      ORDER BY ts_dt DESC
+                    ) AS rn
+                  FROM ev
+                )
+                SELECT
+                  mac_norm AS mac,
+                  host,
+                  ts_dt AS ts
+                FROM ranked
+                WHERE rn = 1
+                """,
+                [cache_files],
+            ).df()
+            con.close()
+        except Exception:
+            rows = pd.DataFrame()
+
+        if rows is not None and not rows.empty:
+            out = rows.copy()
+            out["mac"] = out.get("mac", pd.Series(index=out.index, dtype="object")).map(normalize_mac)
+            out["ts"] = _coerce_ts_any(out.get("ts", pd.Series(index=out.index, dtype="object")))
+            host_series = out.get("host", pd.Series(index=out.index, dtype="object"))
+            out["host"] = host_series.fillna("-").astype(str)
+            out["host_name"] = "-"
+            out = out.dropna(subset=["mac", "ts"])
+            out = out[~out["mac"].map(is_broadcast_mac)]
+            if not out.empty:
+                return out[base_cols].reset_index(drop=True)
+
+    known_hosts, dhcp = load_visual_metrics_from_parquet(parquet_root, inventory_sig)
+    if known_hosts is None or known_hosts.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    out = known_hosts.copy()
+    out["mac"] = out.get("mac", pd.Series(index=out.index, dtype="object")).map(normalize_mac)
+    out["ts"] = _coerce_ts_any(out.get("ts", pd.Series(index=out.index, dtype="object")))
+    host_series = out.get("host", pd.Series(index=out.index, dtype="object")).astype("string")
+    out["host"] = (
+        host_series.replace(["", "nan", "None", "none", "<NA>"], pd.NA)
+        .fillna("-")
+        .astype(str)
+    )
+    out = out.dropna(subset=["mac", "ts"])
+    out = out[~out["mac"].map(is_broadcast_mac)]
+    if out.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    out["host_name"] = "-"
+    if dhcp is not None and not dhcp.empty and "mac" in dhcp.columns:
+        dh = dhcp.copy()
+        dh["mac"] = dh["mac"].map(normalize_mac)
+        dh = dh.dropna(subset=["mac"])
+        if "host_name" in dh.columns:
+            dh_map = (
+                dh[["mac", "host_name"]]
+                .dropna(subset=["host_name"])
+                .drop_duplicates(subset=["mac"], keep="last")
+                .set_index("mac")["host_name"]
+                .astype(str)
+            )
+            out["host_name"] = out["mac"].map(dh_map).fillna("-").astype(str)
+
+    return out[base_cols].reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -1867,17 +2033,6 @@ def device_list_popup(
             _close_dialog()
 
     available_dates_for_filter = list(available_dates_list or [])
-    if status_type == "Authorized":
-        auth_dates = sorted(
-            {
-                dtv.strftime("%Y-%m-%d")
-                for dtv in authorized_added_at_map.values()
-                if isinstance(dtv, datetime)
-            },
-            reverse=True,
-        )
-        if auth_dates:
-            available_dates_for_filter = sorted(set(available_dates_for_filter).union(auth_dates), reverse=True)
 
     # Toolbar
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
@@ -1886,11 +2041,6 @@ def device_list_popup(
     date_mode_state_key = f"popup_list_mode_applied_{scope_key}"
     history_mode_state_key = f"popup_list_history_mode_applied_{scope_key}"
     spec_date_state_key = f"popup_list_spec_date_applied_{scope_key}"
-
-    mac_draft_key = f"popup_mac_search_draft_{scope_key}"
-    date_mode_draft_key = f"popup_list_mode_draft_{scope_key}"
-    history_mode_draft_key = f"popup_list_history_mode_draft_{scope_key}"
-    spec_date_draft_key = f"popup_list_spec_date_draft_{scope_key}"
 
     date_mode_options = ["Last 7 Days", "Last 30 Days", "Specific Date", "All Time"]
     history_mode_options = ["Hide", "Last 7 Days", "All"]
@@ -1907,86 +2057,62 @@ def device_list_popup(
     else:
         st.session_state[spec_date_state_key] = None
 
-    if mac_draft_key not in st.session_state:
-        st.session_state[mac_draft_key] = st.session_state[mac_state_key]
-    if st.session_state.get(date_mode_draft_key) not in date_mode_options:
-        st.session_state[date_mode_draft_key] = st.session_state[date_mode_state_key]
-    if st.session_state.get(history_mode_draft_key) not in history_mode_options:
-        st.session_state[history_mode_draft_key] = st.session_state[history_mode_state_key]
-    if available_dates_for_filter:
-        if st.session_state.get(spec_date_draft_key) not in available_dates_for_filter:
-            st.session_state[spec_date_draft_key] = st.session_state[spec_date_state_key]
-    else:
-        st.session_state[spec_date_draft_key] = None
-
-    with st.form(f"devices_list_filters_form_{scope_key}", clear_on_submit=False):
-        t1, t2, t3, t4, t5 = st.columns([2.0, 1.15, 1.15, 1.8, 0.9], vertical_alignment="bottom")
-        with t1:
-            st.text_input(
-                "Search MAC:",
-                placeholder="aa:bb:cc:dd:ee:ff",
-                key=mac_draft_key,
-            )
-        with t2:
-            st.selectbox(
-                "Time Range:",
-                date_mode_options,
-                key=date_mode_draft_key,
-            )
-        with t3:
-            st.selectbox(
-                "History:",
-                history_mode_options,
-                key=history_mode_draft_key,
-            )
-        with t4:
-            draft_date_mode = str(st.session_state.get(date_mode_draft_key, "Last 7 Days") or "Last 7 Days")
-            if draft_date_mode == "Specific Date":
-                if available_dates_for_filter:
-                    st.selectbox(
-                        "Date:",
-                        available_dates_for_filter,
-                        key=spec_date_draft_key,
-                    )
-                else:
-                    st.caption("No dates available.")
+    t1, t2, t3, t4, t5 = st.columns([2.0, 1.15, 1.15, 1.8, 0.9], vertical_alignment="bottom")
+    with t1:
+        st.text_input(
+            "Search MAC:",
+            placeholder="aa:bb:cc:dd:ee:ff",
+            key=mac_state_key,
+        )
+    with t2:
+        st.selectbox(
+            "Time Range:",
+            date_mode_options,
+            key=date_mode_state_key,
+        )
+    with t3:
+        st.selectbox(
+            "History:",
+            history_mode_options,
+            key=history_mode_state_key,
+        )
+    with t4:
+        live_mode = str(st.session_state.get(date_mode_state_key, "Last 7 Days") or "Last 7 Days")
+        if live_mode == "Specific Date":
+            if available_dates_for_filter:
+                if st.session_state.get(spec_date_state_key) not in available_dates_for_filter:
+                    st.session_state[spec_date_state_key] = available_dates_for_filter[0]
+                st.selectbox(
+                    "Date:",
+                    available_dates_for_filter,
+                    key=spec_date_state_key,
+                )
             else:
-                st.markdown("<div style='height: 2.55rem;'></div>", unsafe_allow_html=True)
-        with t5:
-            apply_filters = st.form_submit_button("Apply", use_container_width=True)
-            clear_filters = st.form_submit_button("Reset", use_container_width=True)
+                st.session_state[spec_date_state_key] = None
+                st.caption("No dates available.")
+        else:
+            st.markdown("<div style='height: 2.55rem;'></div>", unsafe_allow_html=True)
+    with t5:
+        clear_filters = st.button("Reset", key=f"devices_list_reset_{scope_key}", use_container_width=True)
 
     if clear_filters:
         st.session_state[mac_state_key] = ""
-        st.session_state[mac_draft_key] = ""
         st.session_state[date_mode_state_key] = "Last 7 Days"
-        st.session_state[date_mode_draft_key] = "Last 7 Days"
         st.session_state[history_mode_state_key] = "Hide"
-        st.session_state[history_mode_draft_key] = "Hide"
         if available_dates_for_filter:
             st.session_state[spec_date_state_key] = available_dates_for_filter[0]
-            st.session_state[spec_date_draft_key] = available_dates_for_filter[0]
         else:
             st.session_state[spec_date_state_key] = None
-            st.session_state[spec_date_draft_key] = None
         st.rerun()
-
-    if apply_filters:
-        st.session_state[mac_state_key] = str(st.session_state.get(mac_draft_key, "") or "").strip().lower()
-        mode_choice = str(st.session_state.get(date_mode_draft_key, "Last 7 Days") or "Last 7 Days")
-        st.session_state[date_mode_state_key] = mode_choice if mode_choice in date_mode_options else "Last 7 Days"
-        history_choice = str(st.session_state.get(history_mode_draft_key, "Hide") or "Hide")
-        st.session_state[history_mode_state_key] = history_choice if history_choice in history_mode_options else "Hide"
-        if st.session_state[date_mode_state_key] == "Specific Date" and available_dates_for_filter:
-            picked_date = st.session_state.get(spec_date_draft_key)
-            st.session_state[spec_date_state_key] = picked_date if picked_date in available_dates_for_filter else available_dates_for_filter[0]
-        else:
-            st.session_state[spec_date_state_key] = None
 
     mac_query = str(st.session_state.get(mac_state_key, "") or "").strip().lower()
     date_filter_mode = str(st.session_state.get(date_mode_state_key, "Last 7 Days") or "Last 7 Days")
     history_filter_mode = str(st.session_state.get(history_mode_state_key, "Hide") or "Hide")
-    spec_date = st.session_state.get(spec_date_state_key)
+    spec_date = (
+        st.session_state.get(spec_date_state_key)
+        if date_filter_mode == "Specific Date"
+        else None
+    )
 
     def _norm_token(x: str) -> str:
         return "".join(ch for ch in (x or "").lower() if ch.isalnum())
@@ -1997,16 +2123,22 @@ def device_list_popup(
     if not filtered_df.empty and "mac" in filtered_df.columns and banned_macs:
         filtered_df = filtered_df[~filtered_df["mac"].isin(banned_macs)]
 
-    if filtered_df.empty and status_type != "Authorized":
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.info(f"No {status_type.lower()} devices found for this criteria.")
-        return
+    scoped_events = filtered_df.copy()
+    if not scoped_events.empty:
+        scoped_events["ts"] = _coerce_ts_any(scoped_events.get("ts", pd.Series(index=scoped_events.index, dtype="object")))
+        scoped_events = scoped_events[scoped_events["ts"].notna()]
+        scoped_events = _filter_df_by_time_mode(
+            scoped_events,
+            "ts",
+            date_filter_mode,
+            spec_date if date_filter_mode == "Specific Date" else None,
+        )
 
-    if filtered_df.empty:
+    if scoped_events.empty:
         inventory = pd.DataFrame(columns=["mac", "ip", "host_name", "last_seen"])
     else:
         inventory = (
-            filtered_df.sort_values("ts", ascending=False)
+            scoped_events.sort_values("ts", ascending=False)
             .groupby("mac")
             .agg(
                 ip=("host", "first"),
@@ -2025,11 +2157,12 @@ def device_list_popup(
     if status_type == "Authorized":
         existing_macs = set(inventory["mac"].astype(str).tolist())
         missing_rows = []
-        for mac in authorized_added_at_map.keys():
-            m = normalize_mac(mac)
-            if not m or is_broadcast_mac(m) or m in existing_macs:
-                continue
-            missing_rows.append({"mac": m, "ip": "-", "host_name": "-", "last_seen": pd.NaT})
+        if date_filter_mode == "All Time":
+            for mac in authorized_added_at_map.keys():
+                m = normalize_mac(mac)
+                if not m or is_broadcast_mac(m) or m in existing_macs:
+                    continue
+                missing_rows.append({"mac": m, "ip": "-", "host_name": "-", "last_seen": pd.NaT})
 
         if missing_rows:
             inventory = pd.concat([inventory, pd.DataFrame(missing_rows)], ignore_index=True)
@@ -2042,26 +2175,9 @@ def device_list_popup(
         # Fetch EXACT date from authorization page map
         inventory["authorized_at"] = inventory["mac"].map(_get_added_dt)
         inventory["authorized_at"] = _coerce_ts_any(inventory["authorized_at"])
-        
-        # Sort and filter the table by the Authorization Date
-        inventory["sort_dt"] = inventory["authorized_at"]
         inventory["Authorized Date"] = inventory["authorized_at"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
-    else:
-        # For unauthorized, sort and filter by Last Seen
-        inventory["sort_dt"] = _coerce_ts_any(inventory["last_seen"])
 
-    # Date Filtering
-    if date_filter_mode == "Last 7 Days":
-        seven_days_ago = get_local_now() - timedelta(days=7)
-        inventory = inventory[inventory["sort_dt"].notna() & (inventory["sort_dt"] >= seven_days_ago)]
-    elif date_filter_mode == "Last 30 Days":
-        thirty_days_ago = get_local_now() - timedelta(days=30)
-        inventory = inventory[inventory["sort_dt"].notna() & (inventory["sort_dt"] >= thirty_days_ago)]
-    elif date_filter_mode == "Specific Date":
-        if spec_date:
-            inventory = inventory[inventory["sort_dt"].dt.strftime("%Y-%m-%d") == spec_date]
-        else:
-            inventory = inventory.iloc[0:0]
+    inventory["sort_dt"] = _coerce_ts_any(inventory.get("last_seen", pd.Series(index=inventory.index, dtype="object")))
 
     if inventory.empty:
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2326,9 +2442,17 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
         f_date = "All Dates"
 
     activity_df = get_device_activity(parquet_root, mac, ip, f_date, selected_dates_tuple)
+    activity_df = _filter_df_by_time_mode(
+        activity_df,
+        "ts",
+        forensic_mode,
+        f_date if forensic_mode == "Specific Date" else None,
+    )
 
     if not activity_df.empty:
         activity_df = activity_df.copy()
+        activity_df["ts"] = _coerce_ts_any(activity_df["ts"])
+        activity_df = activity_df[activity_df["ts"].notna()]
 
         if f_service != "All Services":
             activity_df = activity_df[activity_df["Service"] == f_service]
@@ -2427,6 +2551,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     inventory_sig = _inventory_file_signature(PARQUET_ROOT)
     alerts_cache_sig = _alerts_event_cache_signature(PARQUET_ROOT)
     alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
+    inventory_history_rows = load_device_inventory_history_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
 
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
@@ -2548,6 +2673,22 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     if "mac" in inventory_scope.columns and banned_macs:
         inventory_scope = inventory_scope[~inventory_scope["mac"].isin(banned_macs)].copy()
+
+    # Event-level scope for accurate time-range filtering in Device list dialogs.
+    popup_inventory_scope = inventory_history_rows.copy()
+    if popup_inventory_scope.empty:
+        popup_inventory_scope = in_scope.copy()
+    if "host_name" not in popup_inventory_scope.columns:
+        popup_inventory_scope["host_name"] = "-"
+    popup_inventory_scope["ts"] = _coerce_ts_any(
+        popup_inventory_scope.get("ts", pd.Series(index=popup_inventory_scope.index, dtype="object"))
+    )
+    popup_inventory_scope = popup_inventory_scope.dropna(subset=["mac", "ts"])
+    popup_inventory_scope["status"] = popup_inventory_scope["mac"].apply(
+        lambda m: "Authorized" if (m in authorized_macs) else "Unauthorized"
+    )
+    if "mac" in popup_inventory_scope.columns and banned_macs:
+        popup_inventory_scope = popup_inventory_scope[~popup_inventory_scope["mac"].isin(banned_macs)].copy()
 
     # Metrics
     today = get_local_now().date()
@@ -2801,7 +2942,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if st.session_state.active_dialog == "list":
         device_list_popup(
             st.session_state.list_status_type,
-            inventory_scope,
+            popup_inventory_scope,
             PARQUET_ROOT,
             raw_dates,
             banned_macs,
