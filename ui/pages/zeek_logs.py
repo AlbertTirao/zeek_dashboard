@@ -3,7 +3,12 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import duckdb
 import pandas as pd
-from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
+from .header_layout import (
+    dashboard_loading_ui,
+    inject_traffic_style_header_css,
+    render_traffic_style_header,
+)
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 
 
 def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
@@ -11,6 +16,207 @@ def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
         st.caption(f"Showing {shown_rows:,} of {total_rows:,} rows. Narrow filters or increase row limit for more.")
     else:
         st.caption(f"Showing {shown_rows:,} rows.")
+
+
+def _is_dark_theme() -> bool:
+    try:
+        base = st.get_option("theme.base")
+        if isinstance(base, str) and base.lower() in {"light", "dark"}:
+            return base.lower() == "dark"
+    except Exception:
+        pass
+    return True
+
+
+def get_aggrid_theme_and_css():
+    dark = _is_dark_theme()
+    theme = "alpine-dark" if dark else "alpine"
+
+    custom_css = {
+        ".ag-root-wrapper": {"background-color": "#050B16", "color": "#EAEAEA", "border": "1px solid #22324E"},
+        ".ag-root, .ag-body, .ag-body-viewport, .ag-body-clipper, .ag-center-cols-clipper, .ag-center-cols-viewport, .ag-center-cols-container": {
+            "background-color": "#050B16"
+        },
+        ".ag-header": {"background-color": "#0A1730", "color": "#EAF2FF", "border-bottom": "1px solid #29406A"},
+        ".ag-header-cell, .ag-header-group-cell": {
+            "background-color": "#0A1730",
+            "color": "#EAF2FF",
+            "border-right": "1px solid #20365A",
+        },
+        ".ag-header-cell-menu-button, .ag-header-cell-filter-button": {
+            "opacity": "1 !important",
+            "visibility": "visible !important",
+            "display": "inline-flex !important",
+            "align-items": "center !important",
+            "justify-content": "center !important",
+            "color": "#FFFFFF !important",
+        },
+        ".ag-header-cell-menu-button .ag-icon, .ag-header-cell-filter-button .ag-icon, .ag-header-cell-menu-button .ag-icon-menu": {
+            "opacity": "1 !important",
+            "color": "#FFFFFF !important",
+        },
+        ".ag-header-cell-label": {"font-weight": "700", "letter-spacing": "0.02em"},
+        ".ag-cell": {"background-color": "#050B16", "color": "#EAEAEA", "border-color": "#13233D"},
+        ".ag-row": {"background-color": "#050B16"},
+        ".ag-row-odd": {"background-color": "#071224"},
+        ".ag-row-even": {"background-color": "#050E1D"},
+        ".ag-row-hover": {"background-color": "#0F203D"},
+        ".ag-row-selected": {"background-color": "#1E3A5F"},
+        ".ag-menu, .ag-popup-child, .ag-filter, .ag-filter-body-wrapper, .ag-set-filter-list, .ag-virtual-list-viewport, .ag-rich-select-list": {
+            "background-color": "#071224 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2E4E7A !important",
+        },
+        ".ag-menu-option": {"background-color": "#071224 !important", "color": "#EAF2FF !important"},
+        ".ag-menu-option:hover, .ag-menu-option.ag-menu-option-active, .ag-set-filter-item:hover": {
+            "background-color": "#13305A !important",
+            "color": "#EAF2FF !important",
+        },
+        ".ag-menu .ag-input-field-input, .ag-filter-body input, .ag-mini-filter input, .ag-floating-filter-input": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #32517F !important",
+        },
+        ".ag-picker-field-wrapper, .ag-picker-field-display, .ag-select-list, .ag-list-item": {
+            "background-color": "#071224 !important",
+            "color": "#EAF2FF !important",
+            "border-color": "#2E4E7A !important",
+        },
+        ".ag-floating-filter-body input": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #32517F !important",
+            "border-radius": "6px !important",
+        },
+        ".ag-paging-panel": {"background-color": "#050B16", "color": "#EAEAEA", "border-top": "1px solid #22324E"},
+        ".ag-paging-row-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-paging-page-summary-panel": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-pagination": {"background-color": "#050B16", "color": "#EAEAEA"},
+        ".ag-paging-page-size": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-page-size": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+            "outline": "none !important",
+        },
+        ".ag-paging-panel .ag-page-size option": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-paging-panel .ag-select, .ag-paging-panel .ag-picker-field-wrapper": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAEAEA !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-paging-panel .ag-picker-field-display": {"background-color": "#0A1730 !important", "color": "#EAEAEA !important"},
+        ".ag-standard-button, .ag-button, button.ag-standard-button, .ag-filter-apply-panel button": {
+            "background-color": "#0A1730 !important",
+            "color": "#EAF2FF !important",
+            "border": "1px solid #2D456C !important",
+        },
+        ".ag-standard-button:hover, .ag-button:hover, .ag-filter-apply-panel button:hover": {
+            "background-color": "#13305A !important",
+            "color": "#FFFFFF !important",
+            "border": "1px solid #3B5C8F !important",
+        },
+        ".ag-standard-button span, .ag-button span, .ag-filter-apply-panel button span": {
+            "color": "#EAF2FF !important",
+        },
+        ".ag-root-wrapper ::-webkit-scrollbar-button": {
+            "display": "none !important",
+            "width": "0 !important",
+            "height": "0 !important",
+        },
+    }
+    return theme, custom_css
+
+
+def _table_height_for_rows(
+    n_rows: int,
+    *,
+    row_px: int = 34,
+    header_px: int = 48,
+    min_px: int = 240,
+    max_px: int = 520,
+) -> int:
+    try:
+        rows = max(int(n_rows), 1)
+    except Exception:
+        rows = 1
+    return max(min_px, min(max_px, header_px + rows * row_px))
+
+
+def _apply_shadow_grid_filter_sort(grid_options: dict) -> dict:
+    opts = dict(grid_options or {})
+    default_col_def = dict(opts.get("defaultColDef") or {})
+
+    default_col_def["sortable"] = True
+    default_col_def["filter"] = "agSetColumnFilter"
+    default_col_def["floatingFilter"] = False
+    default_col_def.setdefault("minWidth", 96)
+    default_col_def["menuTabs"] = ["filterMenuTab", "generalMenuTab"]
+    default_col_def["suppressMenu"] = False
+
+    filter_params = dict(default_col_def.get("filterParams") or {})
+    filter_params.setdefault("excelMode", "windows")
+    filter_params.setdefault("suppressMiniFilter", False)
+    default_col_def["filterParams"] = filter_params
+
+    opts["defaultColDef"] = default_col_def
+    opts["suppressMenuHide"] = False
+    opts["enableCellTextSelection"] = True
+    opts["ensureDomOrder"] = True
+    opts["enableRtl"] = False
+    opts["suppressColumnVirtualisation"] = True
+    opts.setdefault("pagination", True)
+    if opts.get("pagination"):
+        opts.setdefault("paginationAutoPageSize", False)
+        opts.setdefault("paginationPageSize", 25)
+        opts.setdefault("paginationPageSizeSelector", [25, 50, 100])
+    # Keep column widths stable in the log explorer so sparse tables stretch cleanly
+    # instead of collapsing to content width and leaving a blank viewport area.
+    opts.pop("autoSizeStrategy", None)
+    opts.pop("onFirstDataRendered", None)
+    opts.pop("onGridSizeChanged", None)
+    return opts
+
+
+def _stretch_sparse_grid_columns(grid_options: dict, df_grid: pd.DataFrame) -> dict:
+    opts = dict(grid_options or {})
+    data_columns = [str(col) for col in df_grid.columns if str(col) != "#"]
+    if len(data_columns) > 6:
+        return opts
+
+    column_defs = [dict(col_def or {}) for col_def in (opts.get("columnDefs") or [])]
+    if not column_defs:
+        return opts
+
+    stretchable_count = max(len(data_columns), 1)
+    flex_value = 2 if stretchable_count <= 3 else 1
+    min_width = 150 if stretchable_count <= 3 else 130
+
+    for col_def in column_defs:
+        field = str(col_def.get("field", "") or "")
+        if field == "#":
+            col_def["width"] = 70
+            col_def["maxWidth"] = 82
+            col_def["minWidth"] = 64
+            col_def["pinned"] = "left"
+            col_def["suppressSizeToFit"] = True
+            col_def.pop("flex", None)
+            continue
+
+        col_def["flex"] = flex_value
+        col_def["minWidth"] = max(int(col_def.get("minWidth", 0) or 0), min_width)
+        col_def["suppressSizeToFit"] = False
+
+    default_col_def = dict(opts.get("defaultColDef") or {})
+    default_col_def["resizable"] = True
+    if stretchable_count <= 6:
+        default_col_def["minWidth"] = max(int(default_col_def.get("minWidth", 0) or 0), min_width)
+    opts["defaultColDef"] = default_col_def
+    opts["columnDefs"] = column_defs
+    opts["suppressHorizontalScroll"] = True
+    return opts
+
+
 
 
 # -------------------------
@@ -382,91 +588,54 @@ def render(parquet_root: Path):
         chip_label="Live monitoring",
         updated_txt=updated_txt,
     )
+    with dashboard_loading_ui(
+        title="Loading Zeek Logs",
+        subtitle="Scanning parquet logs, discovering datasets, and preparing the raw log explorer.",
+        steps=["Discover dates", "Read parquet", "Render explorer"],
+        container=st.empty(),
+    ):
+        available_dates = get_available_dates(parquet_root)
+        if not available_dates:
+            st.warning(f"No parquet data found in `{parquet_root}`")
+            st.info("Try running 'Force Refresh Data' in the sidebar.")
+            return
 
-    available_dates = get_available_dates(parquet_root)
-    if not available_dates:
-        st.warning(f"No parquet data found in `{parquet_root}`")
-        st.info("Try running 'Force Refresh Data' in the sidebar.")
-        return
+        day_col, day_hint_col = st.columns([1.2, 2])
+        with day_col:
+            selected_date = st.selectbox("Dataset Day", available_dates, key="zeek_day_select")
+        with day_hint_col:
+            st.markdown(
+                f"<div class='shadow-day-chip'>Active date: &nbsp; <strong>{selected_date}</strong></div>",
+                unsafe_allow_html=True,
+            )
 
-    day_col, day_hint_col = st.columns([1.2, 2])
-    with day_col:
-        selected_date = st.selectbox("Dataset Day", available_dates, key="zeek_day_select")
-    with day_hint_col:
-        st.markdown(
-            f"<div class='shadow-day-chip'>Active date: &nbsp; <strong>{selected_date}</strong></div>",
-            unsafe_allow_html=True,
-        )
+        log_types = get_log_types_for_date(parquet_root, selected_date)
+        if not log_types:
+            st.info(f"No logs found for {selected_date}")
+            return
 
-    log_types = get_log_types_for_date(parquet_root, selected_date)
-    if not log_types:
-        st.info(f"No logs found for {selected_date}")
-        return
+    log_key = "zeek_log_type"
+    search_key = "zeek_log_search"
 
-    log_applied_key = "zeek_log_type_applied"
-    search_applied_key = "zeek_log_search_applied"
-    row_limit_applied_key = "zeek_row_limit_applied"
-    log_draft_key = "zeek_log_type_draft"
-    search_draft_key = "zeek_log_search_draft"
-    row_limit_draft_key = "zeek_row_limit_draft"
-    row_limit_options = [200, 500, 1000, 2000, 5000, 10000]
-
-    if st.session_state.get(log_applied_key) not in log_types:
-        st.session_state[log_applied_key] = log_types[0]
-    if row_limit_applied_key not in st.session_state:
-        st.session_state[row_limit_applied_key] = 1000
-    if int(st.session_state.get(row_limit_applied_key, 1000)) not in row_limit_options:
-        st.session_state[row_limit_applied_key] = 1000
-
-    if st.session_state.get(log_draft_key) not in log_types:
-        st.session_state[log_draft_key] = st.session_state[log_applied_key]
-    if search_draft_key not in st.session_state:
-        st.session_state[search_draft_key] = str(st.session_state.get(search_applied_key, "") or "")
-    if int(st.session_state.get(row_limit_draft_key, st.session_state[row_limit_applied_key])) not in row_limit_options:
-        st.session_state[row_limit_draft_key] = int(st.session_state[row_limit_applied_key])
+    if st.session_state.get(log_key) not in log_types:
+        st.session_state[log_key] = log_types[0]
+    if search_key not in st.session_state:
+        st.session_state[search_key] = ""
 
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
-    with st.form("zeek_logs_filters_form", clear_on_submit=False):
-        filter_col1, filter_col2, filter_col3 = st.columns([1.0, 1.45, 0.8])
-        with filter_col1:
-            st.selectbox("Log Type", log_types, key=log_draft_key)
-        with filter_col2:
-            st.text_input(
-                "Search (all columns)",
-                placeholder="IP, domain, uid, ts, or any value...",
-                key=search_draft_key,
-            )
-        with filter_col3:
-            st.selectbox(
-                "Rows",
-                options=row_limit_options,
-                key=row_limit_draft_key,
-            )
-        form_btn_col1, form_btn_col2, _ = st.columns([0.75, 0.75, 2.5])
-        with form_btn_col1:
-            apply_filters = st.form_submit_button("Apply Filters", use_container_width=True)
-        with form_btn_col2:
-            reset_filters = st.form_submit_button("Reset", use_container_width=True)
+    filter_col1, filter_col2 = st.columns([1.0, 1.8])
+    with filter_col1:
+        st.selectbox("Log Type", log_types, key=log_key)
+    with filter_col2:
+        st.text_input(
+            "Search (all columns)",
+            placeholder="IP, domain, uid, ts, or any value...",
+            key=search_key,
+        )
 
-    if reset_filters:
-        st.session_state[log_applied_key] = log_types[0]
-        st.session_state[search_applied_key] = ""
-        st.session_state[row_limit_applied_key] = 1000
-        st.session_state[log_draft_key] = log_types[0]
-        st.session_state[search_draft_key] = ""
-        st.session_state[row_limit_draft_key] = 1000
-        st.rerun()
-
-    if apply_filters:
-        chosen_log = st.session_state.get(log_draft_key, log_types[0])
-        st.session_state[log_applied_key] = chosen_log if chosen_log in log_types else log_types[0]
-        st.session_state[search_applied_key] = str(st.session_state.get(search_draft_key, "") or "").strip()
-        chosen_limit = int(st.session_state.get(row_limit_draft_key, 1000) or 1000)
-        st.session_state[row_limit_applied_key] = chosen_limit if chosen_limit in row_limit_options else 1000
-
-    selected_log = str(st.session_state.get(log_applied_key, log_types[0]) or log_types[0])
-    search_term = str(st.session_state.get(search_applied_key, "") or "")
-    row_limit = int(st.session_state.get(row_limit_applied_key, 1000) or 1000)
+    selected_log = str(st.session_state.get(log_key, log_types[0]) or log_types[0])
+    search_term = str(st.session_state.get(search_key, "") or "")
+    row_limit = None
 
     st.markdown(
         f"<div class='shadow-filter-hint'>Log: <strong>{selected_log}</strong> | Search: <strong>{'On' if search_term.strip() else 'Off'}</strong> | Datetime: <strong>YYYY-MM-DD[ HH[:MM[:SS[.ffffff]]]]</strong></div>",
@@ -485,13 +654,62 @@ def render(parquet_root: Path):
 
     st.write(f"### {selected_log}.log")
     render_rows_caption(total_rows=len(df_display), shown_rows=len(df_display))
-    if len(df_display) >= row_limit:
-        st.caption(f"Query is capped at {row_limit:,} rows for responsiveness.")
-
     df_display = df_display.reset_index(drop=True)
     df_display.index = df_display.index + 1
 
     st.markdown("<div class='shadow-table-shell'>", unsafe_allow_html=True)
-    st.dataframe(df_display, width="stretch", height=600)
+    df_grid = df_display.copy()
+    df_grid.insert(0, "#", range(1, len(df_grid) + 1))
+
+    gb = GridOptionsBuilder.from_dataframe(df_grid)
+    gb.configure_default_column(filter=True, sortable=True, resizable=True)
+    gb.configure_column("#", header_name="#", width=70, pinned="left", suppressMovable=True, resizable=False)
+
+    grid_options = _apply_shadow_grid_filter_sort(gb.build())
+    grid_options = _stretch_sparse_grid_columns(grid_options, df_grid)
+    grid_options["pagination"] = False
+    grid_options["rowSelection"] = "single"
+    grid_options["suppressRowClickSelection"] = True
+    grid_options["rowMultiSelectWithClick"] = False
+    grid_options["domLayout"] = "normal"
+    grid_options["alwaysShowVerticalScroll"] = True
+    grid_options.setdefault("suppressHorizontalScroll", False)
+    grid_options["alwaysShowHorizontalScroll"] = not bool(grid_options.get("suppressHorizontalScroll"))
+    grid_options["maintainColumnOrder"] = True
+    grid_options["suppressMovableColumns"] = True
+
+    ag_theme, ag_css = get_aggrid_theme_and_css()
+    log_ag_css = dict(ag_css)
+    log_ag_css.update(
+        {
+            ".ag-root-wrapper": {"background-color": "#061120", "color": "#EAF2FF", "border": "1px solid #2A466E"},
+            ".ag-header": {"background-color": "#10213E", "color": "#EAF2FF", "border-bottom": "1px solid #3A5A8E"},
+            ".ag-header-cell, .ag-header-group-cell": {"background-color": "#10213E", "color": "#EAF2FF", "border-right": "1px solid #2A466E"},
+            ".ag-row-odd": {"background-color": "#07162A"},
+            ".ag-row-even": {"background-color": "#0A1C33"},
+            ".ag-row-hover": {"background-color": "#13305A"},
+            ".ag-row-selected": {"background-color": "#1B3F75"},
+            ".ag-root-wrapper ::-webkit-scrollbar-button": {
+                "display": "none !important",
+                "width": "0 !important",
+                "height": "0 !important",
+            },
+        }
+    )
+
+    AgGrid(
+        df_grid,
+        gridOptions=grid_options,
+        update_mode=GridUpdateMode.MODEL_CHANGED,
+        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+        height=_table_height_for_rows(len(df_grid), min_px=240, max_px=520),
+        theme=ag_theme,
+        custom_css=log_ag_css,
+        allow_unsafe_jscode=True,
+        enable_enterprise_modules=True,
+        fit_columns_on_grid_load=False,
+        reload_data=False,
+        key=f"zeek_log_grid_{selected_date}_{selected_log}",
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 

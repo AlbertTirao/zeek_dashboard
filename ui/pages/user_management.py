@@ -4,7 +4,11 @@ from datetime import datetime
 import time
 
 from services import auth_service
-from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
+from .header_layout import (
+    inject_traffic_style_header_css,
+    render_dashboard_loading_state,
+    render_traffic_style_header,
+)
 
 try:
     from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, GridUpdateMode, JsCode
@@ -433,7 +437,7 @@ def _safe_display_name(raw_name: str, username: str) -> str:
 
 def _um_table_height_for_rows(row_count: int) -> int:
     visible_rows = max(4, min(int(row_count or 0), 8))
-    return 50 + (visible_rows * 54) + 4
+    return 42 + (visible_rows * 42) + 4
 
 
 def _user_table_aggrid_theme_and_css() -> tuple[str, dict]:
@@ -831,12 +835,6 @@ def render(current_username: str):
         st.error("streamlit-aggrid is required for the Action column UI.")
         return
 
-    users = _get_cached_users(force=False)
-
-    total_users = len(users)
-    admin_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
-    staff_count = sum(1 for u in users if str(u.get("role", "")).lower() == "staff")
-
     updated_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     render_traffic_style_header(
         title="User Management",
@@ -844,6 +842,19 @@ def render(current_username: str):
         chip_label="Identity Access",
         updated_txt=updated_txt,
     )
+    loading_slot = st.empty()
+    render_dashboard_loading_state(
+        title="Loading User Management",
+        subtitle="Loading account records, access roles, and the admin management workspace.",
+        steps=["Read users", "Prepare table", "Render controls"],
+        container=loading_slot,
+    )
+    users = _get_cached_users(force=False)
+    loading_slot.empty()
+
+    total_users = len(users)
+    admin_count = sum(1 for u in users if str(u.get("role", "")).lower() == "admin")
+    staff_count = sum(1 for u in users if str(u.get("role", "")).lower() == "staff")
 
     create_feedback = st.session_state.pop("um_create_feedback", None)
     if isinstance(create_feedback, dict):
@@ -958,8 +969,8 @@ def render(current_username: str):
         grid_options["rowMultiSelectWithClick"] = False
         grid_options["enableCellTextSelection"] = True
         grid_options["ensureDomOrder"] = True
-        grid_options["rowHeight"] = 54
-        grid_options["headerHeight"] = 50
+        grid_options["rowHeight"] = 42
+        grid_options["headerHeight"] = 42
         grid_options["suppressHorizontalScroll"] = True
         grid_options["alwaysShowHorizontalScroll"] = False
         grid_options["alwaysShowVerticalScroll"] = True

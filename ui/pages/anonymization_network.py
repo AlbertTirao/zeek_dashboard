@@ -2071,6 +2071,22 @@ def load_scored_date(
     return scored
 
 
+def _is_scored_cache_current(
+    parquet_root: Path,
+    date_str: str,
+    *,
+    feed_sig: dict,
+    ip2_sig: dict,
+) -> bool:
+    root = Path(parquet_root).resolve()
+    files = _collect_date_files(root / date_str)
+    base_sig = _date_sig_map(files)
+    expected = _scored_meta_expected(base_sig=base_sig, feed_sig=feed_sig, ip2_sig=ip2_sig)
+    cpath = cache_scored_path(root, date_str)
+    mpath = cache_scored_meta_path(root, date_str)
+    return cpath.exists() and _read_json(mpath) == expected
+
+
 def _feed_label(meta: dict) -> str:
     out = f"{meta.get('status','unknown')} | {int(meta.get('count',0)):,} IPs"
     if "pair_count" in meta:
@@ -2558,8 +2574,6 @@ def inject_anonymization_network_css():
         """,
         unsafe_allow_html=True,
     )
-
-
 def inject_shadow_tunnels_css():
     # Backward-compatible alias.
     inject_anonymization_network_css()
@@ -2572,10 +2586,26 @@ def ensure_scored_cache(
     feeds: dict,
     ip2_df: pd.DataFrame,
     ip2_sig: dict,
+    show_progress: bool = True,
 ) -> None:
-    total = max(len(target_dates), 1)
-    prog = st.progress(0, text="Preparing optimized cache...")
-    for i, d in enumerate(target_dates, start=1):
+    stale_dates: List[str] = []
+    for d in target_dates:
+        if not _is_scored_cache_current(parquet_root, d, feed_sig=_feed_signature(parquet_root, d), ip2_sig=ip2_sig):
+            stale_dates.append(str(d))
+    if not stale_dates:
+        return
+
+    total = max(len(stale_dates), 1)
+
+    class _NoopProgress:
+        def progress(self, *_args, **_kwargs):
+            return None
+
+        def empty(self):
+            return None
+
+    prog = st.progress(0, text="Preparing optimized cache...") if show_progress else _NoopProgress()
+    for i, d in enumerate(stale_dates, start=1):
         _ = load_scored_date(
             parquet_root,
             d,
@@ -2626,19 +2656,38 @@ def _folder_date_from_scored_cache_path(path: Path) -> str:
 
 @st.cache_data(show_spinner=False)
 def _load_scored_scope_cached(sig: Tuple[Tuple[str, int, int], ...]) -> pd.DataFrame:
+    paths = [Path(str(row[0])) for row in sig if row and str(row[0]).strip()]
+    if not paths:
+        return pd.DataFrame()
+
+    con = _duck_conn()
+    try:
+        df = con.execute(
+            "SELECT * FROM read_parquet("
+            + _sql_list(paths)
+            + ", union_by_name=TRUE, filename='source_file_path')"
+        ).fetchdf()
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if "source_file_path" in df.columns:
+            df["_folder_date"] = df["source_file_path"].map(
+                lambda raw: _folder_date_from_scored_cache_path(Path(str(raw)))
+            )
+            df = df.drop(columns=["source_file_path"], errors="ignore")
+        return _to_datetime(df, "ts")
+    except Exception:
+        pass
+
     frames: List[pd.DataFrame] = []
-    for row in sig:
-        if not row:
-            continue
-        p = Path(str(row[0]))
+    for path in paths:
         try:
-            dfi = pd.read_parquet(p)
+            dfi = pd.read_parquet(path)
         except Exception:
             continue
         if dfi is None or dfi.empty:
             continue
         dfi = dfi.copy()
-        dfi["_folder_date"] = _folder_date_from_scored_cache_path(p)
+        dfi["_folder_date"] = _folder_date_from_scored_cache_path(path)
         frames.append(dfi)
     if not frames:
         return pd.DataFrame()
@@ -2891,6 +2940,21 @@ def render_anonymization_network(parquet_root: Path):
         st.error("No dated parquet folders found.")
         return
 
+    sync_token = int(st.session_state.get("_parquet_sync_token", 0))
+    if st.session_state.get("_anonym_net_last_sync_token") != sync_token:
+        _close_anonymization_allow_dialog()
+        _bump_anonymization_table_nonce()
+        st.session_state["anonym_net_date"] = dates[0]
+        st.session_state["_anonym_net_last_sync_token"] = sync_token
+        st.session_state.pop("_anonym_net_scope_df_key_v1", None)
+        st.session_state.pop("_anonym_net_scope_df_v1", None)
+    elif str(st.session_state.get("anonym_net_date", "")).strip() not in dates:
+        _close_anonymization_allow_dialog()
+        _bump_anonymization_table_nonce()
+        st.session_state["anonym_net_date"] = dates[0]
+        st.session_state.pop("_anonym_net_scope_df_key_v1", None)
+        st.session_state.pop("_anonym_net_scope_df_v1", None)
+
     date_sel_state = str(st.session_state.get("anonym_net_date", dates[0]))
     if date_sel_state not in dates:
         date_sel_state = dates[0]
@@ -2901,20 +2965,34 @@ def render_anonymization_network(parquet_root: Path):
     ip2, _, ip2_sig = load_ip2proxy_lookup()
 
     target_dates, adjacent_dates = _resolve_target_dates_with_adjacent(str(date_sel), dates)
-
     ensure_scored_cache(
         parquet_root,
         target_dates,
         feeds=feeds,
         ip2_df=ip2,
         ip2_sig=ip2_sig,
+        show_progress=False,
     )
 
     cached_files = read_scored_cached_files(parquet_root, target_dates)
     if not cached_files:
         st.info("No cached anonymization files available for selected date.")
         return
-    scored = load_scored_scope(cached_files)
+    scope_cache_key = (
+        sync_token,
+        str(date_sel),
+        tuple(target_dates),
+        _scored_sig(cached_files),
+    )
+    if (
+        st.session_state.get("_anonym_net_scope_df_key_v1") == scope_cache_key
+        and isinstance(st.session_state.get("_anonym_net_scope_df_v1"), pd.DataFrame)
+    ):
+        scored = st.session_state.get("_anonym_net_scope_df_v1")
+    else:
+        scored = load_scored_scope(cached_files)
+        st.session_state["_anonym_net_scope_df_key_v1"] = scope_cache_key
+        st.session_state["_anonym_net_scope_df_v1"] = scored
 
     if scored.empty:
         st.info("No scored events.")

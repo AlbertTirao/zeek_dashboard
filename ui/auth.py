@@ -41,6 +41,7 @@ LOGIN_CAPTCHA_CLEAR_INPUT_FLAG_SESSION_KEY = "login_captcha_clear_input_flag"
 LOGIN_STAGE_SESSION_KEY = "login_stage"
 LOGIN_PENDING_USER_SESSION_KEY = "login_pending_user"
 LOGIN_OTP_HASH_SESSION_KEY = "login_otp_hash"
+LOGIN_OTP_SALT_SESSION_KEY = "login_otp_salt"
 LOGIN_OTP_EXPIRES_AT_SESSION_KEY = "login_otp_expires_at"
 LOGIN_OTP_SENT_AT_SESSION_KEY = "login_otp_sent_at"
 LOGIN_FEEDBACK_MESSAGE_SESSION_KEY = "login_feedback_message"
@@ -205,6 +206,7 @@ def _clear_pending_login_flow(*, reset_stage: bool = True) -> None:
     for key in (
         LOGIN_PENDING_USER_SESSION_KEY,
         LOGIN_OTP_HASH_SESSION_KEY,
+        LOGIN_OTP_SALT_SESSION_KEY,
         LOGIN_OTP_EXPIRES_AT_SESSION_KEY,
         LOGIN_OTP_SENT_AT_SESSION_KEY,
     ):
@@ -219,12 +221,25 @@ def _otp_signature(username: str, otp_code: str) -> str:
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
 
+def _otp_digest(username: str, otp_code: str, salt: str) -> str:
+    payload = (
+        f"{str(username or '').strip().lower()}|{str(otp_code or '').strip()}|{str(salt or '').strip()}"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _normalize_otp_input(raw_value: str) -> str:
+    return "".join(ch for ch in str(raw_value or "") if ch.isdigit())
+
+
 def _issue_and_send_login_otp(username: str) -> None:
     clean_username = str(username or "").strip().lower()
     code = generate_email_otp_code(length=6)
     send_login_otp_email(clean_username, code, expires_seconds=LOGIN_OTP_EXPIRES_SECONDS)
     now = int(time.time())
-    st.session_state[LOGIN_OTP_HASH_SESSION_KEY] = _otp_signature(clean_username, code)
+    otp_salt = py_secrets.token_urlsafe(16)
+    st.session_state[LOGIN_OTP_SALT_SESSION_KEY] = otp_salt
+    st.session_state[LOGIN_OTP_HASH_SESSION_KEY] = _otp_digest(clean_username, code, otp_salt)
     st.session_state[LOGIN_OTP_SENT_AT_SESSION_KEY] = now
     st.session_state[LOGIN_OTP_EXPIRES_AT_SESSION_KEY] = now + LOGIN_OTP_EXPIRES_SECONDS
 
@@ -1185,20 +1200,28 @@ def require_authentication() -> None:
             _set_login_feedback("Your login session expired. Enter your credentials again.", "warning")
             st.rerun()
 
-        clean_otp = str(otp_code or "").strip()
-        if not clean_otp.isdigit():
-            st.error("OTP code must be numeric.")
+        clean_otp = _normalize_otp_input(otp_code)
+        if len(clean_otp) != 6:
+            st.error("OTP code must be a 6-digit number.")
             st.stop()
         if _otp_seconds_remaining() <= 0:
             st.error("OTP expired. Click Resend OTP to get a new code.")
             st.stop()
 
         expected_hash = str(st.session_state.get(LOGIN_OTP_HASH_SESSION_KEY, "") or "").strip()
-        if not expected_hash or not hmac.compare_digest(_otp_signature(pending_username, clean_otp), expected_hash):
+        otp_salt = str(st.session_state.get(LOGIN_OTP_SALT_SESSION_KEY, "") or "").strip()
+        otp_is_valid = False
+        if expected_hash and otp_salt:
+            otp_is_valid = hmac.compare_digest(_otp_digest(pending_username, clean_otp, otp_salt), expected_hash)
+        elif expected_hash:
+            otp_is_valid = hmac.compare_digest(_otp_signature(pending_username, clean_otp), expected_hash)
+
+        if not otp_is_valid:
             st.error("Invalid OTP code.")
             st.stop()
 
         st.session_state.pop(LOGIN_OTP_HASH_SESSION_KEY, None)
+        st.session_state.pop(LOGIN_OTP_SALT_SESSION_KEY, None)
         st.session_state.pop(LOGIN_OTP_EXPIRES_AT_SESSION_KEY, None)
         st.session_state.pop(LOGIN_OTP_SENT_AT_SESSION_KEY, None)
 

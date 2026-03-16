@@ -10,7 +10,11 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yaml
-from .header_layout import inject_traffic_style_header_css, render_traffic_style_header
+from .header_layout import (
+    inject_traffic_style_header_css,
+    render_dashboard_loading_state,
+    render_traffic_style_header,
+)
 
 # =============================================================================
 # Timezone Configuration
@@ -246,6 +250,18 @@ def _inventory_file_signature(parquet_root: Path) -> tuple[tuple[str, float, int
     return tuple(sig)
 
 
+def _alerts_source_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
+    sig = []
+    for _day_str, day_dir in iter_date_dirs(parquet_root):
+        for name in ("conn.parquet", "dhcp.parquet", "arp.parquet", "known_hosts.parquet"):
+            fp = day_dir / name
+            if not fp.exists():
+                continue
+            mtime_ns, size = _path_stat_sig(fp)
+            sig.append((str(fp), mtime_ns, size))
+    return tuple(sig)
+
+
 def _alerts_event_cache_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
     cache_root = parquet_root / "_cache_alerts"
     if not cache_root.exists():
@@ -370,6 +386,25 @@ def _filter_df_by_time_mode(
 
     cutoff = now - pd.Timedelta(days=ROLLING_TIME_WINDOWS_DAYS["Last 7 Days"])
     return out[out[ts_col] >= cutoff]
+
+
+def _clean_text_series(series: pd.Series | None, index) -> pd.Series:
+    if series is None:
+        return pd.Series(pd.NA, index=index, dtype="string")
+    out = series.astype("string")
+    out = out.str.strip()
+    out = out.replace(["", "-", "nan", "None", "none", "<NA>"], pd.NA)
+    return out
+
+
+def _normalize_dhcp_host_name(dhcp: pd.DataFrame) -> pd.DataFrame:
+    if dhcp is None or dhcp.empty:
+        return dhcp
+    host_name = _clean_text_series(dhcp.get("host_name"), dhcp.index)
+    fqdn = _clean_text_series(dhcp.get("client_fqdn"), dhcp.index)
+    dhcp = dhcp.copy()
+    dhcp["host_name"] = host_name.where(host_name.notna(), fqdn)
+    return dhcp
 
 
 @st.cache_data(show_spinner=False)
@@ -643,9 +678,32 @@ def load_visual_metrics_from_parquet(
     )
     dhcp = _duckdb_read_parquet_union_columns(
         dhcp_paths,
-        ("mac", "client_addr", "host_name", "domain"),
+        ("mac", "client_addr", "host_name", "client_fqdn", "domain"),
     )
+    dhcp = _normalize_dhcp_host_name(dhcp)
     return known_hosts, dhcp
+
+
+@st.cache_data(show_spinner=False)
+def load_dhcp_from_parquet(
+    parquet_root: Path,
+    inventory_sig: tuple[tuple[str, float, int], ...],
+) -> pd.DataFrame:
+    _ = inventory_sig
+    dhcp_paths: list[Path] = []
+    if not parquet_root.exists():
+        return pd.DataFrame()
+
+    for _date_str, day_dir in iter_date_dirs(parquet_root):
+        dh = day_dir / "dhcp.parquet"
+        if dh.exists():
+            dhcp_paths.append(dh)
+
+    dhcp = _duckdb_read_parquet_union_columns(
+        dhcp_paths,
+        ("mac", "client_addr", "host_name", "client_fqdn", "domain"),
+    )
+    return _normalize_dhcp_host_name(dhcp)
 
 
 # =====================================================
@@ -667,77 +725,40 @@ def _list_alert_event_cache_files(
 def load_alerts_latest_inventory_rows(
     parquet_root: Path,
     alert_cache_sig: tuple[tuple[str, float, int], ...],
-    inventory_sig: tuple[tuple[str, float, int], ...],
+    alerts_source_sig: tuple[tuple[str, float, int], ...],
 ) -> pd.DataFrame:
     """
     Pull the same latest-per-MAC inventory basis used by Alerts page so
     Device Inspection cards/table reconcile with Alerts.
     """
-    _ = inventory_sig
+    _ = alert_cache_sig
+    _ = alerts_source_sig
     base_cols = ["mac", "host", "ts"]
-
     latest = None
+    try:
+        from ui.pages import alerts as alerts_page
 
-    cache_files = list(_list_alert_event_cache_files(parquet_root, alert_cache_sig))
-    if cache_files:
-        try:
-            import duckdb
-
-            con = duckdb.connect(database=":memory:")
-            fallback = con.execute(
-                """
-                WITH ev AS (
-                  SELECT
-                    try_cast(ts_dt AS timestamp) AS ts_dt,
-                    cast(mac_norm AS varchar) AS mac_norm,
-                    NULLIF(NULLIF(cast(ip AS varchar), ''), 'nan') AS ip,
-                    NULLIF(NULLIF(cast(host AS varchar), ''), 'nan') AS host
-                  FROM read_parquet(?, union_by_name=true)
-                  WHERE mac_norm IS NOT NULL
-                )
-                SELECT
-                  mac_norm AS mac,
-                  ip,
-                  host,
-                  ts_dt AS ts
-                FROM ev
-                WHERE ts_dt IS NOT NULL
-                QUALIFY row_number() OVER (PARTITION BY mac_norm ORDER BY ts_dt DESC) = 1
-                """,
-                [cache_files],
-            ).df()
-            con.close()
-
-            if fallback is not None and not fallback.empty:
-                latest = fallback[["mac", "ip", "host", "ts"]].copy()
-        except Exception:
-            latest = None
-
-    if latest is None or latest.empty:
-        try:
-            from ui.pages import alerts as alerts_page
-
-            by_date_str = alerts_page._discover_date_dirs(str(parquet_root))
-            selected_date_dirs_key = tuple(
-                (date_str, str(Path(day_dir)))
-                for date_str in sorted(by_date_str.keys(), reverse=True)
-                for day_dir in by_date_str.get(date_str, [])
+        by_date_str = alerts_page._discover_date_dirs(str(parquet_root))
+        selected_date_dirs = [
+            (date_str, Path(day_dir))
+            for date_str in sorted(by_date_str.keys(), reverse=True)
+            for day_dir in by_date_str.get(date_str, [])
+        ]
+        if selected_date_dirs:
+            raw_events, _known_hosts_norm = alerts_page._load_cached_for_date_dirs(
+                Path(parquet_root), selected_date_dirs
             )
-            if selected_date_dirs_key:
-                raw_events, known_hosts_norm = alerts_page._load_cached_for_date_dirs_cached(
-                    str(parquet_root), selected_date_dirs_key
-                )
-                if raw_events is not None and not raw_events.empty:
-                    mac_to_ip, _ = alerts_page.build_known_maps(known_hosts_norm)
-                    latest = alerts_page.build_device_table(raw_events, mac_to_ip)
-        except Exception:
-            latest = None
+            if raw_events is not None and not raw_events.empty:
+                latest = raw_events[["mac_norm", "ip", "host", "ts_dt"]].copy()
+                latest = latest.rename(columns={"mac_norm": "mac", "ts_dt": "ts"})
+    except Exception:
+        latest = None
 
     if latest is None or latest.empty:
         return pd.DataFrame(columns=base_cols)
 
     out = latest.copy()
-    out["mac"] = out.get("mac_norm", pd.Series(index=out.index, dtype="object")).map(normalize_mac)
+    out["mac"] = out.get("mac", pd.Series(index=out.index, dtype="object")).map(normalize_mac)
     if "mac" not in out.columns or out["mac"].isna().all():
         if "mac_norm" in latest.columns:
             out["mac"] = latest["mac_norm"].map(normalize_mac)
@@ -1135,6 +1156,83 @@ def _extract_list_from_yaml(data, stem_key: str):
     return []
 
 
+def _normalize_item_keys(item: dict) -> dict:
+    return {str(k).strip().lower(): v for k, v in (item or {}).items()}
+
+
+def _clean_device_field(value: object) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"", "-", "nan", "none", "<na>", "null"}:
+        return ""
+    return text
+
+
+def _extract_mac_from_item(item: dict) -> str | None:
+    item_l = _normalize_item_keys(item)
+    for key in (
+        "mac",
+        "mac_address",
+        "mac address",
+        "macaddress",
+        "device_mac",
+        "device mac",
+        "client_mac",
+        "client mac",
+        "l2addr",
+        "l2_addr",
+    ):
+        val = item_l.get(key)
+        if val:
+            return val
+    return None
+
+
+def load_authorized_device_records(file_path: Path) -> dict[str, dict]:
+    if file_path.suffix == ".txt":
+        yaml_path = file_path.with_suffix(".yaml")
+        if yaml_path.exists():
+            file_path = yaml_path
+
+    if not file_path.exists():
+        return {}
+
+    try:
+        data = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    raw_list = _extract_list_from_yaml(data, file_path.stem)
+    details: dict[str, dict] = {}
+    for item in raw_list:
+        if isinstance(item, str):
+            mac = normalize_mac(item)
+            if not mac or is_broadcast_mac(mac):
+                continue
+            details[mac] = {"ip": "", "host_name": "", "vendor": "", "date_modified": ""}
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        item_l = _normalize_item_keys(item)
+        mac = normalize_mac(_extract_mac_from_item(item_l))
+        if not mac or is_broadcast_mac(mac):
+            continue
+
+        details[mac] = {
+            "ip": _clean_device_field(item_l.get("ip") or item_l.get("host") or item_l.get("client_addr")),
+            "host_name": _clean_device_field(
+                item_l.get("hostname")
+                or item_l.get("host_name")
+                or item_l.get("host name")
+                or item_l.get("client_fqdn")
+            ),
+            "vendor": _clean_device_field(item_l.get("vendor") or item_l.get("manufacturer")),
+            "date_modified": _clean_device_field(item_l.get("date_modified")),
+        }
+    return details
+
+
 def load_banned_macs(ban_file: Path) -> set:
     if not ban_file.exists():
         return set()
@@ -1152,7 +1250,7 @@ def load_banned_macs(ban_file: Path) -> set:
             if m and not is_broadcast_mac(m):
                 banned.add(m)
         elif isinstance(it, dict):
-            m = normalize_mac(it.get("mac"))
+            m = normalize_mac(_extract_mac_from_item(it))
             if m and not is_broadcast_mac(m):
                 banned.add(m)
     return banned
@@ -1311,11 +1409,12 @@ def load_authorized_macs_with_history(file_path: Path, authorized_mac_file_for_s
         if isinstance(item, str):
             mac = normalize_mac(item)
         elif isinstance(item, dict):
-            mac = normalize_mac(item.get("mac"))
+            item_l = _normalize_item_keys(item)
+            mac = normalize_mac(_extract_mac_from_item(item_l))
             # Specifically grab the date_modified stored by the authorization page
             for k in ["date_modified", "date_added", "added_at", "timestamp", "created_at"]:
-                if k in item and item.get(k):
-                    added_dt = _parse_any_dt(item.get(k))
+                if k in item_l and item_l.get(k):
+                    added_dt = _parse_any_dt(item_l.get(k))
                     if added_dt:
                         break
 
@@ -1905,31 +2004,16 @@ def active_today_popup(
     inv["last_seen_today"] = _coerce_ts_any(inv["last_seen_today"])
     inv["last_seen_today_str"] = inv["last_seen_today"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    active_search_state_key = "active_search_applied"
-    active_search_draft_key = "active_search_draft"
+    active_search_state_key = "active_search"
     if active_search_state_key not in st.session_state:
         st.session_state[active_search_state_key] = ""
-    if active_search_draft_key not in st.session_state:
-        st.session_state[active_search_draft_key] = st.session_state[active_search_state_key]
 
     st.markdown("<div class='dialog-toolbar'>", unsafe_allow_html=True)
-    with st.form("active_devices_search_form", clear_on_submit=False):
-        st.text_input(
-            "Search MAC:",
-            placeholder="aa:bb:cc:dd:ee:ff",
-            key=active_search_draft_key,
-        )
-        active_form_col1, active_form_col2, _ = st.columns([1.0, 1.0, 4.0])
-        with active_form_col1:
-            apply_active_search = st.form_submit_button("Apply Search", use_container_width=True)
-        with active_form_col2:
-            clear_active_search = st.form_submit_button("Clear", use_container_width=True)
-    if clear_active_search:
-        st.session_state[active_search_state_key] = ""
-        st.session_state[active_search_draft_key] = ""
-        st.rerun()
-    if apply_active_search:
-        st.session_state[active_search_state_key] = str(st.session_state.get(active_search_draft_key, "") or "").strip().lower()
+    st.text_input(
+        "Search MAC:",
+        placeholder="aa:bb:cc:dd:ee:ff",
+        key=active_search_state_key,
+    )
     q = str(st.session_state.get(active_search_state_key, "") or "").strip().lower()
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown(
@@ -2013,6 +2097,7 @@ def device_list_popup(
     banned_macs: set,
     authorized_added_at_map: dict,
     auth_change_history_df: pd.DataFrame,
+    authorized_device_details: dict[str, dict],
 ):
     hide_dialog_header()
     inject_page_css()
@@ -2148,8 +2233,23 @@ def device_list_popup(
             .reset_index()
         )
     inventory["last_seen"] = _coerce_ts_any(inventory["last_seen"])
-    inventory["ip"] = inventory.get("ip", "-").fillna("-").astype(str)
-    inventory["host_name"] = inventory.get("host_name", "-").fillna("-").astype(str)
+    auth_details = authorized_device_details or {}
+    auth_ip_series = pd.Series(
+        [auth_details.get(normalize_mac(mac) or "", {}).get("ip", "") for mac in inventory.get("mac", pd.Series(dtype="object"))],
+        index=inventory.index,
+        dtype="object",
+    )
+    auth_host_series = pd.Series(
+        [auth_details.get(normalize_mac(mac) or "", {}).get("host_name", "") for mac in inventory.get("mac", pd.Series(dtype="object"))],
+        index=inventory.index,
+        dtype="object",
+    )
+    base_ip = _clean_text_series(inventory.get("ip"), inventory.index)
+    auth_ip = _clean_text_series(auth_ip_series, inventory.index)
+    inventory["ip"] = base_ip.where(base_ip.notna(), auth_ip).fillna("-").astype(str)
+    base_host = _clean_text_series(inventory.get("host_name"), inventory.index)
+    auth_host = _clean_text_series(auth_host_series, inventory.index)
+    inventory["host_name"] = base_host.where(base_host.notna(), auth_host).fillna("-").astype(str)
 
     # ==========================================================
     # CORE FIX: Explicitly separate Authorized Date and Last Seen
@@ -2162,7 +2262,15 @@ def device_list_popup(
                 m = normalize_mac(mac)
                 if not m or is_broadcast_mac(m) or m in existing_macs:
                     continue
-                missing_rows.append({"mac": m, "ip": "-", "host_name": "-", "last_seen": pd.NaT})
+                auth_meta = auth_details.get(m, {})
+                missing_rows.append(
+                    {
+                        "mac": m,
+                        "ip": auth_meta.get("ip") or "-",
+                        "host_name": auth_meta.get("host_name") or "-",
+                        "last_seen": pd.NaT,
+                    }
+                )
 
         if missing_rows:
             inventory = pd.concat([inventory, pd.DataFrame(missing_rows)], ignore_index=True)
@@ -2206,8 +2314,14 @@ def device_list_popup(
             return
         inventory = inv
 
-    inventory["vendor"] = inventory["mac"].map(get_mac_vendor)
-    inventory["vendor"] = inventory["vendor"].fillna("Unknown").astype(str)
+    auth_vendor_series = pd.Series(
+        [auth_details.get(normalize_mac(mac) or "", {}).get("vendor", "") for mac in inventory["mac"]],
+        index=inventory.index,
+        dtype="object",
+    )
+    auth_vendor = _clean_text_series(auth_vendor_series, inventory.index)
+    vendor_lookup = _clean_text_series(inventory["mac"].map(get_mac_vendor), inventory.index)
+    inventory["vendor"] = auth_vendor.where(auth_vendor.notna(), vendor_lookup).fillna("Unknown").astype(str)
     if status_type != "Authorized":
         inventory["mac_spoofing"] = inventory["mac"].map(mac_spoofing_status)
 
@@ -2546,16 +2660,34 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     inject_page_css()
     inject_traffic_style_header_css()
+    updated_txt = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
+    header_slot = st.empty()
+    render_traffic_style_header(
+        title="Device Overview",
+        subtitle="Network inventory and activity",
+        chip_label="Preparing telemetry...",
+        updated_txt=updated_txt,
+        container=header_slot,
+    )
+    loading_slot = st.empty()
+    render_dashboard_loading_state(
+        title="Loading Device Inspection",
+        subtitle="Preparing device inventory, trust posture, and activity context for the latest telemetry.",
+        steps=["Read inventory", "Merge trust state", "Render overview"],
+        container=loading_slot,
+    )
 
     PARQUET_ROOT = Path(logs_root)
     inventory_sig = _inventory_file_signature(PARQUET_ROOT)
     alerts_cache_sig = _alerts_event_cache_signature(PARQUET_ROOT)
-    alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
+    alerts_source_sig = _alerts_source_signature(PARQUET_ROOT)
+    alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, alerts_source_sig)
     inventory_history_rows = load_device_inventory_history_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
 
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
     )
+    authorized_device_details = load_authorized_device_records(authorized_mac_file)
     auth_change_history_df = load_device_change_history(authorized_mac_file)
 
     BAN_FILE = authorized_mac_file.with_name("banned_macs.yaml")
@@ -2571,6 +2703,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
     dhcp = pd.DataFrame()
     if alerts_latest_rows.empty:
         known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT, inventory_sig)
+    else:
+        dhcp = load_dhcp_from_parquet(PARQUET_ROOT, inventory_sig)
 
     hourly = load_hourly_status_from_alert_cache(
         PARQUET_ROOT,
@@ -2610,6 +2744,14 @@ def render(logs_root: Path, authorized_mac_file: Path):
             )
 
     if known_hosts.empty:
+        render_traffic_style_header(
+            title="Device Overview",
+            subtitle="Network inventory and activity",
+            chip_label="No telemetry",
+            updated_txt=updated_txt,
+            container=header_slot,
+        )
+        loading_slot.empty()
         st.info("No device data available")
         return
 
@@ -2690,14 +2832,52 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if "mac" in popup_inventory_scope.columns and banned_macs:
         popup_inventory_scope = popup_inventory_scope[~popup_inventory_scope["mac"].isin(banned_macs)].copy()
 
+    # Fill host names for inventory list from DHCP-enriched merge.
+    if "host_name" not in inventory_scope.columns:
+        inventory_scope["host_name"] = "-"
+    if not merged.empty and "host_name" in merged.columns and "mac" in merged.columns:
+        host_map = (
+            merged.sort_values("ts", ascending=False)
+            .drop_duplicates(subset=["mac"], keep="first")[["mac", "host_name"]]
+            .copy()
+        )
+        inventory_scope = inventory_scope.merge(host_map, how="left", on="mac", suffixes=("", "_merged"))
+        if "host_name_merged" in inventory_scope.columns:
+            base_host = _clean_text_series(inventory_scope.get("host_name"), inventory_scope.index)
+            merged_host = _clean_text_series(inventory_scope.get("host_name_merged"), inventory_scope.index)
+            inventory_scope["host_name"] = base_host.where(base_host.notna(), merged_host).fillna("-")
+            inventory_scope = inventory_scope.drop(columns=["host_name_merged"], errors="ignore")
+    if authorized_device_details and not inventory_scope.empty:
+        auth_meta_df = pd.DataFrame(
+            [
+                {
+                    "mac": mac,
+                    "auth_ip": detail.get("ip", ""),
+                    "auth_host_name": detail.get("host_name", ""),
+                }
+                for mac, detail in authorized_device_details.items()
+                if mac
+            ]
+        )
+        if not auth_meta_df.empty:
+            inventory_scope = inventory_scope.merge(auth_meta_df, how="left", on="mac")
+            base_ip = _clean_text_series(inventory_scope.get("host"), inventory_scope.index)
+            auth_ip = _clean_text_series(inventory_scope.get("auth_ip"), inventory_scope.index)
+            inventory_scope["host"] = base_ip.where(base_ip.notna(), auth_ip).fillna("-").astype(str)
+            base_host = _clean_text_series(inventory_scope.get("host_name"), inventory_scope.index)
+            auth_host = _clean_text_series(inventory_scope.get("auth_host_name"), inventory_scope.index)
+            inventory_scope["host_name"] = base_host.where(base_host.notna(), auth_host).fillna("-").astype(str)
+            inventory_scope = inventory_scope.drop(columns=["auth_ip", "auth_host_name"], errors="ignore")
+
     # Metrics
     today = get_local_now().date()
     today_str = today.strftime("%Y-%m-%d")
     active_day_str, active_known_hosts_sig = _resolve_active_devices_day(PARQUET_ROOT, today_str)
 
     unauth_seen = int(inventory_scope[inventory_scope["status"] == "Unauthorized"]["mac"].nunique())
-    auth_seen = int(inventory_scope[inventory_scope["status"] == "Authorized"]["mac"].nunique())
-    total_devices = auth_seen + unauth_seen
+    auth_seen_inventory = int(inventory_scope[inventory_scope["status"] == "Authorized"]["mac"].nunique())
+    auth_configured = int(len({m for m in authorized_macs if m}))
+    total_devices = auth_seen_inventory + unauth_seen
 
     active_today_set = set()
     if active_day_str:
@@ -2718,28 +2898,50 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     if store.get("daily_date") != today_str or not isinstance(store.get("daily_baseline"), dict):
         store["daily_date"] = today_str
-        store["daily_baseline"] = {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
+        store["daily_baseline"] = {
+            "total": total_devices,
+            "active_today": active_today,
+            "auth": auth_configured,
+            "unauth": unauth_seen,
+            "risk": float(risk),
+        }
         store["daily_delta"] = {"total": 0, "active_today": 0, "auth": 0, "unauth": 0, "risk": 0.0}
         store["daily_locked"] = False
 
-    baseline = store.get("daily_baseline") if isinstance(store.get("daily_baseline"), dict) else {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
+    baseline = (
+        store.get("daily_baseline")
+        if isinstance(store.get("daily_baseline"), dict)
+        else {
+            "total": total_devices,
+            "active_today": active_today,
+            "auth": auth_configured,
+            "unauth": unauth_seen,
+            "risk": float(risk),
+        }
+    )
 
     b_total = int(baseline.get("total", total_devices))
     b_active = int(baseline.get("active_today", active_today))
-    b_auth = int(baseline.get("auth", auth_seen))
+    b_auth = int(baseline.get("auth", auth_configured))
     b_unauth = int(baseline.get("unauth", unauth_seen))
     b_risk = float(baseline.get("risk", float(risk)))
 
     daily_delta = {
         "total": total_devices - b_total,
         "active_today": active_today - b_active,
-        "auth": auth_seen - b_auth,
+        "auth": auth_configured - b_auth,
         "unauth": unauth_seen - b_unauth,
         "risk": round(risk - b_risk, 2),
     }
 
     store["daily_delta"] = daily_delta
-    store["state"] = {"total": total_devices, "active_today": active_today, "auth": auth_seen, "unauth": unauth_seen, "risk": float(risk)}
+    store["state"] = {
+        "total": total_devices,
+        "active_today": active_today,
+        "auth": auth_configured,
+        "unauth": unauth_seen,
+        "risk": float(risk),
+    }
     save_metrics_store(authorized_mac_file, store)
 
     d_total = int(daily_delta.get("total", 0))
@@ -2753,13 +2955,14 @@ def render(logs_root: Path, authorized_mac_file: Path):
     GREY = "#9aa0a6"
     CYAN = "#00F7FF"
 
-    updated_txt = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
     risk_state = "Healthy" if risk <= 20 else ("Warning" if risk <= 50 else "High Risk")
+    loading_slot.empty()
     render_traffic_style_header(
         title="Device Overview",
         subtitle="Network inventory and activity",
         chip_label=f"Risk posture: {risk_state}",
         updated_txt=updated_txt,
+        container=header_slot,
     )
     inject_metric_card_css()
 
@@ -2785,7 +2988,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             f"""
             <div class="metric-overlay">
                 <div class="metric-label">Authorized</div>
-                <div class="metric-value">{auth_seen}</div>
+                <div class="metric-value">{auth_configured}</div>
                 {_metric_delta_html(d_auth, delta_is_percent=False, up_color=GREEN, down_color=GREY)}
                 <div class="metric-hint">Click to view</div>
             </div>
@@ -2948,6 +3151,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
             banned_macs,
             authorized_added_at_map,
             auth_change_history_df,
+            authorized_device_details,
         )
 
     elif st.session_state.active_dialog == "active_today":

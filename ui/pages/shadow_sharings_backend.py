@@ -4,6 +4,7 @@ import math
 import warnings
 import ipaddress
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -172,12 +173,72 @@ def _extract_whitelist_domains(y: dict) -> List[str]:
     for k in ["trusted_domains", "whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]:
         v = y.get(k)
         if isinstance(v, list):
-            return [str(x).strip().lower() for x in v if str(x).strip()]
+            out: List[str] = []
+            seen: set[str] = set()
+            for item in v:
+                domain = _extract_whitelist_domain_item(item)
+                if domain and domain not in seen:
+                    seen.add(domain)
+                    out.append(domain)
+            return out
     # also allow dict form: {domain: true}
     for k in ["trusted_domains", "whitelist_domains", "domains", "allowed_domains", "whitelist", "allowlist"]:
         if k in y and isinstance(y[k], dict):
             return [str(x).strip().lower() for x in y[k].keys()]
     return []
+
+
+def _normalize_whitelist_host_early(value: object) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0]
+    s = s.split("?", 1)[0]
+    s = s.split("#", 1)[0]
+    if s.startswith("[") and "]" in s:
+        s = s[1 : s.index("]")]
+    elif s.count(":") == 1:
+        host, port = s.rsplit(":", 1)
+        if port.isdigit():
+            s = host
+    s = str(s or "").strip().strip(".").lower()
+    s = s.split("%", 1)[0]
+    if s in {"", "unknown", "nan", "none", "-", "(empty)", "*"}:
+        return ""
+    return s
+
+
+def _extract_whitelist_domain_item(item: object) -> str:
+    if isinstance(item, dict):
+        for key in ("domain", "domain_name", "host", "name", "value"):
+            value = item.get(key)
+            host = _normalize_whitelist_host_early(value)
+            if host:
+                return host
+        return ""
+    return _normalize_whitelist_host_early(item)
+
+
+def _normalize_whitelist_list_entries(entries: list, *, preserve_dict_rows: bool) -> list:
+    normalized_rows = []
+    seen: set[str] = set()
+    for item in entries or []:
+        domain = _extract_whitelist_domain_item(item)
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        if preserve_dict_rows:
+            row = {"domain": domain}
+            if isinstance(item, dict):
+                stamp = str(item.get("date_modified", "") or "").strip()
+                if stamp:
+                    row["date_modified"] = stamp
+            normalized_rows.append(row)
+        else:
+            normalized_rows.append(domain)
+    return normalized_rows
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -413,15 +474,24 @@ def _add_domain_to_whitelist(domain: str) -> Tuple[bool, str]:
                     return True, f"Added {host} to {k}"
                 except Exception as e:
                     return False, f"Failed to write whitelist: {e}"
-        key = "trusted_domains"
+        key = WHITELIST_FILE.stem
         y[key] = []
 
-    lst = [str(x).strip().lower() for x in (y.get(key) or []) if str(x).strip()]
-    if host in lst:
+    existing_list = y.get(key) or []
+    preserve_dict_rows = any(isinstance(item, dict) for item in existing_list)
+    normalized_rows = _normalize_whitelist_list_entries(existing_list, preserve_dict_rows=preserve_dict_rows)
+    existing_domains = {
+        (row.get("domain") if isinstance(row, dict) else row)
+        for row in normalized_rows
+        if (row.get("domain") if isinstance(row, dict) else row)
+    }
+    if host in existing_domains:
         return True, f"{host} already present in {key}"
-    lst.append(host)
-    lst = sorted(set(lst))
-    y[key] = lst
+    if preserve_dict_rows:
+        normalized_rows.append({"domain": host, "date_modified": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    else:
+        normalized_rows.append(host)
+    y[key] = normalized_rows
 
     try:
         WHITELIST_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -452,10 +522,18 @@ def _remove_domain_from_whitelist(domain: str) -> Tuple[bool, str]:
     for k in keys:
         v = y.get(k)
         if isinstance(v, list):
-            lst = [str(x).strip().lower() for x in v if str(x).strip()]
-            kept = [d for d in lst if d != host]
-            if len(kept) != len(lst):
-                y[k] = sorted(set(kept))
+            preserve_dict_rows = any(isinstance(item, dict) for item in v)
+            normalized_rows = _normalize_whitelist_list_entries(v, preserve_dict_rows=preserve_dict_rows)
+            kept = []
+            removed_here = False
+            for item in normalized_rows:
+                domain = item.get("domain") if isinstance(item, dict) else item
+                if domain == host:
+                    removed_here = True
+                    continue
+                kept.append(item)
+            if removed_here:
+                y[k] = kept
                 removed_from = k
                 changed = True
                 break

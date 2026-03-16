@@ -2,9 +2,11 @@ import os
 import re
 import time
 import tempfile
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -12,11 +14,13 @@ import pyarrow.parquet as pq
 import streamlit as st
 import duckdb
 
+from config import client as client_config
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from pydrive2.files import ApiRequestError
 
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE_TOKEN_RE = re.compile(r"(\d{4}-\d{1,2}-\d{1,2})")
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -28,7 +32,7 @@ PROXY_ENV_KEYS = (
 
 
 def _extract_date_from_dirname(name: str) -> Optional[str]:
-    """Accept both YYYY-MM-DD and date=YYYY-MM-DD folder names."""
+    """Accept YYYY-MM-DD date tokens, including date=YYYY-MM-DD and unpadded forms."""
     base = (name or "").strip()
     if not base:
         return None
@@ -40,6 +44,13 @@ def _extract_date_from_dirname(name: str) -> Optional[str]:
         tail = base.split("date=", 1)[1].strip()
         if DATE_DIR_RE.match(tail):
             return tail
+
+    token_match = DATE_TOKEN_RE.search(base)
+    if token_match:
+        try:
+            return datetime.strptime(token_match.group(1), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     return None
 
@@ -68,10 +79,11 @@ def _parse_drive_modified_date(modified_date: str) -> Optional[str]:
 
 
 def _resolve_log_date(file_obj, folder_date_hint: Optional[str], default_date: str) -> str:
+    parsed_date = _parse_drive_modified_date(str(file_obj.get("modifiedDate", "")))
+    if folder_date_hint and parsed_date:
+        return max(folder_date_hint, parsed_date)
     if folder_date_hint:
         return folder_date_hint
-
-    parsed_date = _parse_drive_modified_date(str(file_obj.get("modifiedDate", "")))
     return parsed_date or default_date
 
 
@@ -97,16 +109,75 @@ def _restore_env_vars(values: dict):
         os.environ[key] = val
 
 
+def _sync_state_path(parquet_root: Path) -> Path:
+    return parquet_root / "_drive_sync_state.json"
+
+
+def _load_sync_state(parquet_root: Path) -> Dict[str, dict]:
+    path = _sync_state_path(parquet_root)
+    if not path.exists():
+        return {}
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    files = raw.get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def _save_sync_state(parquet_root: Path, files_state: Dict[str, dict]) -> None:
+    parquet_root.mkdir(parents=True, exist_ok=True)
+    path = _sync_state_path(parquet_root)
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "files": files_state,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _file_sync_key(file_obj, log_date: str, log_type: str) -> str:
+    file_id = str(file_obj.get("id", "")).strip()
+    if file_id:
+        return file_id
+    return f"{log_date}:{log_type}:{str(file_obj.get('title', '')).strip()}"
+
+
+def _default_sync_dates() -> Tuple[str, ...]:
+    today = datetime.now().date()
+    previous = today - timedelta(days=1)
+    return (today.strftime("%Y-%m-%d"), previous.strftime("%Y-%m-%d"))
+
+
+LOG_SYNC_PRIORITY = {
+    "known_hosts": 0,
+    "dhcp": 1,
+    "conn": 2,
+    "dns": 3,
+    "http": 4,
+    "ssl": 5,
+    "files": 6,
+    "notice": 7,
+}
+
+
 # =====================================================
 # 1) AUTHENTICATION (BOTH OPTIONS) + RETRY HELPERS
 # =====================================================
 
-@st.cache_resource
-def authenticate_drive_oauth(client_secret_path: str, credentials_file: str) -> GoogleDrive:
+# Background sync runs in a worker thread, so these caches must stay independent of Streamlit runtime state.
+@lru_cache(maxsize=None)
+def authenticate_drive_oauth(
+    client_secret_path: str,
+    credentials_file: str,
+    allow_interactive: bool = False,
+) -> GoogleDrive:
     """
-    OAuth flow:
-    - First run: browser login
-    - Next runs: silent (loads/saves token to credentials_file)
+    OAuth flow for dashboard/server use:
+    - Uses the saved credentials file silently.
+    - Refreshes expired access tokens from the stored refresh token.
+    - Does not open a browser unless allow_interactive=True.
     """
     cred_path = Path(credentials_file)
     cred_path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +202,11 @@ def authenticate_drive_oauth(client_secret_path: str, credentials_file: str) -> 
 
     # Authenticate / refresh silently if possible
     if gauth.credentials is None:
-        # First time only -> opens browser
+        if not allow_interactive:
+            raise RuntimeError(
+                "Drive OAuth credentials are missing. Populate secrets/drive_credentials.json "
+                "with a refresh_token-enabled credential file before starting the dashboard."
+            )
         gauth.LocalWebserverAuth()
     else:
         try:
@@ -140,8 +215,13 @@ def authenticate_drive_oauth(client_secret_path: str, credentials_file: str) -> 
             else:
                 gauth.Authorize()
         except Exception:
-            # Revoked/expired tokens can fail refresh with invalid_grant.
-            # Reset credentials and re-run OAuth to recover.
+            # Never open a browser during dashboard reruns/server execution.
+            # If silent refresh fails, require a one-time manual re-auth outside the app.
+            if not allow_interactive:
+                raise RuntimeError(
+                    "Drive OAuth token refresh failed. Recreate secrets/drive_credentials.json "
+                    "once with a valid refresh token, then rerun the dashboard."
+                )
             gauth.credentials = None
             gauth.LocalWebserverAuth()
 
@@ -155,7 +235,7 @@ def authenticate_drive_oauth(client_secret_path: str, credentials_file: str) -> 
     return GoogleDrive(gauth)
 
 
-@st.cache_resource
+@lru_cache(maxsize=None)
 def authenticate_drive_service_account(service_account_json_path: str) -> GoogleDrive:
     """
     Service account flow (NO browser login, ever).
@@ -180,6 +260,7 @@ def authenticate_drive_auto(
     client_secret_path: str,
     oauth_credentials_file: str,
     service_account_file: str,
+    allow_interactive_oauth: bool = False,
 ) -> GoogleDrive:
     """
     mode:
@@ -193,13 +274,21 @@ def authenticate_drive_auto(
         return authenticate_drive_service_account(service_account_file)
 
     if mode == "oauth":
-        return authenticate_drive_oauth(client_secret_path, oauth_credentials_file)
+        return authenticate_drive_oauth(
+            client_secret_path,
+            oauth_credentials_file,
+            allow_interactive=allow_interactive_oauth,
+        )
 
     # auto fallback: service -> oauth
     try:
         return authenticate_drive_service_account(service_account_file)
     except Exception:
-        return authenticate_drive_oauth(client_secret_path, oauth_credentials_file)
+        return authenticate_drive_oauth(
+            client_secret_path,
+            oauth_credentials_file,
+            allow_interactive=allow_interactive_oauth,
+        )
 
 
 def list_files_with_retry(drive: GoogleDrive, query: str, max_retries: int = 5):
@@ -312,24 +401,34 @@ def sync_drive_to_parquet(
     client_secret_path: str,
     folder_id: str,
     parquet_root: Path,
+    target_dates: Optional[Tuple[str, ...]] = None,
     log_callback=None,
 ):
     """
     Sync Google Drive logs to local Parquet cache.
-    - Skips historical logs that already exist.
-    - Overwrites newest available date logs to capture rolling updates.
+    - Focuses on the current day plus the previous day by default.
+    - Downloads new logs that do not exist locally.
+    - Re-downloads logs whose Drive modified timestamp changed.
     """
 
-    # Import config here to avoid circular imports elsewhere
-    from config.client import DRIVE_AUTH_MODE, DRIVE_CREDENTIALS_FILE, SERVICE_ACCOUNT_FILE
+    drive_allow_interactive_oauth = bool(
+        getattr(client_config, "DRIVE_ALLOW_INTERACTIVE_OAUTH", False)
+    )
+    drive_auth_mode = str(getattr(client_config, "DRIVE_AUTH_MODE", "oauth"))
+    drive_credentials_file = str(
+        getattr(client_config, "DRIVE_CREDENTIALS_FILE", "secrets/drive_credentials.json")
+    )
+    service_account_file = str(
+        getattr(client_config, "SERVICE_ACCOUNT_FILE", "secrets/service_account.json")
+    )
 
-    # Unified logger (toast in UI OR callback)
+    # Keep the sync worker decoupled from Streamlit APIs.
     def _log(msg: str):
         try:
             if callable(log_callback):
                 log_callback(msg)
             else:
-                st.toast(msg)
+                print(msg)
         except Exception:
             pass
 
@@ -341,17 +440,22 @@ def sync_drive_to_parquet(
         # Authenticate with chosen mode
         try:
             drive = authenticate_drive_auto(
-                DRIVE_AUTH_MODE,
+                drive_auth_mode,
                 client_secret_path=client_secret_path,
-                oauth_credentials_file=DRIVE_CREDENTIALS_FILE,
-                service_account_file=SERVICE_ACCOUNT_FILE,
+                oauth_credentials_file=drive_credentials_file,
+                service_account_file=service_account_file,
+                allow_interactive_oauth=drive_allow_interactive_oauth,
             )
         except Exception as e:
-            _log(f"❌ Drive authentication failed: {e}")
+            _log(f"Drive authentication failed: {e}")
             raise
 
         default_date = datetime.now().strftime("%Y-%m-%d")
+        desired_dates = tuple(target_dates or _default_sync_dates())
+        desired_date_set = {str(d).strip() for d in desired_dates if str(d).strip()}
         files_processed = 0
+        sync_state = _load_sync_state(parquet_root)
+        next_state: Dict[str, dict] = {}
 
         # Recursive generator
         def walk_folder(fid: str, inherited_date_hint: Optional[str] = None):
@@ -374,41 +478,84 @@ def sync_drive_to_parquet(
 
             log_type = name.replace(".log", "")
             log_date = _resolve_log_date(f, folder_date_hint, default_date)
+            if desired_date_set and log_date not in desired_date_set:
+                continue
             log_candidates.append((f, name, log_type, log_date))
 
         if not log_candidates:
-            _log("No Zeek .log files discovered in Drive.")
+            _log(f"No Zeek .log files discovered in Drive for dates: {', '.join(desired_dates)}.")
             return 0
 
-        refresh_date = max(row[3] for row in log_candidates)
-        _log(f"Refreshing rolling date partition: {refresh_date}")
+        latest_drive_date = max(row[3] for row in log_candidates)
+        log_candidates.sort(
+            key=lambda row: (
+                0 if row[3] == latest_drive_date else 1,
+                row[3],
+                LOG_SYNC_PRIORITY.get(row[2], 999),
+                row[2],
+            )
+        )
 
         for f, name, log_type, log_date in log_candidates:
             target_path = parquet_root / log_date / f"{log_type}.parquet"
+            file_key = _file_sync_key(f, log_date, log_type)
+            modified_date = str(f.get("modifiedDate", "")).strip()
+            state_entry = sync_state.get(file_key) or {}
+            has_state = bool(state_entry)
+            previous_target_raw = str(state_entry.get("target_path", "")).strip()
+            previous_target = Path(previous_target_raw) if previous_target_raw else None
+            target_missing = not target_path.exists()
+            metadata_changed = has_state and (
+                str(state_entry.get("modifiedDate", "")).strip() != modified_date
+                or str(state_entry.get("log_date", "")).strip() != log_date
+                or str(state_entry.get("title", "")).strip() != name
+            )
+            should_sync = target_missing or metadata_changed or (not has_state and log_date == latest_drive_date)
 
-            # Incremental logic
-            if target_path.exists():
-                # Skip immutable historical dates; keep newest date hot.
-                if log_date != refresh_date:
-                    continue
-                # Rebuild newest date logs to capture latest events.
+            if should_sync and target_path.exists():
                 try:
                     os.remove(target_path)
                 except OSError:
                     pass
 
-            _log(f"📥 Ingesting: {log_date} / {name} ...")
+            if should_sync and previous_target and previous_target != target_path and previous_target.exists():
+                try:
+                    os.remove(previous_target)
+                except OSError:
+                    pass
+
+            if not should_sync:
+                next_state[file_key] = {
+                    "title": name,
+                    "log_type": log_type,
+                    "log_date": log_date,
+                    "modifiedDate": modified_date,
+                    "target_path": str(target_path),
+                }
+                continue
+
+            _log(f"Ingesting: {log_date} / {name} ...")
 
             try:
                 stream_zeek_log_to_parquet(drive, f, target_path)
                 files_processed += 1
+                next_state[file_key] = {
+                    "title": name,
+                    "log_type": log_type,
+                    "log_date": log_date,
+                    "modifiedDate": modified_date,
+                    "target_path": str(target_path),
+                }
+                _save_sync_state(parquet_root, next_state)
             except Exception as e:
-                _log(f"❌ Error on {name}: {e}")
+                _log(f"Error on {name}: {e}")
+
+        _save_sync_state(parquet_root, next_state)
 
         if files_processed > 0:
-            _log(f"✅ Sync Complete: {files_processed} new logs.")
+            _log(f"Sync complete: {files_processed} logs updated.")
         else:
-            _log("⚡ Cache is up to date.")
+            _log("Cache is up to date.")
 
         return files_processed
     finally:
@@ -481,10 +628,10 @@ def debug_print_catalog(parquet_root: Path):
         st.warning("Cache is empty. Run Sync.")
         return
 
-    st.markdown("### 🗂️ Data Catalog (Lazy Index)")
+    st.markdown("### Data Catalog (Lazy Index)")
 
     for date, files in catalog.items():
-        with st.expander(f"📅 {date} ({len(files)} files)"):
+        with st.expander(f"{date} ({len(files)} files)"):
             df_files = pd.DataFrame(files)
             st.dataframe(
                 df_files,

@@ -80,7 +80,7 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
     profile_role_safe = html.escape(str(profile_role))
 
     sidebar_width_px = SIDEBAR_COLLAPSED_WIDTH_PX if collapsed else SIDEBAR_EXPANDED_WIDTH_PX
-    sidebar_block_padding = "0.78rem 0.56rem 0.68rem 0.56rem"
+    sidebar_block_padding = "0.22rem 0.56rem 0.68rem 0.56rem"
     toggle_justify = "center" if collapsed else "flex-end"
     st.markdown(
         f"""
@@ -386,8 +386,9 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
 
         page = selected_value_to_page.get(selected_value, st.session_state.sidebar_page)
 
-        # Keep auto-refresh timer (not a button)
-        st_autorefresh(interval=int(auto_refresh_interval) * 1000, key="auto_refresh_timer")
+        # Keep auto-refresh timer optional so app-level background refresh can own it.
+        if int(auto_refresh_interval or 0) > 0:
+            st_autorefresh(interval=int(auto_refresh_interval) * 1000, key="auto_refresh_timer")
 
     st.session_state.sidebar_page = page
     return page

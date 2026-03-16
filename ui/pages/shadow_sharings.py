@@ -682,7 +682,6 @@ def inject_shadow_sharing_css():
         """,
         unsafe_allow_html=True,
     )
-
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
@@ -1867,6 +1866,17 @@ def render_shadow_sharing(parquet_root: Path):
     st.session_state.setdefault("_shadow_sharing_scope_cache_key_v1", None)
     st.session_state.setdefault("_shadow_sharing_scope_df_v1", None)
     st.session_state.setdefault("_shadow_sharing_scope_incidents_v1", None)
+    sync_token = int(st.session_state.get("_parquet_sync_token", 0))
+    if st.session_state.get("_shadow_sharing_last_sync_token") != sync_token:
+        _close_shadow_sharing_dialog()
+        _close_shadow_sharing_allow_dialog(reset_grid=False)
+        _invalidate_shadow_sharing_frontend_cache()
+        st.session_state["shadow_sharing_date"] = available_dates[0]
+        st.session_state["_shadow_sharing_last_sync_token"] = sync_token
+    elif str(st.session_state.get("shadow_sharing_date", "")).strip() not in available_dates:
+        _close_shadow_sharing_dialog()
+        _close_shadow_sharing_allow_dialog(reset_grid=False)
+        st.session_state["shadow_sharing_date"] = available_dates[0]
 
     origin = st.session_state.pop("shadow_sharing_dialog_origin", None)
     if st.session_state.get("shadow_sharing_dialog_open") and origin not in ("grid", "dialog"):

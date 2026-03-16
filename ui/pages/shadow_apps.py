@@ -14,7 +14,6 @@ import yaml
 
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 
-DEFAULT_ROW_LIMIT_OPTIONS: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000)
 
 
 def _closest_row_option(options: list[int], target: int) -> int:
@@ -40,7 +39,7 @@ def row_limit_selector(
     total_rows: int,
     label: str = "Rows shown",
     default_limit: int = 500,
-    options: tuple[int, ...] = DEFAULT_ROW_LIMIT_OPTIONS,
+    options: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000),
 ) -> int:
     row_options = _normalize_row_limit_options(int(total_rows or 0), options)
     state_key = f"{key_prefix}_row_limit"
@@ -1075,6 +1074,37 @@ def whitelist_state():
     return {"whitelist_mtime": m, "whitelist_size": s}
 
 
+def _extract_allowlist_domain_item(item: object) -> str:
+    if isinstance(item, dict):
+        for key in ("domain", "domain_name", "host", "name", "value"):
+            value = item.get(key)
+            domain = extract_domain(value)
+            if domain:
+                return domain
+        return ""
+    return extract_domain(str(item))
+
+
+def _normalize_allowlist_entries(entries: list, *, preserve_dict_rows: bool) -> list:
+    normalized_rows = []
+    seen: set[str] = set()
+    for item in entries or []:
+        domain = _extract_allowlist_domain_item(item)
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        if preserve_dict_rows:
+            row = {"domain": domain}
+            if isinstance(item, dict):
+                stamp = str(item.get("date_modified", "") or "").strip()
+                if stamp:
+                    row["date_modified"] = stamp
+            normalized_rows.append(row)
+        else:
+            normalized_rows.append(domain)
+    return normalized_rows
+
+
 def risk_policy_state():
     m, s = _stat_sig(RISK_POLICY_FILE)
     return {"risk_policy_mtime": m, "risk_policy_size": s}
@@ -1651,7 +1681,7 @@ def load_allowlist():
                             break
 
             for item in raw_list:
-                domain = extract_domain(str(item))
+                domain = _extract_allowlist_domain_item(item)
                 if domain:
                     approved.add(domain)
     except Exception:
@@ -1675,7 +1705,7 @@ def _pick_allowlist_key(data: dict) -> str:
     for k, v in data.items():
         if isinstance(v, list):
             return str(k)
-    return "trusted_domains"
+    return WHITELIST_FILE.stem
 
 
 def add_domain_to_allowlist(domain_value: str) -> tuple[bool, str]:
@@ -1692,18 +1722,21 @@ def add_domain_to_allowlist(domain_value: str) -> tuple[bool, str]:
     if not isinstance(existing_list, list):
         existing_list = []
 
-    existing_norm = []
-    existing_set = set()
-    for item in existing_list:
-        d = extract_domain(str(item))
-        if d and d not in existing_set:
-            existing_set.add(d)
-            existing_norm.append(d)
+    preserve_dict_rows = any(isinstance(item, dict) for item in existing_list)
+    existing_norm = _normalize_allowlist_entries(existing_list, preserve_dict_rows=preserve_dict_rows)
+    existing_set = {
+        (row.get("domain") if isinstance(row, dict) else row)
+        for row in existing_norm
+        if (row.get("domain") if isinstance(row, dict) else row)
+    }
 
     if domain in existing_set:
         return True, f"{domain} is already allowlisted."
 
-    existing_norm.append(domain)
+    if preserve_dict_rows:
+        existing_norm.append({"domain": domain, "date_modified": _dt.now().strftime("%Y-%m-%d %H:%M:%S")})
+    else:
+        existing_norm.append(domain)
     data[allow_key] = existing_norm
     write_yaml(WHITELIST_FILE, data)
     return True, f"{domain} added to allowlist."
@@ -2408,10 +2441,26 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
     write_yaml(cache_meta_path(parquet_root, date_str), meta)
 
 
-def ensure_cache(conn, parquet_root: Path, target_dates: list[str], allow_re, risk_policy: dict):
+def ensure_cache(
+    conn,
+    parquet_root: Path,
+    target_dates: list[str],
+    allow_re,
+    risk_policy: dict,
+    *,
+    show_progress: bool = True,
+):
     if not target_dates:
         return
-    prog = st.progress(0, text="Preparing optimized cache...")
+
+    class _NoopProgress:
+        def progress(self, *_args, **_kwargs):
+            return None
+
+        def empty(self):
+            return None
+
+    prog = st.progress(0, text="Preparing optimized cache...") if show_progress else _NoopProgress()
     total = len(target_dates)
     for i, d in enumerate(target_dates, start=1):
         try:
@@ -4332,6 +4381,17 @@ def render_shadow_apps(parquet_root: Path):
         st.warning("No log directories found.")
         return
 
+    sync_token = int(st.session_state.get("_parquet_sync_token", 0))
+    if st.session_state.get("_shadow_apps_last_sync_token") != sync_token:
+        latest_available = available_dates[0]
+        if st.session_state.get("shadow_day_select") != latest_available:
+            _close_shadow_dialog(reset_grid=True)
+        st.session_state["shadow_day_select"] = latest_available
+        st.session_state["_shadow_apps_last_sync_token"] = sync_token
+    elif str(st.session_state.get("shadow_day_select", "")).strip() not in available_dates:
+        _close_shadow_dialog(reset_grid=True)
+        st.session_state["shadow_day_select"] = available_dates[0]
+
     risk_policy = load_risk_policy()
     st.markdown("### Shadow App Incidents")
     st.markdown(
@@ -4345,14 +4405,7 @@ def render_shadow_apps(parquet_root: Path):
             unsafe_allow_html=True,
         )
         ref_df = build_risk_policy_reference(risk_policy)
-        ref_limit = row_limit_selector(
-            key_prefix="shadow_apps_risk_reference",
-            total_rows=len(ref_df),
-            label="Rows shown",
-            default_limit=250,
-        )
-        ref_view = cap_dataframe_rows(ref_df, ref_limit)
-        render_rows_caption(total_rows=len(ref_df), shown_rows=len(ref_view))
+        ref_view = cap_dataframe_rows(ref_df, 250)
         st.dataframe(ref_view, width="stretch", hide_index=True)
         if risk_policy:
             st.caption(

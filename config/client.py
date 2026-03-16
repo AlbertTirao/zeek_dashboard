@@ -24,11 +24,12 @@ CLIENT_SECRET_FILE = (
 # -----------------------------------------------------
 # Drive auth mode:
 #   - "service" : best for production, never prompts
-#   - "oauth"   : prompts once then reuses token file
+#   - "oauth"   : uses saved token file and refresh token silently
 #   - "auto"    : try service first, fallback to oauth
 # -----------------------------------------------------
 DRIVE_AUTH_MODE = "oauth"
 #DRIVE_AUTH_MODE = "auto"
+DRIVE_ALLOW_INTERACTIVE_OAUTH = False
 
 # Store secrets OUTSIDE git (put secrets/ in .gitignore)
 SERVICE_ACCOUNT_FILE = "secrets/service_account.json"
@@ -38,3 +39,4 @@ DRIVE_CREDENTIALS_FILE = "secrets/drive_credentials.json"
 # Streamlit refresh settings
 # =====================================================
 AUTO_REFRESH_INTERVAL = 3600  # seconds
+DRIVE_SYNC_INTERVAL = 3600  # seconds

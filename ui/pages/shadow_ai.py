@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse
 
+import duckdb
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -155,6 +156,123 @@ def _harden_pattern(p: str) -> str:
         return p
 
     return rf"(?:^|[^a-z0-9_-])(?:{p})(?:$|[^a-z0-9_-])"
+
+
+@st.cache_resource
+def get_shadow_ai_duckdb_connection():
+    conn = duckdb.connect(database=":memory:")
+    try:
+        conn.execute("SET memory_limit='4GB'")
+    except Exception:
+        pass
+    try:
+        conn.execute("SET threads TO 4")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA enable_object_cache")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA enable_progress_bar=false")
+    except Exception:
+        pass
+    try:
+        tmp = PROJECT_ROOT / ".duckdb_temp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        conn.execute(f"SET temp_directory='{tmp.as_posix()}'")
+    except Exception:
+        pass
+    return conn
+
+
+def _sql_path_list(paths: List[Path]) -> str:
+    items: List[str] = []
+    for p in paths:
+        items.append("'" + p.resolve().as_posix().replace("'", "''") + "'")
+    return "[" + ",".join(items) + "]"
+
+
+def _sql_ident(name: str) -> str:
+    return '"' + str(name or "").replace('"', '""') + '"'
+
+
+@st.cache_data(show_spinner=False)
+def _duck_union_available_columns(paths_key: Tuple[str, ...]) -> Tuple[str, ...]:
+    if not paths_key:
+        return tuple()
+    con = get_shadow_ai_duckdb_connection()
+    try:
+        sql = (
+            "DESCRIBE SELECT * FROM read_parquet("
+            + "[" + ",".join(["'" + str(p).replace("'", "''") + "'" for p in paths_key]) + "]"
+            + ", union_by_name=TRUE)"
+        )
+        desc = con.execute(sql).fetchdf()
+        if "column_name" in desc.columns:
+            return tuple(desc["column_name"].astype(str).tolist())
+    except Exception:
+        pass
+    return tuple()
+
+
+def _read_parquet_columns_pandas(path: Path, desired_cols: List[str]) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(path, columns=desired_cols)
+    except Exception:
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            pf = pq.ParquetFile(path)
+            available = set(pf.schema.names)
+            cols = [c for c in desired_cols if c in available]
+            if cols:
+                return pd.read_parquet(path, columns=cols)
+        except Exception:
+            pass
+
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                return df
+            cols = [c for c in desired_cols if c in df.columns]
+            return df[cols] if cols else df
+        except Exception:
+            return pd.DataFrame()
+
+
+def _read_parquet_union_columns(paths: List[Path], desired_cols: List[str]) -> pd.DataFrame:
+    files = [Path(p) for p in (paths or []) if Path(p).exists()]
+    wanted = [str(c).strip() for c in (desired_cols or []) if str(c).strip()]
+    if not files or not wanted:
+        return pd.DataFrame()
+
+    con = get_shadow_ai_duckdb_connection()
+    try:
+        select_sql = ", ".join([_sql_ident(col) for col in wanted])
+        return con.execute(
+            f"SELECT {select_sql} FROM read_parquet({_sql_path_list(files)}, union_by_name=TRUE)"
+        ).fetchdf()
+    except Exception:
+        pass
+
+    try:
+        available = set(_duck_union_available_columns(tuple(str(p.resolve().as_posix()) for p in files)))
+        cols = [c for c in wanted if c in available]
+        if cols:
+            select_sql = ", ".join([_sql_ident(col) for col in cols])
+            return con.execute(
+                f"SELECT {select_sql} FROM read_parquet({_sql_path_list(files)}, union_by_name=TRUE)"
+            ).fetchdf()
+    except Exception:
+        pass
+
+    dfs: List[pd.DataFrame] = []
+    for path in files:
+        df = _read_parquet_columns_pandas(path, wanted)
+        if df is not None and not df.empty:
+            dfs.append(df)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
 DEFAULT_GENERIC_NAME_PATTERNS = [
@@ -1334,30 +1452,7 @@ def _read_parquet_columns(path: Path, desired_cols: List[str]) -> pd.DataFrame:
       - If it fails (missing columns), probe parquet schema (fast) and retry with existing cols
       - Fallback: read full file then subset
     """
-    try:
-        return pd.read_parquet(path, columns=desired_cols)
-    except Exception:
-        # Fast retry: intersect desired columns with parquet schema (avoid full read on missing columns)
-        try:
-            import pyarrow.parquet as pq  # type: ignore
-
-            pf = pq.ParquetFile(path)
-            available = set(pf.schema.names)
-            cols = [c for c in desired_cols if c in available]
-            if cols:
-                return pd.read_parquet(path, columns=cols)
-        except Exception:
-            pass
-
-        # Last resort (slower): read full file then subset
-        try:
-            df = pd.read_parquet(path)
-            if df.empty:
-                return df
-            cols = [c for c in desired_cols if c in df.columns]
-            return df[cols] if cols else df
-        except Exception:
-            return pd.DataFrame()
+    return _read_parquet_union_columns([Path(path)], desired_cols)
 
 
 def _zeek_truthy_series(s: pd.Series) -> pd.Series:
@@ -1390,42 +1485,40 @@ def _collect_files_upload_uids(files_paths: List[Path]) -> set[str]:
     if FILE_UPLOAD_EXTENSIONS:
         ext_pat = r"\.(?:" + "|".join([re.escape(x) for x in FILE_UPLOAD_EXTENSIONS]) + r")(?:$|[?&#])"
 
-    for f in files_paths or []:
-        df = _read_parquet_columns(f, cols)
-        if df.empty or "uid" not in df.columns:
-            continue
+    df = _read_parquet_union_columns(files_paths or [], cols)
+    if df.empty or "uid" not in df.columns:
+        return set()
 
-        uid = df["uid"].astype(str).str.strip()
-        uid_valid = uid.ne("") & ~uid.str.lower().isin(["nan", "none", "-", "null"])
-        if not uid_valid.any():
-            continue
+    uid = df["uid"].astype(str).str.strip()
+    uid_valid = uid.ne("") & ~uid.str.lower().isin(["nan", "none", "-", "null"])
+    if not uid_valid.any():
+        return set()
 
-        source = df.get("source", pd.Series("", index=df.index)).astype(str).str.upper()
-        is_http = source.eq("HTTP")
-        mime = df.get("mime_type", pd.Series("", index=df.index)).astype(str).str.lower()
-        filename = df.get("filename", pd.Series("", index=df.index)).astype(str).str.lower()
+    source = df.get("source", pd.Series("", index=df.index)).astype(str).str.upper()
+    is_http = source.eq("HTTP")
+    mime = df.get("mime_type", pd.Series("", index=df.index)).astype(str).str.lower()
+    filename = df.get("filename", pd.Series("", index=df.index)).astype(str).str.lower()
 
-        file_like_name = filename.str.contains(ext_pat, regex=True, na=False) if ext_pat else pd.Series(False, index=df.index)
-        file_like_mime = mime.str.contains(r"(?:csv|excel|spreadsheet|pdf|zip|json|application\/octet-stream)", regex=True, na=False)
-        file_like = file_like_name | file_like_mime
-        if not file_like.any():
-            continue
+    file_like_name = filename.str.contains(ext_pat, regex=True, na=False) if ext_pat else pd.Series(False, index=df.index)
+    file_like_mime = mime.str.contains(r"(?:csv|excel|spreadsheet|pdf|zip|json|application\/octet-stream)", regex=True, na=False)
+    file_like = file_like_name | file_like_mime
+    if not file_like.any():
+        return set()
 
-        seen = pd.to_numeric(df.get("seen_bytes", 0), errors="coerce").fillna(0)
-        total = pd.to_numeric(df.get("total_bytes", 0), errors="coerce").fillna(0)
-        bytes_seen = seen.where(seen >= total, total)
-        has_payload = bytes_seen.gt(0)
+    seen = pd.to_numeric(df.get("seen_bytes", 0), errors="coerce").fillna(0)
+    total = pd.to_numeric(df.get("total_bytes", 0), errors="coerce").fillna(0)
+    bytes_seen = seen.where(seen >= total, total)
+    has_payload = bytes_seen.gt(0)
 
-        local_orig_true = _zeek_truthy_series(df.get("local_orig", pd.Series("", index=df.index)))
-        is_orig_true = _zeek_truthy_series(df.get("is_orig", pd.Series("", index=df.index)))
-        orig_priv = _is_private_ip_series(df.get("id.orig_h", pd.Series("", index=df.index)))
-        resp_priv = _is_private_ip_series(df.get("id.resp_h", pd.Series("", index=df.index)))
-        internal_to_external = orig_priv & (~resp_priv)
-        outbound_like = local_orig_true | is_orig_true | internal_to_external
+    local_orig_true = _zeek_truthy_series(df.get("local_orig", pd.Series("", index=df.index)))
+    is_orig_true = _zeek_truthy_series(df.get("is_orig", pd.Series("", index=df.index)))
+    orig_priv = _is_private_ip_series(df.get("id.orig_h", pd.Series("", index=df.index)))
+    resp_priv = _is_private_ip_series(df.get("id.resp_h", pd.Series("", index=df.index)))
+    internal_to_external = orig_priv & (~resp_priv)
+    outbound_like = local_orig_true | is_orig_true | internal_to_external
 
-        candidate = is_http & uid_valid & file_like & has_payload & outbound_like
-        if not candidate.any():
-            continue
+    candidate = is_http & uid_valid & file_like & has_payload & outbound_like
+    if candidate.any():
         uid_set.update(uid.loc[candidate].tolist())
 
     return {u for u in uid_set if str(u).strip()}
@@ -1574,15 +1667,17 @@ def _build_identity_maps(dhcp_files: List[Path], known_files: List[Path]) -> Tup
             if not subm.empty:
                 mac_rows.append(subm[["ts", "mac", "host_name"]])
 
-    # DHCP
-    for f in dhcp_files or []:
-        df = _read_parquet_columns(f, ["ts", "mac", "client_addr", "assigned_addr", "host_name", "hostname", "id.orig_h", "orig_l2_addr"])
-        ingest(df)
+    dhcp_df = _read_parquet_union_columns(
+        dhcp_files or [],
+        ["ts", "mac", "client_addr", "assigned_addr", "host_name", "hostname", "id.orig_h", "orig_l2_addr"],
+    )
+    ingest(dhcp_df)
 
-    # known_hosts / known_devices
-    for f in known_files or []:
-        df = _read_parquet_columns(f, ["ts", "mac", "l2_addr", "orig_l2_addr", "addr", "ip", "host_name", "hostname", "device_name", "id.orig_h"])
-        ingest(df)
+    known_df = _read_parquet_union_columns(
+        known_files or [],
+        ["ts", "mac", "l2_addr", "orig_l2_addr", "addr", "ip", "host_name", "hostname", "device_name", "id.orig_h"],
+    )
+    ingest(known_df)
 
     ip_hist = pd.concat(ip_rows, ignore_index=True) if ip_rows else pd.DataFrame(columns=["ts", "ip", "mac", "host_name"])
     mac_hist = pd.concat(mac_rows, ignore_index=True) if mac_rows else pd.DataFrame(columns=["ts", "mac", "host_name"])
@@ -2531,140 +2626,122 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         "host", "uri", "user_agent", "method", "request_body_len", "content_type",
         "orig_l2_addr", "l2_addr", "src_mac",
     ]
-    for f in buckets["http"]:
-        df = _read_parquet_columns(f, http_cols)
-        if df.empty:
-            continue
+    df = _read_parquet_union_columns(buckets["http"], http_cols)
+    if not df.empty:
         df = _ensure_ts_datetime(df)
         host_col = "host" if "host" in df.columns else ("id.resp_h" if "id.resp_h" in df.columns else None)
-        if host_col is None:
-            continue
+        if host_col is not None:
+            host_s = df[host_col].astype(str).fillna("")
+            uri_s = df["uri"].astype(str).fillna("") if "uri" in df.columns else pd.Series("", index=df.index)
+            combined = (host_s.astype(str) + " " + uri_s.astype(str)).str.strip()
 
-        host_s = df[host_col].astype(str).fillna("")
-        uri_s = df["uri"].astype(str).fillna("") if "uri" in df.columns else pd.Series("", index=df.index)
-        combined = (host_s.astype(str) + " " + uri_s.astype(str)).str.strip()
+            prov_all, sig_all = _assign_provider_and_signature(combined)
+            mask = prov_all != "Unknown"
+            if mask.any():
+                hit = df.loc[mask].copy()
+                hit = _ensure_ts_datetime(hit)
 
-        prov_all, sig_all = _assign_provider_and_signature(combined)
-        mask = prov_all != "Unknown"
-        if not mask.any():
-            continue
+                host_s_hit = hit[host_col].astype(str).fillna("")
+                uri_s_hit = hit["uri"].astype(str).fillna("") if "uri" in hit.columns else pd.Series("", index=hit.index)
+                hit["AI_Provider"] = prov_all.loc[mask].values
+                hit["Signature_Match"] = sig_all.loc[mask].values
+                hit["Detection_Source"] = "HTTP"
 
-        hit = df.loc[mask].copy()
-        hit = _ensure_ts_datetime(hit)
+                if "user_agent" in hit.columns:
+                    hit["Client_Type"] = hit["user_agent"].apply(fingerprint_client)
+                else:
+                    hit["user_agent"] = "-"
+                    hit["Client_Type"] = "Unknown"
 
-        host_s_hit = hit[host_col].astype(str).fillna("")
-        uri_s_hit = hit["uri"].astype(str).fillna("") if "uri" in hit.columns else pd.Series("", index=hit.index)
-        hit["AI_Provider"] = prov_all.loc[mask].values
-        hit["Signature_Match"] = sig_all.loc[mask].values
-        hit["Detection_Source"] = "HTTP"
+                hit["Upload_Bytes"] = pd.to_numeric(hit.get("request_body_len", 0), errors="coerce").fillna(0)
 
-        if "user_agent" in hit.columns:
-            hit["Client_Type"] = hit["user_agent"].apply(fingerprint_client)
-        else:
-            hit["user_agent"] = "-"
-            hit["Client_Type"] = "Unknown"
+                method_s = hit["method"].astype(str).fillna("-") if "method" in hit.columns else "-"
+                uri_s2 = hit["uri"].astype(str).fillna("-") if "uri" in hit.columns else "-"
+                hit["Detail"] = method_s + " " + uri_s2
 
-        hit["Upload_Bytes"] = pd.to_numeric(hit.get("request_body_len", 0), errors="coerce").fillna(0)
+                if "id.resp_p" in hit.columns:
+                    p = pd.to_numeric(hit["id.resp_p"], errors="coerce").fillna(-1).astype(int)
+                    hit["Destination"] = host_s_hit + ":" + p.astype(str)
+                else:
+                    hit["Destination"] = host_s_hit
 
-        method_s = hit["method"].astype(str).fillna("-") if "method" in hit.columns else "-"
-        uri_s2 = hit["uri"].astype(str).fillna("-") if "uri" in hit.columns else "-"
-        hit["Detail"] = method_s + " " + uri_s2
+                matched_http = pd.DataFrame(
+                    {
+                        "_host": host_s_hit.astype(str),
+                        "_uri": uri_s_hit.astype(str),
+                        "_sig": hit["Signature_Match"].astype(str),
+                    },
+                    index=hit.index,
+                ).apply(
+                    lambda r: _http_match_field_and_value(r["_host"], r["_uri"], r["_sig"]),
+                    axis=1,
+                )
+                hit["Match_Field"] = matched_http.map(lambda t: t[0] if isinstance(t, tuple) and len(t) > 0 else "HTTP host/uri")
+                hit["Matched_Value"] = matched_http.map(lambda t: t[1] if isinstance(t, tuple) and len(t) > 1 else "")
 
-        if "id.resp_p" in hit.columns:
-            p = pd.to_numeric(hit["id.resp_p"], errors="coerce").fillna(-1).astype(int)
-            hit["Destination"] = host_s_hit + ":" + p.astype(str)
-        else:
-            hit["Destination"] = host_s_hit
-
-        matched_http = pd.DataFrame(
-            {
-                "_host": host_s_hit.astype(str),
-                "_uri": uri_s_hit.astype(str),
-                "_sig": hit["Signature_Match"].astype(str),
-            },
-            index=hit.index,
-        ).apply(
-            lambda r: _http_match_field_and_value(r["_host"], r["_uri"], r["_sig"]),
-            axis=1,
-        )
-        hit["Match_Field"] = matched_http.map(lambda t: t[0] if isinstance(t, tuple) and len(t) > 0 else "HTTP host/uri")
-        hit["Matched_Value"] = matched_http.map(lambda t: t[1] if isinstance(t, tuple) and len(t) > 1 else "")
-
-        hit["Detection_Basis"] = hit["Match_Field"] + " matched '" + hit["Signature_Match"].astype(str) + "'"
-        events.append(hit)
+                hit["Detection_Basis"] = hit["Match_Field"] + " matched '" + hit["Signature_Match"].astype(str) + "'"
+                events.append(hit)
 
     # --- SSL ---
     ssl_cols = ["uid", "ts", "id.orig_h", "id.resp_h", "server_name", "established", "orig_l2_addr", "l2_addr", "src_mac"]
-    for f in buckets["ssl"]:
-        df = _read_parquet_columns(f, ssl_cols)
-        if df.empty:
-            continue
+    df = _read_parquet_union_columns(buckets["ssl"], ssl_cols)
+    if not df.empty:
         df = _ensure_ts_datetime(df)
-        if "server_name" not in df.columns:
-            continue
+        if "server_name" in df.columns:
+            sni = df["server_name"].astype(str).fillna("")
+            prov_all, sig_all = _assign_provider_and_signature(sni)
+            mask = prov_all != "Unknown"
+            if mask.any():
+                hit = df.loc[mask].copy()
+                hit = _ensure_ts_datetime(hit)
 
-        sni = df["server_name"].astype(str).fillna("")
-        prov_all, sig_all = _assign_provider_and_signature(sni)
-        mask = prov_all != "Unknown"
-        if not mask.any():
-            continue
+                sni_hit = hit["server_name"].astype(str).fillna("")
 
-        hit = df.loc[mask].copy()
-        hit = _ensure_ts_datetime(hit)
+                hit["AI_Provider"] = prov_all.loc[mask].values
+                hit["Signature_Match"] = sig_all.loc[mask].values
+                hit["Detection_Source"] = "SSL"
+                hit["Match_Field"] = "TLS SNI"
+                hit["Client_Type"] = "Encrypted (TLS)"
+                hit["Upload_Bytes"] = 0
+                hit["Detail"] = "SNI: " + sni_hit
+                hit["Destination"] = sni_hit
+                hit["user_agent"] = "-"
+                hit["Matched_Value"] = sni_hit.astype(str)
 
-        sni_hit = hit["server_name"].astype(str).fillna("")
-
-        hit["AI_Provider"] = prov_all.loc[mask].values
-        hit["Signature_Match"] = sig_all.loc[mask].values
-        hit["Detection_Source"] = "SSL"
-        hit["Match_Field"] = "TLS SNI"
-        hit["Client_Type"] = "Encrypted (TLS)"
-        hit["Upload_Bytes"] = 0
-        hit["Detail"] = "SNI: " + sni_hit
-        hit["Destination"] = sni_hit
-        hit["user_agent"] = "-"
-        hit["Matched_Value"] = sni_hit.astype(str)
-
-        hit["Detection_Basis"] = hit["Match_Field"] + " matched '" + hit["Signature_Match"].astype(str) + "'"
-        events.append(hit)
+                hit["Detection_Basis"] = hit["Match_Field"] + " matched '" + hit["Signature_Match"].astype(str) + "'"
+                events.append(hit)
 
     # --- DNS ---
     dns_cols = ["uid", "ts", "id.orig_h", "id.resp_h", "query", "qtype_name", "rcode_name", "orig_l2_addr", "l2_addr", "src_mac"]
-    for f in buckets["dns"]:
-        df = _read_parquet_columns(f, dns_cols)
-        if df.empty:
-            continue
+    df = _read_parquet_union_columns(buckets["dns"], dns_cols)
+    if not df.empty:
         df = _ensure_ts_datetime(df)
-        if "query" not in df.columns:
-            continue
+        if "query" in df.columns:
+            q = df["query"].astype(str).fillna("")
+            prov_all, sig_all = _assign_provider_and_signature(q)
+            mask = prov_all != "Unknown"
+            if mask.any():
+                hit = df.loc[mask].copy()
+                hit = _ensure_ts_datetime(hit)
 
-        q = df["query"].astype(str).fillna("")
-        prov_all, sig_all = _assign_provider_and_signature(q)
-        mask = prov_all != "Unknown"
-        if not mask.any():
-            continue
+                q_hit = hit["query"].astype(str).fillna("")
 
-        hit = df.loc[mask].copy()
-        hit = _ensure_ts_datetime(hit)
+                hit["AI_Provider"] = prov_all.loc[mask].values
+                hit["Signature_Match"] = sig_all.loc[mask].values
+                hit["Detection_Source"] = "DNS"
+                hit["Match_Field"] = "DNS query"
+                hit["Client_Type"] = "DNS Resolver"
+                hit["Upload_Bytes"] = 0
 
-        q_hit = hit["query"].astype(str).fillna("")
+                qtype = hit.get("qtype_name", "-").astype(str).fillna("-")
+                rcode = hit.get("rcode_name", "-").astype(str).fillna("-")
+                hit["Detail"] = "DNS " + qtype + " " + rcode
+                hit["Destination"] = q_hit
+                hit["user_agent"] = "-"
+                hit["Matched_Value"] = q_hit.astype(str)
 
-        hit["AI_Provider"] = prov_all.loc[mask].values
-        hit["Signature_Match"] = sig_all.loc[mask].values
-        hit["Detection_Source"] = "DNS"
-        hit["Match_Field"] = "DNS query"
-        hit["Client_Type"] = "DNS Resolver"
-        hit["Upload_Bytes"] = 0
-
-        qtype = hit.get("qtype_name", "-").astype(str).fillna("-")
-        rcode = hit.get("rcode_name", "-").astype(str).fillna("-")
-        hit["Detail"] = "DNS " + qtype + " " + rcode
-        hit["Destination"] = q_hit
-        hit["user_agent"] = "-"
-        hit["Matched_Value"] = q_hit.astype(str)
-
-        hit["Detection_Basis"] = hit["Match_Field"] + " matched '" + hit["Signature_Match"].astype(str) + "'"
-        events.append(hit)
+                hit["Detection_Basis"] = hit["Match_Field"] + " matched '" + hit["Signature_Match"].astype(str) + "'"
+                events.append(hit)
 
     # --- CONN (local AI ports) ---
     conn_cols = ["uid", "ts", "id.orig_h", "id.resp_h", "id.resp_p", "orig_ip_bytes", "orig_l2_addr", "l2_addr", "src_mac"]
@@ -4073,7 +4150,7 @@ def _render_shadow_ai_mac_drilldown(
         st.session_state[dialog_tab_key] = dialog_tab_options[0]
     st.markdown("<div class='shadow-tab-selector'>", unsafe_allow_html=True)
     dialog_tab = st.radio(
-        "",
+        "Shadow AI dialog tab",
         dialog_tab_options,
         horizontal=True,
         label_visibility="collapsed",
@@ -4736,8 +4813,6 @@ def inject_shadow_ai_css():
         """,
         unsafe_allow_html=True,
     )
-
-
 def _shadow_ai_bust_ui_caches() -> None:
     """Clear Shadow AI session caches and refresh Streamlit caches (used by this page)."""
     st.session_state["_shadow_ai_cache_bust_v1"] = int(st.session_state.get("_shadow_ai_cache_bust_v1", 0)) + 1
@@ -4847,7 +4922,20 @@ def render_shadow_ai(parquet_root: Path):
     date_options = available_dates
     today_str = datetime.now().strftime("%Y-%m-%d")
     default_scope = today_str if today_str in available_dates else available_dates[0]
-    default_index = date_options.index(default_scope) if default_scope in date_options else 0
+    sync_token = int(st.session_state.get("_parquet_sync_token", 0))
+    previous_sync_token = st.session_state.get("_shadow_ai_last_sync_token_v1")
+    if previous_sync_token != sync_token:
+        if previous_sync_token is not None:
+            _shadow_ai_bust_ui_caches()
+        st.session_state["shadow_ai_date_v4"] = default_scope
+        st.session_state["_shadow_ai_last_sync_token_v1"] = sync_token
+    elif str(st.session_state.get("shadow_ai_date_v4", "")).strip() not in date_options:
+        st.session_state["shadow_ai_date_v4"] = default_scope
+    selected_date_state = str(st.session_state.get("shadow_ai_date_v4", default_scope)).strip() or default_scope
+    if selected_date_state not in date_options:
+        selected_date_state = default_scope
+        st.session_state["shadow_ai_date_v4"] = default_scope
+    default_index = date_options.index(selected_date_state) if selected_date_state in date_options else 0
     selected_date = st.selectbox(
         "Dataset Scope",
         date_options,
@@ -4934,7 +5022,6 @@ def render_shadow_ai(parquet_root: Path):
     # Keep a hot in-session copy so search/filter/dialog reruns don't reload/unpickle.
     st.session_state.setdefault("_shadow_ai_cache_bust_v1", 0)
     cache_bust = int(st.session_state.get("_shadow_ai_cache_bust_v1", 0))
-    sync_token = int(st.session_state.get("_parquet_sync_token", 0))
     scope_df_key = (
         sync_token,
         cache_bust,
@@ -5102,7 +5189,7 @@ def render_shadow_ai(parquet_root: Path):
         st.session_state["shadow_ai_main_tab"] = main_tab_options[0]
     st.markdown("<div class='shadow-tab-selector'>", unsafe_allow_html=True)
     active_tab = st.radio(
-        "",
+        "Shadow AI main tab",
         main_tab_options,
         horizontal=True,
         label_visibility="collapsed",
