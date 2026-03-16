@@ -3,6 +3,7 @@ import re
 import time
 import tempfile
 import json
+import webbrowser
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -15,7 +16,8 @@ import streamlit as st
 import duckdb
 
 from config import client as client_config
-from pydrive2.auth import GoogleAuth
+from oauth2client.tools import ClientRedirectHandler, ClientRedirectServer
+from pydrive2.auth import AuthenticationError, AuthenticationRejected, GoogleAuth
 from pydrive2.drive import GoogleDrive
 from pydrive2.files import ApiRequestError
 
@@ -29,6 +31,10 @@ PROXY_ENV_KEYS = (
     "https_proxy",
     "all_proxy",
 )
+
+
+class DriveOAuthReauthRequired(RuntimeError):
+    """Stored OAuth credentials expired and require an interactive re-login."""
 
 
 def _extract_date_from_dirname(name: str) -> Optional[str]:
@@ -149,6 +155,101 @@ def _default_sync_dates() -> Tuple[str, ...]:
     return tuple()
 
 
+def _configure_drive_oauth(gauth: GoogleAuth, client_secret_path: str) -> GoogleAuth:
+    gauth.settings["client_config_file"] = client_secret_path
+    gauth.settings["oauth_scope"] = ["https://www.googleapis.com/auth/drive.readonly"]
+    gauth.settings["get_refresh_token"] = True
+    gauth.settings["access_type"] = "offline"
+    gauth.settings["approval_prompt"] = "auto"
+    return gauth
+
+
+def _interactive_drive_oauth_code(
+    gauth: GoogleAuth,
+    *,
+    host_name: str = "localhost",
+    port_numbers: Optional[Tuple[int, ...]] = None,
+    launch_browser: bool = True,
+    timeout_seconds: int = 300,
+) -> str:
+    ports = tuple(port_numbers or (8080, 8090))
+    httpd = None
+    port_number = 0
+    for port in ports:
+        try:
+            httpd = ClientRedirectServer((host_name, port), ClientRedirectHandler)
+        except OSError:
+            continue
+        port_number = int(port)
+        break
+
+    if httpd is None:
+        raise AuthenticationError(
+            "Failed to start the local Google Drive login listener. Check whether ports 8080 or 8090 are blocked."
+        )
+
+    try:
+        if gauth.flow is None:
+            gauth.GetFlow()
+        gauth.flow.redirect_uri = f"http://{host_name}:{port_number}/"
+        authorize_url = gauth.GetAuthUrl()
+        if launch_browser:
+            webbrowser.open(authorize_url, new=1, autoraise=True)
+
+        httpd.timeout = 1
+        deadline = time.time() + max(int(timeout_seconds or 0), 30)
+        while time.time() < deadline:
+            httpd.handle_request()
+            params = getattr(httpd, "query_params", {}) or {}
+            if not params:
+                continue
+            if "error" in params:
+                raise AuthenticationRejected("User rejected authentication")
+            code = str(params.get("code", "") or "").strip()
+            if code:
+                return code
+
+        raise AuthenticationError("Timed out waiting for the Google Drive login callback.")
+    finally:
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+
+
+def clear_drive_auth_caches() -> None:
+    authenticate_drive_oauth.cache_clear()
+    authenticate_drive_service_account.cache_clear()
+
+
+def reauthenticate_drive_oauth_interactive(
+    client_secret_path: str,
+    credentials_file: str,
+    *,
+    launch_browser: bool = True,
+) -> GoogleDrive:
+    cred_path = Path(credentials_file)
+    cred_path.parent.mkdir(parents=True, exist_ok=True)
+
+    proxy_overrides = _disable_dead_loopback_proxies()
+    try:
+        clear_drive_auth_caches()
+        gauth = _configure_drive_oauth(GoogleAuth(), client_secret_path)
+        gauth.credentials = None
+        code = _interactive_drive_oauth_code(gauth, launch_browser=launch_browser)
+        gauth.Auth(code)
+
+        try:
+            gauth.SaveCredentialsFile(str(cred_path))
+        except Exception:
+            pass
+
+        clear_drive_auth_caches()
+        return GoogleDrive(gauth)
+    finally:
+        _restore_env_vars(proxy_overrides)
+
+
 LOG_SYNC_PRIORITY = {
     "known_hosts": 0,
     "dhcp": 1,
@@ -181,15 +282,7 @@ def authenticate_drive_oauth(
     cred_path = Path(credentials_file)
     cred_path.parent.mkdir(parents=True, exist_ok=True)
 
-    gauth = GoogleAuth()
-    gauth.settings["client_config_file"] = client_secret_path
-    gauth.settings["oauth_scope"] = ["https://www.googleapis.com/auth/drive.readonly"]
-
-    # Needed to obtain refresh token (first login) so future runs don't prompt
-    gauth.settings["get_refresh_token"] = True
-    gauth.settings["access_type"] = "offline"
-    # IMPORTANT: do NOT force consent every run
-    gauth.settings["approval_prompt"] = "auto"
+    gauth = _configure_drive_oauth(GoogleAuth(), client_secret_path)
 
     # Load saved credentials if they exist
     if cred_path.exists():
@@ -206,8 +299,10 @@ def authenticate_drive_oauth(
                 "Drive OAuth credentials are missing. Populate secrets/drive_credentials.json "
                 "with a refresh_token-enabled credential file before starting the dashboard."
             )
-        gauth.LocalWebserverAuth()
+        code = _interactive_drive_oauth_code(gauth)
+        gauth.Auth(code)
     else:
+        refresh_attempted = bool(gauth.access_token_expired)
         try:
             if gauth.access_token_expired:
                 gauth.Refresh()
@@ -217,12 +312,17 @@ def authenticate_drive_oauth(
             # Never open a browser during dashboard reruns/server execution.
             # If silent refresh fails, require a one-time manual re-auth outside the app.
             if not allow_interactive:
+                if refresh_attempted:
+                    raise DriveOAuthReauthRequired(
+                        "Drive OAuth session expired. Reconnect Google Drive to resume parquet sync."
+                    )
                 raise RuntimeError(
-                    "Drive OAuth token refresh failed. Recreate secrets/drive_credentials.json "
-                    "once with a valid refresh token, then rerun the dashboard."
+                    "Drive OAuth authorization failed. Check the client secret, stored credentials, "
+                    "and Google Drive access, then retry."
                 )
             gauth.credentials = None
-            gauth.LocalWebserverAuth()
+            code = _interactive_drive_oauth_code(gauth)
+            gauth.Auth(code)
 
     # Save for future runs
     try:

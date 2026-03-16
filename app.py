@@ -19,12 +19,18 @@ from config import client as client_config
 
 AUTO_REFRESH_INTERVAL = int(getattr(client_config, "AUTO_REFRESH_INTERVAL", 3600))
 CLIENT_SECRET_FILE = str(getattr(client_config, "CLIENT_SECRET_FILE", ""))
+DRIVE_AUTH_MODE = str(getattr(client_config, "DRIVE_AUTH_MODE", "oauth")).strip().lower()
+DRIVE_CREDENTIALS_FILE = str(getattr(client_config, "DRIVE_CREDENTIALS_FILE", "secrets/drive_credentials.json"))
 DRIVE_SYNC_INTERVAL = int(getattr(client_config, "DRIVE_SYNC_INTERVAL", AUTO_REFRESH_INTERVAL))
 FOLDER_ID = str(getattr(client_config, "FOLDER_ID", ""))
 PARQUET_DIR = Path(getattr(client_config, "PARQUET_DIR", Path("data/parquet")))
 
 from services import auth_service
-from services.drive_services import sync_drive_to_parquet
+from services.drive_services import (
+    DriveOAuthReauthRequired,
+    reauthenticate_drive_oauth_interactive,
+    sync_drive_to_parquet,
+)
 
 from ui.auth import require_authentication, current_user, clear_persistent_auth_session
 from ui.sidebar import render_sidebar
@@ -44,6 +50,7 @@ class DriveSyncManager:
     last_processed: int = 0
     last_run_at: str = ""
     target_dates: tuple[str, ...] = field(default_factory=tuple)
+    reauth_required: bool = False
     completion_token: int = 0
     parquet_token: int = 0
 
@@ -63,6 +70,7 @@ class DriveSyncManager:
                 "last_processed": int(self.last_processed or 0),
                 "last_run_at": str(self.last_run_at or ""),
                 "target_dates": tuple(self.target_dates),
+                "reauth_required": bool(self.reauth_required),
                 "completion_token": int(self.completion_token or 0),
                 "parquet_token": int(self.parquet_token or 0),
             }
@@ -72,6 +80,8 @@ class DriveSyncManager:
             future = self.future
             last_tick = max(float(self.requested_at or 0.0), float(self.completed_at or 0.0))
             if future is not None and not future.done():
+                return False
+            if self.reauth_required:
                 return False
             if last_tick and (time.time() - last_tick) < max(int(min_interval_seconds), 30):
                 return False
@@ -95,22 +105,35 @@ class DriveSyncManager:
 
         processed = 0
         error = ""
+        reauth_required = False
         try:
             processed = int(future.result() or 0)
         except Exception as exc:
             error = str(exc)
+            reauth_required = isinstance(exc, DriveOAuthReauthRequired)
 
         with self.lock:
             if self.future is future:
                 self.future = None
             self.last_error = error
+            self.reauth_required = bool(reauth_required)
             if not error:
                 self.last_processed = processed
                 self.parquet_token = int(self.parquet_token or 0) + 1
+                self.reauth_required = False
             self.last_run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.completed_at = time.time()
             self.completion_token = int(self.completion_token or 0) + 1
         return True
+
+    def notify_credentials_refreshed(self) -> None:
+        with self.lock:
+            self.future = None
+            self.requested_at = 0.0
+            self.completed_at = 0.0
+            self.last_error = ""
+            self.reauth_required = False
+            self.messages.append("Google Drive reconnected. Background sync will retry automatically.")
 
 
 # =====================================================
@@ -170,6 +193,7 @@ def _sync_session_drive_state(snapshot: dict) -> None:
     st.session_state["_drive_sync_requested_at"] = float(snapshot.get("requested_at") or 0.0)
     st.session_state["_drive_sync_completed_at"] = float(snapshot.get("completed_at") or 0.0)
     st.session_state["_drive_sync_target_dates"] = tuple(snapshot.get("target_dates") or ())
+    st.session_state["_drive_sync_reauth_required"] = bool(snapshot.get("reauth_required"))
 
     previous_completion_token = st.session_state.get("_drive_sync_seen_completion_token")
     completion_token = int(snapshot.get("completion_token") or 0)
@@ -214,6 +238,35 @@ def _ensure_background_refresh(*, sync_running: bool) -> None:
         interval=int(_background_refresh_interval_seconds(sync_running=sync_running)) * 1000,
         key="background_sync_refresh_timer",
     )
+
+
+def _render_drive_reauth_notice() -> None:
+    if DRIVE_AUTH_MODE not in {"oauth", "auto"}:
+        return
+    if not bool(st.session_state.get("_drive_sync_reauth_required")):
+        return
+
+    error_text = str(st.session_state.get("_drive_sync_last_error") or "").strip()
+    with st.sidebar:
+        st.warning("Google Drive login expired. Reconnect to resume parquet backfill.")
+        st.caption("Click reconnect to open the Google login flow and save a new Drive token.")
+        if error_text:
+            st.caption(error_text)
+        if st.button("Reconnect Google Drive", key="drive_oauth_reconnect_btn", use_container_width=True):
+            try:
+                with st.spinner("Waiting for Google Drive login..."):
+                    reauthenticate_drive_oauth_interactive(
+                        CLIENT_SECRET_FILE,
+                        DRIVE_CREDENTIALS_FILE,
+                    )
+            except Exception as exc:
+                st.session_state["_drive_sync_last_error"] = f"Drive re-login failed: {exc}"
+                st.error(st.session_state["_drive_sync_last_error"])
+            else:
+                manager = _drive_sync_manager()
+                manager.notify_credentials_refreshed()
+                _sync_session_drive_state(manager.snapshot())
+                st.rerun()
 
 
 PARQUET_DIR.mkdir(parents=True, exist_ok=True)
@@ -319,6 +372,7 @@ selected_page = render_sidebar(
     menu_options=menu_options,
     menu_icons=menu_icons,
 )
+_render_drive_reauth_notice()
 
 # ✅ Logout action: go back to login page immediately
 if selected_page == "Logout":
