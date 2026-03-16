@@ -3,7 +3,7 @@ import re
 import time
 import tempfile
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -145,9 +145,8 @@ def _file_sync_key(file_obj, log_date: str, log_type: str) -> str:
 
 
 def _default_sync_dates() -> Tuple[str, ...]:
-    today = datetime.now().date()
-    previous = today - timedelta(days=1)
-    return (today.strftime("%Y-%m-%d"), previous.strftime("%Y-%m-%d"))
+    # Empty tuple means "do not filter dates; backfill every available log date".
+    return tuple()
 
 
 LOG_SYNC_PRIORITY = {
@@ -406,7 +405,7 @@ def sync_drive_to_parquet(
 ):
     """
     Sync Google Drive logs to local Parquet cache.
-    - Focuses on the current day plus the previous day by default.
+    - Backfills every available Drive date by default.
     - Downloads new logs that do not exist locally.
     - Re-downloads logs whose Drive modified timestamp changed.
     """
@@ -451,7 +450,10 @@ def sync_drive_to_parquet(
             raise
 
         default_date = datetime.now().strftime("%Y-%m-%d")
-        desired_dates = tuple(target_dates or _default_sync_dates())
+        if target_dates is None:
+            desired_dates = tuple(_default_sync_dates())
+        else:
+            desired_dates = tuple(str(d).strip() for d in target_dates if str(d).strip())
         desired_date_set = {str(d).strip() for d in desired_dates if str(d).strip()}
         files_processed = 0
         sync_state = _load_sync_state(parquet_root)
@@ -483,7 +485,10 @@ def sync_drive_to_parquet(
             log_candidates.append((f, name, log_type, log_date))
 
         if not log_candidates:
-            _log(f"No Zeek .log files discovered in Drive for dates: {', '.join(desired_dates)}.")
+            if desired_dates:
+                _log(f"No Zeek .log files discovered in Drive for dates: {', '.join(desired_dates)}.")
+            else:
+                _log("No Zeek .log files discovered in Drive.")
             return 0
 
         latest_drive_date = max(row[3] for row in log_candidates)

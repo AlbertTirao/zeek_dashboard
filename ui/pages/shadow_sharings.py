@@ -52,6 +52,21 @@ CONFIDENCE_COLORS = {
 }
 
 
+def _traffic_admin_can_authorize() -> bool:
+    auth_user = st.session_state.get("auth_user") or {}
+    role = ""
+    if isinstance(auth_user, dict):
+        role = auth_user.get("role") or ""
+    if not str(role).strip():
+        role = (
+            st.session_state.get("current_role")
+            or st.session_state.get("role")
+            or st.session_state.get("user_role")
+            or ""
+        )
+    return str(role).strip().lower() == "admin"
+
+
 def _shadow_sharing_policy_stamp() -> tuple:
     project_root = Path(__file__).resolve().parents[2]
     out: List[int] = []
@@ -1429,6 +1444,9 @@ def _apply_allowed_domain_checkbox_changes(grid_before: pd.DataFrame, grid_respo
     if grid_before is None or grid_before.empty or grid_response is None:
         return False
 
+    if not _traffic_admin_can_authorize():
+        return False
+
     if st.session_state.get("shadow_sharing_allow_dialog_open"):
         return False
 
@@ -1514,6 +1532,7 @@ def _apply_allowed_domain_checkbox_changes(grid_before: pd.DataFrame, grid_respo
 
 @st.dialog("Allow Destination Domain", width="small", dismissible=False)
 def show_shadow_sharing_allow_dialog():
+    can_manage_allow = _traffic_admin_can_authorize()
     st.session_state["shadow_sharing_dialog_origin"] = "dialog"
     candidate = st.session_state.get("shadow_sharing_allow_candidate") or {}
     target_domain = _clean_whitelist_target_value(candidate.get("domain", ""))
@@ -1539,6 +1558,8 @@ def show_shadow_sharing_allow_dialog():
 
     if invalid_target:
         st.error("This row has no valid domain in the Domain column.")
+    if not can_manage_allow:
+        st.error("Admin role is required to allowlist destination domains.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1546,7 +1567,7 @@ def show_shadow_sharing_allow_dialog():
             "Allow Domain",
             type="primary",
             width="stretch",
-            disabled=invalid_target,
+            disabled=(invalid_target or (not can_manage_allow)),
             key="shadow_sharing_allow_confirm_btn",
         ):
             ok, message = _add_domain_to_whitelist(str(target_domain))
@@ -1801,10 +1822,11 @@ def show_shadow_sharing_device_dialog(
         )
 
         gb_rows = GridOptionsBuilder.from_dataframe(grid_rows)
+        can_manage_allow = _traffic_admin_can_authorize()
         _configure_incident_grid_columns(
             gb_rows,
             clickable_mac=False,
-            editable_allowed_domain=True,
+            editable_allowed_domain=can_manage_allow,
             include_hostname=False,
         )
         row_response = render_shadow_aggrid(
@@ -1828,7 +1850,10 @@ def show_shadow_sharing_device_dialog(
             st.markdown(
                 f"{len(grid_rows):,} grouped rows shown for this MAC. Rows are grouped by unique MAC + Destination within the selected date scope."
             )
-            st.markdown("`Allowed` is editable and updates whitelist decisions for the destination domain.")
+            if can_manage_allow:
+                st.markdown("`Allowed` is editable for admins and updates whitelist decisions for the destination domain.")
+            else:
+                st.markdown("`Allowed` is view-only for staff. Only admins can update whitelist decisions for the destination domain.")
             st.markdown("`Confidence`, `Score`, and `Reasons` summarize correlated conn/ssl/http/files evidence per incident row.")
         st.download_button(
             "Download CSV",
@@ -2495,10 +2520,11 @@ def render_shadow_sharing(parquet_root: Path):
                 dev_grid = dev_grid.reset_index(drop=True)
                 dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
             gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
+            can_manage_allow = _traffic_admin_can_authorize()
             _configure_incident_grid_columns(
                 gb_dev,
                 clickable_mac=True,
-                editable_allowed_domain=True,
+                editable_allowed_domain=can_manage_allow,
                 include_hostname=True,
             )
 
@@ -2569,7 +2595,10 @@ def render_shadow_sharing(parquet_root: Path):
                     f"{len(dev_grid):,} grouped rows shown. Rows are grouped by unique MAC + Destination for the selected date scope."
                 )
                 st.markdown("Search, Confidence Level, and Source Logs filters above affect this table only.")
-                st.markdown("`Allowed` is editable and updates whitelist decisions for each destination domain.")
+                if can_manage_allow:
+                    st.markdown("`Allowed` is editable for admins and updates whitelist decisions for each destination domain.")
+                else:
+                    st.markdown("`Allowed` is view-only for staff. Only admins can update whitelist decisions for each destination domain.")
                 st.markdown("`Outbound_MB`, `Inbound_MB`, `Ratio`, `Confidence`, and `Score` help prioritize suspicious transfer behavior.")
             st.download_button(
                 "Download CSV",

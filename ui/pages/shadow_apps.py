@@ -15,6 +15,20 @@ import yaml
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 
 
+def _traffic_admin_can_authorize() -> bool:
+    auth_user = st.session_state.get("auth_user") or {}
+    role = ""
+    if isinstance(auth_user, dict):
+        role = auth_user.get("role") or ""
+    if not str(role).strip():
+        role = (
+            st.session_state.get("current_role")
+            or st.session_state.get("role")
+            or st.session_state.get("user_role")
+            or ""
+        )
+    return str(role).strip().lower() == "admin"
+
 
 def _closest_row_option(options: list[int], target: int) -> int:
     if not options:
@@ -470,16 +484,23 @@ def _close_shadow_dialog(reset_grid: bool = True):
     st.session_state["shadow_dialog_mac"] = None
     st.session_state["shadow_last_selected_mac"] = None
     st.session_state.pop("shadow_dialog_origin", None)
-    _close_inventory_allow_dialog()
-    _close_inventory_app_dialog()
+    _close_inventory_allow_dialog(reset_grid=False)
+    _close_inventory_app_dialog(reset_grid=False)
 
     if reset_grid:
         st.session_state["shadow_grid_nonce"] = int(st.session_state.get("shadow_grid_nonce", 0)) + 1
+        _bump_shadow_inventory_grid_nonce()
 
 
-def _close_inventory_allow_dialog():
+def _bump_shadow_inventory_grid_nonce():
+    st.session_state["shadow_inv_grid_nonce"] = int(st.session_state.get("shadow_inv_grid_nonce", 0)) + 1
+
+
+def _close_inventory_allow_dialog(*, reset_grid: bool = True):
     st.session_state["shadow_allow_dialog_open"] = False
     st.session_state.pop("shadow_allow_candidate", None)
+    if reset_grid:
+        _bump_shadow_inventory_grid_nonce()
 
 
 def _open_inventory_allow_dialog(candidate: dict):
@@ -488,10 +509,11 @@ def _open_inventory_allow_dialog(candidate: dict):
     st.session_state["shadow_dialog_origin"] = "dialog"
 
 
-def _close_inventory_app_dialog():
+def _close_inventory_app_dialog(*, reset_grid: bool = True):
     st.session_state["shadow_app_detail_dialog_open"] = False
     st.session_state.pop("shadow_app_detail_context", None)
-    st.session_state["shadow_inv_grid_nonce"] = int(st.session_state.get("shadow_inv_grid_nonce", 0)) + 1
+    if reset_grid:
+        _bump_shadow_inventory_grid_nonce()
 
 
 def _open_inventory_app_dialog(context: dict):
@@ -2619,6 +2641,7 @@ def _sql_fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
 # =============================================================================
 @st.dialog("Allow Application / Identifier", width="small", dismissible=False)
 def show_inventory_allow_dialog():
+    can_manage_allow = _traffic_admin_can_authorize()
     candidate = st.session_state.get("shadow_allow_candidate") or {}
     target_mac = str(candidate.get("mac") or "").strip().lower()
     destination_raw = str(candidate.get("destination") or "").strip()
@@ -2637,6 +2660,8 @@ def show_inventory_allow_dialog():
 
     if invalid_target:
         st.error("This row has no valid destination domain to allowlist.")
+    if not can_manage_allow:
+        st.error("Admin role is required to allowlist applications or domains.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2644,7 +2669,7 @@ def show_inventory_allow_dialog():
             "Allow This App/Domain",
             type="primary",
             width="stretch",
-            disabled=invalid_target,
+            disabled=(invalid_target or (not can_manage_allow)),
             key="shadow_allow_confirm_btn",
         ):
             ok, message = add_domain_to_allowlist(destination)
@@ -4061,6 +4086,7 @@ def show_forensics_dialog(conn):
     if inventory_df.empty:
         st.info("No valid application/software/domain identifiers were detected for this MAC with the current filters.")
     else:
+        can_manage_allow = _traffic_admin_can_authorize()
         inv_grid = inventory_df.copy()
         inv_grid.insert(0, "#", range(1, len(inv_grid) + 1))
         inv_grid["Allowed"] = inv_grid["status"].astype(str).str.lower().eq("authorized")
@@ -4189,7 +4215,7 @@ def show_forensics_dialog(conn):
             "Allowed",
             header_name="Allowed",
             width=96,
-            editable=inv_allow_editable,
+            editable=(inv_allow_editable if can_manage_allow else False),
             cellRenderer="agCheckboxCellRenderer",
             cellEditor="agCheckboxCellEditor",
             singleClickEdit=True,
@@ -4254,7 +4280,10 @@ def show_forensics_dialog(conn):
                 "Rows are grouped by Destination + Application/Software/Domain. Sources, first/last seen, duration, and hits are aggregated per MAC."
             )
             st.markdown("Search, Risk Level, and Source Logs filters above affect this table only.")
-            st.markdown("`Status` and `Max Risk` keep the highest-severity state per grouped row; `Allowed` is editable.")
+            if can_manage_allow:
+                st.markdown("`Status` and `Max Risk` keep the highest-severity state per grouped row; `Allowed` is editable for admins.")
+            else:
+                st.markdown("`Status` and `Max Risk` keep the highest-severity state per grouped row; `Allowed` is view-only for staff.")
             st.markdown("`Port(s)` shows top observed ports (up to 3). Click an app row to open full per-port details.")
 
         edited_inv = inv_grid_response.get("data", None)
@@ -4266,7 +4295,8 @@ def show_forensics_dialog(conn):
             edited_df = pd.DataFrame()
 
         if (
-            not edited_df.empty
+            can_manage_allow
+            and not edited_df.empty
             and "Allowed" in edited_df.columns
             and "_allow_key" in edited_df.columns
             and not st.session_state.get("shadow_allow_dialog_open")

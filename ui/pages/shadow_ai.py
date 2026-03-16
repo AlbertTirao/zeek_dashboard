@@ -38,6 +38,21 @@ except Exception:
     HAS_FUZZYWUZZY = False
 
 
+def _traffic_admin_can_authorize() -> bool:
+    auth_user = st.session_state.get("auth_user") or {}
+    role = ""
+    if isinstance(auth_user, dict):
+        role = auth_user.get("role") or ""
+    if not str(role).strip():
+        role = (
+            st.session_state.get("current_role")
+            or st.session_state.get("role")
+            or st.session_state.get("user_role")
+            or ""
+        )
+    return str(role).strip().lower() == "admin"
+
+
 # =============================================================================
 # CACHE HELPERS (MATCH SHADOW APPS)
 # =============================================================================
@@ -4420,6 +4435,7 @@ def _render_shadow_ai_mac_drilldown(
 
 @st.dialog("Allow AI Provider", width="small", dismissible=False)
 def show_shadow_ai_allow_dialog() -> None:
+    can_manage_allow = _traffic_admin_can_authorize()
     candidate = st.session_state.get("shadow_ai_allow_candidate") or {}
     provider_raw = _normalize_provider_name(candidate.get("provider"))
     verdict_raw = str(candidate.get("verdict") or "").strip()
@@ -4435,6 +4451,8 @@ def show_shadow_ai_allow_dialog() -> None:
 
     if invalid_target:
         st.error("This row has no valid AI provider value to allowlist.")
+    if not can_manage_allow:
+        st.error("Admin role is required to allowlist AI providers.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -4442,7 +4460,7 @@ def show_shadow_ai_allow_dialog() -> None:
             "Allow This AI",
             type="primary",
             use_container_width=True,
-            disabled=invalid_target,
+            disabled=(invalid_target or (not can_manage_allow)),
             key="shadow_ai_allow_confirm_btn",
         ):
             ok, message = add_provider_to_authorized(provider_raw)
@@ -5313,6 +5331,7 @@ def render_shadow_ai(parquet_root: Path):
             str(k): _coerce_checkbox_bool(v)
             for k, v in zip(prov_grid["_allow_key"].tolist(), prov_grid["Allowed"].tolist())
         }
+        can_manage_allow = _traffic_admin_can_authorize()
         prov_allow_editable = JsCode(
             """
             function(params) {
@@ -5331,7 +5350,7 @@ def render_shadow_ai(parquet_root: Path):
             "Allowed",
             header_name="Allowed",
             width=96,
-            editable=prov_allow_editable,
+            editable=(prov_allow_editable if can_manage_allow else False),
             cellRenderer="agCheckboxCellRenderer",
             cellEditor="agCheckboxCellEditor",
             singleClickEdit=True,
@@ -5369,7 +5388,11 @@ def render_shadow_ai(parquet_root: Path):
             f"{len(prov_grid):,} provider rows shown for the current page filters.",
             [
                 "Rows are grouped by `AI_Provider` + `Policy_Verdict` in the selected scope.",
-                "`Allowed` is editable for Shadow AI rows and updates `authorized_providers` after confirmation.",
+                (
+                    "`Allowed` is editable for admins on Shadow AI rows and updates `authorized_providers` after confirmation."
+                    if can_manage_allow
+                    else "`Allowed` is view-only for staff. Only admins can update `authorized_providers`."
+                ),
                 "`Max_Risk_Level` and `Risk_Level_Basis` explain prioritized providers.",
             ],
         )
@@ -5393,7 +5416,8 @@ def render_shadow_ai(parquet_root: Path):
             edited_df = pd.DataFrame()
 
         if (
-            not edited_df.empty
+            can_manage_allow
+            and not edited_df.empty
             and "Allowed" in edited_df.columns
             and "_allow_key" in edited_df.columns
             and not st.session_state.get("shadow_ai_allow_dialog_open")

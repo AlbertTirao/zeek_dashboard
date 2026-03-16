@@ -6,7 +6,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -152,10 +152,9 @@ def perform_logout():
     st.rerun()
 
 
-def _auto_sync_target_dates() -> tuple[str, str]:
-    today = datetime.now().date()
-    previous = today - timedelta(days=1)
-    return (today.strftime("%Y-%m-%d"), previous.strftime("%Y-%m-%d"))
+def _auto_sync_target_dates() -> tuple[str, ...]:
+    # Empty target list means "sync every available Drive date".
+    return tuple()
 
 
 @st.cache_resource
