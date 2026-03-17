@@ -74,6 +74,7 @@ Important:
 
 1. Share the Google Drive folder with the service account e-mail.
 2. Keep `secrets/service_account.json` out of Git.
+3. If the placeholder file is missing or empty, the app now auto-detects the first valid service account JSON in `secrets/`, but the canonical filename above is still recommended for servers.
 
 ## 6) Configure App Auth Backend in `.streamlit/secrets.toml`
 
@@ -272,7 +273,7 @@ sudo systemctl status zeek-dashboard --no-pager
 Back up these files before upgrades or server changes:
 
 1. `/opt/zeek-dashboard/.streamlit/secrets.toml`
-2. `/opt/zeek-dashboard/secrets/service_account.json`
+2. `/opt/zeek-dashboard/secrets/service_account.json` or whichever service account JSON is configured/auto-detected
 3. `/opt/zeek-dashboard/secrets/drive_credentials.json` (if OAuth mode is used)
 
 ## 15) Common Troubleshooting
@@ -286,7 +287,7 @@ Back up these files before upgrades or server changes:
    - verify `mongodb_uri` and allowlist server IP in Atlas
 4. Google Drive sync errors:
    - confirm Drive folder is shared to service account e-mail
-   - confirm `secrets/service_account.json` exists and is valid
+   - confirm `secrets/service_account.json` exists and is valid, or that another valid service account JSON exists in `secrets/`
 5. OTP e-mail not sending:
    - verify SMTP host/user/password and app password settings
 

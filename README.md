@@ -224,8 +224,17 @@ python -c "from services import auth_service; print(auth_service._get_smtp_confi
 
 ## Google Drive Note
 
-On first run/rerun, app asks for Google authentication in browser.
-Make sure your Google account is a collaborator on the Zeek logs Drive folder.
+The project now defaults to Google Drive `service` auth in `config/client.py`, which is the server-safe mode and does not open a browser.
+
+Preferred setup:
+
+1. Put a valid Google service account key in `secrets/service_account.json`.
+2. Share the Zeek logs Drive folder with the service account e-mail from that key.
+
+Fallback behavior:
+
+1. If `secrets/service_account.json` is missing or empty, the app scans `secrets/*.json` and uses the first valid service account key it finds.
+2. OAuth files such as `secrets/drive_credentials.json` are only needed if you intentionally switch `DRIVE_AUTH_MODE` back to `oauth` or `auto`.
 
 ## Troubleshooting
 
@@ -247,6 +256,10 @@ Make sure your Google account is a collaborator on the Zeek logs Drive folder.
 7. `This e-mail is not approved for login`:
    - this check applies when Google OAuth is enabled
    - add the address to `auth.allowed_google_emails` in `.streamlit/secrets.toml`
+8. `Google Drive sync errors`:
+   - confirm `config/client.py` is using `DRIVE_AUTH_MODE = "service"`
+   - confirm the Drive folder is shared with the service account e-mail
+   - confirm there is at least one valid service account JSON file in `secrets/`
 
 ## Security
 
