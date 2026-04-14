@@ -4622,16 +4622,15 @@ def render_shadow_apps(parquet_root: Path):
         )
         bottom_filter_col1, bottom_filter_col2 = st.columns([2.2, 2.2])
         with bottom_filter_col1:
-            audit_risk_filter = risk_multiselect(
+            audit_risk_filter = st.multiselect(
                 "Risk Level",
+                RISK_OPTIONS,
                 key=risk_state_key,
-                default=list(st.session_state[risk_state_key]),
             )
         with bottom_filter_col2:
             audit_source_filter = st.multiselect(
                 "Source Logs",
                 audit_sources,
-                default=list(st.session_state[source_state_key]),
                 key=source_state_key,
             )
         st.markdown("</div>", unsafe_allow_html=True)
