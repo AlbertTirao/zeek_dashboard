@@ -3045,21 +3045,18 @@ def render_anonymization_network(parquet_root: Path):
         conf_filter = st.multiselect(
             "Confidence",
             conf_options,
-            default=st.session_state.get("anonym_net_conf_applied", conf_options),
             key="anonym_net_conf_applied",
         )
     with c7:
         source_filter = st.multiselect(
             "Source",
             source_opts,
-            default=st.session_state.get("anonym_net_source_applied", source_opts),
             key="anonym_net_source_applied",
         )
     st.markdown("<div class='shadow-filter-shell'>", unsafe_allow_html=True)
     cat_filter = st.multiselect(
         "Category",
         cat_opts,
-        default=st.session_state.get("anonym_net_cat_applied", cat_opts),
         key="anonym_net_cat_applied",
     )
     st.markdown("</div>", unsafe_allow_html=True)
