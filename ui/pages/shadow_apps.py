@@ -93,7 +93,7 @@ def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
 # =============================================================================
 
 # Bump version so old cached parquet gets rebuilt automatically when ingestion logic changes.
-CACHE_VERSION = "shadow-cache-v14-risk-engine-escalation"
+CACHE_VERSION = "shadow-cache-v15-ts-format-compat"
 
 # -----------------------------
 # Config
@@ -2025,6 +2025,13 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             valid = [f'try_cast("{c}" as {cast_type})' for c in candidates if c in existing_cols]
             return f"COALESCE({', '.join(valid)}, {fallback})" if valid else fallback
 
+        def get_first_existing(candidates, fallback="NULL"):
+            for c in candidates:
+                if c in existing_cols:
+                    return f'"{c}"'
+            return fallback
+
+        sql_ts = get_first_existing(["ts", "timestamp", "time", "seen_ts"], "NULL")
         sql_ip = get_coalesce(["id.orig_h", "orig_h", "src_ip", "ip"], "'0.0.0.0'")
         sql_mac = get_coalesce(["mac", "orig_mac", "id.orig_mac", "src_mac"], "NULL")
         sql_port = get_cast_coalesce(["id.resp_p", "dst_port", "resp_p"], "INT")
@@ -2062,7 +2069,7 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
 
         query = f"""
         SELECT
-            try_cast(ts as DOUBLE) as ts,
+            {sql_ts} as ts,
             {sql_ip} as ip,
             COALESCE({sql_mac}, m.mac_addr, 'Unknown') as mac,
             COALESCE(NULLIF(m.hostname,''), 'Unknown') as hostname,
@@ -2081,6 +2088,31 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
         return _conn.execute(query).df()
     except Exception:
         return pd.DataFrame()
+
+
+def _coerce_event_datetime(ts_values) -> pd.Series:
+    """
+    Parse Zeek event time robustly from either:
+    - epoch seconds (numeric/string), or
+    - parquet timestamp/datetime values.
+    Returns tz-naive datetimes for downstream day-scoping logic.
+    """
+    s = ts_values if isinstance(ts_values, pd.Series) else pd.Series(ts_values)
+    if pd.api.types.is_datetime64_any_dtype(s):
+        dt = pd.to_datetime(s, errors="coerce", utc=True)
+    else:
+        dt = pd.to_datetime(s, errors="coerce", utc=True)
+        num = pd.to_numeric(s, errors="coerce")
+        if num.notna().any():
+            dt_epoch = pd.to_datetime(num, unit="s", errors="coerce", utc=True)
+            dt = dt.where(~num.notna(), dt_epoch)
+    try:
+        return dt.dt.tz_convert(None)
+    except Exception:
+        try:
+            return dt.dt.tz_localize(None)
+        except Exception:
+            return pd.to_datetime(dt, errors="coerce")
 
 
 def cache_is_fresh(parquet_root: Path, date_str: str, sources_max_mtime: int) -> bool:
@@ -2328,7 +2360,7 @@ def build_daily_cache(conn, parquet_root: Path, date_str: str, allow_re, risk_po
         return
 
     df = raw_df.copy()
-    df["datetime"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
+    df["datetime"] = _coerce_event_datetime(df.get("ts", pd.Series(index=df.index, dtype="object")))
     df = df.dropna(subset=["datetime"])
 
     df["ip"] = df["ip"].fillna("Unknown").astype(str)
