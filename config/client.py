@@ -78,3 +78,6 @@ DRIVE_CREDENTIALS_FILE = "secrets/drive_credentials.json"
 # =====================================================
 AUTO_REFRESH_INTERVAL = 3600  # seconds
 DRIVE_SYNC_INTERVAL = 3600  # seconds
+# Number of recent days to sync from Drive on each cycle.
+# Set to 0 or negative to sync all available historical dates.
+DRIVE_SYNC_LOOKBACK_DAYS = 2

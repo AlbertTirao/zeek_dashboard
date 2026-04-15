@@ -6,7 +6,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -22,6 +22,7 @@ CLIENT_SECRET_FILE = str(getattr(client_config, "CLIENT_SECRET_FILE", ""))
 DRIVE_AUTH_MODE = str(getattr(client_config, "DRIVE_AUTH_MODE", "oauth")).strip().lower()
 DRIVE_CREDENTIALS_FILE = str(getattr(client_config, "DRIVE_CREDENTIALS_FILE", "secrets/drive_credentials.json"))
 DRIVE_SYNC_INTERVAL = int(getattr(client_config, "DRIVE_SYNC_INTERVAL", AUTO_REFRESH_INTERVAL))
+DRIVE_SYNC_LOOKBACK_DAYS = int(getattr(client_config, "DRIVE_SYNC_LOOKBACK_DAYS", 2))
 FOLDER_ID = str(getattr(client_config, "FOLDER_ID", ""))
 PARQUET_DIR = Path(getattr(client_config, "PARQUET_DIR", Path("data/parquet")))
 
@@ -119,7 +120,8 @@ class DriveSyncManager:
             self.reauth_required = bool(reauth_required)
             if not error:
                 self.last_processed = processed
-                self.parquet_token = int(self.parquet_token or 0) + 1
+                if processed > 0:
+                    self.parquet_token = int(self.parquet_token or 0) + 1
                 self.reauth_required = False
             self.last_run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.completed_at = time.time()
@@ -176,8 +178,13 @@ def perform_logout():
 
 
 def _auto_sync_target_dates() -> tuple[str, ...]:
-    # Empty target list means "sync every available Drive date".
-    return tuple()
+    lookback_days = int(DRIVE_SYNC_LOOKBACK_DAYS or 0)
+    # lookback_days <= 0 means "sync every available Drive date".
+    if lookback_days <= 0:
+        return tuple()
+
+    today = datetime.now().date()
+    return tuple((today - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(lookback_days))
 
 
 @st.cache_resource

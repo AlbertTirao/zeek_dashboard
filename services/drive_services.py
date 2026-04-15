@@ -613,10 +613,14 @@ def sync_drive_to_parquet(
 
         # Recursive generator
         def walk_folder(fid: str, inherited_date_hint: Optional[str] = None):
+            if desired_date_set and inherited_date_hint and inherited_date_hint not in desired_date_set:
+                return
             items = list_files_with_retry(drive, f"'{fid}' in parents and trashed=false")
             for item in items:
                 if item.get("mimeType") == "application/vnd.google-apps.folder":
                     folder_date_hint = _extract_date_from_dirname(str(item.get("title", "")))
+                    if desired_date_set and folder_date_hint and folder_date_hint not in desired_date_set:
+                        continue
                     next_hint = folder_date_hint or inherited_date_hint
                     yield from walk_folder(item["id"], next_hint)
                 else:
