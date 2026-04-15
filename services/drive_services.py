@@ -23,6 +23,7 @@ from pydrive2.files import ApiRequestError
 
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DATE_TOKEN_RE = re.compile(r"(\d{4}-\d{1,2}-\d{1,2})")
+SUPPORTED_SOURCE_EXTS = {".log", ".parquet"}
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -91,6 +92,38 @@ def _resolve_log_date(file_obj, folder_date_hint: Optional[str], default_date: s
     if folder_date_hint:
         return folder_date_hint
     return parsed_date or default_date
+
+
+def _supported_source_extension(file_name: str) -> Optional[str]:
+    suffix = Path(str(file_name or "")).suffix.strip().lower()
+    if suffix in SUPPORTED_SOURCE_EXTS:
+        return suffix
+    return None
+
+
+def _drive_modified_ts_seconds(modified_date: str) -> float:
+    raw = (modified_date or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return float(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        pass
+    try:
+        parsed = datetime.strptime(raw.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+        return float(parsed.timestamp())
+    except Exception:
+        return 0.0
+
+
+def _drive_file_size_bytes(file_obj) -> int:
+    raw = str(file_obj.get("fileSize", "")).strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except Exception:
+        return 0
 
 
 def _is_dead_loopback_proxy(proxy_value: str) -> bool:
@@ -410,6 +443,25 @@ def list_files_with_retry(drive: GoogleDrive, query: str, max_retries: int = 5):
 # 2) STREAMING INGEST (LOG -> PARQUET)
 # =====================================================
 
+def download_drive_parquet_to_path(file_obj, parquet_path: Path) -> None:
+    """
+    Downloads a Drive parquet object directly to the target parquet path.
+    """
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+    os.close(fd)
+
+    try:
+        file_obj.GetContentFile(tmp_path)
+        os.replace(tmp_path, parquet_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def stream_zeek_log_to_parquet(drive: GoogleDrive, file_obj, parquet_path: Path, chunk_size: int = 100_000):
     """
     Downloads a Zeek log, parses it line-by-line, and streams it
@@ -570,29 +622,54 @@ def sync_drive_to_parquet(
                 else:
                     yield item, inherited_date_hint
 
-        log_candidates: List[Tuple[dict, str, str, str]] = []
+        source_candidates: List[Tuple[dict, str, str, str, str]] = []
         for f, folder_date_hint in walk_folder(folder_id):
             name = str(f.get("title", ""))
+            lower_name = name.lower()
 
-            # Filter: Only .log files, ignore summaries
-            if not name.endswith(".log") or "conn-summary" in name:
+            # Filter: only supported source files, ignore summaries.
+            if "conn-summary" in lower_name:
                 continue
 
-            log_type = name.replace(".log", "")
+            source_ext = _supported_source_extension(lower_name)
+            if source_ext is None:
+                continue
+
+            log_type = Path(name).stem.strip()
+            if not log_type:
+                continue
+
             log_date = _resolve_log_date(f, folder_date_hint, default_date)
             if desired_date_set and log_date not in desired_date_set:
                 continue
-            log_candidates.append((f, name, log_type, log_date))
+            source_candidates.append((f, name, log_type, log_date, source_ext))
 
-        if not log_candidates:
+        # De-duplicate by (date, log_type); prefer parquet over log.
+        picked_candidates: Dict[Tuple[str, str], Tuple[Tuple[dict, str, str, str, str], Tuple[int, float, int, str]]] = {}
+        for row in source_candidates:
+            f, name, log_type, log_date, source_ext = row
+            score = (
+                1 if source_ext == ".parquet" else 0,
+                _drive_modified_ts_seconds(str(f.get("modifiedDate", ""))),
+                _drive_file_size_bytes(f),
+                name.lower(),
+            )
+            key = (log_date, log_type)
+            existing = picked_candidates.get(key)
+            if existing is None or score > existing[1]:
+                picked_candidates[key] = (row, score)
+
+        sync_candidates = [entry[0] for entry in picked_candidates.values()]
+
+        if not sync_candidates:
             if desired_dates:
-                _log(f"No Zeek .log files discovered in Drive for dates: {', '.join(desired_dates)}.")
+                _log(f"No Zeek .log/.parquet files discovered in Drive for dates: {', '.join(desired_dates)}.")
             else:
-                _log("No Zeek .log files discovered in Drive.")
+                _log("No Zeek .log/.parquet files discovered in Drive.")
             return 0
 
-        latest_drive_date = max(row[3] for row in log_candidates)
-        log_candidates.sort(
+        latest_drive_date = max(row[3] for row in sync_candidates)
+        sync_candidates.sort(
             key=lambda row: (
                 0 if row[3] == latest_drive_date else 1,
                 row[3],
@@ -601,7 +678,7 @@ def sync_drive_to_parquet(
             )
         )
 
-        for f, name, log_type, log_date in log_candidates:
+        for f, name, log_type, log_date, source_ext in sync_candidates:
             target_path = parquet_root / log_date / f"{log_type}.parquet"
             file_key = _file_sync_key(f, log_date, log_type)
             modified_date = str(f.get("modifiedDate", "")).strip()
@@ -614,8 +691,17 @@ def sync_drive_to_parquet(
                 str(state_entry.get("modifiedDate", "")).strip() != modified_date
                 or str(state_entry.get("log_date", "")).strip() != log_date
                 or str(state_entry.get("title", "")).strip() != name
+                or str(state_entry.get("source_ext", "")).strip() != source_ext
             )
-            should_sync = target_missing or metadata_changed or (not has_state and log_date == latest_drive_date)
+            # Migration safety: newly discovered parquet sources should sync once even when
+            # a same-name local parquet exists from prior .log conversion.
+            parquet_bootstrap_sync = source_ext == ".parquet" and not has_state
+            should_sync = (
+                target_missing
+                or metadata_changed
+                or parquet_bootstrap_sync
+                or (not has_state and log_date == latest_drive_date)
+            )
 
             if should_sync and target_path.exists():
                 try:
@@ -636,13 +722,17 @@ def sync_drive_to_parquet(
                     "log_date": log_date,
                     "modifiedDate": modified_date,
                     "target_path": str(target_path),
+                    "source_ext": source_ext,
                 }
                 continue
 
-            _log(f"Ingesting: {log_date} / {name} ...")
+            _log(f"Ingesting ({source_ext}): {log_date} / {name} ...")
 
             try:
-                stream_zeek_log_to_parquet(drive, f, target_path)
+                if source_ext == ".parquet":
+                    download_drive_parquet_to_path(f, target_path)
+                else:
+                    stream_zeek_log_to_parquet(drive, f, target_path)
                 files_processed += 1
                 next_state[file_key] = {
                     "title": name,
@@ -650,6 +740,7 @@ def sync_drive_to_parquet(
                     "log_date": log_date,
                     "modifiedDate": modified_date,
                     "target_path": str(target_path),
+                    "source_ext": source_ext,
                 }
                 _save_sync_state(parquet_root, next_state)
             except Exception as e:
@@ -658,7 +749,7 @@ def sync_drive_to_parquet(
         _save_sync_state(parquet_root, next_state)
 
         if files_processed > 0:
-            _log(f"Sync complete: {files_processed} logs updated.")
+            _log(f"Sync complete: {files_processed} files updated.")
         else:
             _log("Cache is up to date.")
 
