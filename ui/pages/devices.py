@@ -2683,8 +2683,10 @@ def render(logs_root: Path, authorized_mac_file: Path):
     else:
         loading_slot = None
 
+    upstream_trace = st.session_state.get("app_load_trace", [])
+
     # Define the exact processes we want to track
-    processes = [
+    local_processes = [
         {"name": "Validating signatures & loading auth rules", "status": "pending", "duration": 0.0},
         {"name": "Resolving latest alert inventory", "status": "pending", "duration": 0.0},
         {"name": "Extracting historical device timelines", "status": "pending", "duration": 0.0},
@@ -2704,7 +2706,24 @@ def render(logs_root: Path, authorized_mac_file: Path):
             "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>"
         ]
 
-        for p in processes:
+        if upstream_trace:
+            html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 4px; margin-bottom: -2px; padding-left: 4px;'>Initial Load:</div>")
+            for p in upstream_trace:
+                icon = "✅"
+                time_str = f"{p.get('duration', 0.0):.2f}s"
+                bg = "rgba(46, 204, 113, 0.08)"
+                border = "rgba(46, 204, 113, 0.3)"
+                color = "#2ecc71"
+                html_parts.append(
+                    f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
+                )
+                html_parts.append(f"        <span style='font-weight: 700;'>{icon} &nbsp;{p.get('name', 'Task')}</span>")
+                html_parts.append(f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>")
+                html_parts.append("    </div>")
+
+        html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 10px; margin-bottom: -2px; padding-left: 4px;'>Device Inspection Load:</div>")
+        
+        for p in local_processes:
             if p["status"] == "pending":
                 icon = "⏳"
                 time_str = "Waiting..."
@@ -2743,7 +2762,7 @@ def render(logs_root: Path, authorized_mac_file: Path):
         loading_slot.markdown("".join(html_parts), unsafe_allow_html=True)
 
     # --- Step 1: Signatures & Auth Rules ---
-    processes[0]["status"] = "running"
+    local_processes[0]["status"] = "running"
     update_loading_ui()
     t0 = time.time()
     PARQUET_ROOT = Path(logs_root)
@@ -2764,27 +2783,27 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if intersect:
         banned_macs = banned_macs - intersect
         save_banned_macs(BAN_FILE, banned_macs)
-    processes[0]["duration"] = time.time() - t0
-    processes[0]["status"] = "done"
+    local_processes[0]["duration"] = time.time() - t0
+    local_processes[0]["status"] = "done"
 
     # --- Step 2: Alert Inventory Resolution ---
-    processes[1]["status"] = "running"
+    local_processes[1]["status"] = "running"
     update_loading_ui()
     t0 = time.time()
     alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, alerts_source_sig)
-    processes[1]["duration"] = time.time() - t0
-    processes[1]["status"] = "done"
+    local_processes[1]["duration"] = time.time() - t0
+    local_processes[1]["status"] = "done"
 
     # --- Step 3: Historical Inventory Extract ---
-    processes[2]["status"] = "running"
+    local_processes[2]["status"] = "running"
     update_loading_ui()
     t0 = time.time()
     inventory_history_rows = load_device_inventory_history_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
-    processes[2]["duration"] = time.time() - t0
-    processes[2]["status"] = "done"
+    local_processes[2]["duration"] = time.time() - t0
+    local_processes[2]["status"] = "done"
 
     # --- Step 4: Visual Metrics & DHCP ---
-    processes[3]["status"] = "running"
+    local_processes[3]["status"] = "running"
     update_loading_ui()
     t0 = time.time()
     known_hosts = pd.DataFrame(columns=["mac", "host", "ts"])
@@ -2793,11 +2812,11 @@ def render(logs_root: Path, authorized_mac_file: Path):
         known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT, inventory_sig)
     else:
         dhcp = load_dhcp_from_parquet(PARQUET_ROOT, inventory_sig)
-    processes[3]["duration"] = time.time() - t0
-    processes[3]["status"] = "done"
+    local_processes[3]["duration"] = time.time() - t0
+    local_processes[3]["status"] = "done"
 
     # --- Step 5: Hourly Aggregation ---
-    processes[4]["status"] = "running"
+    local_processes[4]["status"] = "running"
     update_loading_ui()
     t0 = time.time()
     hourly = load_hourly_status_from_alert_cache(
@@ -2806,8 +2825,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
         tuple(sorted(authorized_macs)),
         tuple(sorted(banned_macs)),
     )
-    processes[4]["duration"] = time.time() - t0
-    processes[4]["status"] = "done"
+    local_processes[4]["duration"] = time.time() - t0
+    local_processes[4]["status"] = "done"
 
     # Finalize UI and lock it in place
     update_loading_ui(complete=True)
