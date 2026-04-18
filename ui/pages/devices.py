@@ -2671,7 +2671,17 @@ def render(logs_root: Path, authorized_mac_file: Path):
         container=header_slot,
     )
     
-    loading_slot = st.empty()
+    if "hide_devices_trace" not in st.session_state:
+        st.session_state.hide_devices_trace = False
+
+    trace_container = st.empty()
+    show_trace = not st.session_state.hide_devices_trace
+
+    if show_trace:
+        trace_box = trace_container.container()
+        loading_slot = trace_box.empty()
+    else:
+        loading_slot = None
 
     # Define the exact processes we want to track
     processes = [
@@ -2683,14 +2693,16 @@ def render(logs_root: Path, authorized_mac_file: Path):
     ]
 
     def update_loading_ui(complete=False):
-        # We use strict concatenation to avoid Streamlit markdown parsing multiline strings as <pre> code blocks.
-        html = (
-            "<div class='dashboard-loading-shell' style='margin-bottom: 24px;'>\n"
-            "  <div class='dashboard-loading-kicker'>Execution Trace</div>\n"
-            "  <div class='dashboard-loading-title'>Initializing Device Inspection</div>\n"
-            "  <div class='dashboard-loading-copy'>Tracking real-time data ingestion and processing...</div>\n"
-            "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>\n"
-        )
+        if not show_trace or loading_slot is None:
+            return
+        
+        html_parts = [
+            "<div class='dashboard-loading-shell' style='margin-bottom: 8px;'>",
+            "  <div class='dashboard-loading-kicker'>Execution Trace</div>",
+            "  <div class='dashboard-loading-title'>Initializing Device Inspection</div>",
+            "  <div class='dashboard-loading-copy'>Tracking real-time data ingestion and processing...</div>",
+            "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>"
+        ]
 
         for p in processes:
             if p["status"] == "pending":
@@ -2712,22 +2724,23 @@ def render(logs_root: Path, authorized_mac_file: Path):
                 border = "rgba(46, 204, 113, 0.3)"
                 color = "#2ecc71"
 
-            html += f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>\n"
-            html += f"        <span style='font-weight: 700;'>{icon} &nbsp;{p['name']}</span>\n"
-            html += f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>\n"
-            html += f"    </div>\n"
-
-        html += "  </div>\n"
-        if not complete:
-            html += (
-                "  <div class='dashboard-loading-bars' style='margin-top: 18px;'>\n"
-                "      <div class='dashboard-loading-bar' style='--delay:0s'></div>\n"
-                "      <div class='dashboard-loading-bar' style='--delay:0.15s'></div>\n"
-                "      <div class='dashboard-loading-bar' style='--delay:0.3s'></div>\n"
-                "  </div>\n"
+            html_parts.append(
+                f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
             )
-        html += "</div>"
-        loading_slot.markdown(html, unsafe_allow_html=True)
+            html_parts.append(f"        <span style='font-weight: 700;'>{icon} &nbsp;{p['name']}</span>")
+            html_parts.append(f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>")
+            html_parts.append(f"    </div>")
+
+        html_parts.append("  </div>")
+        if not complete:
+            html_parts.append("  <div class='dashboard-loading-bars' style='margin-top: 18px;'>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0s'></div>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.15s'></div>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.3s'></div>")
+            html_parts.append("  </div>")
+        
+        html_parts.append("</div>")
+        loading_slot.markdown("".join(html_parts), unsafe_allow_html=True)
 
     # --- Step 1: Signatures & Auth Rules ---
     processes[0]["status"] = "running"
@@ -2798,6 +2811,11 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     # Finalize UI and lock it in place
     update_loading_ui(complete=True)
+
+    if show_trace:
+        def close_trace():
+            st.session_state.hide_devices_trace = True
+        trace_box.button("Close Execution Trace", key="close_devices_trace_btn", on_click=close_trace)
 
     if "mac" in known_hosts.columns:
         known_hosts = known_hosts.copy()
