@@ -276,21 +276,16 @@ def _render_drive_reauth_notice() -> None:
                 st.rerun()
 
 
-app_load_trace = []
-
-t_sync = time.time()
 PARQUET_DIR.mkdir(parents=True, exist_ok=True)
 drive_sync_snapshot = _poll_background_drive_sync()
 drive_sync_snapshot = _maybe_schedule_background_drive_sync()
 _ensure_background_refresh(sync_running=bool(drive_sync_snapshot.get("running")))
-app_load_trace.append({"name": "Background Drive Sync Polling", "status": "done", "duration": time.time() - t_sync})
 
 
 # =====================================================
 # Authentication (MongoDB/MySQL via Python)
 # =====================================================
 
-t_auth = time.time()
 if "auth_schema_initialized" not in st.session_state:
     try:
         auth_service.init_auth_schema()
@@ -310,14 +305,12 @@ require_authentication()
 auth_user = current_user()
 if not auth_user:
     st.stop()
-app_load_trace.append({"name": "Authentication & Session Verification", "status": "done", "duration": time.time() - t_auth})
 
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
 
-t_side = time.time()
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
 
 if "initialized" not in st.session_state:
@@ -396,7 +389,6 @@ if dialog_open and st.session_state.get("current_page"):
     st.session_state.sidebar_page = st.session_state.current_page
 else:
     st.session_state.current_page = selected_page
-app_load_trace.append({"name": "Sidebar & Navigation Rendering", "status": "done", "duration": time.time() - t_side})
 
 
 PAGE_LOADING_CONFIG = {
@@ -582,51 +574,33 @@ def render_current_page():
     page = st.session_state.current_page
 
     if page == "Device Inspection":
-        t_mod = time.time()
         devices = importlib.import_module("ui.pages.devices")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
-        st.session_state.app_load_trace = app_load_trace
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
     elif page == "Traffic Monitoring":
-        t_mod = time.time()
         analytics = importlib.import_module("ui.pages.analytics")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
-        st.session_state.app_load_trace = app_load_trace
         analytics.render(PARQUET_DIR)
 
     elif page == "Zeek Logs":
-        t_mod = time.time()
         zeek_logs = importlib.import_module("ui.pages.zeek_logs")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
-        st.session_state.app_load_trace = app_load_trace
         zeek_logs.render(PARQUET_DIR)
 
     elif page == "Alerts":
-        t_mod = time.time()
         alerts = importlib.import_module("ui.pages.alerts")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
-        st.session_state.app_load_trace = app_load_trace
         alerts.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
     elif page == "Authorization":
         if auth_user["role"] != "admin":
             st.error("Admin role is required for this page.")
             return
-        t_mod = time.time()
         authorization = importlib.import_module("ui.pages.authorization")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
-        st.session_state.app_load_trace = app_load_trace
         authorization.render(AUTHORIZED_MACS_FILE)
 
     elif page == "User Management":
         if auth_user["role"] != "admin":
             st.error("Admin role is required for this page.")
             return
-        t_mod = time.time()
         user_management = importlib.import_module("ui.pages.user_management")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
-        st.session_state.app_load_trace = app_load_trace
         user_management.render(current_username=auth_user["username"])
 
 
