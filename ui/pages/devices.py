@@ -1,6 +1,7 @@
 # ui/pages/device.py
 import json
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -2669,21 +2670,74 @@ def render(logs_root: Path, authorized_mac_file: Path):
         updated_txt=updated_txt,
         container=header_slot,
     )
+    
     loading_slot = st.empty()
-    render_dashboard_loading_state(
-        title="Loading Device Inspection",
-        subtitle="Preparing device inventory, trust posture, and activity context for the latest telemetry.",
-        steps=["Read inventory", "Merge trust state", "Render overview"],
-        container=loading_slot,
-    )
 
+    # Define the exact processes we want to track
+    processes = [
+        {"name": "Validating signatures & loading auth rules", "status": "pending", "duration": 0.0},
+        {"name": "Resolving latest alert inventory", "status": "pending", "duration": 0.0},
+        {"name": "Extracting historical device timelines", "status": "pending", "duration": 0.0},
+        {"name": "Merging visual metrics & DHCP contexts", "status": "pending", "duration": 0.0},
+        {"name": "Aggregating hourly trust status", "status": "pending", "duration": 0.0},
+    ]
+
+    def update_loading_ui(complete=False):
+        # We use strict concatenation to avoid Streamlit markdown parsing multiline strings as <pre> code blocks.
+        html = (
+            "<div class='dashboard-loading-shell' style='margin-bottom: 24px;'>\n"
+            "  <div class='dashboard-loading-kicker'>Execution Trace</div>\n"
+            "  <div class='dashboard-loading-title'>Initializing Device Inspection</div>\n"
+            "  <div class='dashboard-loading-copy'>Tracking real-time data ingestion and processing...</div>\n"
+            "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>\n"
+        )
+
+        for p in processes:
+            if p["status"] == "pending":
+                icon = "⏳"
+                time_str = "Waiting..."
+                bg = "rgba(255,255,255,0.02)"
+                border = "rgba(255,255,255,0.05)"
+                color = "rgba(255,255,255,0.4)"
+            elif p["status"] == "running":
+                icon = "🔄"
+                time_str = "Processing..."
+                bg = "rgba(0, 247, 255, 0.08)"
+                border = "rgba(0, 247, 255, 0.3)"
+                color = "#00F7FF"
+            else:
+                icon = "✅"
+                time_str = f"{p['duration']:.2f}s"
+                bg = "rgba(46, 204, 113, 0.08)"
+                border = "rgba(46, 204, 113, 0.3)"
+                color = "#2ecc71"
+
+            html += f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>\n"
+            html += f"        <span style='font-weight: 700;'>{icon} &nbsp;{p['name']}</span>\n"
+            html += f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>\n"
+            html += f"    </div>\n"
+
+        html += "  </div>\n"
+        if not complete:
+            html += (
+                "  <div class='dashboard-loading-bars' style='margin-top: 18px;'>\n"
+                "      <div class='dashboard-loading-bar' style='--delay:0s'></div>\n"
+                "      <div class='dashboard-loading-bar' style='--delay:0.15s'></div>\n"
+                "      <div class='dashboard-loading-bar' style='--delay:0.3s'></div>\n"
+                "  </div>\n"
+            )
+        html += "</div>"
+        loading_slot.markdown(html, unsafe_allow_html=True)
+
+    # --- Step 1: Signatures & Auth Rules ---
+    processes[0]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     PARQUET_ROOT = Path(logs_root)
     inventory_sig = _inventory_file_signature(PARQUET_ROOT)
     alerts_cache_sig = _alerts_event_cache_signature(PARQUET_ROOT)
     alerts_source_sig = _alerts_source_signature(PARQUET_ROOT)
-    alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, alerts_source_sig)
-    inventory_history_rows = load_device_inventory_history_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
-
+    
     authorized_macs, authorized_added_at_map = load_authorized_macs_with_history(
         authorized_mac_file, authorized_mac_file
     )
@@ -2697,21 +2751,53 @@ def render(logs_root: Path, authorized_mac_file: Path):
     if intersect:
         banned_macs = banned_macs - intersect
         save_banned_macs(BAN_FILE, banned_macs)
+    processes[0]["duration"] = time.time() - t0
+    processes[0]["status"] = "done"
 
-    # Prefer alerts cache path (fast). Fallback to full historical scan only when needed.
+    # --- Step 2: Alert Inventory Resolution ---
+    processes[1]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
+    alerts_latest_rows = load_alerts_latest_inventory_rows(PARQUET_ROOT, alerts_cache_sig, alerts_source_sig)
+    processes[1]["duration"] = time.time() - t0
+    processes[1]["status"] = "done"
+
+    # --- Step 3: Historical Inventory Extract ---
+    processes[2]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
+    inventory_history_rows = load_device_inventory_history_rows(PARQUET_ROOT, alerts_cache_sig, inventory_sig)
+    processes[2]["duration"] = time.time() - t0
+    processes[2]["status"] = "done"
+
+    # --- Step 4: Visual Metrics & DHCP ---
+    processes[3]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     known_hosts = pd.DataFrame(columns=["mac", "host", "ts"])
     dhcp = pd.DataFrame()
     if alerts_latest_rows.empty:
         known_hosts, dhcp = load_visual_metrics_from_parquet(PARQUET_ROOT, inventory_sig)
     else:
         dhcp = load_dhcp_from_parquet(PARQUET_ROOT, inventory_sig)
+    processes[3]["duration"] = time.time() - t0
+    processes[3]["status"] = "done"
 
+    # --- Step 5: Hourly Aggregation ---
+    processes[4]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     hourly = load_hourly_status_from_alert_cache(
         PARQUET_ROOT,
         alerts_cache_sig,
         tuple(sorted(authorized_macs)),
         tuple(sorted(banned_macs)),
     )
+    processes[4]["duration"] = time.time() - t0
+    processes[4]["status"] = "done"
+
+    # Finalize UI and lock it in place
+    update_loading_ui(complete=True)
 
     if "mac" in known_hosts.columns:
         known_hosts = known_hosts.copy()
@@ -2751,7 +2837,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
             updated_txt=updated_txt,
             container=header_slot,
         )
-        loading_slot.empty()
         st.info("No device data available")
         return
 
@@ -2956,7 +3041,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     CYAN = "#00F7FF"
 
     risk_state = "Healthy" if risk <= 20 else ("Warning" if risk <= 50 else "High Risk")
-    loading_slot.empty()
     render_traffic_style_header(
         title="Device Overview",
         subtitle="Network inventory and activity",
@@ -3170,4 +3254,3 @@ def render(logs_root: Path, authorized_mac_file: Path):
             st.session_state.selected_forensic_ip,
             raw_dates,
         )
-
