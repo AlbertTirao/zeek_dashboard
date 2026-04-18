@@ -15,6 +15,172 @@ from streamlit_autorefresh import st_autorefresh
 # Use one global page layout so auth/logout cycles render consistently.
 st.set_page_config(page_title="Zeek Dashboard", layout="wide")
 
+def inject_page_loading_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .dashboard-loading-shell {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 18px;
+            padding: 18px 20px 16px 20px;
+            margin: 8px 0 16px 0;
+            background:
+                radial-gradient(circle at top right, rgba(0,247,255,0.08), transparent 40%),
+                linear-gradient(135deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
+            box-shadow: 0 14px 38px rgba(0,0,0,0.25);
+        }
+
+        .dashboard-loading-shell::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(110deg, transparent 20%, rgba(255,255,255,0.08) 48%, transparent 72%);
+            transform: translateX(-120%);
+            animation: dashboard-loading-sweep 1.9s linear infinite;
+            pointer-events: none;
+        }
+
+        .dashboard-loading-kicker {
+            font-size: 0.72rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            font-weight: 800;
+            color: #7EE7FF;
+            margin-bottom: 0.32rem;
+        }
+
+        .dashboard-loading-title {
+            font-size: 1.05rem;
+            font-weight: 900;
+            line-height: 1.2;
+            color: #F5FAFF;
+        }
+
+        .dashboard-loading-copy {
+            margin-top: 0.22rem;
+            color: rgba(255,255,255,0.76);
+            font-size: 0.88rem;
+        }
+
+        .dashboard-loading-steps {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 0.85rem;
+        }
+
+        .dashboard-loading-step {
+            display: inline-flex;
+            align-items: center;
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(255,255,255,0.04);
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 0.74rem;
+            font-weight: 700;
+            color: #DCEAFB;
+        }
+
+        .dashboard-loading-bars {
+            display: grid;
+            gap: 7px;
+            margin-top: 0.85rem;
+        }
+
+        .dashboard-loading-bar {
+            position: relative;
+            overflow: hidden;
+            height: 8px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.09);
+        }
+
+        .dashboard-loading-bar::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            border-radius: inherit;
+            background: linear-gradient(90deg, rgba(0,247,255,0.12), rgba(0,247,255,0.95), rgba(246,48,73,0.28));
+            transform: translateX(-55%);
+            animation: dashboard-loading-pulse 1.25s ease-in-out infinite;
+            animation-delay: var(--delay, 0s);
+        }
+
+        @keyframes dashboard-loading-sweep {
+            to { transform: translateX(120%); }
+        }
+
+        @keyframes dashboard-loading-pulse {
+            0%, 100% { transform: translateX(-55%); opacity: 0.78; }
+            50% { transform: translateX(20%); opacity: 1; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+inject_page_loading_css()
+
+global_trace_container = st.empty()
+
+app_load_trace = [
+    {"name": "Background Drive Sync Polling", "status": "pending", "duration": 0.0},
+    {"name": "Authentication & Session Verification", "status": "pending", "duration": 0.0},
+    {"name": "Sidebar & Navigation Rendering", "status": "pending", "duration": 0.0},
+    {"name": "Dynamic Module Loading & Bootstrapping", "status": "pending", "duration": 0.0},
+]
+
+def update_live_trace_ui(trace, container):
+    if st.session_state.get("hide_devices_trace", False):
+        container.empty()
+        return
+        
+    html_parts = [
+        "<div class='dashboard-loading-shell' style='margin-bottom: 8px;'>",
+        "  <div class='dashboard-loading-kicker'>Execution Trace</div>",
+        "  <div class='dashboard-loading-title'>System Initialization</div>",
+        "  <div class='dashboard-loading-copy'>Running global startup sequence...</div>",
+        "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>"
+    ]
+    for p in trace:
+        if p["status"] == "pending":
+            icon = "⏳"
+            time_str = "Waiting..."
+            bg = "rgba(255,255,255,0.02)"
+            border = "rgba(255,255,255,0.05)"
+            color = "rgba(255,255,255,0.4)"
+        elif p["status"] == "running":
+            icon = "🔄"
+            time_str = "Processing..."
+            bg = "rgba(0, 247, 255, 0.08)"
+            border = "rgba(0, 247, 255, 0.3)"
+            color = "#00F7FF"
+        else:
+            icon = "✅"
+            time_str = f"{p['duration']:.2f}s"
+            bg = "rgba(46, 204, 113, 0.08)"
+            border = "rgba(46, 204, 113, 0.3)"
+            color = "#2ecc71"
+
+        html_parts.append(
+            f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
+        )
+        html_parts.append(f"        <span style='font-weight: 700;'>{icon} &nbsp;{p['name']}</span>")
+        html_parts.append(f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>")
+        html_parts.append(f"    </div>")
+
+    html_parts.append("  </div>")
+    if any(p["status"] == "running" for p in trace):
+        html_parts.append("  <div class='dashboard-loading-bars' style='margin-top: 18px;'>")
+        html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0s'></div>")
+        html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.15s'></div>")
+        html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.3s'></div>")
+        html_parts.append("  </div>")
+    html_parts.append("</div>")
+    container.markdown("".join(html_parts), unsafe_allow_html=True)
+
+
 from config import client as client_config
 
 AUTO_REFRESH_INTERVAL = int(getattr(client_config, "AUTO_REFRESH_INTERVAL", 3600))
@@ -276,20 +442,23 @@ def _render_drive_reauth_notice() -> None:
                 st.rerun()
 
 
-app_load_trace = []
-
+app_load_trace[0]["status"] = "running"
+update_live_trace_ui(app_load_trace, global_trace_container)
 t_sync = time.time()
 PARQUET_DIR.mkdir(parents=True, exist_ok=True)
 drive_sync_snapshot = _poll_background_drive_sync()
 drive_sync_snapshot = _maybe_schedule_background_drive_sync()
 _ensure_background_refresh(sync_running=bool(drive_sync_snapshot.get("running")))
-app_load_trace.append({"name": "Background Drive Sync Polling", "status": "done", "duration": time.time() - t_sync})
+app_load_trace[0]["duration"] = time.time() - t_sync
+app_load_trace[0]["status"] = "done"
 
 
 # =====================================================
 # Authentication (MongoDB/MySQL via Python)
 # =====================================================
 
+app_load_trace[1]["status"] = "running"
+update_live_trace_ui(app_load_trace, global_trace_container)
 t_auth = time.time()
 if "auth_schema_initialized" not in st.session_state:
     try:
@@ -310,13 +479,16 @@ require_authentication()
 auth_user = current_user()
 if not auth_user:
     st.stop()
-app_load_trace.append({"name": "Authentication & Session Verification", "status": "done", "duration": time.time() - t_auth})
+app_load_trace[1]["duration"] = time.time() - t_auth
+app_load_trace[1]["status"] = "done"
 
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
 
+app_load_trace[2]["status"] = "running"
+update_live_trace_ui(app_load_trace, global_trace_container)
 t_side = time.time()
 AUTHORIZED_MACS_FILE = Path("authorized_macs.txt")
 
@@ -396,7 +568,8 @@ if dialog_open and st.session_state.get("current_page"):
     st.session_state.sidebar_page = st.session_state.current_page
 else:
     st.session_state.current_page = selected_page
-app_load_trace.append({"name": "Sidebar & Navigation Rendering", "status": "done", "duration": time.time() - t_side})
+app_load_trace[2]["duration"] = time.time() - t_side
+app_load_trace[2]["status"] = "done"
 
 
 PAGE_LOADING_CONFIG = {
@@ -428,111 +601,7 @@ PAGE_LOADING_CONFIG = {
 }
 
 
-def inject_page_loading_css() -> None:
-    st.markdown(
-        """
-        <style>
-        .dashboard-loading-shell {
-            position: relative;
-            overflow: hidden;
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 18px;
-            padding: 18px 20px 16px 20px;
-            margin: 8px 0 16px 0;
-            background:
-                radial-gradient(circle at top right, rgba(0,247,255,0.08), transparent 40%),
-                linear-gradient(135deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
-            box-shadow: 0 14px 38px rgba(0,0,0,0.25);
-        }
 
-        .dashboard-loading-shell::before {
-            content: "";
-            position: absolute;
-            inset: 0;
-            background: linear-gradient(110deg, transparent 20%, rgba(255,255,255,0.08) 48%, transparent 72%);
-            transform: translateX(-120%);
-            animation: dashboard-loading-sweep 1.9s linear infinite;
-            pointer-events: none;
-        }
-
-        .dashboard-loading-kicker {
-            font-size: 0.72rem;
-            letter-spacing: 0.16em;
-            text-transform: uppercase;
-            font-weight: 800;
-            color: #7EE7FF;
-            margin-bottom: 0.32rem;
-        }
-
-        .dashboard-loading-title {
-            font-size: 1.05rem;
-            font-weight: 900;
-            line-height: 1.2;
-            color: #F5FAFF;
-        }
-
-        .dashboard-loading-copy {
-            margin-top: 0.22rem;
-            color: rgba(255,255,255,0.76);
-            font-size: 0.88rem;
-        }
-
-        .dashboard-loading-steps {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            margin-top: 0.85rem;
-        }
-
-        .dashboard-loading-step {
-            display: inline-flex;
-            align-items: center;
-            border: 1px solid rgba(255,255,255,0.14);
-            background: rgba(255,255,255,0.04);
-            border-radius: 999px;
-            padding: 6px 10px;
-            font-size: 0.74rem;
-            font-weight: 700;
-            color: #DCEAFB;
-        }
-
-        .dashboard-loading-bars {
-            display: grid;
-            gap: 7px;
-            margin-top: 0.85rem;
-        }
-
-        .dashboard-loading-bar {
-            position: relative;
-            overflow: hidden;
-            height: 8px;
-            border-radius: 999px;
-            background: rgba(255,255,255,0.09);
-        }
-
-        .dashboard-loading-bar::after {
-            content: "";
-            position: absolute;
-            inset: 0;
-            border-radius: inherit;
-            background: linear-gradient(90deg, rgba(0,247,255,0.12), rgba(0,247,255,0.95), rgba(246,48,73,0.28));
-            transform: translateX(-55%);
-            animation: dashboard-loading-pulse 1.25s ease-in-out infinite;
-            animation-delay: var(--delay, 0s);
-        }
-
-        @keyframes dashboard-loading-sweep {
-            to { transform: translateX(120%); }
-        }
-
-        @keyframes dashboard-loading-pulse {
-            0%, 100% { transform: translateX(-55%); opacity: 0.78; }
-            50% { transform: translateX(20%); opacity: 1; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def _render_page_loading_state(slot, *, title: str, subtitle: str, steps: list[str]) -> None:
@@ -580,33 +649,44 @@ def _page_loading_ui(page: str):
 
 def render_current_page():
     page = st.session_state.current_page
+    
+    app_load_trace[3]["status"] = "running"
+    update_live_trace_ui(app_load_trace, global_trace_container)
 
     if page == "Device Inspection":
         t_mod = time.time()
         devices = importlib.import_module("ui.pages.devices")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
+        app_load_trace[3]["duration"] = time.time() - t_mod
+        app_load_trace[3]["status"] = "done"
         st.session_state.app_load_trace = app_load_trace
+        global_trace_container.empty()
         devices.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
     elif page == "Traffic Monitoring":
         t_mod = time.time()
         analytics = importlib.import_module("ui.pages.analytics")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
+        app_load_trace[3]["duration"] = time.time() - t_mod
+        app_load_trace[3]["status"] = "done"
         st.session_state.app_load_trace = app_load_trace
+        global_trace_container.empty()
         analytics.render(PARQUET_DIR)
 
     elif page == "Zeek Logs":
         t_mod = time.time()
         zeek_logs = importlib.import_module("ui.pages.zeek_logs")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
+        app_load_trace[3]["duration"] = time.time() - t_mod
+        app_load_trace[3]["status"] = "done"
         st.session_state.app_load_trace = app_load_trace
+        global_trace_container.empty()
         zeek_logs.render(PARQUET_DIR)
 
     elif page == "Alerts":
         t_mod = time.time()
         alerts = importlib.import_module("ui.pages.alerts")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
+        app_load_trace[3]["duration"] = time.time() - t_mod
+        app_load_trace[3]["status"] = "done"
         st.session_state.app_load_trace = app_load_trace
+        global_trace_container.empty()
         alerts.render(PARQUET_DIR, AUTHORIZED_MACS_FILE)
 
     elif page == "Authorization":
@@ -615,8 +695,10 @@ def render_current_page():
             return
         t_mod = time.time()
         authorization = importlib.import_module("ui.pages.authorization")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
+        app_load_trace[3]["duration"] = time.time() - t_mod
+        app_load_trace[3]["status"] = "done"
         st.session_state.app_load_trace = app_load_trace
+        global_trace_container.empty()
         authorization.render(AUTHORIZED_MACS_FILE)
 
     elif page == "User Management":
@@ -625,8 +707,10 @@ def render_current_page():
             return
         t_mod = time.time()
         user_management = importlib.import_module("ui.pages.user_management")
-        app_load_trace.append({"name": "Dynamic Module Loading & Bootstrapping", "status": "done", "duration": time.time() - t_mod})
+        app_load_trace[3]["duration"] = time.time() - t_mod
+        app_load_trace[3]["status"] = "done"
         st.session_state.app_load_trace = app_load_trace
+        global_trace_container.empty()
         user_management.render(current_username=auth_user["username"])
 
 
