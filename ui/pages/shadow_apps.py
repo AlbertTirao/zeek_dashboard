@@ -93,7 +93,7 @@ def render_rows_caption(*, total_rows: int, shown_rows: int) -> None:
 # =============================================================================
 
 # Bump version so old cached parquet gets rebuilt automatically when ingestion logic changes.
-CACHE_VERSION = "shadow-cache-v15-ts-format-compat"
+CACHE_VERSION = "shadow-cache-v16-python-mapping"
 
 # -----------------------------
 # Config
@@ -1873,143 +1873,83 @@ def _describe_cols(conn, obj_name: str) -> list[str]:
             return []
 
 
+def _build_aggressive_identity_map(_conn, dhcp_files: list[str], known_hosts_files: list[str], log_files: list[str]):
+    """Aggressively maps IPs to MACs and Hostnames using Python dictionaries."""
+    ip_to_mac = {}
+    ip_to_host = {}
+
+    def extract_mappings(files, ip_candidates, mac_candidates, host_candidates):
+        if not files: return
+        try:
+            _conn.execute(f"CREATE OR REPLACE VIEW temp_map_view AS SELECT * FROM read_parquet({files}, union_by_name=True)")
+            cols = _describe_cols(_conn, "temp_map_view")
+            
+            ip_col = next((c for c in ip_candidates if c in cols), None)
+            mac_col = next((c for c in mac_candidates if c in cols), None)
+            host_col = next((c for c in host_candidates if c in cols), None)
+
+            if not ip_col: return
+
+            selects = [f'"{ip_col}" AS ip']
+            if mac_col: selects.append(f'"{mac_col}" AS mac')
+            else: selects.append("NULL AS mac")
+            if host_col: selects.append(f'"{host_col}" AS host')
+            else: selects.append("NULL AS host")
+
+            query = f"SELECT {', '.join(selects)} FROM temp_map_view WHERE \"{ip_col}\" IS NOT NULL"
+            df = _conn.execute(query).df()
+
+            for _, row in df.iterrows():
+                ip_val = str(row['ip']).strip()
+                if ip_val in ["", "None", "nan", "0.0.0.0"]: continue
+                
+                if pd.notna(row['mac']) and str(row['mac']).strip():
+                    ip_to_mac[ip_val] = str(row['mac']).strip().lower()
+                if pd.notna(row['host']) and str(row['host']).strip():
+                    ip_to_host[ip_val] = str(row['host']).strip()
+        except Exception:
+            pass
+
+    # 1. Scrape DHCP
+    extract_mappings(
+        dhcp_files,
+        ["client_addr", "assigned_addr", "requested_addr", "ip", "id.orig_h", "orig_h"],
+        ["mac", "client_chaddr", "hardware_address", "hwaddr", "chaddr"],
+        ["host_name", "hostname", "client_hostname", "client_fqdn", "client_name"]
+    )
+
+    # 2. Scrape Known Hosts
+    extract_mappings(
+        known_hosts_files,
+        ["host", "ip", "ip_addr", "addr", "id.orig_h", "orig_h"],
+        ["mac", "mac_addr", "hwaddr", "client_chaddr"],
+        ["host_name", "hostname", "name", "device_name"]
+    )
+
+    # 3. Scrape CONN (often contains original L2 addresses)
+    conn_files = [f for f in log_files if 'conn' in f.lower()]
+    extract_mappings(
+        conn_files,
+        ["id.orig_h", "orig_h", "src_ip", "ip"],
+        ["orig_l2_addr", "mac", "orig_mac", "id.orig_mac"],
+        [] 
+    )
+
+    return ip_to_mac, ip_to_host
+
+
 def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[str], log_files: list[str]) -> pd.DataFrame:
     """
-    Returns event rows with mapping ip -> mac + hostname (DHCP/known_hosts).
-    Output columns include: ts, ip, mac, hostname, dst_port, bytes_sent, bytes_received, app_identifier, Info, source_log
+    Returns event rows by extracting raw logs and aggressively mapping 
+    ip -> mac + hostname using Python dictionaries.
     """
     if not log_files:
         return pd.DataFrame()
 
-    # ---- DHCP mapping view ----
-    if dhcp_files:
-        try:
-            _conn.execute(
-                "CREATE OR REPLACE VIEW raw_dhcp_files AS "
-                f"SELECT * FROM read_parquet({dhcp_files}, union_by_name=True)"
-            )
-            dhcp_cols = _describe_cols(_conn, "raw_dhcp_files")
+    # 1. Build the Python dictionaries aggressively
+    ip_to_mac, ip_to_host = _build_aggressive_identity_map(_conn, dhcp_files, known_hosts_files, log_files)
 
-            dhcp_ip = next((c for c in ["client_addr", "assigned_addr", "requested_addr", "ip", "id.orig_h", "orig_h"] if c in dhcp_cols), None)
-            dhcp_mac = next((c for c in ["mac", "client_chaddr", "hardware_address", "hwaddr", "chaddr"] if c in dhcp_cols), None)
-            dhcp_host = next((c for c in ["host_name", "hostname", "client_hostname", "client_fqdn", "client_name"] if c in dhcp_cols), None)
-            dhcp_ts = next((c for c in ["ts", "timestamp", "seen_ts", "time"] if c in dhcp_cols), None)
-
-            if dhcp_ip and dhcp_mac:
-                host_expr = f'CAST("{dhcp_host}" AS VARCHAR)' if dhcp_host else "'Unknown'"
-                if dhcp_ts:
-                    _conn.execute(
-                        f"""
-                        CREATE OR REPLACE VIEW v_dhcp AS
-                        WITH base AS (
-                            SELECT
-                                CAST("{dhcp_ip}" AS VARCHAR) AS ip_addr,
-                                CAST("{dhcp_mac}" AS VARCHAR) AS mac_raw,
-                                {host_expr} AS host_raw,
-                                try_cast("{dhcp_ts}" AS DOUBLE) AS ts
-                            FROM raw_dhcp_files
-                            WHERE "{dhcp_ip}" IS NOT NULL AND "{dhcp_mac}" IS NOT NULL
-                        )
-                        SELECT
-                            ip_addr,
-                            arg_max(mac_raw, ts) AS mac_addr,
-                            COALESCE(NULLIF(arg_max(host_raw, ts), ''), 'Unknown') AS hostname
-                        FROM base
-                        GROUP BY ip_addr
-                        """
-                    )
-                else:
-                    _conn.execute(
-                        f"""
-                        CREATE OR REPLACE VIEW v_dhcp AS
-                        SELECT
-                            CAST("{dhcp_ip}" AS VARCHAR) AS ip_addr,
-                            any_value(CAST("{dhcp_mac}" AS VARCHAR)) AS mac_addr,
-                            COALESCE(NULLIF(any_value({host_expr}), ''), 'Unknown') AS hostname
-                        FROM raw_dhcp_files
-                        WHERE "{dhcp_ip}" IS NOT NULL AND "{dhcp_mac}" IS NOT NULL
-                        GROUP BY 1
-                        """
-                    )
-            else:
-                _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
-        except Exception:
-            _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
-    else:
-        _conn.execute("CREATE OR REPLACE VIEW v_dhcp AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
-
-    # ---- known_hosts mapping view (fallback) ----
-    if known_hosts_files:
-        try:
-            _conn.execute(
-                "CREATE OR REPLACE VIEW raw_known_hosts_files AS "
-                f"SELECT * FROM read_parquet({known_hosts_files}, union_by_name=True)"
-            )
-            kh_cols = _describe_cols(_conn, "raw_known_hosts_files")
-
-            kh_ip = next((c for c in ["host", "ip", "ip_addr", "addr", "id.orig_h", "orig_h"] if c in kh_cols), None)
-            kh_mac = next((c for c in ["mac", "mac_addr", "hwaddr", "client_chaddr"] if c in kh_cols), None)
-            kh_host = next((c for c in ["host_name", "hostname", "name", "device_name"] if c in kh_cols), None)
-            kh_ts = next((c for c in ["ts", "timestamp", "seen_ts", "time"] if c in kh_cols), None)
-
-            if kh_ip and kh_mac:
-                host_expr = f'CAST("{kh_host}" AS VARCHAR)' if kh_host else "'Unknown'"
-                if kh_ts:
-                    _conn.execute(
-                        f"""
-                        CREATE OR REPLACE VIEW v_known AS
-                        WITH base AS (
-                            SELECT
-                                CAST("{kh_ip}" AS VARCHAR) AS ip_addr,
-                                CAST("{kh_mac}" AS VARCHAR) AS mac_raw,
-                                {host_expr} AS host_raw,
-                                try_cast("{kh_ts}" AS DOUBLE) AS ts
-                            FROM raw_known_hosts_files
-                            WHERE "{kh_ip}" IS NOT NULL AND "{kh_mac}" IS NOT NULL
-                        )
-                        SELECT
-                            ip_addr,
-                            arg_max(mac_raw, ts) AS mac_addr,
-                            COALESCE(NULLIF(arg_max(host_raw, ts), ''), 'Unknown') AS hostname
-                        FROM base
-                        GROUP BY ip_addr
-                        """
-                    )
-                else:
-                    _conn.execute(
-                        f"""
-                        CREATE OR REPLACE VIEW v_known AS
-                        SELECT
-                            CAST("{kh_ip}" AS VARCHAR) AS ip_addr,
-                            any_value(CAST("{kh_mac}" AS VARCHAR)) AS mac_addr,
-                            COALESCE(NULLIF(any_value({host_expr}), ''), 'Unknown') AS hostname
-                        FROM raw_known_hosts_files
-                        WHERE "{kh_ip}" IS NOT NULL AND "{kh_mac}" IS NOT NULL
-                        GROUP BY 1
-                        """
-                    )
-            else:
-                _conn.execute("CREATE OR REPLACE VIEW v_known AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
-        except Exception:
-            _conn.execute("CREATE OR REPLACE VIEW v_known AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
-    else:
-        _conn.execute("CREATE OR REPLACE VIEW v_known AS SELECT NULL::VARCHAR as ip_addr, NULL::VARCHAR as mac_addr, 'Unknown'::VARCHAR as hostname WHERE false")
-
-    # Merge mapping
-    _conn.execute(
-        """
-        CREATE OR REPLACE VIEW v_ip_map AS
-        SELECT
-            COALESCE(d.ip_addr, k.ip_addr) AS ip_addr,
-            COALESCE(NULLIF(d.mac_addr,''), NULLIF(k.mac_addr,''), 'Unknown') AS mac_addr,
-            COALESCE(NULLIF(d.hostname,''), NULLIF(k.hostname,''), 'Unknown') AS hostname
-        FROM v_dhcp d
-        FULL OUTER JOIN v_known k
-            ON d.ip_addr = k.ip_addr
-        """
-    )
-
-    # ---- Logs view ----
+    # 2. Fetch Raw Logs (NO SQL JOINS)
     try:
         _conn.execute(
             "CREATE OR REPLACE VIEW raw_logs AS "
@@ -2041,18 +1981,9 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             ["host", "server_name", "query", "filename", "service", "unparsed_version", "name", "note"],
             "'-'",
         )
-        sql_app_software_raw = get_coalesce(
-            ["name", "service", "unparsed_version", "filename"],
-            "''",
-        )
-        sql_software_type_raw = get_coalesce(
-            ["software_type"],
-            "''",
-        )
-        sql_software_name_raw = get_coalesce(
-            ["name"],
-            "''",
-        )
+        sql_app_software_raw = get_coalesce(["name", "service", "unparsed_version", "filename"], "''")
+        sql_software_type_raw = get_coalesce(["software_type"], "''")
+        sql_software_name_raw = get_coalesce(["name"], "''")
 
         info_parts = []
         if "method" in existing_cols and "uri" in existing_cols:
@@ -2071,8 +2002,7 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
         SELECT
             {sql_ts} as ts,
             {sql_ip} as ip,
-            COALESCE({sql_mac}, m.mac_addr, 'Unknown') as mac,
-            COALESCE(NULLIF(m.hostname,''), 'Unknown') as hostname,
+            {sql_mac} as raw_mac,
             {sql_port} as dst_port,
             {sql_sent} as bytes_sent,
             {sql_recv} as bytes_received,
@@ -2083,10 +2013,26 @@ def query_shadow_logs_raw(_conn, dhcp_files: list[str], known_hosts_files: list[
             {sql_info} as Info,
             COALESCE(NULLIF(upper(regexp_extract(source_file_path, '([a-z]+)\\.parquet', 1)), ''), 'UNKNOWN') as source_log
         FROM raw_logs r
-        LEFT JOIN v_ip_map m ON {sql_ip} = m.ip_addr
         """
-        return _conn.execute(query).df()
-    except Exception:
+        
+        df = _conn.execute(query).df()
+
+        # 3. Apply the Python Dictionaries
+        df['ip_str'] = df['ip'].astype(str).str.strip()
+        
+        # Map MAC (fallback to raw_mac if dict misses, then Unknown)
+        df['raw_mac'] = df['raw_mac'].replace(['None', 'NaN', ''], pd.NA)
+        df['mac'] = df['raw_mac'].fillna(df['ip_str'].map(ip_to_mac)).fillna('Unknown')
+        
+        # Map Hostname
+        df['hostname'] = df['ip_str'].map(ip_to_host).fillna('Unknown')
+
+        # Clean up temporary columns
+        df = df.drop(columns=['raw_mac', 'ip_str'])
+        
+        return df
+
+    except Exception as e:
         return pd.DataFrame()
 
 
@@ -4916,6 +4862,7 @@ def render_shadow_apps(parquet_root: Path):
             m_known_identifier = _is_real_identifier_series(display_df["application_or_identifier"])
 
             display_df = display_df[m_known_mac & m_known_domain & m_known_identifier].copy()
+            # display_df = display_df[m_known_mac | m_known_domain | m_known_identifier].copy()
             display_df["First_Seen"] = display_df["First_Seen"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
             display_df["Last_Seen"] = display_df["Last_Seen"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
 
