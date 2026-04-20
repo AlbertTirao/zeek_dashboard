@@ -23,7 +23,10 @@ from pydrive2.files import ApiRequestError
 
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DATE_TOKEN_RE = re.compile(r"(\d{4}-\d{1,2}-\d{1,2})")
-SUPPORTED_SOURCE_EXTS = {".log", ".parquet"}
+
+# STRICTLY PARQUET ONLY
+SUPPORTED_SOURCE_EXTS = {".parquet"}
+
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -440,7 +443,7 @@ def list_files_with_retry(drive: GoogleDrive, query: str, max_retries: int = 5):
 
 
 # =====================================================
-# 2) STREAMING INGEST (LOG -> PARQUET)
+# 2) STREAMING INGEST (PARQUET ONLY)
 # =====================================================
 
 def download_drive_parquet_to_path(file_obj, parquet_path: Path) -> None:
@@ -460,88 +463,6 @@ def download_drive_parquet_to_path(file_obj, parquet_path: Path) -> None:
                 os.remove(tmp_path)
             except OSError:
                 pass
-
-
-def stream_zeek_log_to_parquet(drive: GoogleDrive, file_obj, parquet_path: Path, chunk_size: int = 100_000):
-    """
-    Downloads a Zeek log, parses it line-by-line, and streams it
-    into a Parquet file with Snappy compression.
-    """
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # create temp file for download (Windows safe)
-    fd, tmp_path = tempfile.mkstemp()
-    os.close(fd)
-
-    try:
-        # 1) Download Content
-        file_obj.GetContentFile(tmp_path)
-
-        rows = []
-        headers = []
-        writer = None
-
-        # 2) Stream Parse
-        with open(tmp_path, "r", errors="ignore", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#close"):
-                    continue
-
-                # Extract headers
-                if line.startswith("#fields"):
-                    headers = line.split("\t")[1:]
-                    continue
-
-                # Skip comments or until headers appear
-                if line.startswith("#") or not headers:
-                    continue
-
-                parts = line.split("\t")
-
-                # Pad missing columns with None
-                if len(parts) < len(headers):
-                    parts += [None] * (len(headers) - len(parts))
-
-                rows.append(dict(zip(headers, parts)))
-
-                # 3) Flush chunk
-                if len(rows) >= chunk_size:
-                    writer = _flush_chunk(rows, parquet_path, writer)
-                    rows.clear()
-
-        # 4) Flush remaining
-        if rows:
-            writer = _flush_chunk(rows, parquet_path, writer)
-
-        # 5) Handle empty logs
-        if writer is None and not parquet_path.exists():
-            pd.DataFrame({"status": ["empty"]}).to_parquet(parquet_path)
-
-        if writer:
-            writer.close()
-
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-def _flush_chunk(rows, path: Path, writer):
-    """
-    Helper: Writes a list of dicts to the Parquet writer.
-    Initializes the writer if it doesn't exist.
-    """
-    if not rows:
-        return writer
-
-    df = pd.DataFrame(rows)
-    table = pa.Table.from_pandas(df)
-
-    if writer is None:
-        writer = pq.ParquetWriter(path, table.schema, compression="snappy")
-
-    writer.write_table(table)
-    return writer
 
 
 # =====================================================
@@ -648,12 +569,11 @@ def sync_drive_to_parquet(
                 continue
             source_candidates.append((f, name, log_type, log_date, source_ext))
 
-        # De-duplicate by (date, log_type); prefer parquet over log.
-        picked_candidates: Dict[Tuple[str, str], Tuple[Tuple[dict, str, str, str, str], Tuple[int, float, int, str]]] = {}
+        # De-duplicate by (date, log_type)
+        picked_candidates: Dict[Tuple[str, str], Tuple[Tuple[dict, str, str, str, str], Tuple[float, int, str]]] = {}
         for row in source_candidates:
             f, name, log_type, log_date, source_ext = row
             score = (
-                1 if source_ext == ".parquet" else 0,
                 _drive_modified_ts_seconds(str(f.get("modifiedDate", ""))),
                 _drive_file_size_bytes(f),
                 name.lower(),
@@ -667,9 +587,9 @@ def sync_drive_to_parquet(
 
         if not sync_candidates:
             if desired_dates:
-                _log(f"No Zeek .log/.parquet files discovered in Drive for dates: {', '.join(desired_dates)}.")
+                _log(f"No Zeek .parquet files discovered in Drive for dates: {', '.join(desired_dates)}.")
             else:
-                _log("No Zeek .log/.parquet files discovered in Drive.")
+                _log("No Zeek .parquet files discovered in Drive.")
             return 0
 
         latest_drive_date = max(row[3] for row in sync_candidates)
@@ -697,14 +617,12 @@ def sync_drive_to_parquet(
                 or str(state_entry.get("title", "")).strip() != name
                 or str(state_entry.get("source_ext", "")).strip() != source_ext
             )
-            # Migration safety: newly discovered parquet sources should sync once even when
-            # a same-name local parquet exists from prior .log conversion.
-            parquet_bootstrap_sync = source_ext == ".parquet" and not has_state
+
+            # Ensure we sync if it's missing, modified, or entirely new
             should_sync = (
                 target_missing
                 or metadata_changed
-                or parquet_bootstrap_sync
-                or (not has_state and log_date == latest_drive_date)
+                or not has_state
             )
 
             if should_sync and target_path.exists():
@@ -733,10 +651,7 @@ def sync_drive_to_parquet(
             _log(f"Ingesting ({source_ext}): {log_date} / {name} ...")
 
             try:
-                if source_ext == ".parquet":
-                    download_drive_parquet_to_path(f, target_path)
-                else:
-                    stream_zeek_log_to_parquet(drive, f, target_path)
+                download_drive_parquet_to_path(f, target_path)
                 files_processed += 1
                 next_state[file_key] = {
                     "title": name,
