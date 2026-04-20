@@ -4368,7 +4368,105 @@ def render_shadow_apps(parquet_root: Path):
     hide_dialog_x_button()
     inject_shadow_apps_css()
 
-    # --- init state ---
+    if "hide_shadow_apps_trace" not in st.session_state:
+        st.session_state.hide_shadow_apps_trace = False
+
+    trace_container = st.empty()
+    show_trace = not st.session_state.hide_shadow_apps_trace
+
+    if show_trace:
+        trace_box = trace_container.container()
+        loading_slot = trace_box.empty()
+    else:
+        trace_box = None
+        loading_slot = None
+
+    upstream_trace = st.session_state.get("app_load_trace", [])
+    local_processes = [
+        {"name": "Restoring session state & dialog controls", "status": "pending", "duration": 0.0},
+        {"name": "Resolving dataset scope & policy inputs", "status": "pending", "duration": 0.0},
+        {"name": "Rebuilding cached shadow telemetry slices", "status": "pending", "duration": 0.0},
+        {"name": "Registering scoped shadow events view", "status": "pending", "duration": 0.0},
+        {"name": "Computing shadow app headline metrics", "status": "pending", "duration": 0.0},
+    ]
+
+    def update_loading_ui(complete=False):
+        if not show_trace or loading_slot is None:
+            return
+
+        html_parts = [
+            "<div class='dashboard-loading-shell' style='margin-bottom: 8px;'>",
+            "  <div class='dashboard-loading-kicker'>Execution Trace</div>",
+            "  <div class='dashboard-loading-title'>Initializing Shadow App Incidents</div>",
+            "  <div class='dashboard-loading-copy'>Tracking cache warmup, day scoping, and analytics readiness...</div>",
+            "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>",
+        ]
+
+        if upstream_trace:
+            html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 4px; margin-bottom: -2px; padding-left: 4px;'>Initial Load:</div>")
+            for p in upstream_trace:
+                icon = "✅"
+                time_str = f"{p.get('duration', 0.0):.2f}s"
+                bg = "rgba(46, 204, 113, 0.08)"
+                border = "rgba(46, 204, 113, 0.3)"
+                color = "#2ecc71"
+                html_parts.append(
+                    f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
+                )
+                html_parts.append(f"        <span style='font-weight: 700;'>{icon} &nbsp;{p.get('name', 'Task')}</span>")
+                html_parts.append(f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>")
+                html_parts.append("    </div>")
+
+        html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 10px; margin-bottom: -2px; padding-left: 4px;'>Shadow Apps Load:</div>")
+
+        for p in local_processes:
+            if p["status"] == "pending":
+                icon = "⏳"
+                time_str = "Waiting..."
+                bg = "rgba(255,255,255,0.02)"
+                border = "rgba(255,255,255,0.05)"
+                color = "rgba(255,255,255,0.4)"
+            elif p["status"] == "running":
+                icon = "🔄"
+                time_str = "Processing..."
+                bg = "rgba(0, 247, 255, 0.08)"
+                border = "rgba(0, 247, 255, 0.3)"
+                color = "#00F7FF"
+            else:
+                icon = "✅"
+                time_str = f"{p['duration']:.2f}s"
+                bg = "rgba(46, 204, 113, 0.08)"
+                border = "rgba(46, 204, 113, 0.3)"
+                color = "#2ecc71"
+
+            html_parts.append(
+                f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
+            )
+            html_parts.append(f"        <span style='font-weight: 700;'>{icon} &nbsp;{p['name']}</span>")
+            html_parts.append(f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>")
+            html_parts.append("    </div>")
+
+        html_parts.append("  </div>")
+        if not complete:
+            html_parts.append("  <div class='dashboard-loading-bars' style='margin-top: 18px;'>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0s'></div>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.15s'></div>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.3s'></div>")
+            html_parts.append("  </div>")
+        html_parts.append("</div>")
+        loading_slot.markdown("".join(html_parts), unsafe_allow_html=True)
+
+    def finalize_loading_ui():
+        update_loading_ui(complete=True)
+        if show_trace and trace_box is not None:
+            def close_trace():
+                st.session_state.hide_shadow_apps_trace = True
+            trace_box.button("Close Execution Trace", key="close_shadow_apps_trace_btn", on_click=close_trace)
+
+    # --- Step 1: Session State & Dialog Guards ---
+    local_processes[0]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     st.session_state.setdefault("shadow_dialog_open", False)
     st.session_state.setdefault("shadow_dialog_mac", None)
     st.session_state.setdefault("shadow_last_selected_mac", None)
@@ -4379,13 +4477,24 @@ def render_shadow_apps(parquet_root: Path):
     st.session_state.setdefault("shadow_app_detail_dialog_open", False)
     st.session_state.setdefault("shadow_app_detail_context", None)
 
-    # --- auto-close stale dialogs ---
     origin = st.session_state.pop("shadow_dialog_origin", None)
     if st.session_state.get("shadow_dialog_open") and origin not in ("grid", "dialog"):
         _close_shadow_dialog(reset_grid=False)
+    local_processes[0]["duration"] = time.time() - t0
+    local_processes[0]["status"] = "done"
 
+    # --- Step 2: Scope & Policy Resolution ---
+    local_processes[1]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     available_dates = list_available_dates(parquet_root)
     if not available_dates:
+        local_processes[1]["duration"] = time.time() - t0
+        local_processes[1]["status"] = "done"
+        local_processes[2]["status"] = "done"
+        local_processes[3]["status"] = "done"
+        local_processes[4]["status"] = "done"
+        finalize_loading_ui()
         st.warning("No log directories found.")
         return
 
@@ -4446,13 +4555,29 @@ def render_shadow_apps(parquet_root: Path):
 
     approved = load_allowlist()
     allow_re = compile_allow_regex(approved)
+    local_processes[1]["duration"] = time.time() - t0
+    local_processes[1]["status"] = "done"
 
+    # --- Step 3: Cache Build / Refresh ---
+    local_processes[2]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     conn = get_db_connection()
     with st.spinner("Optimizing logs for fast load..."):
         ensure_cache(conn, parquet_root, target_dates, allow_re, risk_policy)
+    local_processes[2]["duration"] = time.time() - t0
+    local_processes[2]["status"] = "done"
 
+    # --- Step 4: Register Scoped View ---
+    local_processes[3]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     cached_files = read_cached_files(parquet_root, target_dates)
     if not cached_files:
+        local_processes[3]["duration"] = time.time() - t0
+        local_processes[3]["status"] = "done"
+        local_processes[4]["status"] = "done"
+        finalize_loading_ui()
         st.info("No cached shadow files available for selected day.")
         return
 
@@ -4462,6 +4587,8 @@ def render_shadow_apps(parquet_root: Path):
         str(selected_day),
         selected_day_adjacent,
     )
+    local_processes[3]["duration"] = time.time() - t0
+    local_processes[3]["status"] = "done"
     st.caption(
         "Date scope note: "
         f"excluded {excluded_rows:,} rows because their timestamps were outside {selected_day}. "
@@ -4470,16 +4597,25 @@ def render_shadow_apps(parquet_root: Path):
 
     # --- render dialog only when allowed for this rerun ---
     if st.session_state.get("shadow_allow_dialog_open") and st.session_state.get("shadow_allow_candidate"):
+        local_processes[4]["status"] = "done"
+        finalize_loading_ui()
         show_inventory_allow_dialog()
         st.stop()
     elif st.session_state.get("shadow_app_detail_dialog_open") and st.session_state.get("shadow_app_detail_context"):
+        local_processes[4]["status"] = "done"
+        finalize_loading_ui()
         show_inventory_app_dialog(conn)
         st.stop()
     elif st.session_state.get("shadow_dialog_open") and st.session_state.get("shadow_dialog_mac") and origin in ("grid", "dialog"):
+        local_processes[4]["status"] = "done"
+        finalize_loading_ui()
         show_forensics_dialog(conn)
         st.stop()
 
-    # Metrics
+    # --- Step 5: Headline Metrics ---
+    local_processes[4]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
     stats = conn.execute(
         """
         SELECT
@@ -4498,6 +4634,9 @@ def render_shadow_apps(parquet_root: Path):
     auth_pct = (authorized_count / total_events * 100) if total_events else 0
     unauth_pct = (unauthorized_count / total_events * 100) if total_events else 0
     crit_high_pct = (crit_high_count / total_events * 100) if total_events else 0
+    local_processes[4]["duration"] = time.time() - t0
+    local_processes[4]["status"] = "done"
+    finalize_loading_ui()
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Events", f"{total_events:,}")
