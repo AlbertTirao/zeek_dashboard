@@ -202,7 +202,7 @@ from services.drive_services import (
 from ui.auth import require_authentication, current_user, clear_persistent_auth_session
 from ui.sidebar import render_sidebar
 
-BACKGROUND_SYNC_POLL_INTERVAL_SECONDS = 15
+HOURLY_SYNC_INTERVAL_SECONDS = 3600
 
 
 @dataclass
@@ -345,7 +345,8 @@ def perform_logout():
 
 def _auto_sync_target_dates() -> tuple[str, ...]:
     lookback_days = int(DRIVE_SYNC_LOOKBACK_DAYS or 0)
-    # lookback_days <= 0 means "sync every available Drive date".
+    # lookback_days <= 0 lets drive sync use its scoped policy:
+    # current date refresh + missing historical-date backfill only.
     if lookback_days <= 0:
         return tuple()
 
@@ -378,7 +379,6 @@ def _sync_session_drive_state(snapshot: dict) -> None:
         st.session_state["_parquet_sync_token"] = parquet_token
         if previous_completion_token is not None:
             st.cache_data.clear()
-            st.rerun()
 
 
 def _poll_background_drive_sync() -> dict:
@@ -392,7 +392,7 @@ def _poll_background_drive_sync() -> dict:
 def _maybe_schedule_background_drive_sync() -> dict:
     manager = _drive_sync_manager()
     manager.maybe_start(
-        min_interval_seconds=max(int(DRIVE_SYNC_INTERVAL), 30),
+        min_interval_seconds=HOURLY_SYNC_INTERVAL_SECONDS,
         target_dates=_auto_sync_target_dates(),
     )
     snapshot = manager.snapshot()
@@ -401,9 +401,8 @@ def _maybe_schedule_background_drive_sync() -> dict:
 
 
 def _background_refresh_interval_seconds(*, sync_running: bool) -> int:
-    if sync_running:
-        return max(min(int(AUTO_REFRESH_INTERVAL), BACKGROUND_SYNC_POLL_INTERVAL_SECONDS), 5)
-    return max(int(AUTO_REFRESH_INTERVAL), 30)
+    _ = sync_running
+    return HOURLY_SYNC_INTERVAL_SECONDS
 
 
 def _ensure_background_refresh(*, sync_running: bool) -> None:

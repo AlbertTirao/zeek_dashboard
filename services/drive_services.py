@@ -187,8 +187,29 @@ def _file_sync_key(file_obj, log_date: str, log_type: str) -> str:
 
 
 def _default_sync_dates() -> Tuple[str, ...]:
-    # Empty tuple means "do not filter dates; backfill every available log date".
+    # Empty tuple means "use scoped sync policy":
+    # current date refresh + missing historical-date backfill.
     return tuple()
+
+
+def _iter_local_parquet_dates(parquet_root: Path) -> set[str]:
+    out: set[str] = set()
+    if not parquet_root.exists():
+        return out
+
+    try:
+        for p in parquet_root.iterdir():
+            if not p.is_dir():
+                continue
+            name_l = p.name.lower()
+            if name_l.startswith("_") or "cache" in name_l:
+                continue
+            d = _extract_date_from_dirname(p.name)
+            if d:
+                out.add(d)
+    except Exception:
+        return out
+    return out
 
 
 def _configure_drive_oauth(gauth: GoogleAuth, client_secret_path: str) -> GoogleAuth:
@@ -478,9 +499,14 @@ def sync_drive_to_parquet(
 ):
     """
     Sync Google Drive logs to local Parquet cache.
-    - Backfills every available Drive date by default.
-    - Downloads new logs that do not exist locally.
-    - Re-downloads logs whose Drive modified timestamp changed.
+    Default policy (when target_dates is empty):
+    - Refresh current-date logs.
+    - Backfill historical dates only when missing locally.
+    - Do not re-check historical modified timestamps.
+
+    Explicit target_dates policy:
+    - Sync only requested dates.
+    - Re-download files when missing or Drive metadata changed.
     """
 
     drive_allow_interactive_oauth = bool(
@@ -527,22 +553,57 @@ def sync_drive_to_parquet(
             desired_dates = tuple(_default_sync_dates())
         else:
             desired_dates = tuple(str(d).strip() for d in target_dates if str(d).strip())
-        desired_date_set = {str(d).strip() for d in desired_dates if str(d).strip()}
+        explicit_desired_date_set = {str(d).strip() for d in desired_dates if str(d).strip()}
         files_processed = 0
         sync_state = _load_sync_state(parquet_root)
-        next_state: Dict[str, dict] = {}
+        next_state: Dict[str, dict] = dict(sync_state)
 
-        # Recursive generator
+        drive_dates: set[str] = set()
+
+        # Pass 1: discover which dates exist in Drive without downloading file content.
+        def walk_drive_dates(fid: str, inherited_date_hint: Optional[str] = None) -> None:
+            items = list_files_with_retry(drive, f"'{fid}' in parents and trashed=false")
+            for item in items:
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    folder_date_hint = _extract_date_from_dirname(str(item.get("title", "")))
+                    if folder_date_hint:
+                        drive_dates.add(folder_date_hint)
+                    next_hint = folder_date_hint or inherited_date_hint
+                    walk_drive_dates(item["id"], next_hint)
+                else:
+                    inferred = inherited_date_hint or _parse_drive_modified_date(str(item.get("modifiedDate", "")))
+                    if inferred:
+                        drive_dates.add(inferred)
+
+        historical_missing_date_set: set[str] = set()
+        if explicit_desired_date_set:
+            effective_date_set = set(explicit_desired_date_set)
+        else:
+            walk_drive_dates(folder_id)
+            local_dates = _iter_local_parquet_dates(parquet_root)
+            historical_drive_dates = {d for d in drive_dates if d and d < default_date}
+            historical_missing_date_set = historical_drive_dates - local_dates
+            effective_date_set = set(historical_missing_date_set)
+            # Always include "today" for hourly refreshes.
+            effective_date_set.add(default_date)
+
+            if historical_missing_date_set:
+                _log(
+                    "Historical backfill missing locally; syncing dates: "
+                    + ", ".join(sorted(historical_missing_date_set))
+                )
+
+        # Pass 2: list only files under scoped dates (today + missing historical dates).
         def walk_folder(fid: str, inherited_date_hint: Optional[str] = None):
-            if desired_date_set and inherited_date_hint and inherited_date_hint not in desired_date_set:
+            if inherited_date_hint and inherited_date_hint not in effective_date_set:
                 return
             items = list_files_with_retry(drive, f"'{fid}' in parents and trashed=false")
             for item in items:
                 if item.get("mimeType") == "application/vnd.google-apps.folder":
                     folder_date_hint = _extract_date_from_dirname(str(item.get("title", "")))
-                    if desired_date_set and folder_date_hint and folder_date_hint not in desired_date_set:
-                        continue
                     next_hint = folder_date_hint or inherited_date_hint
+                    if next_hint and next_hint not in effective_date_set:
+                        continue
                     yield from walk_folder(item["id"], next_hint)
                 else:
                     yield item, inherited_date_hint
@@ -565,7 +626,7 @@ def sync_drive_to_parquet(
                 continue
 
             log_date = _resolve_log_date(f, folder_date_hint, default_date)
-            if desired_date_set and log_date not in desired_date_set:
+            if log_date not in effective_date_set:
                 continue
             source_candidates.append((f, name, log_type, log_date, source_ext))
 
@@ -586,10 +647,11 @@ def sync_drive_to_parquet(
         sync_candidates = [entry[0] for entry in picked_candidates.values()]
 
         if not sync_candidates:
-            if desired_dates:
+            if explicit_desired_date_set:
                 _log(f"No Zeek .parquet files discovered in Drive for dates: {', '.join(desired_dates)}.")
             else:
-                _log("No Zeek .parquet files discovered in Drive.")
+                _log("No scoped Drive files found for hourly sync (today + missing historical dates).")
+            _save_sync_state(parquet_root, next_state)
             return 0
 
         latest_drive_date = max(row[3] for row in sync_candidates)
@@ -618,12 +680,14 @@ def sync_drive_to_parquet(
                 or str(state_entry.get("source_ext", "")).strip() != source_ext
             )
 
-            # Ensure we sync if it's missing, modified, or entirely new
-            should_sync = (
-                target_missing
-                or metadata_changed
-                or not has_state
-            )
+            # Historical dates are immutable for this deployment:
+            # - backfill only when missing locally
+            # - do not re-check historical modifications
+            is_hourly_today_sync = log_date == default_date
+            if not explicit_desired_date_set and not is_hourly_today_sync:
+                should_sync = target_missing
+            else:
+                should_sync = target_missing or metadata_changed or not has_state
 
             if should_sync and target_path.exists():
                 try:
