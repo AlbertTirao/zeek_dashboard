@@ -1,5 +1,5 @@
 # Zeek Dashboard - Accurate Functional Documentation
-Last validated against source code: 2026-03-15
+Last validated against source code: 2026-04-21
 
 ## 1) Scope
 This document describes how the current dashboard implementation works in this repository.
@@ -41,13 +41,14 @@ Current behavior in `app.py`:
 6. On each rerun, the app:
 - polls any in-flight Drive sync job
 - schedules a new background sync when enough time has passed
-- targets the local current date and previous date
+- computes target dates from `DRIVE_SYNC_LOOKBACK_DAYS`; when this is `<= 0`, it passes an empty target tuple and lets Drive sync use scoped policy
 7. Default timing from `config/client.py`:
 - `AUTO_REFRESH_INTERVAL = 3600` seconds
 - `DRIVE_SYNC_INTERVAL = 3600` seconds
+- `DRIVE_SYNC_LOOKBACK_DAYS = 0` (scoped policy)
 8. Background refresh behavior:
-- while a Drive sync is running, the app polls as fast as 15 seconds
-- otherwise it refreshes on the normal app interval
+- `st_autorefresh(...)` currently runs on a fixed hourly cadence (`HOURLY_SYNC_INTERVAL_SECONDS = 3600`)
+- user interactions also cause normal Streamlit reruns
 9. If a Drive sync completes successfully:
 - `_parquet_sync_token` is incremented
 - `st.cache_data.clear()` is called
@@ -244,6 +245,7 @@ Primary outputs:
 - Authorized Events
 - Unauthorized Events
 - Critical / High Risk
+- execution trace panel with `Initial Load` and `Shadow Apps Load` step timings
 - timeline chart
 - source pie chart
 - risk-ranked incidents grid
@@ -561,3 +563,109 @@ Use this checklist after deployment or dashboard changes:
 10. Authorization edits persist and appear in the audit log.
 11. User add/edit/delete and inline role updates persist in the auth backend.
 12. Logout clears the session and returns to the login page.
+
+## 13) Execution Trace Timing Notes
+Why seconds can reset or change between runs:
+1. Streamlit reruns the script top-to-bottom on interactions. Every click, page switch, or dialog action reruns the app, so trace durations are recalculated for that specific rerun.
+2. Timers are live-run measurements. The trace uses `time.time() - start_time`, so values represent current-run cost, not a single lifetime startup value.
+3. `@st.cache_data` reduces repeated work. First pass does heavy parquet/aggregation reads; subsequent reruns often return cached data and appear near-zero.
+4. Auto refresh triggers reruns. `st_autorefresh` in `app.py` fires on an hourly interval, which recalculates trace timings even without manual clicks.
+5. Python module import caching matters. First import of a page module can be slower; later navigations reuse `sys.modules` and usually load faster.
+
+Practical interpretation:
+- fluctuating trace numbers are expected and usually indicate caching is working correctly.
+
+## 14) Manifest-Driven Verification Blueprint (Proposed)
+Status:
+- this section is an implementation blueprint for integrity automation, not the current shipped behavior.
+- design goal: no manual checksum work in production operations.
+
+### 14.1 Architecture
+1. Zeek server is the source of truth and writes a per-date `manifest.json`.
+2. Dashboard server consumes that manifest and performs lightweight verification during download and render.
+
+### 14.2 Zeek Server Verification Pipeline
+1. Validate log -> parquet -> csv conversion consistency:
+- load raw log-derived frame, parquet frame, and csv frame
+- assert row counts match (`len(df_log) == len(df_parquet) == len(df_csv)`)
+- abort upload on mismatch
+2. Validate upload integrity programmatically (no manual checks):
+- compute local hash before upload
+- upload file via Drive API
+- compare local hash with checksum metadata returned by API (for example `md5Checksum`)
+- store verification result in manifest
+3. Publish manifest:
+- include date, log type, expected row count, checksum, source timestamps, and verification status
+- upload manifest beside data artifacts
+
+### 14.3 Dashboard Verification Pipeline
+1. Verify downloaded parquet automatically:
+- fetch Drive metadata checksum for each file
+- hash downloaded local file
+- compare checksums in worker code
+- on mismatch, delete corrupted local copy and queue re-download
+2. Verify parquet retrieval completeness:
+- read expected row count from manifest
+- compare with DuckDB `COUNT(*)` on local parquet
+- fail closed when mismatch is detected
+3. Verify UI render integrity visibly:
+- expose a `Data Health` status in UI
+- example: `Data Integrity: Verified (Loaded 14,502 of 14,502 expected records)`
+
+## 15) Component Notes and FAQ
+### 15.1 What `ui/auth.py` does
+1. Implements login UX state machine (`credentials`, `otp`, `password_reset`) with captcha and feedback handling.
+2. Restores/persists auth sessions via signed token (`?auth=...`) plus local session store (`.streamlit/auth_session_store.json`).
+3. Handles Google OAuth callback routing and expected-email state validation.
+4. Finalizes authenticated session state in Streamlit session.
+5. Exposes gatekeepers:
+- `require_authentication()` to block app pages until login succeeds
+- `require_role(*allowed_roles)` for role-based page restrictions
+
+### 15.2 What `services/auth_service.py` does
+1. Initializes auth backend schema and seeds bootstrap admin.
+2. Implements user CRUD and account listing across supported backends.
+3. Handles password policy, PBKDF2 hashing, and credential verification.
+4. Generates and validates OTP flow support primitives.
+5. Sends OTP/credential emails through SMTP.
+6. Validates Google OAuth auth codes against Google endpoints and maps them to local users.
+
+### 15.3 What `config/client.py` does
+1. Defines local data/log directories and parquet paths.
+2. Resolves service account credentials with fallback discovery in `secrets/*.json`.
+3. Stores Drive auth mode and credential paths.
+4. Defines refresh/sync knobs:
+- `AUTO_REFRESH_INTERVAL = 3600`
+- `DRIVE_SYNC_INTERVAL = 3600`
+- `DRIVE_SYNC_LOOKBACK_DAYS = 0` (scoped sync policy instead of fixed N-day lookback)
+
+### 15.4 When data sync is triggered
+1. On each rerun, `app.py` polls sync state and may schedule background sync if minimum interval has elapsed.
+2. `st_autorefresh` forces periodic reruns on the configured interval (hourly in current code).
+3. User interactions trigger reruns too, but sync does not restart unless schedule conditions are met.
+4. In OAuth mode, reauth flow can be triggered when stored credentials expire.
+
+### 15.5 Cache layers used in this app
+1. Python function cache (`@lru_cache`) in Drive auth helpers.
+2. Disk sync ledger cache (`data/parquet/_drive_sync_state.json`) for incremental Drive pulls.
+3. Streamlit data cache (`@st.cache_data`) for heavy dataframe/query reuse (for example `ttl=600` in `load_single_log`).
+4. Page-level parquet cache directories:
+- `_cache_alerts`
+- `_shadow_cache_apps`
+- `_shadow_cache_sharing`
+- `_shadow_cache_ai`
+- `_shadow_cache_anonymization_network`
+5. Streamlit resource cache (`@st.cache_resource`) for long-lived resources such as in-memory DB connections and manager objects.
+
+### 15.6 Difference between 1 hour and 10 minutes
+1. 1-hour interval controls cloud sync cadence (Drive polling/download behavior).
+2. 10-minute cache TTL controls in-memory dataframe reuse for UI/query speed.
+3. They operate at different layers:
+- cloud-to-disk sync cadence vs RAM cache retention
+
+### 15.7 What `services/drive_services.py` does
+1. Authenticates to Google Drive (`service`, `oauth`, or `auto` mode).
+2. Syncs Drive logs to local parquet cache with incremental logic and state tracking.
+3. Enforces parquet-only ingestion from Drive sources.
+4. Organizes data by resolved date and log type, with deterministic candidate selection.
+5. Exposes quick read helpers (`load_single_log`, `run_duckdb_query`, catalog scan) for dashboard pages.
