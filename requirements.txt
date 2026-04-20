@@ -15,7 +15,6 @@ cryptography==43.0.3
 dnspython==2.8.0
 duckdb==1.4.4
 frozenlist==1.8.0
-fuzzywuzzy==0.18.0
 gitdb==4.0.12
 GitPython==3.1.46
 google-api-core==2.29.0
@@ -56,6 +55,7 @@ python-dateutil==2.9.0.post0
 python-decouple==3.8
 pytz==2025.2
 PyYAML==6.0.3
+RapidFuzz==3.14.3
 referencing==0.37.0
 requests==2.32.5
 rpds-py==0.30.0
