@@ -639,13 +639,20 @@ Status:
 - `DRIVE_SYNC_INTERVAL = 3600`
 - `DRIVE_SYNC_LOOKBACK_DAYS = 0` (scoped sync policy instead of fixed N-day lookback)
 
-### 15.4 When data sync is triggered
+### 15.4 What `services/drive_services.py` does
+1. Authenticates to Google Drive (`service`, `oauth`, or `auto` mode).
+2. Syncs Drive logs to local parquet cache with incremental logic and state tracking.
+3. Enforces parquet-only ingestion from Drive sources.
+4. Organizes data by resolved date and log type, with deterministic candidate selection.
+5. Exposes quick read helpers (`load_single_log`, `run_duckdb_query`, catalog scan) for dashboard pages.
+
+### 15.5 When data sync is triggered
 1. On each rerun, `app.py` polls sync state and may schedule background sync if minimum interval has elapsed.
 2. `st_autorefresh` forces periodic reruns on the configured interval (hourly in current code).
 3. User interactions trigger reruns too, but sync does not restart unless schedule conditions are met.
 4. In OAuth mode, reauth flow can be triggered when stored credentials expire.
 
-### 15.5 Cache layers used in this app
+### 15.6 Cache layers used in this app
 1. Python function cache (`@lru_cache`) in Drive auth helpers.
 2. Disk sync ledger cache (`data/parquet/_drive_sync_state.json`) for incremental Drive pulls.
 3. Streamlit data cache (`@st.cache_data`) for heavy dataframe/query reuse (for example `ttl=600` in `load_single_log`).
@@ -657,15 +664,8 @@ Status:
 - `_shadow_cache_anonymization_network`
 5. Streamlit resource cache (`@st.cache_resource`) for long-lived resources such as in-memory DB connections and manager objects.
 
-### 15.6 Difference between 1 hour and 10 minutes
+### 15.7 Difference between 1 hour and 10 minutes
 1. 1-hour interval controls cloud sync cadence (Drive polling/download behavior).
 2. 10-minute cache TTL controls in-memory dataframe reuse for UI/query speed.
 3. They operate at different layers:
 - cloud-to-disk sync cadence vs RAM cache retention
-
-### 15.7 What `services/drive_services.py` does
-1. Authenticates to Google Drive (`service`, `oauth`, or `auto` mode).
-2. Syncs Drive logs to local parquet cache with incremental logic and state tracking.
-3. Enforces parquet-only ingestion from Drive sources.
-4. Organizes data by resolved date and log type, with deterministic candidate selection.
-5. Exposes quick read helpers (`load_single_log`, `run_duckdb_query`, catalog scan) for dashboard pages.
