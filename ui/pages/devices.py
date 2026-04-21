@@ -2842,7 +2842,9 @@ def render(logs_root: Path, authorized_mac_file: Path):
         known_hosts = known_hosts.dropna(subset=["mac"])
         known_hosts = known_hosts[~known_hosts["mac"].map(is_broadcast_mac)]
     else:
-        known_hosts = pd.DataFrame(columns=["mac", "host", "ts"])
+        # FIX: Preserve IP and timestamp data, just insert an empty MAC column
+        known_hosts = known_hosts.copy()
+        known_hosts["mac"] = pd.NA
 
     if "host" not in known_hosts.columns:
         known_hosts["host"] = "-"
@@ -2884,9 +2886,16 @@ def render(logs_root: Path, authorized_mac_file: Path):
             dhcp["mac"] = dhcp["mac"].map(normalize_mac)
             dhcp = dhcp.dropna(subset=["mac"])
             dhcp = dhcp[~dhcp["mac"].map(is_broadcast_mac)]
-            dhcp_cols = [c for c in ["mac", "host_name", "domain"] if c in dhcp.columns]
-            dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"])
-            merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
+            
+            # FIX: If known_hosts lacks MACs, use the IP (host) to pull MACs from DHCP
+            if known_hosts["mac"].isna().all() and "client_addr" in dhcp.columns:
+                dhcp_cols = [c for c in ["mac", "client_addr", "host_name", "domain"] if c in dhcp.columns]
+                dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"])
+                merged = pd.merge(known_hosts.drop(columns=["mac"]), dhcp_norm, how="left", left_on="host", right_on="client_addr")
+            else:
+                dhcp_cols = [c for c in ["mac", "host_name", "domain"] if c in dhcp.columns]
+                dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["mac"])
+                merged = pd.merge(known_hosts, dhcp_norm, how="left", on="mac")
         else:
             dhcp_cols = [c for c in ["client_addr", "host_name", "domain"] if c in dhcp.columns]
             dhcp_norm = dhcp[dhcp_cols].drop_duplicates(subset=["client_addr"])
