@@ -11,6 +11,8 @@ from .header_layout import (
     render_traffic_style_header,
 )
 
+ENABLE_HARDCODED_TRAFFIC_LOADERS = False  # Temporary: rely on per-module execution-trace loaders.
+
 
 def inject_traffic_header_css():
     st.markdown(
@@ -279,18 +281,20 @@ def _traffic_loading_ui(section: str, slot=None):
         return
 
     target = slot or st.empty()
-    render_dashboard_loading_state(
-        title=str(config["title"]),
-        subtitle=str(config["subtitle"]),
-        steps=[str(x) for x in config.get("steps", [])],
-        kicker="Traffic Monitoring",
-        container=target,
-    )
+    if ENABLE_HARDCODED_TRAFFIC_LOADERS:
+        render_dashboard_loading_state(
+            title=str(config["title"]),
+            subtitle=str(config["subtitle"]),
+            steps=[str(x) for x in config.get("steps", [])],
+            kicker="Traffic Monitoring",
+            container=target,
+        )
     try:
         with st.spinner(f"Loading {section}..."):
             yield
     finally:
-        target.empty()
+        if ENABLE_HARDCODED_TRAFFIC_LOADERS:
+            target.empty()
 
 
 def _render_traffic_section(section: str, parquet_root: Path, loading_slot=None) -> None:
@@ -321,15 +325,16 @@ def render(parquet_root: Path):
     if st.session_state.get("traffic_monitoring_section") not in section_options:
         st.session_state["traffic_monitoring_section"] = section_options[0]
     loading_slot = st.empty()
-    current_section = str(st.session_state.get("traffic_monitoring_section") or section_options[0])
-    current_config = SECTION_LOADING_CONFIG.get(current_section, SECTION_LOADING_CONFIG[section_options[0]])
-    render_dashboard_loading_state(
-        title=str(current_config["title"]),
-        subtitle=str(current_config["subtitle"]),
-        steps=[str(x) for x in current_config.get("steps", [])],
-        kicker="Traffic Monitoring",
-        container=loading_slot,
-    )
+    if ENABLE_HARDCODED_TRAFFIC_LOADERS:
+        current_section = str(st.session_state.get("traffic_monitoring_section") or section_options[0])
+        current_config = SECTION_LOADING_CONFIG.get(current_section, SECTION_LOADING_CONFIG[section_options[0]])
+        render_dashboard_loading_state(
+            title=str(current_config["title"]),
+            subtitle=str(current_config["subtitle"]),
+            steps=[str(x) for x in current_config.get("steps", [])],
+            kicker="Traffic Monitoring",
+            container=loading_slot,
+        )
 
     section = st.radio(
         "Traffic monitoring section",

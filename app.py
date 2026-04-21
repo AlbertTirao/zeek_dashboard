@@ -571,6 +571,9 @@ app_load_trace[2]["duration"] = time.time() - t_side
 app_load_trace[2]["status"] = "done"
 
 
+ENABLE_HARDCODED_PAGE_LOADERS = False  # Temporary: rely on execution-trace loaders for demos.
+
+
 PAGE_LOADING_CONFIG = {
     "Device Inspection": {
         "title": "Loading Device Inspection",
@@ -626,6 +629,10 @@ def _render_page_loading_state(slot, *, title: str, subtitle: str, steps: list[s
 
 @contextmanager
 def _page_loading_ui(page: str):
+    if not ENABLE_HARDCODED_PAGE_LOADERS:
+        yield
+        return
+
     config = PAGE_LOADING_CONFIG.get(str(page))
     if not config:
         yield
