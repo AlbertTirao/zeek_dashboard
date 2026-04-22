@@ -981,6 +981,12 @@ def _get_bootstrap_admin_password() -> Optional[str]:
         ]
     )
 
+# ADD CACHED HELPER
+@st.cache_resource(show_spinner=False)
+def _get_cached_mongo_client(uri: str):
+    client = MongoClient(uri, serverSelectionTimeoutMS=MONGO_TIMEOUT_MS)
+    client.admin.command("ping")
+    return client
 
 def _get_db():
     mongodb_uri = get_mongodb_uri()
@@ -990,8 +996,9 @@ def _get_db():
         )
 
     try:
-        client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=MONGO_TIMEOUT_MS)
-        client.admin.command("ping")
+        client = _get_cached_mongo_client(mongodb_uri)
+        # client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=MONGO_TIMEOUT_MS)
+        # client.admin.command("ping")
     except PyMongoError as exc:
         raise RuntimeError(
             "Could not connect to MongoDB. Check MONGODB_URI, database user/password, and Atlas IP access settings."
@@ -1000,24 +1007,22 @@ def _get_db():
     db_name = _get_database_name()
     return client[db_name]
 
+@st.cache_resource(show_spinner=False)
+def _get_cached_mysql_connection():
+    cfg = get_mysql_config()
+    return mysql_connector.connect(**cfg)
 
 def _mysql_connect():
     if mysql_connector is None:
-        raise RuntimeError("MySQL backend requested but mysql-connector-python is not installed.")
-
-    cfg = get_mysql_config()
-    if not cfg:
-        raise RuntimeError(
-            "MySQL is not configured. Set AUTH_MYSQL_HOST, AUTH_MYSQL_PORT, AUTH_MYSQL_USER, AUTH_MYSQL_PASSWORD, "
-            "AUTH_MYSQL_DATABASE (or AUTH_MYSQL_URI), and set AUTH_DB_BACKEND=mysql."
-        )
-
+        raise RuntimeError("mysql-connector-python is not installed.")
+    
     try:
-        return mysql_connector.connect(**cfg)
+        conn = _get_cached_mysql_connection()
+        if not conn.is_connected():
+            conn.reconnect(attempts=3, delay=1)
+        return conn
     except MySQLError as exc:
-        raise RuntimeError(
-            "Could not connect to MySQL. Check AUTH_MYSQL_* credentials, database name, network/IP allowlist, and server reachability."
-        ) from exc
+        raise RuntimeError("Could not connect to MySQL...") from exc
 
 
 def _mysql_errno(exc: Exception) -> Optional[int]:
@@ -1089,7 +1094,7 @@ def _fetch_user_row(username: str) -> Optional[dict]:
             return dict(row) if row else None
         finally:
             cur.close()
-            conn.close()
+            # conn.close()
 
     row = _get_db()["app_users"].find_one({"username": username})
     return dict(row) if row else None
@@ -1106,7 +1111,7 @@ def _count_users() -> int:
             return int((row or [0])[0] or 0)
         finally:
             cur.close()
-            conn.close()
+            # conn.close()
     return int(_get_db()["app_users"].count_documents({}))
 
 
@@ -1145,7 +1150,7 @@ def _insert_user_row(payload: dict) -> None:
             raise
         finally:
             cur.close()
-            conn.close()
+            # conn.close()
 
     try:
         for attempt in range(MONGO_WRITE_RETRY_ATTEMPTS):
@@ -1208,7 +1213,7 @@ def _update_user_row(username: str, updates: dict) -> int:
             raise
         finally:
             cur.close()
-            conn.close()
+            # conn.close()
 
     try:
         result = _get_db()["app_users"].update_one({"username": username}, {"$set": updates})
@@ -1228,7 +1233,7 @@ def _delete_user_row(username: str) -> int:
             return int(cur.rowcount or 0)
         finally:
             cur.close()
-            conn.close()
+            # conn.close()
 
     result = _get_db()["app_users"].delete_one({"username": username})
     return int(result.deleted_count or 0)
@@ -1250,7 +1255,7 @@ def _list_user_rows() -> list[dict]:
             return [dict(row) for row in (cur.fetchall() or [])]
         finally:
             cur.close()
-            conn.close()
+            # conn.close()
 
     rows = _get_db()["app_users"].find({}, {"_id": 0, "password_hash": 0}).sort("username", ASCENDING)
     return [dict(row) for row in rows]
@@ -1277,7 +1282,7 @@ def _insert_audit_row(username: str, success: bool, reason: str, occurred_at: da
             conn.commit()
         finally:
             cur.close()
-            conn.close()
+            # conn.close()
         return
 
     _get_db()["auth_login_audit"].insert_one(
@@ -1372,7 +1377,7 @@ def _init_mysql_auth_schema() -> None:
         conn.commit()
     finally:
         cur.close()
-        conn.close()
+        # conn.close()
 
 
 def hash_password(password: str) -> str:
