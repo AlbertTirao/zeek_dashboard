@@ -2571,7 +2571,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
     )
     
     if "hide_devices_trace" not in st.session_state:
-        st.session_state.hide_devices_trace = False
+        # change to True
+        st.session_state.hide_devices_trace = True
 
     trace_container = st.empty()
     show_trace = not st.session_state.hide_devices_trace

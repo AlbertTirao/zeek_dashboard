@@ -132,7 +132,8 @@ app_load_trace = [
 ]
 
 def update_live_trace_ui(trace, container):
-    if st.session_state.get("hide_devices_trace", False):
+    # change to True
+    if st.session_state.get("hide_devices_trace", True):
         container.empty()
         return
         
