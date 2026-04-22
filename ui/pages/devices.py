@@ -2868,6 +2868,15 @@ def render(logs_root: Path, authorized_mac_file: Path):
                 sort=False,
             )
 
+    # --- ADD THIS FALLBACK BLOCK ---
+    if known_hosts.empty and not dhcp.empty:
+        # Emergency fallback: construct known_hosts from DHCP data
+        known_hosts = dhcp[["mac", "client_addr"]].copy()
+        known_hosts.rename(columns={"client_addr": "host"}, inplace=True)
+        # Apply the local timezone function you already have in devices.py
+        known_hosts["ts"] = get_local_now()
+    # -------------------------------
+
     if known_hosts.empty:
         render_traffic_style_header(
             title="Device Overview",
