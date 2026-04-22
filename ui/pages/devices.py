@@ -240,28 +240,33 @@ def _resolve_active_devices_day(parquet_root: Path, preferred_day: str) -> tuple
 
 
 def _inventory_file_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
+    """Optimized: Only scan today's date folder for cache invalidation."""
     sig = []
-    for _day_str, day_dir in iter_date_dirs(parquet_root):
+    today_str = get_local_now().strftime("%Y-%m-%d")
+    day_dir = parquet_root / today_str
+    
+    if day_dir.exists():
         for name in ("known_hosts.parquet", "dhcp.parquet"):
             fp = day_dir / name
-            if not fp.exists():
-                continue
-            mtime_ns, size = _path_stat_sig(fp)
-            sig.append((str(fp), mtime_ns, size))
+            if fp.exists():
+                mtime_ns, size = _path_stat_sig(fp)
+                sig.append((str(fp), mtime_ns, size))
     return tuple(sig)
 
 
 def _alerts_source_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
+    """Optimized: Only scan today's date folder for cache invalidation."""
     sig = []
-    for _day_str, day_dir in iter_date_dirs(parquet_root):
+    today_str = get_local_now().strftime("%Y-%m-%d")
+    day_dir = parquet_root / today_str
+    
+    if day_dir.exists():
         for name in ("conn.parquet", "dhcp.parquet", "arp.parquet", "known_hosts.parquet"):
             fp = day_dir / name
-            if not fp.exists():
-                continue
-            mtime_ns, size = _path_stat_sig(fp)
-            sig.append((str(fp), mtime_ns, size))
+            if fp.exists():
+                mtime_ns, size = _path_stat_sig(fp)
+                sig.append((str(fp), mtime_ns, size))
     return tuple(sig)
-
 
 def _alerts_event_cache_signature(parquet_root: Path) -> tuple[tuple[str, float, int], ...]:
     cache_root = parquet_root / "_cache_alerts"
