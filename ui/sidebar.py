@@ -331,6 +331,7 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
         selected_value_to_page = dict(zip(collapsed_tokens, options))
 
     with st.sidebar:
+
         with st.container(key="sb_toggle"):
             toggle_label = "☰"
             if st.button(toggle_label, key="sidebar_toggle_btn"):
@@ -383,6 +384,29 @@ def render_sidebar(auto_refresh_interval=3600, menu_options=None, menu_icons=Non
             },
             key="sidebar_option_menu",
         )
+
+        with st.expander("🔄 Background Sync Status", expanded=False):
+            last_run = st.session_state.get("_drive_sync_last_run_at", "Never")
+            st.caption(f"**Last Checked:** {last_run}")
+            
+            # Show hard errors if the background thread crashed
+            last_error = st.session_state.get("_drive_sync_last_error")
+            if last_error:
+                st.error(f"Sync Error: {last_error}")
+                
+            # Show the live logs (including your manifest validation warnings)
+            logs = st.session_state.get("_drive_sync_messages", [])
+            if logs:
+                st.markdown("**Recent Activity:**")
+                for msg in reversed(logs): # Show newest logs at the top
+                    if "WARNING" in msg or "Error" in msg:
+                        st.markdown(f"🔴 `{msg}`")
+                    elif "Sync complete" in msg:
+                        st.markdown(f"🟢 `{msg}`")
+                    else:
+                        st.markdown(f"⚪ `{msg}`")
+            else:
+                st.caption("No recent sync activity.")
 
         page = selected_value_to_page.get(selected_value, st.session_state.sidebar_page)
 
