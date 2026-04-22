@@ -11,7 +11,9 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yaml
+import contextlib
 from .header_layout import (
+    dashboard_loading_ui,
     inject_traffic_style_header_css,
     render_dashboard_loading_state,
     render_traffic_style_header,
@@ -2542,6 +2544,10 @@ def forensic_popup(parquet_root, mac, ip, available_dates_list):
 # Main Render
 # =====================================================
 def render(logs_root: Path, authorized_mac_file: Path):
+    # --- TOGGLE SWITCH ---
+    # Set to True to use the hardcoded animation, False to use the execution trace
+    USE_HARDCODED_LOADING_UI = True 
+    
     # session state
     if "active_dialog" not in st.session_state:
         st.session_state.active_dialog = None
@@ -2571,7 +2577,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
     )
     
     if "hide_devices_trace" not in st.session_state:
-        # change to True
         st.session_state.hide_devices_trace = True
 
     trace_container = st.empty()
@@ -2582,10 +2587,10 @@ def render(logs_root: Path, authorized_mac_file: Path):
         loading_slot = trace_box.empty()
     else:
         loading_slot = None
+        trace_box = None
 
     upstream_trace = st.session_state.get("app_load_trace", [])
 
-    # Define the exact processes we want to track
     local_processes = [
         {"name": "Validating signatures & loading auth rules", "status": "pending", "duration": 0.0},
         {"name": "Resolving latest alert inventory", "status": "pending", "duration": 0.0},
@@ -2595,7 +2600,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
     ]
 
     def update_loading_ui(complete=False):
-        if not show_trace or loading_slot is None:
+        # Abort the trace UI if we are using the hardcoded UI
+        if USE_HARDCODED_LOADING_UI or not show_trace or loading_slot is None:
             return
         
         html_parts = [
@@ -2661,10 +2667,26 @@ def render(logs_root: Path, authorized_mac_file: Path):
         html_parts.append("</div>")
         loading_slot.markdown("".join(html_parts), unsafe_allow_html=True)
 
-    # --- Step 1: Signatures & Auth Rules ---
-    local_processes[0]["status"] = "running"
-    update_loading_ui()
-    t0 = time.time()
+    # --- Conditional Loader Wrapper ---
+    @contextlib.contextmanager
+    def device_loading_wrapper():
+        if USE_HARDCODED_LOADING_UI:
+            with dashboard_loading_ui(
+                title="Loading Device Inspection",
+                subtitle="Preparing device inventory, trust posture, and activity context for the latest telemetry.",
+                steps=["Read inventory", "Merge trust state", "Render overview"],
+                container=trace_container,
+            ):
+                yield
+        else:
+            yield
+
+    # Wrap the heavy steps so the loader stays active until they finish
+    with device_loading_wrapper():
+        # --- Step 1: Signatures & Auth Rules ---
+        local_processes[0]["status"] = "running"
+        update_loading_ui()
+        t0 = time.time()
     PARQUET_ROOT = Path(logs_root)
     inventory_sig = _inventory_file_signature(PARQUET_ROOT)
     alerts_cache_sig = _alerts_event_cache_signature(PARQUET_ROOT)
@@ -2733,7 +2755,8 @@ def render(logs_root: Path, authorized_mac_file: Path):
     # Finalize UI and lock it in place
     update_loading_ui(complete=True)
 
-    if show_trace:
+    # Make sure the close trace button only shows if we are actually using the trace
+    if not USE_HARDCODED_LOADING_UI and show_trace and trace_box:
         def close_trace():
             st.session_state.hide_devices_trace = True
         trace_box.button("Close Execution Trace", key="close_devices_trace_btn", on_click=close_trace)

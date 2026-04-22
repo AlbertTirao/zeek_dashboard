@@ -5,7 +5,10 @@ from contextlib import contextmanager
 
 import streamlit as st
 from pathlib import Path
+import contextlib
+import time
 from .header_layout import (
+    dashboard_loading_ui,
     inject_traffic_style_header_css,
     render_dashboard_loading_state,
     render_traffic_style_header,
@@ -310,6 +313,10 @@ def _render_traffic_section(section: str, parquet_root: Path, loading_slot=None)
 # Main Render
 # ---------------------------------------------------------
 def render(parquet_root: Path):
+    # --- TOGGLE SWITCH ---
+    # Set to True to use the hardcoded animation, False to use the execution trace
+    USE_HARDCODED_LOADING_UI = True 
+
     # REMOVED st.set_page_config() - This must be at the very top of app.py, not here
     inject_traffic_header_css()
     inject_traffic_style_header_css()
@@ -324,17 +331,99 @@ def render(parquet_root: Path):
     section_options = ["Shadow Apps", "Shadow Sharings", "Shadow AI", "Anonymization Network"]
     if st.session_state.get("traffic_monitoring_section") not in section_options:
         st.session_state["traffic_monitoring_section"] = section_options[0]
-    loading_slot = st.empty()
-    if ENABLE_HARDCODED_TRAFFIC_LOADERS:
-        current_section = str(st.session_state.get("traffic_monitoring_section") or section_options[0])
-        current_config = SECTION_LOADING_CONFIG.get(current_section, SECTION_LOADING_CONFIG[section_options[0]])
-        render_dashboard_loading_state(
-            title=str(current_config["title"]),
-            subtitle=str(current_config["subtitle"]),
-            steps=[str(x) for x in current_config.get("steps", [])],
-            kicker="Traffic Monitoring",
-            container=loading_slot,
-        )
+
+    # Get current section config to feed into the hardcoded loader dynamically
+    current_section = str(st.session_state.get("traffic_monitoring_section") or section_options[0])
+    current_config = SECTION_LOADING_CONFIG.get(current_section, SECTION_LOADING_CONFIG.get(section_options[0], {"title": "Loading", "subtitle": "Please wait", "steps": []}))
+
+    # --- Setup Trace State ---
+    if "hide_analytics_trace" not in st.session_state:
+        st.session_state.hide_analytics_trace = True
+
+    trace_container = st.empty()
+    show_trace = not st.session_state.hide_analytics_trace
+
+    if show_trace:
+        trace_box = trace_container.container()
+        loading_slot = trace_box.empty()
+    else:
+        loading_slot = None
+        trace_box = None
+
+    upstream_trace = st.session_state.get("app_load_trace", [])
+
+    # Custom trace steps for Traffic Monitoring
+    local_processes = [
+        {"name": "Scanning network traffic logs", "status": "pending", "duration": 0.0},
+        {"name": f"Processing {current_section} datasets", "status": "pending", "duration": 0.0},
+        {"name": "Rendering analytical charts", "status": "pending", "duration": 0.0},
+    ]
+
+    def update_loading_ui(complete=False):
+        if USE_HARDCODED_LOADING_UI or not show_trace or loading_slot is None:
+            return
+        
+        html_parts = [
+            "<div class='dashboard-loading-shell' style='margin-bottom: 8px;'>",
+            "  <div class='dashboard-loading-kicker'>Execution Trace</div>",
+            f"  <div class='dashboard-loading-title'>Initializing {current_section}</div>",
+            "  <div class='dashboard-loading-copy'>Tracking real-time data ingestion and processing...</div>",
+            "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>"
+        ]
+
+        if upstream_trace:
+            html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 4px; margin-bottom: -2px; padding-left: 4px;'>Initial Load:</div>")
+            for p in upstream_trace:
+                time_str = f"{p.get('duration', 0.0):.2f}s"
+                html_parts.append(
+                    f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: rgba(46, 204, 113, 0.08); border: 1px solid rgba(46, 204, 113, 0.3); border-radius: 8px; color: #2ecc71; padding: 8px 14px;'>"
+                    f"        <span style='font-weight: 700;'>✅ &nbsp;{p.get('name', 'Task')}</span>"
+                    f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>"
+                    f"    </div>"
+                )
+
+        html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 10px; margin-bottom: -2px; padding-left: 4px;'>Analytics Load:</div>")
+        
+        for p in local_processes:
+            if p["status"] == "pending":
+                icon, time_str, bg, border, color = "⏳", "Waiting...", "rgba(255,255,255,0.02)", "rgba(255,255,255,0.05)", "rgba(255,255,255,0.4)"
+            elif p["status"] == "running":
+                icon, time_str, bg, border, color = "🔄", "Processing...", "rgba(0, 247, 255, 0.08)", "rgba(0, 247, 255, 0.3)", "#00F7FF"
+            else:
+                icon, time_str, bg, border, color = "✅", f"{p['duration']:.2f}s", "rgba(46, 204, 113, 0.08)", "rgba(46, 204, 113, 0.3)", "#2ecc71"
+
+            html_parts.append(
+                f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
+                f"        <span style='font-weight: 700;'>{icon} &nbsp;{p['name']}</span>"
+                f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>"
+                f"    </div>"
+            )
+
+        html_parts.append("  </div>")
+        if not complete:
+            html_parts.append(
+                "  <div class='dashboard-loading-bars' style='margin-top: 18px;'>"
+                "      <div class='dashboard-loading-bar' style='--delay:0s'></div>"
+                "      <div class='dashboard-loading-bar' style='--delay:0.15s'></div>"
+                "      <div class='dashboard-loading-bar' style='--delay:0.3s'></div>"
+                "  </div>"
+            )
+        html_parts.append("</div>")
+        loading_slot.markdown("".join(html_parts), unsafe_allow_html=True)
+
+    # --- Conditional Loader Wrapper ---
+    @contextlib.contextmanager
+    def analytics_loading_wrapper():
+        if USE_HARDCODED_LOADING_UI:
+            with dashboard_loading_ui(
+                title=str(current_config["title"]),
+                subtitle=str(current_config["subtitle"]),
+                steps=[str(x) for x in current_config.get("steps", [])],
+                container=trace_container,
+            ):
+                yield
+        else:
+            yield
 
     section = st.radio(
         "Traffic monitoring section",
@@ -344,4 +433,39 @@ def render(parquet_root: Path):
         key="traffic_monitoring_section",
     )
 
-    _render_traffic_section(section, parquet_root, loading_slot=loading_slot)
+    with analytics_loading_wrapper():
+        
+        # Track Step 1: Initial scanning (stubbed timer for flow)
+        local_processes[0]["status"] = "running"
+        update_loading_ui()
+        t0 = time.time()
+        time.sleep(0.05) # Brief pause so the UI transitions smoothly
+        local_processes[0]["duration"] = time.time() - t0
+        local_processes[0]["status"] = "done"
+
+        # Track Step 2: Main Processing
+        local_processes[1]["status"] = "running"
+        update_loading_ui()
+        t1 = time.time()
+        
+        # Execute the main section rendering
+        _render_traffic_section(section, parquet_root, loading_slot=trace_container)
+        
+        local_processes[1]["duration"] = time.time() - t1
+        local_processes[1]["status"] = "done"
+        
+        # Track Step 3: Finalizing Charts
+        local_processes[2]["status"] = "running"
+        update_loading_ui()
+        t2 = time.time()
+        local_processes[2]["duration"] = time.time() - t2
+        local_processes[2]["status"] = "done"
+
+    # Finalize UI and lock it in place
+    update_loading_ui(complete=True)
+
+    # Make sure the close trace button only shows if we are actually using the trace
+    if not USE_HARDCODED_LOADING_UI and show_trace and trace_box:
+        def close_trace():
+            st.session_state.hide_analytics_trace = True
+        trace_box.button("Close Execution Trace", key="close_analytics_trace_btn", on_click=close_trace)
