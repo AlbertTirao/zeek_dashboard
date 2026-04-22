@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import streamlit as st
 import duckdb
+import hashlib
 
 from config import client as client_config
 from oauth2client.tools import ClientRedirectHandler, ClientRedirectServer
@@ -40,6 +41,91 @@ PROXY_ENV_KEYS = (
 class DriveOAuthReauthRequired(RuntimeError):
     """Stored OAuth credentials expired and require an interactive re-login."""
 
+def validate_date_folder(parquet_root: Path, log_date: str) -> bool:
+    """
+    Validates a local folder against its manifest.json.
+    Checks existence and verifies that the Parquet row count matches the raw_rows.
+    """
+    # 1. Skip dates before the manifest was implemented
+    if log_date < "2026-03-21":
+        return True 
+
+    # 2. Skip if already validated
+    if log_date in _load_validated_dates(parquet_root):
+        return True
+
+    date_dir = parquet_root / log_date
+    manifest_path = date_dir / "manifest.json"
+
+    # If no manifest is local yet, it might still be uploading.
+    if not manifest_path.exists():
+        return False 
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        is_fully_valid = True
+        
+        # files_dict looks like: {"dns": {"raw_rows": 20358, ...}, ...}
+        files_dict = manifest.get("files", {})
+        
+        for log_type, metadata in files_dict.items():
+            file_path = date_dir / f"{log_type}.parquet"
+            
+            # If a file is missing, it's likely still in transit to Drive.
+            if not file_path.exists():
+                is_fully_valid = False
+                continue
+                
+            # Perform Row Count Integrity Check
+            expected_rows = metadata.get("raw_rows")
+            
+            if expected_rows is not None:
+                try:
+                    # pq.read_metadata is extremely fast and doesn't load the file into RAM
+                    parquet_meta = pq.read_metadata(file_path)
+                    actual_rows = parquet_meta.num_rows
+                    
+                    if actual_rows != expected_rows:
+                        # Row count mismatch! Delete the corrupted/incomplete file
+                        file_path.unlink()
+                        is_fully_valid = False
+                        continue
+                        
+                except Exception:
+                    # If PyArrow throws an error, the Parquet file is completely corrupted/unreadable
+                    file_path.unlink()
+                    is_fully_valid = False
+                    continue
+
+        # Only mark as validated if EVERY file exists and row counts match perfectly
+        if is_fully_valid:
+            _mark_date_validated(parquet_root, log_date)
+            
+        return is_fully_valid
+
+    except Exception:
+        # If the manifest itself is corrupted/unreadable, delete it to force a re-download
+        if manifest_path.exists():
+            manifest_path.unlink()
+        return False
+
+def _validation_state_path(parquet_root: Path) -> Path:
+    return parquet_root / "_manifest_validation_state.json"
+
+def _load_validated_dates(parquet_root: Path) -> set:
+    path = _validation_state_path(parquet_root)
+    if not path.exists():
+        return set()
+    try:
+        return set(json.loads(path.read_text(encoding="utf-8")).get("validated_dates", []))
+    except Exception:
+        return set()
+
+def _mark_date_validated(parquet_root: Path, log_date: str):
+    validated = _load_validated_dates(parquet_root)
+    validated.add(log_date)
+    path = _validation_state_path(parquet_root)
+    path.write_text(json.dumps({"validated_dates": list(validated)}, indent=2), encoding="utf-8")
 
 def _extract_date_from_dirname(name: str) -> Optional[str]:
     """Accept YYYY-MM-DD date tokens, including date=YYYY-MM-DD and unpadded forms."""
@@ -467,24 +553,23 @@ def list_files_with_retry(drive: GoogleDrive, query: str, max_retries: int = 5):
 # 2) STREAMING INGEST (PARQUET ONLY)
 # =====================================================
 
-def download_drive_parquet_to_path(file_obj, parquet_path: Path) -> None:
+def download_drive_file_to_path(file_obj, target_path: Path, suffix: str = ".parquet") -> None:
     """
-    Downloads a Drive parquet object directly to the target parquet path.
+    Downloads a Drive object to the target path using the correct file extension.
     """
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
 
     try:
         file_obj.GetContentFile(tmp_path)
-        os.replace(tmp_path, parquet_path)
+        os.replace(tmp_path, target_path)
     finally:
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-
 
 # =====================================================
 # 3) ORCHESTRATION (INCREMENTAL SYNC)
@@ -618,8 +703,13 @@ def sync_drive_to_parquet(
                 continue
 
             source_ext = _supported_source_extension(lower_name)
-            if source_ext is None:
+            is_manifest = (lower_name == "manifest.json")
+            
+            if source_ext is None and not is_manifest:
                 continue
+                
+            if is_manifest:
+                source_ext = ".json"
 
             log_type = Path(name).stem.strip()
             if not log_type:
@@ -715,7 +805,7 @@ def sync_drive_to_parquet(
             _log(f"Ingesting ({source_ext}): {log_date} / {name} ...")
 
             try:
-                download_drive_parquet_to_path(f, target_path)
+                download_drive_file_to_path(f, target_path, suffix=source_ext)
                 files_processed += 1
                 next_state[file_key] = {
                     "title": name,
@@ -730,6 +820,15 @@ def sync_drive_to_parquet(
                 _log(f"Error on {name}: {e}")
 
         _save_sync_state(parquet_root, next_state)
+
+        # -----------------------------------------------------
+        # NEW: Pass 3 - Validate Manifest Integrity
+        # -----------------------------------------------------
+        for log_date in effective_date_set:
+            is_valid = validate_date_folder(parquet_root, log_date)
+            if not is_valid:
+                _log(f"WARNING: Integrity check failed for {log_date}. Manifest mismatch.")
+        # -----------------------------------------------------
 
         if files_processed > 0:
             _log(f"Sync complete: {files_processed} files updated.")
