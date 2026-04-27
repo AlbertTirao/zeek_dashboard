@@ -805,80 +805,90 @@ def load_device_inventory_history_rows(
         return pd.DataFrame(columns=base_cols)
 
 @st.cache_data(show_spinner=False)
-def load_hourly_status_from_alert_cache(
+@st.cache_data(show_spinner=False)
+def load_hourly_status_from_conn_logs(
     parquet_root: Path,
-    alert_cache_sig: tuple[tuple[str, float, int], ...],
+    alerts_source_sig: tuple[tuple[str, float, int], ...],
     allowed_macs_tuple: tuple[str, ...],
     banned_macs_tuple: tuple[str, ...],
 ) -> pd.DataFrame:
     """
-    Fast hourly trend using Alerts cache files.
+    Fast hourly trend using raw conn.parquet logs for the last 7 days.
     Returns columns: ts, status, events
     """
-    cache_files = list(_list_alert_event_cache_files(parquet_root, alert_cache_sig))
-    if not cache_files:
+    _ = alerts_source_sig  # Used for cache invalidation when new logs arrive
+    
+    recent_conn_paths = []
+    date_dirs = sorted(list(iter_date_dirs(parquet_root)), key=lambda x: x[0], reverse=True)
+    for d_str, d_path in date_dirs[:7]:
+        cp = d_path / "conn.parquet"
+        if cp.exists():
+            recent_conn_paths.append(str(cp))
+            
+    if not recent_conn_paths:
         return pd.DataFrame(columns=["ts", "status", "events"])
 
     try:
         import duckdb
-
         con = duckdb.connect(database=":memory:")
-        hourly_mac = con.execute(
-            """
-            WITH ev AS (
-              SELECT
-                try_cast(ts_dt AS timestamp) AS ts_dt,
-                cast(mac_norm AS varchar) AS mac
-              FROM read_parquet(?, union_by_name=true)
-            ),
-            clean AS (
-              SELECT
-                date_trunc('hour', ts_dt) AS ts,
-                mac
-              FROM ev
-              WHERE ts_dt IS NOT NULL
-                AND mac IS NOT NULL
-                AND mac != 'ff:ff:ff:ff:ff:ff'
-            )
-            SELECT
-              ts,
-              mac,
-              count(*) AS events
-            FROM clean
-            GROUP BY ts, mac
-            ORDER BY ts
-            """,
-            [cache_files],
-        ).df()
-        con.close()
-    except Exception:
-        return pd.DataFrame(columns=["ts", "status", "events"])
-
-    if hourly_mac is None or hourly_mac.empty:
-        return pd.DataFrame(columns=["ts", "status", "events"])
-
-    out = hourly_mac.copy()
-    out["mac"] = out["mac"].map(normalize_mac)
-    out = out.dropna(subset=["mac", "ts"])
-    if out.empty:
-        return pd.DataFrame(columns=["ts", "status", "events"])
-
-    banned_set = set(banned_macs_tuple or ())
-    if banned_set:
-        out = out[~out["mac"].isin(banned_set)]
-        if out.empty:
+        
+        # 1. Dynamically find the correct MAC column (conn.log uses orig_l2_addr)
+        schema_df = con.execute("DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)", [recent_conn_paths]).df()
+        available_cols = schema_df["column_name"].tolist()
+        
+        mac_col = None
+        if "orig_l2_addr" in available_cols:
+            mac_col = "orig_l2_addr"
+        elif "mac" in available_cols:
+            mac_col = "mac"
+            
+        # If somehow neither exists, safely exit
+        if not mac_col:
+            con.close()
             return pd.DataFrame(columns=["ts", "status", "events"])
 
-    allowed_set = set(allowed_macs_tuple or ())
-    out["status"] = out["mac"].apply(lambda m: "Authorized" if m in allowed_set else "Unauthorized")
-    out = (
-        out.groupby(["ts", "status"], as_index=False)["events"]
-        .sum()
-        .sort_values("ts")
-    )
-    return out
+        # 2. Safely execute the query using the correctly identified column
+        query = f"""
+            SELECT 
+                date_trunc('hour', try_cast(ts AS timestamp)) AS ts,
+                lower(cast("{mac_col}" AS varchar)) AS mac,
+                count(*) AS events
+            FROM read_parquet(?, union_by_name=true)
+            WHERE ts IS NOT NULL 
+              AND "{mac_col}" IS NOT NULL 
+              AND "{mac_col}" != 'ff:ff:ff:ff:ff:ff'
+            GROUP BY 1, 2
+        """
+        raw_hourly = con.execute(query, [recent_conn_paths]).df()
+        con.close()
 
+        if raw_hourly.empty:
+            return pd.DataFrame(columns=["ts", "status", "events"])
 
+        # 3. Process and apply authorization rules
+        raw_hourly["mac"] = raw_hourly["mac"].apply(normalize_mac)
+        raw_hourly = raw_hourly.dropna(subset=["mac", "ts"])
+
+        banned_set = set(banned_macs_tuple or ())
+        if banned_set:
+            raw_hourly = raw_hourly[~raw_hourly["mac"].isin(banned_set)]
+
+        allowed_set = set(allowed_macs_tuple or ())
+        raw_hourly["status"] = raw_hourly["mac"].apply(
+            lambda m: "Authorized" if m in allowed_set else "Unauthorized"
+        )
+
+        hourly = (
+            raw_hourly.groupby(["ts", "status"], as_index=False)["events"]
+            .sum()
+            .sort_values("ts")
+        )
+        return hourly
+
+    except Exception as e:
+        # Silently return empty on failure so the UI does not crash
+        return pd.DataFrame(columns=["ts", "status", "events"])
+    
 # =====================================================
 # 2) Drill-Down Log Loader (robust ts + robust MAC)
 # =====================================================
@@ -2743,12 +2753,15 @@ def render(logs_root: Path, authorized_mac_file: Path):
     local_processes[4]["status"] = "running"
     update_loading_ui()
     t0 = time.time()
-    hourly = load_hourly_status_from_alert_cache(
+    
+    # NEW: Calls our raw log query instead of the alerts cache
+    hourly = load_hourly_status_from_conn_logs(
         PARQUET_ROOT,
-        alerts_cache_sig,
+        alerts_source_sig,  # Triggers a cache refresh when conn.parquet updates
         tuple(sorted(authorized_macs)),
         tuple(sorted(banned_macs)),
     )
+    
     local_processes[4]["duration"] = time.time() - t0
     local_processes[4]["status"] = "done"
 
@@ -3087,15 +3100,6 @@ def render(logs_root: Path, authorized_mac_file: Path):
 
     if active_day_str and active_day_str != today_str:
         st.caption(f"Active Devices source date: {active_day_str} (latest available known_hosts capture).")
-
-    if hourly.empty and not in_scope.empty:
-        hourly = (
-            in_scope.set_index("ts")
-            .groupby("status")
-            .resample("1h", include_groups=False)
-            .size()
-            .reset_index(name="events")
-        )
 
     warning_text, warning_color = "SAFE", "#6CA651"
     if risk > 20:
