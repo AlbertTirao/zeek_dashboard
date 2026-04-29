@@ -4369,7 +4369,7 @@ def render_shadow_apps(parquet_root: Path):
     inject_shadow_apps_css()
 
     if "hide_shadow_apps_trace" not in st.session_state:
-        # change to True
+        # change to false to show execution trace and vice versa
         st.session_state.hide_shadow_apps_trace = True
 
     trace_container = st.empty()

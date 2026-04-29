@@ -1865,15 +1865,124 @@ def show_shadow_sharing_device_dialog(
 
 
 def render_shadow_sharing(parquet_root: Path):
+    import time
     inject_shadow_sharing_css()
+
+    if "hide_shadow_sharing_trace" not in st.session_state:
+        #change to false to show execution trace and vice versa
+        st.session_state.hide_shadow_sharing_trace = False
+
+    trace_container = st.empty()
+    show_trace = not st.session_state.hide_shadow_sharing_trace
+
+    if show_trace:
+        trace_box = trace_container.container()
+        loading_slot = trace_box.empty()
+    else:
+        trace_box = None
+        loading_slot = None
+
+    upstream_trace = st.session_state.get("app_load_trace", [])
+    local_processes = [
+        {"name": "Restoring session state & dialog controls", "status": "pending", "duration": 0.0},
+        {"name": "Resolving dataset scope & policy inputs", "status": "pending", "duration": 0.0},
+        {"name": "Rebuilding cached shadow sharing telemetry slices", "status": "pending", "duration": 0.0},
+        {"name": "Computing shadow sharing incident rollup & metrics", "status": "pending", "duration": 0.0},
+    ]
+
+    def update_loading_ui(complete=False):
+        if not show_trace or loading_slot is None:
+            return
+
+        html_parts = [
+            "<div class='dashboard-loading-shell' style='margin-bottom: 8px;'>",
+            "  <div class='dashboard-loading-kicker'>Execution Trace</div>",
+            "  <div class='dashboard-loading-title'>Initializing Shadow Sharing Incidents</div>",
+            "  <div class='dashboard-loading-copy'>Tracking cache warmup, day scoping, and analytics readiness...</div>",
+            "  <div class='dashboard-loading-steps' style='display: flex; flex-direction: column; gap: 8px; margin-top: 16px;'>",
+        ]
+
+        if upstream_trace:
+            html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 4px; margin-bottom: -2px; padding-left: 4px;'>Initial Load:</div>")
+            for p in upstream_trace:
+                icon = "✅"
+                time_str = f"{p.get('duration', 0.0):.2f}s"
+                bg = "rgba(46, 204, 113, 0.08)"
+                border = "rgba(46, 204, 113, 0.3)"
+                color = "#2ecc71"
+                html_parts.append(
+                    f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
+                )
+                html_parts.append(f"        <span style='font-weight: 700;'>{icon} &nbsp;{p.get('name', 'Task')}</span>")
+                html_parts.append(f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>")
+                html_parts.append("    </div>")
+
+        html_parts.append("    <div style='font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 800; color: rgba(255,255,255,0.5); margin-top: 10px; margin-bottom: -2px; padding-left: 4px;'>Shadow Sharing Load:</div>")
+
+        for p in local_processes:
+            if p["status"] == "pending":
+                icon = "⏳"
+                time_str = "Waiting..."
+                bg = "rgba(255,255,255,0.02)"
+                border = "rgba(255,255,255,0.05)"
+                color = "rgba(255,255,255,0.4)"
+            elif p["status"] == "running":
+                icon = "🔄"
+                time_str = "Processing..."
+                bg = "rgba(0, 247, 255, 0.08)"
+                border = "rgba(0, 247, 255, 0.3)"
+                color = "#00F7FF"
+            else:
+                icon = "✅"
+                time_str = f"{p['duration']:.2f}s"
+                bg = "rgba(46, 204, 113, 0.08)"
+                border = "rgba(46, 204, 113, 0.3)"
+                color = "#2ecc71"
+
+            html_parts.append(
+                f"    <div class='dashboard-loading-step' style='width: 100%; display: flex; justify-content: space-between; background: {bg}; border: 1px solid {border}; border-radius: 8px; color: {color}; padding: 8px 14px;'>"
+            )
+            html_parts.append(f"        <span style='font-weight: 700;'>{icon} &nbsp;{p['name']}</span>")
+            html_parts.append(f"        <span style='font-family: monospace; font-size: 0.85rem; opacity: 0.9;'>{time_str}</span>")
+            html_parts.append("    </div>")
+
+        html_parts.append("  </div>")
+        if not complete:
+            html_parts.append("  <div class='dashboard-loading-bars' style='margin-top: 18px;'>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0s'></div>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.15s'></div>")
+            html_parts.append("      <div class='dashboard-loading-bar' style='--delay:0.3s'></div>")
+            html_parts.append("  </div>")
+        html_parts.append("</div>")
+        loading_slot.markdown("".join(html_parts), unsafe_allow_html=True)
+
+    def finalize_loading_ui():
+        update_loading_ui(complete=True)
+        if show_trace and trace_box is not None:
+            def close_trace():
+                st.session_state.hide_shadow_sharing_trace = True
+            trace_box.button("Close Execution Trace", key="close_shadow_sharing_trace_btn", on_click=close_trace)
+
+    # --- Step 0: Restoring Session State & Dialogs ---
+    local_processes[0]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
 
     parquet_root = Path(parquet_root)
     if not parquet_root.exists():
+        local_processes[0]["duration"] = time.time() - t0
+        local_processes[0]["status"] = "done"
+        for i in range(1, len(local_processes)): local_processes[i]["status"] = "done"
+        finalize_loading_ui()
         st.error("Data directory not found.")
         return
 
     available_dates = get_available_dates(parquet_root)
     if not available_dates:
+        local_processes[0]["duration"] = time.time() - t0
+        local_processes[0]["status"] = "done"
+        for i in range(1, len(local_processes)): local_processes[i]["status"] = "done"
+        finalize_loading_ui()
         st.warning("No logs found.")
         return
 
@@ -1891,6 +2000,7 @@ def render_shadow_sharing(parquet_root: Path):
     st.session_state.setdefault("_shadow_sharing_scope_cache_key_v1", None)
     st.session_state.setdefault("_shadow_sharing_scope_df_v1", None)
     st.session_state.setdefault("_shadow_sharing_scope_incidents_v1", None)
+    
     sync_token = int(st.session_state.get("_parquet_sync_token", 0))
     if st.session_state.get("_shadow_sharing_last_sync_token") != sync_token:
         _close_shadow_sharing_dialog()
@@ -1910,6 +2020,14 @@ def render_shadow_sharing(parquet_root: Path):
         if not (isinstance(cached_base, pd.DataFrame) and isinstance(cached_incidents, pd.DataFrame)):
             _close_shadow_sharing_dialog()
             origin = None
+
+    local_processes[0]["duration"] = time.time() - t0
+    local_processes[0]["status"] = "done"
+
+    # --- Step 1: Scope & Policy Inputs ---
+    local_processes[1]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
 
     st.markdown("### Shadow Sharing Incidents")
     st.markdown(
@@ -1938,9 +2056,13 @@ def render_shadow_sharing(parquet_root: Path):
     cached_incidents = st.session_state.get("shadow_sharing_dialog_incidents_df")
     cached_scope_key = st.session_state.get("shadow_sharing_dialog_scope_key") or selected_scope_key
     cached_scope_label = st.session_state.get("shadow_sharing_dialog_scope_label") or str(selected_date)
+
     if st.session_state.get("shadow_sharing_allow_dialog_open") and st.session_state.get("shadow_sharing_allow_candidate"):
+        for i in range(1, len(local_processes)): local_processes[i]["status"] = "done"
+        finalize_loading_ui()
         show_shadow_sharing_allow_dialog()
         st.stop()
+
     if (
         st.session_state.get("shadow_sharing_dialog_open")
         and dialog_mac_pending
@@ -1948,6 +2070,8 @@ def render_shadow_sharing(parquet_root: Path):
         and isinstance(cached_incidents, pd.DataFrame)
     ):
         st.session_state["shadow_sharing_dialog_origin"] = "dialog"
+        for i in range(1, len(local_processes)): local_processes[i]["status"] = "done"
+        finalize_loading_ui()
         show_shadow_sharing_device_dialog(
             cached_base,
             cached_incidents,
@@ -1966,11 +2090,7 @@ def render_shadow_sharing(parquet_root: Path):
         if err_msgs:
             err_txt = "; ".join(err_msgs[:2]) + (" ..." if len(err_msgs) > 2 else "")
             st.warning(f"Whitelist update issues: {err_txt}")
-    # Date scope
-    # NOTE: Zeek can write logs into a "day folder" that contains spillover timestamps
-    # from the previous/next day around midnight. To avoid missing events for the
-    # selected date, we load the selected folder plus adjacent folders (if present),
-    # then apply a strict timestamp filter to keep only the selected date.
+
     target_dates: List[str] = []
     if selected_date:
         target_dates = [str(selected_date)]
@@ -1984,6 +2104,15 @@ def render_shadow_sharing(parquet_root: Path):
                         target_dates.append(d)
         except Exception:
             pass
+
+    local_processes[1]["duration"] = time.time() - t0
+    local_processes[1]["status"] = "done"
+
+    # --- Step 2: Rebuilding Cached Telemetry ---
+    local_processes[2]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
+
     logs_sig = shadow_sharing_logs_signature(parquet_root, target_dates)
     scope_cache_key = (
         str(parquet_root.resolve()),
@@ -1994,6 +2123,7 @@ def render_shadow_sharing(parquet_root: Path):
     cached_key = st.session_state.get("_shadow_sharing_scope_cache_key_v1")
     cached_df = st.session_state.get("_shadow_sharing_scope_df_v1")
     cached_incidents = st.session_state.get("_shadow_sharing_scope_incidents_v1")
+
     if cached_key == scope_cache_key and isinstance(cached_df, pd.DataFrame):
         df = cached_df
         incidents = cached_incidents if isinstance(cached_incidents, pd.DataFrame) else pd.DataFrame()
@@ -2006,8 +2136,6 @@ def render_shadow_sharing(parquet_root: Path):
         st.session_state.pop("_shadow_sharing_filtered_cache_v1", None)
         st.session_state.pop("_shadow_sharing_source_masks_cache_v1", None)
 
-    # Keep date scope strict to selected day by event timestamp.
-    # Some day folders can still contain spillover rows around midnight.
     df_union = df
     total_scope_rows = int(len(df_union))
     df = _strict_scope_by_selected_date(df_union, str(selected_date), ts_col="ts")
@@ -2027,82 +2155,38 @@ def render_shadow_sharing(parquet_root: Path):
             f"Date scope note: excluded {trimmed_rows:,} rows because their timestamps were outside `{selected_date}`. "
             f"Included {included_from_adjacent:,} rows from adjacent day folders (yesterday/tomorrow)."
         )
+
     if isinstance(incidents, pd.DataFrame) and not incidents.empty:
         incidents = _strict_scope_by_selected_date(incidents, str(selected_date), ts_col="first_ts")
     elif not df.empty:
-        # Fallback if incident cache is unavailable.
         incidents = build_shadow_sharing_incidents(df)
     else:
         incidents = pd.DataFrame()
 
     if df.empty:
+        local_processes[2]["duration"] = time.time() - t0
+        local_processes[2]["status"] = "done"
+        local_processes[3]["status"] = "done"
+        finalize_loading_ui()
         st.info("No data detected for the selected timeframe.")
         return
 
-    # -------------------------------------------------------------------------
-    # Incident Rollup (Algorithms #2/#4/#5/#6)
-    # -------------------------------------------------------------------------
-    incidents = _filter_incidents_nonzero_outbound(incidents)
+    local_processes[2]["duration"] = time.time() - t0
+    local_processes[2]["status"] = "done"
 
+    # --- Step 3: Computing Rollup & Metrics ---
+    local_processes[3]["status"] = "running"
+    update_loading_ui()
+    t0 = time.time()
+
+    incidents = _filter_incidents_nonzero_outbound(incidents)
     if incidents.empty:
         st.info("No flow-based incidents were found in this scope.")
-
-    def _has_text(s: pd.Series) -> pd.Series:
-        t = s.astype(str).str.strip().str.lower()
-        return ~t.isin(["", "nan", "none", "-", "unknown"])
-
-    def _to_bool(s: pd.Series) -> pd.Series:
-        if pd.api.types.is_bool_dtype(s):
-            return s.fillna(False)
-        t = s.astype(str).str.strip().str.lower()
-        return t.isin(["1", "true", "t", "yes", "y"])
-
-    def _build_real_source_masks(src: pd.DataFrame) -> Dict[str, pd.Series]:
-        idx = src.index
-        log_src = src["log_source"].astype(str).str.strip().str.lower() if "log_source" in src.columns else pd.Series("", index=idx)
-        dns_mask = log_src.eq("dns")
-        conn_mask = ~dns_mask
-
-        http_mask = pd.Series(False, index=idx)
-        for col in ["method", "uri", "user_agent", "host", "content_type"]:
-            if col in src.columns:
-                http_mask = http_mask | _has_text(src[col])
-        for col in ["request_body_len", "response_body_len", "status_code"]:
-            if col in src.columns:
-                v = pd.to_numeric(src[col], errors="coerce").fillna(0)
-                http_mask = http_mask | (v > 0)
-        for col in ["http_any_upload", "http_any_share"]:
-            if col in src.columns:
-                http_mask = http_mask | _to_bool(src[col])
-        http_mask = http_mask & conn_mask
-
-        ssl_mask = pd.Series(False, index=idx)
-        for col in ["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"]:
-            if col in src.columns:
-                ssl_mask = ssl_mask | _has_text(src[col])
-        ssl_mask = ssl_mask & conn_mask
-
-        files_mask = pd.Series(False, index=idx)
-        for col in ["file_total_bytes", "file_seen_bytes"]:
-            if col in src.columns:
-                v = pd.to_numeric(src[col], errors="coerce").fillna(0)
-                files_mask = files_mask | (v > 0)
-        for col in ["file_mime_types", "file_names", "file_sources"]:
-            if col in src.columns:
-                files_mask = files_mask | _has_text(src[col])
-        files_mask = files_mask & conn_mask
-
-        return {
-            "conn": conn_mask,
-            "http": http_mask,
-            "ssl": ssl_mask,
-            "dns": dns_mask,
-            "files": files_mask,
-        }
 
     source_data_stamp = _shadow_sharing_data_stamp(df)
     source_mask_key = (str(selected_scope_key), source_data_stamp)
     source_mask_cache = st.session_state.get("_shadow_sharing_source_masks_cache_v1", {})
+
     if isinstance(source_mask_cache, dict) and source_mask_cache.get("key") == source_mask_key:
         source_masks = source_mask_cache.get("masks", {})
         source_options = source_mask_cache.get("options", [])
@@ -2117,26 +2201,6 @@ def render_shadow_sharing(parquet_root: Path):
             "masks": source_masks,
             "options": source_options,
         }
-
-    def _prepare_scope_event_rows(src_df: pd.DataFrame) -> pd.DataFrame:
-        out_df = src_df.copy()
-        if out_df.empty:
-            return out_df
-        # Hard filter: hide Unknown/placeholder destinations.
-        if "destination" in out_df.columns:
-            dest_norm = out_df["destination"].astype(str).str.strip().str.lower()
-            out_df = out_df[~dest_norm.isin(INVALID_DEST_SET)].copy()
-        out_df["bytes"] = pd.to_numeric(out_df["bytes"], errors="coerce").fillna(0)
-        out_df = out_df[out_df["bytes"] > 0].copy()
-        if "event_id" in out_df.columns:
-            out_df = out_df.drop_duplicates(subset=["event_id"], keep="last")
-        else:
-            dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes"] if c in out_df.columns]
-            if dedupe_cols:
-                out_df = out_df.drop_duplicates(subset=dedupe_cols, keep="last")
-            else:
-                out_df = out_df.drop_duplicates()
-        return out_df
 
     overview_filtered = _prepare_scope_event_rows(df)
     overview_incidents = build_shadow_sharing_incidents(overview_filtered)
@@ -2171,6 +2235,7 @@ def render_shadow_sharing(parquet_root: Path):
         search_q=search_q,
         data_stamp=source_data_stamp,
     )
+
     filter_cache_state = st.session_state.get("_shadow_sharing_filtered_cache_v1", {})
     if isinstance(filter_cache_state, dict) and filter_cache_state.get("key") == filter_cache_key:
         filtered = filter_cache_state.get("filtered", pd.DataFrame())
@@ -2178,7 +2243,6 @@ def render_shadow_sharing(parquet_root: Path):
         dev_grid_table_cached = filter_cache_state.get("dev_grid_table", filter_cache_state.get("dev_grid", pd.DataFrame()))
         dev_grid_raw_cached = filter_cache_state.get("dev_grid_raw", pd.DataFrame())
     else:
-        # Apply filters
         filtered = df.copy()
 
         if selected_sources:
@@ -2193,7 +2257,7 @@ def render_shadow_sharing(parquet_root: Path):
             q = search_q.lower().strip()
             if q:
                 filtered = filtered[
-                filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+                    filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
                     | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
                     | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
                     | filtered["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
@@ -2209,11 +2273,13 @@ def render_shadow_sharing(parquet_root: Path):
         if selected_conf_levels and isinstance(filtered_incidents, pd.DataFrame) and not filtered_incidents.empty:
             conf_series = filtered_incidents.get("confidence", pd.Series("", index=filtered_incidents.index)).astype(str).str.upper()
             filtered_incidents = filtered_incidents[conf_series.isin(set(selected_conf_levels))].copy()
+        
         dev_grid_raw_cached = _build_incident_grid_frame(filtered_incidents)
         table_incidents = _aggregate_incidents_for_daily_mac_destination_table(filtered_incidents, str(selected_date))
         dev_grid_table_cached = _build_incident_grid_frame(table_incidents)
         if dev_grid_table_cached.empty and not dev_grid_raw_cached.empty:
             dev_grid_table_cached = dev_grid_raw_cached.copy()
+            
         st.session_state["_shadow_sharing_filtered_cache_v1"] = {
             "key": filter_cache_key,
             "filtered": filtered,
@@ -2222,7 +2288,6 @@ def render_shadow_sharing(parquet_root: Path):
             "dev_grid_raw": dev_grid_raw_cached,
         }
 
-    # Keep overview (metrics/charts) independent from table-only filters.
     table_filtered = filtered.copy() if isinstance(filtered, pd.DataFrame) else pd.DataFrame()
     table_filtered_incidents = filtered_incidents.copy() if isinstance(filtered_incidents, pd.DataFrame) else pd.DataFrame()
 
@@ -2230,6 +2295,9 @@ def render_shadow_sharing(parquet_root: Path):
     dialog_cache_key = (str(selected_scope_key), dialog_mac_pending, filter_cache_key)
 
     if st.session_state.get("shadow_sharing_allow_dialog_open") and st.session_state.get("shadow_sharing_allow_candidate"):
+        local_processes[3]["duration"] = time.time() - t0
+        local_processes[3]["status"] = "done"
+        finalize_loading_ui()
         show_shadow_sharing_allow_dialog()
         st.stop()
 
@@ -2256,10 +2324,14 @@ def render_shadow_sharing(parquet_root: Path):
                 dialog_incidents_df = table_filtered_incidents.loc[inc_mask].copy()
             else:
                 dialog_incidents_df = pd.DataFrame()
+                
             st.session_state["shadow_sharing_dialog_base_key"] = dialog_cache_key
             st.session_state["shadow_sharing_dialog_base_df"] = dialog_base_df
             st.session_state["shadow_sharing_dialog_incidents_df"] = dialog_incidents_df
 
+        local_processes[3]["duration"] = time.time() - t0
+        local_processes[3]["status"] = "done"
+        finalize_loading_ui()
         show_shadow_sharing_device_dialog(
             dialog_base_df,
             dialog_incidents_df,
@@ -2272,10 +2344,17 @@ def render_shadow_sharing(parquet_root: Path):
     filtered_incidents = overview_incidents
 
     if filtered.empty:
+        local_processes[3]["duration"] = time.time() - t0
+        local_processes[3]["status"] = "done"
+        finalize_loading_ui()
         st.warning("No rows above 0 MB are available in this scope.")
         return
 
-    # Metrics
+    local_processes[3]["duration"] = time.time() - t0
+    local_processes[3]["status"] = "done"
+    finalize_loading_ui()
+
+    # --- Rendering Metrics & UI Tabs ---
     m1, m2, m3, m4 = st.columns(4)
 
     total_b = float(filtered.loc[filtered["bytes"] > 0, "bytes"].sum())
@@ -2349,7 +2428,6 @@ def render_shadow_sharing(parquet_root: Path):
         unsafe_allow_html=True,
     )
 
-    # Main content
     tab_overview = st.container()
 
     # -------------------------------------------------------------------------
@@ -2458,7 +2536,7 @@ def render_shadow_sharing(parquet_root: Path):
                 st.plotly_chart(fig_signal, width="stretch")
 
     # -------------------------------------------------------------------------
-    # Device Forensics (incident rows under Overview)
+    # Device Forensics
     # -------------------------------------------------------------------------
     with tab_overview:
         st.markdown("#### Shadow Sharing Incidents")
@@ -2499,12 +2577,15 @@ def render_shadow_sharing(parquet_root: Path):
         else:
             table_incidents = _aggregate_incidents_for_daily_mac_destination_table(table_filtered_incidents, str(selected_date))
             dev_grid = _build_incident_grid_frame(table_incidents)
+            
         if isinstance(dev_grid_raw_cached, pd.DataFrame):
             dev_grid_raw = dev_grid_raw_cached.copy()
         else:
             dev_grid_raw = _build_incident_grid_frame(table_filtered_incidents)
+            
         if dev_grid_raw.empty and not dev_grid.empty:
             dev_grid_raw = dev_grid.copy()
+            
         if dev_grid.empty:
             st.info("No incident rows are available with the current filters.")
             st.session_state["shadow_sharing_last_selected_mac"] = None
@@ -2519,6 +2600,7 @@ def render_shadow_sharing(parquet_root: Path):
             if "#" not in dev_grid.columns:
                 dev_grid = dev_grid.reset_index(drop=True)
                 dev_grid.insert(0, "#", range(1, len(dev_grid) + 1))
+                
             gb_dev = GridOptionsBuilder.from_dataframe(dev_grid)
             can_manage_allow = _traffic_admin_can_authorize()
             _configure_incident_grid_columns(
