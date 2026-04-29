@@ -805,7 +805,6 @@ def load_device_inventory_history_rows(
         return pd.DataFrame(columns=base_cols)
 
 @st.cache_data(show_spinner=False)
-@st.cache_data(show_spinner=False)
 def load_hourly_status_from_conn_logs(
     parquet_root: Path,
     alerts_source_sig: tuple[tuple[str, float, int], ...],
