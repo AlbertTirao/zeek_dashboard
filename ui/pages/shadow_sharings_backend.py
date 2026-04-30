@@ -17,7 +17,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v19-logstamp-runtime-policys"
+CACHE_VERSION = "shadow-sharing-cache-v19-logstamp-runtime-policy"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -1216,12 +1216,126 @@ def _first_nonempty(series: pd.Series) -> str:
             return s
     return ""
 
+
+def _build_ssl_by_uid(ssl_df: pd.DataFrame) -> pd.DataFrame:
+    if ssl_df is None or ssl_df.empty or "uid" not in ssl_df.columns:
+        return pd.DataFrame(columns=["uid", "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"])
+    keep = [c for c in ["uid", "ts", "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"] if c in ssl_df.columns]
+    sdf = ssl_df[keep].copy()
+    sdf = _ensure_ts_datetime(sdf)
+    sdf = sdf.sort_values("ts", ascending=True)
+    g = sdf.groupby("uid", dropna=False)
+    out = pd.DataFrame({
+        "uid": g.size().index.astype(str),
+        "server_name": g["server_name"].apply(_first_nonempty) if "server_name" in sdf.columns else "",
+        "ja3": g["ja3"].apply(_first_nonempty) if "ja3" in sdf.columns else "",
+        "ja3s": g["ja3s"].apply(_first_nonempty) if "ja3s" in sdf.columns else "",
+        "version": g["version"].apply(_first_nonempty) if "version" in sdf.columns else "",
+        "cipher": g["cipher"].apply(_first_nonempty) if "cipher" in sdf.columns else "",
+        "curve": g["curve"].apply(_first_nonempty) if "curve" in sdf.columns else "",
+        "next_protocol": g["next_protocol"].apply(_first_nonempty) if "next_protocol" in sdf.columns else "",
+    }).reset_index(drop=True)
+    out["uid"] = out["uid"].astype(str)
+    return out
+
+
 def _http_content_type_row(df: pd.DataFrame) -> pd.Series:
     if "content_type" in df.columns:
         return df["content_type"].astype(str)
     if "orig_mime_types" in df.columns:
         return df["orig_mime_types"].apply(lambda v: _parse_zeek_list(v)[0] if _parse_zeek_list(v) else "")
     return pd.Series([""] * len(df))
+
+
+def _build_http_by_uid(http_df: pd.DataFrame) -> pd.DataFrame:
+    if http_df is None or http_df.empty or "uid" not in http_df.columns:
+        return pd.DataFrame(columns=[
+            "uid", "host", "method", "uri", "user_agent", "content_type",
+            "status_code", "request_body_len", "response_body_len",
+            "http_any_upload", "http_any_share"
+        ])
+    keep = [c for c in ["uid", "ts", "host", "method", "uri", "user_agent", "status_code", "request_body_len", "response_body_len", "orig_mime_types", "content_type"] if c in http_df.columns]
+    hdf = http_df[keep].copy()
+    hdf = _ensure_ts_datetime(hdf)
+    hdf = hdf.sort_values("ts", ascending=True)
+
+    # normalize content type
+    hdf["content_type_norm"] = _http_content_type_row(hdf).astype(str)
+
+    # flags
+    hdf["method_norm"] = hdf.get("method", "").astype(str).str.upper()
+    hdf["uri_norm"] = hdf.get("uri", "").astype(str)
+    hdf["host_norm"] = hdf.get("host", "").astype(str)
+
+    hdf["http_is_upload"] = hdf["method_norm"].isin(["POST", "PUT", "PATCH"]) & (
+        hdf["uri_norm"].str.contains(UPLOAD_URI_RE) | hdf["content_type_norm"].str.contains(API_UPLOAD_RE)
+    )
+    hdf["http_is_share"] = (
+        hdf["uri_norm"].str.contains(PASTE_URI_RE)
+        | hdf["uri_norm"].str.contains(re.compile(r"(share|shared|sharing|create_shared|create_shared_link|/s/)", re.IGNORECASE))
+    )
+
+    # numeric body lens
+    if "request_body_len" in hdf.columns:
+        hdf["request_body_len_num"] = pd.to_numeric(hdf["request_body_len"], errors="coerce").fillna(0)
+    else:
+        hdf["request_body_len_num"] = 0.0
+    if "response_body_len" in hdf.columns:
+        hdf["response_body_len_num"] = pd.to_numeric(hdf["response_body_len"], errors="coerce").fillna(0)
+    else:
+        hdf["response_body_len_num"] = 0.0
+
+    g = hdf.groupby("uid", dropna=False)
+    out = pd.DataFrame({
+        "uid": g.size().index.astype(str),
+        "host": g["host_norm"].apply(_first_nonempty),
+        "method": g["method_norm"].apply(_first_nonempty),
+        "uri": g["uri_norm"].apply(_first_nonempty),
+        "user_agent": g["user_agent"].apply(_first_nonempty) if "user_agent" in hdf.columns else "",
+        "content_type": g["content_type_norm"].apply(_first_nonempty),
+        "status_code": g["status_code"].apply(_first_nonempty) if "status_code" in hdf.columns else "",
+        "request_body_len": g["request_body_len_num"].sum(),
+        "response_body_len": g["response_body_len_num"].sum(),
+        "http_any_upload": g["http_is_upload"].max().astype(bool),
+        "http_any_share": g["http_is_share"].max().astype(bool),
+    }).reset_index(drop=True)
+    out["uid"] = out["uid"].astype(str)
+    return out
+
+
+def _build_files_by_uid(files_df: pd.DataFrame) -> pd.DataFrame:
+    """Join files.log to conn via uid or conn_uids (Zeek often uses conn_uids list)."""
+    if files_df is None or files_df.empty:
+        return pd.DataFrame(columns=["uid", "file_total_bytes", "file_seen_bytes", "file_mime_types", "file_names", "file_sources"])
+    f = files_df.copy()
+    f = _ensure_ts_datetime(f)
+    if "uid" in f.columns:
+        f["_uid"] = f["uid"].astype(str)
+    elif "conn_uids" in f.columns:
+        f["_uid_list"] = f["conn_uids"].apply(_parse_zeek_list)
+        f = f.explode("_uid_list")
+        f["_uid"] = f["_uid_list"].astype(str)
+    else:
+        return pd.DataFrame(columns=["uid", "file_total_bytes", "file_seen_bytes", "file_mime_types", "file_names", "file_sources"])
+
+    f["file_total_bytes"] = pd.to_numeric(f.get("total_bytes", 0), errors="coerce").fillna(0)
+    f["file_seen_bytes"] = pd.to_numeric(f.get("seen_bytes", 0), errors="coerce").fillna(0)
+    f["file_mime"] = f.get("mime_type", "").astype(str)
+    f["file_name"] = f.get("filename", "").astype(str)
+    f["file_source"] = f.get("source", "").astype(str)
+
+    g = f.groupby("_uid", dropna=False)
+    out = pd.DataFrame({
+        "uid": g.size().index.astype(str),
+        "file_total_bytes": g["file_total_bytes"].sum(),
+        "file_seen_bytes": g["file_seen_bytes"].sum(),
+        "file_mime_types": g["file_mime"].apply(lambda s: ", ".join([x for x in sorted(set([str(v).strip() for v in s.tolist() if str(v).strip()]))][:6])),
+        "file_names": g["file_name"].apply(lambda s: ", ".join([x for x in sorted(set([str(v).strip() for v in s.tolist() if str(v).strip()]))][:6])),
+        "file_sources": g["file_source"].apply(lambda s: ", ".join([x for x in sorted(set([str(v).strip() for v in s.tolist() if str(v).strip()]))][:6])),
+    }).reset_index(drop=True)
+    out["uid"] = out["uid"].astype(str)
+    return out
+
 
 def _detect_action_flow(row: pd.Series) -> Tuple[str, str]:
     """Higher-confidence action inference after correlation."""
@@ -1245,6 +1359,168 @@ def _detect_action_flow(row: pd.Series) -> Tuple[str, str]:
         return ("Download", "conn resp_bytes high and inbound ratio high")
     return ("Access", "baseline access")
 
+
+def _build_correlated_flows(
+    conn_df: pd.DataFrame,
+    ssl_by_uid: pd.DataFrame,
+    http_by_uid: pd.DataFrame,
+    files_by_uid: pd.DataFrame,
+) -> pd.DataFrame:
+    if conn_df is None or conn_df.empty:
+        return pd.DataFrame()
+
+    c = conn_df.copy()
+    c = _ensure_ts_datetime(c)
+    c = c.dropna(subset=["ts"])
+
+    for col in ["uid", "id.orig_h", "id.resp_h", "id.resp_p", "proto", "service", "duration",
+        "orig_bytes", "resp_bytes", "orig_pkts", "resp_pkts", "conn_state", "history", "orig_bytes", "resp_bytes", "orig_ip_bytes", "resp_ip_bytes", "orig_l2_addr"]:
+        if col not in c.columns:
+            c[col] = None
+
+    c["uid"] = c["uid"].astype(str)
+    c["id.orig_h"] = c["id.orig_h"].astype(str).str.strip()
+    c["id.resp_h"] = c["id.resp_h"].astype(str).str.strip()
+    c["id.resp_p"] = pd.to_numeric(c["id.resp_p"], errors="coerce").fillna(0).astype(int)
+
+    ob = pd.to_numeric(c["orig_bytes"], errors="coerce")
+    rb = pd.to_numeric(c["resp_bytes"], errors="coerce")
+    if ob.isna().all():
+        ob = pd.to_numeric(c["orig_ip_bytes"], errors="coerce")
+    if rb.isna().all():
+        rb = pd.to_numeric(c["resp_ip_bytes"], errors="coerce")
+    c["bytes_out"] = ob.fillna(0)
+    c["bytes_in"] = rb.fillna(0)
+    c["out_in_ratio"] = (c["bytes_out"] / (c["bytes_in"].clip(lower=1))).round(3)
+
+    # Focus on internal -> external. If orig_h isn't parseable, keep it.
+    try:
+        c = c[(~c["id.orig_h"].apply(_is_ip_literal)) | (c["id.orig_h"].apply(_is_internal_ip))]
+    except Exception:
+        pass
+    try:
+        c = c[~c["id.resp_h"].apply(_is_internal_ip)]
+    except Exception:
+        pass
+
+    if not ssl_by_uid.empty:
+        c = c.merge(ssl_by_uid, on="uid", how="left", suffixes=("", "_ssl"))
+    else:
+        c["server_name"] = ""
+
+    if not http_by_uid.empty:
+        c = c.merge(http_by_uid, on="uid", how="left", suffixes=("", "_http"))
+    else:
+        for col in ["host", "method", "uri", "user_agent", "content_type", "status_code"]:
+            c[col] = ""
+        c["request_body_len"] = 0.0
+        c["response_body_len"] = 0.0
+        c["http_any_upload"] = False
+        c["http_any_share"] = False
+
+    if not files_by_uid.empty:
+        c = c.merge(files_by_uid, on="uid", how="left", suffixes=("", "_files"))
+    else:
+        c["file_total_bytes"] = 0.0
+        c["file_seen_bytes"] = 0.0
+        c["file_mime_types"] = ""
+        c["file_names"] = ""
+        c["file_sources"] = ""
+
+    c["dest_host_http"] = c.get("host", "").astype(str).apply(_normalize_host)
+    c["dest_host_sni"] = c.get("server_name", "").astype(str).apply(_normalize_host)
+    def _pick_dest(row):
+        if row.get("dest_host_http"):
+            return row["dest_host_http"], "http.host"
+        if row.get("dest_host_sni"):
+            return row["dest_host_sni"], "ssl.server_name"
+        return _normalize_host(str(row.get("id.resp_h") or "")), "conn.id.resp_h"
+
+    picked = c.apply(_pick_dest, axis=1, result_type="expand")
+    c["destination"] = picked[0].replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"}).fillna("Unknown")
+    c["Destination_Basis"] = picked[1].fillna("")
+
+    c["dest_domain"] = c["destination"].apply(_registrable_domain_best_effort)
+    c.loc[c["dest_domain"].eq(""), "dest_domain"] = c["destination"]
+
+    # Primary byte measure for dashboard = outbound bytes
+    c["bytes"] = c["bytes_out"]
+
+    # action inference
+    act = c.apply(_detect_action_flow, axis=1)
+    c["Action"] = [a for a, _ in act]
+    c["Action_Basis"] = [b for _, b in act]
+
+    def _is_meaningful_text(v: object) -> bool:
+        s = str(v or "").strip().lower()
+        return s not in {"", "nan", "none", "-", "unknown", "(empty)"}
+
+    def _to_boolish(v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        return s in {"1", "true", "t", "yes", "y"}
+
+    def _flow_source_types(row: pd.Series) -> str:
+        sources: List[str] = ["conn"]
+
+        http_present = (
+            _is_meaningful_text(row.get("method", ""))
+            or _is_meaningful_text(row.get("uri", ""))
+            or _is_meaningful_text(row.get("user_agent", ""))
+            or _is_meaningful_text(row.get("content_type", ""))
+            or _is_meaningful_text(row.get("host", ""))
+            or float(pd.to_numeric(row.get("request_body_len", 0), errors="coerce") or 0) > 0
+            or float(pd.to_numeric(row.get("response_body_len", 0), errors="coerce") or 0) > 0
+            or _to_boolish(row.get("http_any_upload", False))
+            or _to_boolish(row.get("http_any_share", False))
+        )
+        if http_present:
+            sources.append("http")
+
+        ssl_present = (
+            _is_meaningful_text(row.get("server_name", ""))
+            or _is_meaningful_text(row.get("ja3", ""))
+            or _is_meaningful_text(row.get("ja3s", ""))
+            or _is_meaningful_text(row.get("version", ""))
+            or _is_meaningful_text(row.get("cipher", ""))
+            or _is_meaningful_text(row.get("curve", ""))
+            or _is_meaningful_text(row.get("next_protocol", ""))
+        )
+        if ssl_present:
+            sources.append("ssl")
+
+        files_present = (
+            float(pd.to_numeric(row.get("file_total_bytes", 0), errors="coerce") or 0) > 0
+            or float(pd.to_numeric(row.get("file_seen_bytes", 0), errors="coerce") or 0) > 0
+            or _is_meaningful_text(row.get("file_mime_types", ""))
+            or _is_meaningful_text(row.get("file_names", ""))
+            or _is_meaningful_text(row.get("file_sources", ""))
+        )
+        if files_present:
+            sources.append("files")
+
+        return ", ".join(sources)
+
+    c["source_types"] = c.apply(_flow_source_types, axis=1)
+
+    c["log_source"] = "flow"
+
+    keep_cols = [
+        "ts", "uid", "log_source",
+        "id.orig_h", "id.orig_p", "orig_l2_addr",
+        "id.resp_h", "id.resp_p", "proto", "service", "duration",
+        "destination", "dest_domain", "Destination_Basis",
+        "bytes", "bytes_out", "bytes_in", "out_in_ratio", "is_long", "is_big_out",
+        "method", "uri", "user_agent", "content_type",
+        "server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol",
+        "host", "status_code", "request_body_len", "response_body_len", "http_any_upload", "http_any_share",
+        "file_total_bytes", "file_seen_bytes", "file_mime_types", "file_names", "file_sources",
+        "source_types",
+        "Action", "Action_Basis",
+    ]
+    keep_cols = [c0 for c0 in keep_cols if c0 in c.columns]
+    return c[keep_cols].copy()
 def _domain_in_allowlist(dest: str, allowlist: List[str]) -> Tuple[bool, str]:
     """
     Returns (allowed, basis)
@@ -1502,6 +1778,15 @@ def _bytes_from_df(df: pd.DataFrame, log_source: str) -> pd.Series:
 
 
 def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) -> pd.DataFrame:
+    """
+    Build one day's shadow-sharing dataset.
+
+    New approach:
+      - Use conn.log as the primary table (one row per uid / flow)
+      - Correlate ssl/http/files onto conn via uid (and files.conn_uids)
+      - Destination naming uses http.host -> ssl.server_name -> conn.id.resp_h (no DNS answer fallback)
+      - Keep dns.log rows separately for lookup visibility and context
+    """
     date_dir = _resolve_date_dir(Path(parquet_root), date_str)
     if date_dir is None:
         return pd.DataFrame()
@@ -1519,6 +1804,7 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
 
     cpath = cache_events_path(parquet_root, date_str)
     mpath = cache_meta_path(parquet_root, date_str)
+
     expected = _meta_expected(files_sig)
     meta = read_yaml(mpath)
 
@@ -1526,217 +1812,157 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         try:
             df_cached = pd.read_parquet(cpath)
             if not df_cached.empty:
-                return _ensure_ts_datetime(df_cached)
+                df_cached = _ensure_ts_datetime(df_cached)
+                return df_cached
         except Exception:
             pass
 
-    # Identity maps
+    # identity maps
     ip_map, mac_map = _build_identity_maps(buckets["dhcp"], buckets["conn"], known_files)
 
-    # ---------------------------------------------------------
-    # DYNAMIC DUCKDB CORRELATION
-    # ---------------------------------------------------------
-    con = get_duckdb_connection()
-    
-    def _sql_paths(paths):
-        return "[" + ",".join(f"'{p.as_posix().replace('\'', '\'\'')}'" for p in paths) + "]" if paths else "[]"
-        
-    def _col_exists(view, col):
-        try:
-            return col in [x[0] for x in con.execute(f"DESCRIBE {view}").fetchall()]
-        except Exception:
-            return False
-
-    df_flow = pd.DataFrame()
-    
-    if buckets.get('conn'):
-        con.execute(f"CREATE OR REPLACE VIEW raw_conn AS SELECT * FROM read_parquet({_sql_paths(buckets.get('conn'))}, union_by_name=TRUE)")
-        
-        has_ob = _col_exists('raw_conn', 'orig_bytes')
-        has_oib = _col_exists('raw_conn', 'orig_ip_bytes')
-        ob_sql = "COALESCE(c.orig_bytes, c.orig_ip_bytes, 0)" if has_ob and has_oib else ("COALESCE(c.orig_bytes, 0)" if has_ob else ("COALESCE(c.orig_ip_bytes, 0)" if has_oib else "0"))
-        
-        has_rb = _col_exists('raw_conn', 'resp_bytes')
-        has_rib = _col_exists('raw_conn', 'resp_ip_bytes')
-        rb_sql = "COALESCE(c.resp_bytes, c.resp_ip_bytes, 0)" if has_rb and has_rib else ("COALESCE(c.resp_bytes, 0)" if has_rb else ("COALESCE(c.resp_ip_bytes, 0)" if has_rib else "0"))
-        
-        selects = [
-            "c.ts", "c.uid", "'flow' AS log_source",
-            'c."id.orig_h"', 'c."id.orig_p"', 
-            "c.orig_l2_addr" if _col_exists('raw_conn', 'orig_l2_addr') else "NULL as orig_l2_addr",
-            'c."id.resp_h"', 'c."id.resp_p"', "c.proto", 
-            "c.service" if _col_exists('raw_conn', 'service') else "NULL as service", 
-            "c.duration" if _col_exists('raw_conn', 'duration') else "0 as duration",
-            f"{ob_sql} AS bytes_out", f"{rb_sql} AS bytes_in"
-        ]
-        joins = []
-        
-        # --- SSL ---
-        if buckets.get('ssl'):
-            con.execute(f"CREATE OR REPLACE VIEW raw_ssl AS SELECT * FROM read_parquet({_sql_paths(buckets.get('ssl'))}, union_by_name=TRUE)")
-            s_aggs = []
-            for col in ["server_name", "ja3", "ja3s", "version", "cipher"]:
-                if _col_exists('raw_ssl', col):
-                    s_aggs.append(f"arg_max({col}, ts) as {col}")
-                    selects.append(f"s.{col}")
-                else:
-                    selects.append(f"NULL AS {col}")
-            if s_aggs:
-                joins.append(f"LEFT JOIN (SELECT uid, {', '.join(s_aggs)} FROM raw_ssl GROUP BY uid) s ON c.uid = s.uid")
-        else:
-            selects.extend(["NULL AS server_name", "NULL AS ja3", "NULL AS ja3s", "NULL AS version", "NULL AS cipher"])
-
-        # --- HTTP ---
-        if buckets.get('http'):
-            con.execute(f"CREATE OR REPLACE VIEW raw_http AS SELECT * FROM read_parquet({_sql_paths(buckets.get('http'))}, union_by_name=TRUE)")
-            h_aggs = []
-            for col in ["host", "method", "uri", "user_agent", "content_type", "status_code"]:
-                if _col_exists('raw_http', col):
-                    h_aggs.append(f"arg_max({col}, ts) as {col}")
-                    selects.append(f"h.{col}")
-                else:
-                    selects.append(f"NULL AS {col}")
-            
-            h_aggs.append("SUM(COALESCE(request_body_len, 0)) as request_body_len" if _col_exists('raw_http', 'request_body_len') else "0 as request_body_len")
-            h_aggs.append("SUM(COALESCE(response_body_len, 0)) as response_body_len" if _col_exists('raw_http', 'response_body_len') else "0 as response_body_len")
-            h_aggs.append("MAX(CASE WHEN method IN ('POST','PUT','PATCH') THEN true ELSE false END) as http_any_upload" if _col_exists('raw_http', 'method') else "false as http_any_upload")
-            h_aggs.append("MAX(CASE WHEN uri LIKE '%share%' OR uri LIKE '%paste%' THEN true ELSE false END) as http_any_share" if _col_exists('raw_http', 'uri') else "false as http_any_share")
-            
-            selects.extend(["h.request_body_len", "h.response_body_len", "h.http_any_upload", "h.http_any_share"])
-            joins.append(f"LEFT JOIN (SELECT uid, {', '.join(h_aggs)} FROM raw_http GROUP BY uid) h ON c.uid = h.uid")
-        else:
-            selects.extend(["NULL AS host", "NULL AS method", "NULL AS uri", "NULL AS user_agent", "NULL AS content_type", "NULL AS status_code", "0 AS request_body_len", "0 AS response_body_len", "false AS http_any_upload", "false AS http_any_share"])
-
-        # --- FILES ---
-        if buckets.get('files'):
-            con.execute(f"CREATE OR REPLACE VIEW raw_files AS SELECT * FROM read_parquet({_sql_paths(buckets.get('files'))}, union_by_name=TRUE)")
-            
-            # Safely unnest conn_uids if present, otherwise fallback to uid
-            if _col_exists('raw_files', 'conn_uids'):
-                uid_src = "SELECT unnest(conn_uids) as _uid"
-            elif _col_exists('raw_files', 'uid'):
-                uid_src = "SELECT uid as _uid"
-            else:
-                uid_src = None
-                
-            if uid_src:
-                tb_col = ", total_bytes" if _col_exists('raw_files', 'total_bytes') else ", 0 as total_bytes"
-                sb_col = ", seen_bytes" if _col_exists('raw_files', 'seen_bytes') else ", 0 as seen_bytes"
-                
-                joins.append(f"""
-                LEFT JOIN (
-                    SELECT _uid, SUM(COALESCE(total_bytes, 0)) as file_total_bytes, SUM(COALESCE(seen_bytes, 0)) as file_seen_bytes
-                    FROM ({uid_src} {tb_col} {sb_col} FROM raw_files) GROUP BY _uid
-                ) f ON c.uid = f._uid
-                """)
-                selects.extend(["f.file_total_bytes", "f.file_seen_bytes"])
-            else:
-                selects.extend(["0 AS file_total_bytes", "0 AS file_seen_bytes"])
-        else:
-            selects.extend(["0 AS file_total_bytes", "0 AS file_seen_bytes"])
-
-        query = f"SELECT {', '.join(selects)} FROM raw_conn c {' '.join(joins)}"
-        
-        try:
-            df_flow = con.execute(query).df()
-            
-            # Python-specific fallback logic
-            df_flow["bytes"] = df_flow["bytes_out"]
-            df_flow["out_in_ratio"] = (df_flow["bytes_out"] / (df_flow["bytes_in"].clip(lower=1))).round(3)
-            df_flow["destination"] = df_flow["host"].fillna(df_flow["server_name"]).fillna(df_flow["id.resp_h"]).fillna("Unknown")
-            df_flow["dest_domain"] = df_flow["destination"].apply(_registrable_domain_best_effort)
-            
-            def _is_meaningful_text(v): return str(v or "").strip().lower() not in {"", "nan", "none", "-", "unknown", "(empty)"}
-            def _to_boolish(v): return v if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "t", "yes", "y"}
-
-            def _flow_source_types(row):
-                sources = ["conn"]
-                if any([_is_meaningful_text(row.get(x)) for x in ["method", "uri", "user_agent", "content_type", "host"]]) or row.get("request_body_len", 0) > 0 or row.get("response_body_len", 0) > 0 or _to_boolish(row.get("http_any_upload")) or _to_boolish(row.get("http_any_share")): sources.append("http")
-                if any([_is_meaningful_text(row.get(x)) for x in ["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"]]): sources.append("ssl")
-                if row.get("file_total_bytes", 0) > 0 or row.get("file_seen_bytes", 0) > 0: sources.append("files")
-                return ", ".join(sources)
-
-            df_flow["source_types"] = df_flow.apply(_flow_source_types, axis=1)
-
-        except Exception as e:
-            print(f"SQL Join failed: {e}")
-            df_flow = pd.DataFrame()
-
-    # --- DNS Logs (Kept separated for lookup context) ---
-    df_dns_events = pd.DataFrame()
+    # read logs
+    df_conn = _duck_read_parquet_union(buckets.get("conn") or [])
+    df_ssl = _duck_read_parquet_union(buckets.get("ssl") or [])
+    df_http = _duck_read_parquet_union(buckets.get("http") or [])
+    df_files = _duck_read_parquet_union(buckets.get("files") or [])
     df_dns = _duck_read_parquet_union(buckets.get("dns") or [])
+
+    # correlated flows
+    ssl_by_uid = _build_ssl_by_uid(df_ssl) if not df_ssl.empty else pd.DataFrame()
+    http_by_uid = _build_http_by_uid(df_http) if not df_http.empty else pd.DataFrame()
+    files_by_uid = _build_files_by_uid(df_files) if not df_files.empty else pd.DataFrame()
+    df_flow = _build_correlated_flows(df_conn, ssl_by_uid, http_by_uid, files_by_uid)
+
+    # dns rows (kept for tunneling heuristics / supporting evidence)
+    df_dns_events = pd.DataFrame()
     if not df_dns.empty:
-        d = _ensure_ts_datetime(df_dns.copy()).dropna(subset=["ts"])
-        d["id.orig_h"] = d["id.orig_h"].astype(str).str.strip() if "id.orig_h" in d.columns else ""
-        d["orig_l2_addr"] = None if "orig_l2_addr" not in d.columns else d["orig_l2_addr"]
-        d["query"] = d["query"].astype(str) if "query" in d.columns else ""
-        d["destination"] = d["query"].fillna("").replace({"(empty)": "", "-": "", "*": ""})
+        d = df_dns.copy()
+        d = _ensure_ts_datetime(d)
+        d = d.dropna(subset=["ts"])
+        if "id.orig_h" not in d.columns:
+            d["id.orig_h"] = ""
+        else:
+            d["id.orig_h"] = d["id.orig_h"].astype(str).str.strip()
+        if "orig_l2_addr" not in d.columns:
+            d["orig_l2_addr"] = None
+
+        # destination = query
+        if "query" not in d.columns:
+            d["query"] = ""
+        d["destination"] = d["query"].astype(str).fillna("").replace({"(empty)": "", "-": "", "*": ""})
         d.loc[d["destination"].eq(""), "destination"] = "Unknown"
         d["bytes"] = 0
         d["log_source"] = "dns"
         d["source_types"] = "dns"
-        d["Action"], d["Action_Basis"] = "DNS Lookup", "dns query"
-        d["method"], d["uri"], d["user_agent"], d["content_type"] = "", "", "", ""
-        keep = ["ts", "log_source", "source_types", "id.orig_h", "destination", "bytes", "method", "uri", "user_agent", "content_type", "orig_l2_addr", "query", "answers", "rcode_name", "qtype_name", "Action", "Action_Basis"]
-        df_dns_events = d[[c for c in keep if c in d.columns]].copy()
+        d["method"] = ""
+        d["uri"] = ""
+        d["user_agent"] = ""
+        d["content_type"] = ""
+        d["Action"] = "DNS Lookup"
+        d["Action_Basis"] = "dns query"
+        keep = [
+            "ts", "log_source", "source_types", "id.orig_h", "destination", "bytes",
+            "method", "uri", "user_agent", "content_type",
+            "orig_l2_addr", "query", "answers", "rcode_name", "qtype_name",
+            "Action", "Action_Basis",
+        ]
+        keep = [c for c in keep if c in d.columns]
+        df_dns_events = d[keep].copy()
 
-    frames = [f for f in [df_flow, df_dns_events] if not f.empty]
+    frames: List[pd.DataFrame] = []
+    if df_flow is not None and not df_flow.empty:
+        frames.append(df_flow)
+    if df_dns_events is not None and not df_dns_events.empty:
+        frames.append(df_dns_events)
+
     if not frames:
         return pd.DataFrame()
 
     out = pd.concat(frames, ignore_index=True)
     out = _ensure_ts_datetime(out).sort_values("ts", ascending=False)
 
+    # Stable event identifier for unique counting.
+    # - Prefer Zeek conn UID when present (correlated flow rows).
+    # - Fallback to a composite key for rows that do not have uid (e.g., dns rows).
     if "event_id" not in out.columns:
         uid_norm = out["uid"].astype(str).str.strip() if "uid" in out.columns else pd.Series("", index=out.index)
         uid_ok = ~uid_norm.isin(["", "-", "(empty)", "nan", "none", "None"])
-        ts_str = pd.to_datetime(out["ts"], errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%f").fillna("")
+        ts_str = pd.to_datetime(out["ts"], errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        ts_str = ts_str.fillna("")
         log_src = out.get("log_source", pd.Series("", index=out.index)).astype(str).str.strip().str.lower().fillna("")
         orig_h = out.get("id.orig_h", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
         resp_h = out.get("id.resp_h", pd.Series("", index=out.index)).astype(str).str.strip().fillna("") if "id.resp_h" in out.columns else pd.Series("", index=out.index)
         dest = out.get("destination", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
         method = out.get("method", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
         uri = out.get("uri", pd.Series("", index=out.index)).astype(str).str.strip().fillna("")
-        fallback = ("row:" + log_src + "|" + ts_str + "|" + orig_h + "|" + resp_h + "|" + dest + "|" + method + "|" + uri)
+        fallback = (
+            "row:" + log_src + "|" + ts_str + "|" + orig_h + "|" + resp_h + "|" + dest + "|" + method + "|" + uri
+        )
         out["event_id"] = ("uid:" + uid_norm).where(uid_ok, fallback)
 
-    # Identity enrichment & Base Logic
+    # identity enrichment
     out = _enrich_identity(out, ip_map, mac_map)
     out["Identity_Confidence"] = out.apply(_identity_confidence, axis=1)
 
+    # allowlist basis (destination host/domain)
     allowed_basis = out["destination"].apply(lambda d: _domain_in_allowlist(d, WHITELIST_DOMAINS))
     out["Allowed"] = allowed_basis.apply(lambda x: bool(x[0]))
     out["Allow_Basis"] = allowed_basis.apply(lambda x: str(x[1] or ""))
 
-    _dest_unknown = out["destination"].astype(str).str.strip().str.lower().isin({"", "unknown", "nan", "none", "(empty)", "*"})
-    out.loc[_dest_unknown & (out["Allowed"] == False), "Allow_Basis"] = "n/a (unknown destination)" 
+
+    # Make Allow_Basis explicit for operator clarity.
+    # If not allowed and no whitelist match, show 'no match'.
+    # If destination is unknown/placeholder, show 'n/a (unknown destination)'.
+    _dest_norm = out["destination"].astype(str).str.strip().str.lower()
+    _dest_unknown = _dest_norm.isin({"", "unknown", "nan", "none", "(empty)", "*"})
+    out.loc[_dest_unknown & (out["Allowed"] == False), "Allow_Basis"] = "n/a (unknown destination)"  # noqa: E712
     out.loc[(~_dest_unknown) & (out["Allowed"] == False) & (out["Allow_Basis"].astype(str).str.strip() == ""), "Allow_Basis"] = "no match"
 
+    # Sharing signature match (algorithm #6)
     sig_target = out.get("dest_domain", out["destination"]).astype(str)
     sig = sig_target.apply(lambda d: _domain_in_signatures(d, SIGNATURES_MAP))
     out["Signature_Match"] = sig.apply(lambda x: bool(x[0]))
     out["Signature_Service"] = sig.apply(lambda x: str(x[1] or ""))
-    out["Signature_Basis"] = sig.apply(lambda x: str(x[2] or "")) 
+    out["Signature_Basis"] = sig.apply(lambda x: str(x[2] or ""))  # noqa: E712
 
-    out["Client_Type"] = out.get("user_agent", pd.Series("", index=out.index)).apply(fingerprint_client)
+    # client type
+    if "user_agent" not in out.columns:
+        out["user_agent"] = ""
+    out["Client_Type"] = out["user_agent"].apply(fingerprint_client)
 
-    if "Action" not in out.columns: out["Action"] = ""
-    if "Action_Basis" not in out.columns: out["Action_Basis"] = ""
+    # Fill missing Action (mostly defensive)
+    if "Action" not in out.columns:
+        out["Action"] = ""
+    if "Action_Basis" not in out.columns:
+        out["Action_Basis"] = ""
     missing_action = out["Action"].astype(str).str.strip().eq("")
     if missing_action.any():
-        tmp = out.loc[missing_action].apply(lambda r: _detect_action(str(r.get("log_source", "")), str(r.get("method", "")), str(r.get("uri", "")), str(r.get("user_agent", "")), str(r.get("destination", "")), str(r.get("content_type", ""))), axis=1)
+        tmp = out.loc[missing_action].apply(
+            lambda r: _detect_action(
+                str(r.get("log_source", "")),
+                str(r.get("method", "")),
+                str(r.get("uri", "")),
+                str(r.get("user_agent", "")),
+                str(r.get("destination", "")),
+                str(r.get("content_type", "")),
+            ),
+            axis=1,
+        )
         out.loc[missing_action, "Action"] = tmp.apply(lambda x: x[0])
         out.loc[missing_action, "Action_Basis"] = tmp.apply(lambda x: x[1])
 
+    # risk score + severity + basis
     rs = out.apply(_risk_score_row, axis=1)
     out["Risk_Score"] = rs.apply(lambda x: int(x[0]))
     out["Risk_Basis"] = rs.apply(lambda x: str(x[1]))
     out["Severity"] = out["Risk_Score"].apply(_severity_label)
 
+    # VirusTotal link for domain-like destinations; best-effort.
     vt_target = out["destination"].astype(str).apply(_registrable_domain_best_effort)
     vt_target = vt_target.where(vt_target.astype(str).str.len() > 0, out["destination"].astype(str))
     out["vt_link"] = "https://www.virustotal.com/gui/domain/" + vt_target.astype(str)
 
+    # write cache
     try:
         cpath.parent.mkdir(parents=True, exist_ok=True)
         out.to_parquet(cpath, index=False)
@@ -1745,6 +1971,8 @@ def _build_one_date(parquet_root: Path, date_str: str, known_files: List[Path]) 
         pass
 
     return out
+
+
 def _apply_runtime_policy_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Re-apply policy columns from in-memory whitelist/signatures.
@@ -1834,15 +2062,11 @@ def _apply_runtime_policy_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- Risk scoring (vectorized equivalent of _risk_score_row) ---
     action = out.get("Action", pd.Series("", index=out.index)).fillna("").astype(str)
-    
-    # FIX: Use pd.Series(0, index=out.index) as the fallback instead of the integer 0
-    fallback_zeros = pd.Series(0, index=out.index)
-    
-    bytes_out = pd.to_numeric(out.get("bytes_out", out.get("bytes", fallback_zeros)), errors="coerce").fillna(0.0)
-    bytes_in = pd.to_numeric(out.get("bytes_in", fallback_zeros), errors="coerce").fillna(0.0)
-    ratio = pd.to_numeric(out.get("out_in_ratio", fallback_zeros), errors="coerce").fillna(0.0)
-    file_bytes = pd.to_numeric(out.get("file_total_bytes", fallback_zeros), errors="coerce").fillna(0.0)
-    req_body = pd.to_numeric(out.get("request_body_len", fallback_zeros), errors="coerce").fillna(0.0)
+    bytes_out = pd.to_numeric(out.get("bytes_out", out.get("bytes", 0)), errors="coerce").fillna(0.0)
+    bytes_in = pd.to_numeric(out.get("bytes_in", 0), errors="coerce").fillna(0.0)
+    ratio = pd.to_numeric(out.get("out_in_ratio", 0), errors="coerce").fillna(0.0)
+    file_bytes = pd.to_numeric(out.get("file_total_bytes", 0), errors="coerce").fillna(0.0)
+    req_body = pd.to_numeric(out.get("request_body_len", 0), errors="coerce").fillna(0.0)
 
     unapproved = (~out["Allowed"]) & (~dest_unknown)
     m_action_upload = action.isin({"Upload", "Upload (TLS)", "File Transfer (Upload)"})
@@ -1892,6 +2116,7 @@ def _apply_runtime_policy_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["Risk_Basis"] = reasons.where(reasons.ne(""), "baseline")
     out["Severity"] = out["Risk_Score"].astype(int).apply(_severity_label)
     return out
+
 
 @st.cache_resource(show_spinner=False)
 def _load_shadow_sharing_data_cached(
@@ -1965,77 +2190,235 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     if events_df is None or events_df.empty:
         return pd.DataFrame()
 
-    # Register the Python dataframe so DuckDB can run SQL against it
-    con = get_duckdb_connection()
-    con.register('events_raw', events_df)
-
-    # Push the complex 5-minute grouping and metric summation to C++
-    query = f"""
-        WITH prepped AS (
-            SELECT 
-                *,
-                COALESCE(NULLIF(orig_l2_addr, ''), 'ip:' || "id.orig_h") AS device_id,
-                COALESCE(NULLIF(dest_domain, ''), destination, '') AS domain_clean,
-                time_bucket(INTERVAL {max(1, window_minutes)} MINUTE, ts) AS time_window
-            FROM events_raw
-            WHERE lower(log_source) = 'flow'
-        ),
-        rolled_up AS (
-            SELECT 
-                device_id,
-                domain_clean AS domain,
-                time_window,
-                MIN(ts) AS first_ts,
-                MAX(ts) AS last_ts,
-                SUM(COALESCE(bytes_out, 0)) AS bytes_out_total,
-                SUM(COALESCE(bytes_in, 0)) AS bytes_in_total,
-                SUM(COALESCE(duration, 0)) AS total_duration,
-                COUNT(DISTINCT uid) AS conn_count,
-                
-                -- Maximums for Boolean Flags
-                MAX(CAST(Allowed AS INT)) AS allowed,
-                MAX(CAST(Signature_Match AS INT)) AS sig_match,
-                MAX(CAST(http_any_share AS INT)) AS http_share,
-                
-                -- Capture the last known text value in this time window
-                arg_max(orig_l2_addr, ts) AS mac,
-                arg_max("id.orig_h", ts) AS orig_ip,
-                arg_max(host_name, ts) AS host_name,
-                arg_max(destination, ts) AS destination,
-                arg_max(Action, ts) AS action,
-                arg_max(Action_Basis, ts) AS action_basis,
-                arg_max(Signature_Service, ts) AS sig_service,
-                arg_max(Allow_Basis, ts) AS allow_basis
-            FROM prepped
-            GROUP BY device_id, domain_clean, time_window
-            HAVING SUM(COALESCE(bytes_out, 0)) > 0
-        )
-        SELECT * FROM rolled_up
-    """
-    
-    try:
-        agg = con.execute(query).df()
-    except Exception as e:
-        print(f"DuckDB aggregation failed: {e}")
+    df = events_df.copy()
+    df = _ensure_ts_datetime(df)
+    log_src = df.get("log_source", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
+    df = df[log_src.eq("flow")].copy()
+    if df.empty:
         return pd.DataFrame()
 
+    if "event_id" in df.columns:
+        df = df.drop_duplicates(subset=["event_id"], keep="last")
+    else:
+        dedupe_cols = [c for c in ["uid", "ts", "id.orig_h", "destination", "bytes_out", "bytes_in", "duration"] if c in df.columns]
+        if dedupe_cols:
+            df = df.drop_duplicates(subset=dedupe_cols, keep="last")
+        else:
+            df = df.drop_duplicates()
+
+    def _clean_text(col_name: str, *, lower: bool = False) -> pd.Series:
+        raw = df.get(col_name, pd.Series("", index=df.index))
+        s = raw.astype(str).str.strip()
+        if lower:
+            s = s.str.lower()
+        s = s.replace({"nan": "", "none": "", "None": "", "-": "", "(empty)": "", "unknown": ""})
+        return s.mask(s.eq(""), pd.NA)
+
+    def _coerce_bool_series(raw_series: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(raw_series):
+            return raw_series.fillna(False).astype(bool)
+        t = raw_series.astype(str).str.strip().str.lower()
+        return t.isin(["1", "true", "t", "yes", "y"])
+
+    mac = _clean_text("orig_l2_addr", lower=True).fillna("")
+    ip = _clean_text("id.orig_h").fillna("")
+    df["device_id"] = mac.where(mac.ne(""), "ip:" + ip)
+
+    dom = _clean_text("dest_domain", lower=True)
+    dest_for_dom = _clean_text("destination", lower=True)
+    df["domain"] = dom.fillna(dest_for_dom).fillna("")
+
+    if "source_types" in df.columns:
+        src_text = df["source_types"].astype(str).str.lower()
+    else:
+        src_text = pd.Series("conn", index=df.index, dtype="object")
+
+    def _has_text_columns(cols: List[str]) -> pd.Series:
+        m = pd.Series(False, index=df.index)
+        for c in cols:
+            if c in df.columns:
+                t = df[c].astype(str).str.strip().str.lower()
+                m = m | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
+        return m
+
+    df["_src_conn"] = True
+    src_http = src_text.str.contains(r"\bhttp\b", regex=True, na=False)
+    src_ssl = src_text.str.contains(r"\bssl\b", regex=True, na=False)
+    src_dns = src_text.str.contains(r"\bdns\b", regex=True, na=False)
+    src_files = src_text.str.contains(r"\bfiles\b", regex=True, na=False)
+
+    http_infer = _has_text_columns(["method", "uri", "user_agent", "content_type", "host"])
+    for c in ["request_body_len", "response_body_len"]:
+        if c in df.columns:
+            http_infer = http_infer | (pd.to_numeric(df[c], errors="coerce").fillna(0) > 0)
+    for c in ["http_any_upload", "http_any_share"]:
+        if c in df.columns:
+            http_infer = http_infer | _coerce_bool_series(pd.Series(df[c], index=df.index))
+
+    ssl_infer = _has_text_columns(["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"])
+
+    files_infer = pd.Series(False, index=df.index)
+    for c in ["file_total_bytes", "file_seen_bytes"]:
+        if c in df.columns:
+            files_infer = files_infer | (pd.to_numeric(df[c], errors="coerce").fillna(0) > 0)
+    files_infer = files_infer | _has_text_columns(["file_mime_types", "file_names", "file_sources"])
+
+    df["_src_http"] = src_http | http_infer
+    df["_src_ssl"] = src_ssl | ssl_infer
+    df["_src_dns"] = src_dns
+    df["_src_files"] = src_files | files_infer
+
+    df["bytes_out"] = pd.to_numeric(df.get("bytes_out", 0), errors="coerce").fillna(0)
+    df["bytes_in"] = pd.to_numeric(df.get("bytes_in", 0), errors="coerce").fillna(0)
+    df["duration"] = pd.to_numeric(df.get("duration", 0), errors="coerce").fillna(0)
+    df["is_long"] = df["duration"] >= LONG_DURATION_SEC
+    df["is_big_out"] = df["bytes_out"] >= BIG_OUT_BYTES
+    # Share-link evidence:
+    # Only from explicit http_any_share markers (do not infer from Action/Action_Basis).
+    _http_any_share = _coerce_bool_series(pd.Series(df.get("http_any_share", False), index=df.index))
+    df["http_share_evidence"] = _http_any_share
+    df["sig_match_b"] = _coerce_bool_series(pd.Series(df.get("Signature_Match", False), index=df.index))
+    df["allowed_b"] = _coerce_bool_series(pd.Series(df.get("Allowed", False), index=df.index))
+
+    df["day"] = df["ts"].dt.date
+    rep = (
+        df.groupby(["device_id", "domain"], dropna=False)["day"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"day": "active_days"})
+    )
+    df = df.merge(rep, on=["device_id", "domain"], how="left")
+
+    w = max(1, int(window_minutes))
+    df["time_window"] = df["ts"].dt.floor(f"{w}min")
+
+    # Clean text fields once, then use groupby.last (fast + stable).
+    text_map = {
+        "mac": _clean_text("orig_l2_addr", lower=True),
+        "host_name": _clean_text("host_name"),
+        "orig_ip": _clean_text("id.orig_h"),
+        "destination": _clean_text("destination"),
+        "sig_service": _clean_text("Signature_Service"),
+        "allow_basis": _clean_text("Allow_Basis"),
+        "action": _clean_text("Action"),
+        "action_basis": _clean_text("Action_Basis"),
+        "method": _clean_text("method"),
+        "uri": _clean_text("uri"),
+        "user_agent": _clean_text("user_agent"),
+        "file_names": _clean_text("file_names"),
+        "file_mime_types": _clean_text("file_mime_types"),
+        "uid_clean": _clean_text("uid"),
+    }
+    for k, s in text_map.items():
+        df[f"__{k}"] = s
+
+    group_keys = ["device_id", "domain", "time_window"]
+    gb = df.groupby(group_keys, dropna=False)
+
+    agg_num = gb.agg(
+        first_ts=("ts", "min"),
+        last_ts=("ts", "max"),
+        bytes_out_total=("bytes_out", "sum"),
+        bytes_in_total=("bytes_in", "sum"),
+        total_duration=("duration", "sum"),
+        conn_count=("__uid_clean", "nunique"),
+        sig_match=("sig_match_b", "max"),
+        allowed=("allowed_b", "max"),
+        http_share=("http_share_evidence", "max"),
+        any_long=("is_long", "max"),
+        any_big_out=("is_big_out", "max"),
+        active_days=("active_days", "max"),
+        src_conn=("_src_conn", "max"),
+        src_http=("_src_http", "max"),
+        src_ssl=("_src_ssl", "max"),
+        src_dns=("_src_dns", "max"),
+        src_files=("_src_files", "max"),
+    ).reset_index()
+
+    # Fallback when uid is unavailable.
+    event_counts = gb.size().reset_index(name="event_count")
+    agg = agg_num.merge(event_counts, on=group_keys, how="left")
+    agg["conn_count"] = pd.to_numeric(agg.get("conn_count", 0), errors="coerce").fillna(0)
+    agg["event_count"] = pd.to_numeric(agg.get("event_count", 0), errors="coerce").fillna(0)
+    agg.loc[agg["conn_count"] <= 0, "conn_count"] = agg.loc[agg["conn_count"] <= 0, "event_count"]
+    agg["conn_count"] = agg["conn_count"].astype(int)
+    agg = agg.drop(columns=["event_count"], errors="ignore")
+
+    text_cols = [
+        "__mac",
+        "__host_name",
+        "__orig_ip",
+        "__destination",
+        "__sig_service",
+        "__allow_basis",
+        "__action",
+        "__action_basis",
+                "__method",
+        "__uri",
+        "__user_agent",
+        "__file_names",
+        "__file_mime_types",
+    ]
+    last_txt = gb[text_cols].last().reset_index()
+    agg = agg.merge(last_txt, on=group_keys, how="left")
+    agg = agg.rename(
+        columns={
+            "__mac": "mac",
+            "__host_name": "host_name",
+            "__orig_ip": "orig_ip",
+            "__destination": "destination",
+            "__sig_service": "sig_service",
+            "__allow_basis": "allow_basis",
+            "__action": "action",
+            "__action_basis": "action_basis",
+                        "__method": "method",
+            "__uri": "uri",
+            "__user_agent": "user_agent",
+            "__file_names": "file_names",
+            "__file_mime_types": "file_mime_types",
+        }
+    )
+
+    # Capture an example HTTP share URI/method from rows where http_any_share was true in this window.
+    if "http_share_evidence" in df.columns:
+        share_rows = df[df["http_share_evidence"].fillna(False).astype(bool)].copy()
+        if not share_rows.empty:
+            share_txt = (
+                share_rows.groupby(group_keys, dropna=False)[["__method", "__uri"]]
+                .last()
+                .reset_index()
+                .rename(columns={"__method": "share_method", "__uri": "share_uri"})
+            )
+            agg = agg.merge(share_txt, on=group_keys, how="left")
+
+    src_cols = ["conn", "http", "ssl", "dns", "files"]
+    src_flags = ["src_conn", "src_http", "src_ssl", "src_dns", "src_files"]
+
+    def _compose_sources(row) -> str:
+        out: List[str] = []
+        for c_name, f_name in zip(src_cols, src_flags):
+            if bool(row.get(f_name, False)):
+                out.append(c_name)
+        return ", ".join(out) if out else "conn"
+
+    agg["source_types"] = agg.apply(_compose_sources, axis=1)
+    agg = agg.drop(columns=src_flags, errors="ignore")
+
+    agg["bytes_out_total"] = pd.to_numeric(agg.get("bytes_out_total", 0), errors="coerce").fillna(0)
+    agg["bytes_in_total"] = pd.to_numeric(agg.get("bytes_in_total", 0), errors="coerce").fillna(0)
+    agg = agg[agg["bytes_out_total"] > 0].copy()
     if agg.empty:
-        return agg
+        return pd.DataFrame()
 
-    # The dataset is now tiny (only 1 row per 5-min incident). 
-    # We can run the final confidence scoring safely in Pandas.
-    agg["allowed"] = agg["allowed"].astype(bool)
-    agg["sig_match"] = agg["sig_match"].astype(bool)
-    agg["http_share"] = agg["http_share"].astype(bool)
-    agg["out_in_ratio_total"] = (agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)).round(3)
-    agg["incident_id"] = agg["device_id"].astype(str) + "|" + agg["domain"].astype(str) + "|" + agg["time_window"].astype(str)
-
-    # Scoring Logic
-    cond_sig = agg["sig_match"]
-    cond_not_allowed = ~agg["allowed"]
+    agg["out_in_ratio_total"] = (
+        agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)
+    ).replace([math.inf, -math.inf], 0).fillna(0).round(3)
+    cond_sig = agg["sig_match"].fillna(False).astype(bool)
+    cond_not_allowed = ~agg["allowed"].fillna(False).astype(bool)
     cond_upload = (agg["bytes_out_total"] >= BIG_OUT_BYTES) & (agg["out_in_ratio_total"] >= RATIO_HIGH)
     cond_chunking = agg["conn_count"] >= CHUNK_CONN_COUNT
-    cond_share = agg["http_share"]
+    cond_share = agg["http_share"].fillna(False).astype(bool)
+    cond_repeat = (pd.to_numeric(agg.get("active_days", 0), errors="coerce").fillna(0) >= 2) & cond_not_allowed
 
     agg["confidence_score"] = (
         cond_sig.astype(int) * 40
@@ -2043,18 +2426,52 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         + cond_upload.astype(int) * 30
         + cond_chunking.astype(int) * 15
         + cond_share.astype(int) * 40
-    ).clip(upper=100)
+        + cond_repeat.astype(int) * 20
+    ).clip(upper=100).astype(int)
+    agg["confidence"] = agg["confidence_score"].apply(_confidence_label)
+    reason_chunks: List[pd.Series] = []
+    reason_chunks.append(pd.Series("signature: known sharing service; ", index=agg.index).where(cond_sig, ""))
+    reason_chunks.append(pd.Series("policy: not allowlisted; ", index=agg.index).where(cond_not_allowed, ""))
+    reason_chunks.append(pd.Series("upload: >=10MB and high out/in ratio; ", index=agg.index).where(cond_upload, ""))
+    reason_chunks.append(pd.Series("chunking: many conns in window; ", index=agg.index).where(cond_chunking, ""))
+    # HTTP share-link evidence details (derived from correlated http.log markers)
+    _m_share = agg.get("share_method", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _u_share = agg.get("share_uri", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _m_fallback = agg.get("method", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _u_fallback = agg.get("uri", pd.Series("", index=agg.index)).astype(str).str.strip()
+    _m = _m_share.where(_m_share.ne(""), _m_fallback).str.upper()
+    _u = _u_share.where(_u_share.ne(""), _u_fallback)
+    _detail = (_m + " " + _u).str.strip()
+    _detail = _detail.where(_detail.ne(""), "http_any_share=True")
+    _detail = _detail.where(_detail.str.len() <= 220, _detail.str.slice(0, 217) + "...")
+    http_share_reason = ("http_any_share evidence: " + _detail + "; ")
+    reason_chunks.append(http_share_reason.where(cond_share, ""))
+    reason_chunks.append(pd.Series("repeat: seen across >=2 days; ", index=agg.index).where(cond_repeat, ""))
+    agg["confidence_reasons"] = pd.concat(reason_chunks, axis=1).sum(axis=1).str.rstrip("; ").str.strip()
+    agg["is_shadow_sharing"] = (agg["sig_match"] == True) & (agg["allowed"] == False) & (agg["confidence_score"] >= 50)  # noqa: E712
+    agg["incident_id"] = agg["device_id"].astype(str) + "|" + agg["domain"].astype(str) + "|" + agg["time_window"].astype(str)
 
-    # Scoring Labels
-    def _apply_confidence(score):
-        if score >= 80: return "HIGH"
-        if score >= 50: return "PROBABLE"
-        return "WEAK"
-        
-    agg["confidence"] = agg["confidence_score"].apply(_apply_confidence)
-    agg["is_shadow_sharing"] = (agg["sig_match"] == True) & (agg["allowed"] == False) & (agg["confidence_score"] >= 50)
-
-    return agg.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
+    cols = [
+        "incident_id",
+        "first_ts", "last_ts",
+        "mac", "host_name", "orig_ip",
+        "source_types",
+        "destination", "domain",
+        "action", "action_basis",
+        "sig_service",
+        "allowed", "allow_basis",
+        "bytes_out_total", "bytes_in_total", "out_in_ratio_total",
+        "conn_count", "total_duration",
+        "method", "uri", "user_agent",
+        "file_names", "file_mime_types",
+        "any_long", "any_big_out",
+        "active_days",
+        "confidence_score", "confidence", "confidence_reasons",
+        "is_shadow_sharing",
+    ]
+    cols = [c for c in cols if c in agg.columns]
+    out = agg[cols].drop_duplicates(subset=["incident_id"], keep="last")
+    return out.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
 
 @st.cache_resource(show_spinner=False)
 def _load_shadow_sharing_bundle_cached(
