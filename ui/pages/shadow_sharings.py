@@ -6,7 +6,7 @@
 INVALID_DEST_STRINGS = {"", "unknown", "nan", "none", "(empty)", "*"}
 INVALID_DEST_SET = set(INVALID_DEST_STRINGS)
 AUTO_UNIQUE_ID_COL = "::auto_unique_id::"
-FILTER_CACHE_VERSION = "ratio-precision-3dp-v3-mac-dest-day-tables"
+FILTER_CACHE_VERSION = "ratio-precision-3dp-v3-mac-dest-day-table"
 # ui/pages/shadow_sharings.py
 import hashlib
 import re
@@ -1736,7 +1736,7 @@ def show_shadow_sharing_device_dialog(
             dlg_conf_levels = st.multiselect(
                 "Confidence Level",
                 ["WEAK", "PROBABLE", "HIGH"],
-                default=["WEAK", "PROBABLE", "HIGH"],
+                default=["PROBABLE", "HIGH"],
                 key=f"shadow_sharing_dlg_conf_{selected_scope_key}_{mac_key}",
             )
         with f2:
@@ -1946,7 +1946,7 @@ def render_shadow_sharing(parquet_root: Path):
 
     if "hide_shadow_sharing_trace" not in st.session_state:
         #change to false to show execution trace and vice versa
-        st.session_state.hide_shadow_sharing_trace = False
+        st.session_state.hide_shadow_sharing_trace = True
 
     trace_container = st.empty()
     show_trace = not st.session_state.hide_shadow_sharing_trace
@@ -2292,15 +2292,20 @@ def render_shadow_sharing(parquet_root: Path):
     overview_incidents = _filter_incidents_nonzero_outbound(overview_incidents)
 
     st.session_state.setdefault("shadow_sharing_search_applied", "")
-    st.session_state.setdefault("shadow_sharing_conf_applied", ["WEAK", "PROBABLE", "HIGH"])
+    st.session_state.setdefault("shadow_sharing_conf_applied", ["PROBABLE", "HIGH"])
     st.session_state.setdefault("shadow_sharing_sources_applied", source_options)
 
     search_q = str(st.session_state.get("shadow_sharing_search_applied", "")).strip()
-    confidence_default = ["WEAK", "PROBABLE", "HIGH"]
+    
+    confidence_default = ["PROBABLE", "HIGH"]
+    valid_conf_levels = ["WEAK", "PROBABLE", "HIGH"]
     confidence_state = st.session_state.get("shadow_sharing_conf_applied", confidence_default)
+    
     if not isinstance(confidence_state, list):
         confidence_state = confidence_default
-    selected_conf_levels = [str(x).upper() for x in confidence_state if str(x).upper() in confidence_default]
+        
+    # Crucial Fix: Validate against valid_conf_levels, NOT the default list!
+    selected_conf_levels = [str(x).upper() for x in confidence_state if str(x).upper() in valid_conf_levels]
     if not selected_conf_levels:
         selected_conf_levels = confidence_default
     st.session_state["shadow_sharing_conf_applied"] = list(selected_conf_levels)
@@ -2650,7 +2655,7 @@ def render_shadow_sharing(parquet_root: Path):
 
         selected_conf_levels = [str(x).upper() for x in (selected_conf_levels or []) if str(x).upper() in ["WEAK", "PROBABLE", "HIGH"]]
         if not selected_conf_levels:
-            selected_conf_levels = ["WEAK", "PROBABLE", "HIGH"]
+            selected_conf_levels = ["PROBABLE", "HIGH"]
             st.session_state["shadow_sharing_conf_applied"] = list(selected_conf_levels)
         selected_sources = [str(x) for x in (selected_sources or []) if str(x) in source_options]
         if source_options and not selected_sources:

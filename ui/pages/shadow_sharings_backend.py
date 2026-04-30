@@ -17,7 +17,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v19-logstamp-runtime-policys"
+CACHE_VERSION = "shadow-sharing-cache-v19-logstamp-runtime-policy"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
