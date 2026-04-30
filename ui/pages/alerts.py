@@ -233,7 +233,7 @@ ROLLING_TIME_WINDOWS_DAYS = {
     "Last 7 Days": 7,
     "Last 30 Days": 30,
 }
-ALERT_TIME_RANGE_OPTIONS = ["Last 7 Days", "Last 30 Days", "Specific Date", "All Time"]
+ALERT_TIME_RANGE_OPTIONS = ["Last 7 Days", "Last 30 Days", "Specific Date"  ]
 
 
 # =============================================================================
