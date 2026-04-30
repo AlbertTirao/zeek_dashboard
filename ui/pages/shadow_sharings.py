@@ -1,5 +1,3 @@
-
-
 # ----------------------------------------------------------------------------
 # Hard filters for destination display
 # ----------------------------------------------------------------------------
@@ -51,6 +49,31 @@ CONFIDENCE_COLORS = {
     "WEAK": "#38bdf8",
 }
 
+def _build_real_source_masks(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """
+    Builds a dictionary of boolean masks indicating which rows contain which source types.
+    """
+    masks = {}
+    if df is None or df.empty:
+        return masks
+        
+    src_blob = df.get("source_types", pd.Series("", index=df.index)).astype(str).str.lower()
+    
+    for src_name in ["conn", "http", "ssl", "dns", "files"]:
+        # Uses regex to safely match whole words (e.g., matching 'http' without accidentally matching 'https')
+        pat = rf"(?:^|[^\w]){re.escape(src_name)}(?:[^\w]|$)"
+        masks[src_name] = src_blob.str.contains(pat, regex=True, na=False)
+        
+    return masks
+
+
+def _prepare_scope_event_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepares and safeguards the dataframe before incident generation.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df.copy()
 
 def _traffic_admin_can_authorize() -> bool:
     auth_user = st.session_state.get("auth_user") or {}
