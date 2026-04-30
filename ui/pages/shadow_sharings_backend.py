@@ -137,13 +137,15 @@ def _duck_read_parquet_union(paths: List[Path]) -> pd.DataFrame:
     try:
         arr = _sql_list(paths)
         return con.execute(f"SELECT * FROM read_parquet({arr}, union_by_name=TRUE)").fetchdf()
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ DuckDB Bulk Union Failed: {e}") # print logs
         # fallback: per file
         dfs: List[pd.DataFrame] = []
         for p in paths:
             try:
                 dfs.append(con.execute(f"SELECT * FROM read_parquet('{p.as_posix()}')").fetchdf())
-            except Exception:
+            except Exception as e2:
+                print(f"🚨 DuckDB skipped file {p.name} due to error: {e2}") # <-- Add this print
                 continue
         return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
@@ -2268,9 +2270,9 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
     df["_src_dns"] = src_dns
     df["_src_files"] = src_files | files_infer
 
-    df["bytes_out"] = pd.to_numeric(df.get("bytes_out", 0), errors="coerce").fillna(0)
-    df["bytes_in"] = pd.to_numeric(df.get("bytes_in", 0), errors="coerce").fillna(0)
-    df["duration"] = pd.to_numeric(df.get("duration", 0), errors="coerce").fillna(0)
+    df["bytes_out"] = pd.to_numeric(df.get("bytes_out", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
+    df["bytes_in"] = pd.to_numeric(df.get("bytes_in", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
+    df["duration"] = pd.to_numeric(df.get("duration", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
     df["is_long"] = df["duration"] >= LONG_DURATION_SEC
     df["is_big_out"] = df["bytes_out"] >= BIG_OUT_BYTES
     # Share-link evidence:

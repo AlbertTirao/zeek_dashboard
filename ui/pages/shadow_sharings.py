@@ -18,6 +18,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
+import duckdb
 
 try:
     from .shadow_sharings_backend import (
@@ -1863,6 +1864,81 @@ def show_shadow_sharing_device_dialog(
             key=f"shadow_sharing_mac_csv_{selected_scope_key}_{mac_key}",
         )
 
+def _has_text(s: pd.Series) -> pd.Series:
+    t = s.astype(str).str.strip().str.lower()
+    return ~t.isin(["", "nan", "none", "-", "unknown"])
+
+def _to_bool(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(s):
+        return s.fillna(False)
+    t = s.astype(str).str.strip().str.lower()
+    return t.isin(["1", "true", "t", "yes", "y"])
+
+def _build_real_source_masks(src: pd.DataFrame) -> Dict[str, pd.Series]:
+    idx = src.index
+    log_src = src["log_source"].astype(str).str.strip().str.lower() if "log_source" in src.columns else pd.Series("", index=idx)
+    dns_mask = log_src.eq("dns")
+    conn_mask = ~dns_mask
+
+    http_mask = pd.Series(False, index=idx)
+    for col in ["method", "uri", "user_agent", "host", "content_type"]:
+        if col in src.columns:
+            http_mask = http_mask | _has_text(src[col])
+    for col in ["request_body_len", "response_body_len", "status_code"]:
+        if col in src.columns:
+            v = pd.to_numeric(src[col], errors="coerce").fillna(0)
+            http_mask = http_mask | (v > 0)
+    for col in ["http_any_upload", "http_any_share"]:
+        if col in src.columns:
+            http_mask = http_mask | _to_bool(src[col])
+    http_mask = http_mask & conn_mask
+
+    ssl_mask = pd.Series(False, index=idx)
+    for col in ["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"]:
+        if col in src.columns:
+            ssl_mask = ssl_mask | _has_text(src[col])
+    ssl_mask = ssl_mask & conn_mask
+
+    files_mask = pd.Series(False, index=idx)
+    for col in ["file_total_bytes", "file_seen_bytes"]:
+        if col in src.columns:
+            v = pd.to_numeric(src[col], errors="coerce").fillna(0)
+            files_mask = files_mask | (v > 0)
+    for col in ["file_mime_types", "file_names", "file_sources"]:
+        if col in src.columns:
+            files_mask = files_mask | _has_text(src[col])
+    files_mask = files_mask & conn_mask
+
+    return {
+        "conn": conn_mask,
+        "http": http_mask,
+        "ssl": ssl_mask,
+        "dns": dns_mask,
+        "files": files_mask,
+    }
+
+def _prepare_scope_event_rows(src_df: pd.DataFrame) -> pd.DataFrame:
+    out_df = src_df.copy()
+    if out_df.empty:
+        return out_df
+    # Hard filter: hide Unknown/placeholder destinations.
+    if "destination" in out_df.columns:
+        dest_norm = out_df["destination"].astype(str).str.strip().str.lower()
+        out_df = out_df[~dest_norm.isin(INVALID_DEST_SET)].copy()
+    
+    # Safely convert to numeric using the index to prevent 'int' object fillna errors
+    out_df["bytes"] = pd.to_numeric(out_df.get("bytes", pd.Series(0, index=out_df.index)), errors="coerce").fillna(0)
+    out_df = out_df[out_df["bytes"] > 0].copy()
+    
+    if "event_id" in out_df.columns:
+        out_df = out_df.drop_duplicates(subset=["event_id"], keep="last")
+    else:
+        dedupe_cols = [c for c in ["ts", "id.orig_h", "destination", "bytes"] if c in out_df.columns]
+        if dedupe_cols:
+            out_df = out_df.drop_duplicates(subset=dedupe_cols, keep="last")
+        else:
+            out_df = out_df.drop_duplicates()
+    return out_df
 
 def render_shadow_sharing(parquet_root: Path):
     import time
@@ -2138,7 +2214,11 @@ def render_shadow_sharing(parquet_root: Path):
 
     df_union = df
     total_scope_rows = int(len(df_union))
-    df = _strict_scope_by_selected_date(df_union, str(selected_date), ts_col="ts")
+    
+    df = duckdb.query(f"""
+        SELECT * FROM df_union 
+        WHERE CAST(ts AS DATE) = CAST('{selected_date}' AS DATE)
+    """).df()
 
     trimmed_rows = max(0, total_scope_rows - int(len(df)))
 
@@ -2179,7 +2259,12 @@ def render_shadow_sharing(parquet_root: Path):
     update_loading_ui()
     t0 = time.time()
 
-    incidents = _filter_incidents_nonzero_outbound(incidents)
+    incidents = duckdb.query("""
+        SELECT * FROM incidents 
+        WHERE TRY_CAST(bytes_out_total AS DOUBLE) > 0
+        QUALIFY ROW_NUMBER() OVER(PARTITION BY incident_id ORDER BY last_ts DESC) = 1
+    """).df()
+
     if incidents.empty:
         st.info("No flow-based incidents were found in this scope.")
 
@@ -2245,28 +2330,30 @@ def render_shadow_sharing(parquet_root: Path):
     else:
         filtered = df.copy()
 
+        base_query = "SELECT * FROM df WHERE 1=1"
+
+        # 1. Source Filtering
         if selected_sources:
-            source_keep = pd.Series(False, index=filtered.index)
-            for src_name in selected_sources:
-                mask = source_masks.get(str(src_name).strip().lower())
-                if mask is not None:
-                    source_keep = source_keep | mask
-            filtered = filtered[source_keep]
+            # Create a regex pattern to match whole words, e.g., '(?i)\b(conn|http)\b'
+            src_pattern = f"(?i)\\b({'|'.join(selected_sources)})\\b"
+            base_query += f" AND REGEXP_MATCHES(source_types, '{src_pattern}')"
 
+        # 2. Search Filtering
         if search_q:
-            q = search_q.lower().strip()
-            if q:
-                filtered = filtered[
-                    filtered["mac"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                    | filtered["host_name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                    | filtered["id.orig_h"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                    | filtered["destination"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                    | filtered["Risk_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                    | filtered["Action_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                    | filtered["Allow_Basis"].astype(str).str.lower().str.contains(q, na=False, regex=False)
-                ]
+            q = search_q.lower().replace("'", "''") # escape quotes
+            base_query += f"""
+                AND (
+                    LOWER(CAST(mac AS VARCHAR)) LIKE '%{q}%' OR 
+                    LOWER(CAST(host_name AS VARCHAR)) LIKE '%{q}%' OR 
+                    LOWER(CAST("id.orig_h" AS VARCHAR)) LIKE '%{q}%' OR 
+                    LOWER(CAST(destination AS VARCHAR)) LIKE '%{q}%' OR 
+                    LOWER(CAST(Risk_Basis AS VARCHAR)) LIKE '%{q}%' OR 
+                    LOWER(CAST(Action_Basis AS VARCHAR)) LIKE '%{q}%' OR 
+                    LOWER(CAST(Allow_Basis AS VARCHAR)) LIKE '%{q}%'
+                )
+            """
 
-        filtered = _prepare_scope_event_rows(filtered)
+        filtered = duckdb.query(base_query).df()
 
         filtered_incidents = build_shadow_sharing_incidents(filtered)
         filtered_incidents = _filter_incidents_nonzero_outbound(filtered_incidents)
