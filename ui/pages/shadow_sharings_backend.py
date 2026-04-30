@@ -17,7 +17,7 @@ import yaml
 # CONFIG
 # -----------------------------------------------------------------------------
 
-CACHE_VERSION = "shadow-sharing-cache-v19-logstamp-runtime-policy"
+CACHE_VERSION = "shadow-sharing-cache-v19-logstamp-runtime-policys"
 CACHE_DIRNAME = "_shadow_cache_sharing"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -2193,287 +2193,220 @@ def build_shadow_sharing_incidents(events_df: pd.DataFrame, window_minutes: int 
         return pd.DataFrame()
 
     df = events_df.copy()
-    df = _ensure_ts_datetime(df)
-    log_src = df.get("log_source", pd.Series("", index=df.index)).astype(str).str.strip().str.lower()
-    df = df[log_src.eq("flow")].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    if "event_id" in df.columns:
-        df = df.drop_duplicates(subset=["event_id"], keep="last")
-    else:
-        dedupe_cols = [c for c in ["uid", "ts", "id.orig_h", "destination", "bytes_out", "bytes_in", "duration"] if c in df.columns]
-        if dedupe_cols:
-            df = df.drop_duplicates(subset=dedupe_cols, keep="last")
-        else:
-            df = df.drop_duplicates()
-
-    def _clean_text(col_name: str, *, lower: bool = False) -> pd.Series:
-        raw = df.get(col_name, pd.Series("", index=df.index))
-        s = raw.astype(str).str.strip()
-        if lower:
-            s = s.str.lower()
-        s = s.replace({"nan": "", "none": "", "None": "", "-": "", "(empty)": "", "unknown": ""})
-        return s.mask(s.eq(""), pd.NA)
-
-    def _coerce_bool_series(raw_series: pd.Series) -> pd.Series:
-        if pd.api.types.is_bool_dtype(raw_series):
-            return raw_series.fillna(False).astype(bool)
-        t = raw_series.astype(str).str.strip().str.lower()
-        return t.isin(["1", "true", "t", "yes", "y"])
-
-    mac = _clean_text("orig_l2_addr", lower=True).fillna("")
-    ip = _clean_text("id.orig_h").fillna("")
-    df["device_id"] = mac.where(mac.ne(""), "ip:" + ip)
-
-    dom = _clean_text("dest_domain", lower=True)
-    dest_for_dom = _clean_text("destination", lower=True)
-    df["domain"] = dom.fillna(dest_for_dom).fillna("")
-
-    if "source_types" in df.columns:
-        src_text = df["source_types"].astype(str).str.lower()
-    else:
-        src_text = pd.Series("conn", index=df.index, dtype="object")
-
-    def _has_text_columns(cols: List[str]) -> pd.Series:
-        m = pd.Series(False, index=df.index)
-        for c in cols:
-            if c in df.columns:
-                t = df[c].astype(str).str.strip().str.lower()
-                m = m | ~t.isin(["", "nan", "none", "-", "unknown", "(empty)"])
-        return m
-
-    df["_src_conn"] = True
-    src_http = src_text.str.contains(r"\bhttp\b", regex=True, na=False)
-    src_ssl = src_text.str.contains(r"\bssl\b", regex=True, na=False)
-    src_dns = src_text.str.contains(r"\bdns\b", regex=True, na=False)
-    src_files = src_text.str.contains(r"\bfiles\b", regex=True, na=False)
-
-    http_infer = _has_text_columns(["method", "uri", "user_agent", "content_type", "host"])
-    for c in ["request_body_len", "response_body_len"]:
-        if c in df.columns:
-            http_infer = http_infer | (pd.to_numeric(df[c], errors="coerce").fillna(0) > 0)
-    for c in ["http_any_upload", "http_any_share"]:
-        if c in df.columns:
-            http_infer = http_infer | _coerce_bool_series(pd.Series(df[c], index=df.index))
-
-    ssl_infer = _has_text_columns(["server_name", "ja3", "ja3s", "version", "cipher", "curve", "next_protocol"])
-
-    files_infer = pd.Series(False, index=df.index)
-    for c in ["file_total_bytes", "file_seen_bytes"]:
-        if c in df.columns:
-            files_infer = files_infer | (pd.to_numeric(df[c], errors="coerce").fillna(0) > 0)
-    files_infer = files_infer | _has_text_columns(["file_mime_types", "file_names", "file_sources"])
-
-    df["_src_http"] = src_http | http_infer
-    df["_src_ssl"] = src_ssl | ssl_infer
-    df["_src_dns"] = src_dns
-    df["_src_files"] = src_files | files_infer
-
-    df["bytes_out"] = pd.to_numeric(df.get("bytes_out", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
-    df["bytes_in"] = pd.to_numeric(df.get("bytes_in", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
-    df["duration"] = pd.to_numeric(df.get("duration", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
-    df["is_long"] = df["duration"] >= LONG_DURATION_SEC
-    df["is_big_out"] = df["bytes_out"] >= BIG_OUT_BYTES
-    # Share-link evidence:
-    # Only from explicit http_any_share markers (do not infer from Action/Action_Basis).
-    _http_any_share = _coerce_bool_series(pd.Series(df.get("http_any_share", False), index=df.index))
-    df["http_share_evidence"] = _http_any_share
-    df["sig_match_b"] = _coerce_bool_series(pd.Series(df.get("Signature_Match", False), index=df.index))
-    df["allowed_b"] = _coerce_bool_series(pd.Series(df.get("Allowed", False), index=df.index))
-
-    df["day"] = df["ts"].dt.date
-    rep = (
-        df.groupby(["device_id", "domain"], dropna=False)["day"]
-        .nunique()
-        .reset_index()
-        .rename(columns={"day": "active_days"})
-    )
-    df = df.merge(rep, on=["device_id", "domain"], how="left")
-
-    w = max(1, int(window_minutes))
-    df["time_window"] = df["ts"].dt.floor(f"{w}min")
-
-    # Clean text fields once, then use groupby.last (fast + stable).
-    text_map = {
-        "mac": _clean_text("orig_l2_addr", lower=True),
-        "host_name": _clean_text("host_name"),
-        "orig_ip": _clean_text("id.orig_h"),
-        "destination": _clean_text("destination"),
-        "sig_service": _clean_text("Signature_Service"),
-        "allow_basis": _clean_text("Allow_Basis"),
-        "action": _clean_text("Action"),
-        "action_basis": _clean_text("Action_Basis"),
-        "method": _clean_text("method"),
-        "uri": _clean_text("uri"),
-        "user_agent": _clean_text("user_agent"),
-        "file_names": _clean_text("file_names"),
-        "file_mime_types": _clean_text("file_mime_types"),
-        "uid_clean": _clean_text("uid"),
+    
+    # 1. Guarantee all columns exist so DuckDB doesn't throw Binder Exceptions on sparse data chunks
+    expected_cols = {
+        "log_source": "", "event_id": "", "uid": "", "orig_l2_addr": "", "id.orig_h": "",
+        "dest_domain": "", "destination": "", "ts": pd.NaT, "bytes_out": 0.0, "bytes_in": 0.0,
+        "duration": 0.0, "http_any_share": False, "Signature_Match": False, "Allowed": False,
+        "source_types": "conn", "host_name": "", "Signature_Service": "", "Allow_Basis": "",
+        "Action": "", "Action_Basis": "", "method": "", "uri": "", "user_agent": "",
+        "file_names": "", "file_mime_types": ""
     }
-    for k, s in text_map.items():
-        df[f"__{k}"] = s
+    for col, default in expected_cols.items():
+        if col not in df.columns:
+            df[col] = pd.Series(default, index=df.index)
 
-    group_keys = ["device_id", "domain", "time_window"]
-    gb = df.groupby(group_keys, dropna=False)
+    # 2. Push the entire Python grouping, windowing, and scoring algorithm into DuckDB
+    query = f"""
+    WITH flow_events AS (
+        SELECT * FROM df
+        WHERE LOWER(TRIM(CAST(log_source AS VARCHAR))) = 'flow'
+        QUALIFY ROW_NUMBER() OVER(
+            PARTITION BY COALESCE(NULLIF(CAST(event_id AS VARCHAR), ''), CAST(uid AS VARCHAR), CAST(ts AS VARCHAR)) 
+            ORDER BY ts DESC
+        ) = 1
+    ),
+    cleaned AS (
+        SELECT 
+            *,
+            -- Device ID inference
+            CASE 
+                WHEN LOWER(TRIM(CAST(orig_l2_addr AS VARCHAR))) NOT IN ('', 'nan', 'none', '-', '(empty)', 'unknown') 
+                     AND orig_l2_addr IS NOT NULL 
+                THEN LOWER(TRIM(CAST(orig_l2_addr AS VARCHAR)))
+                ELSE 'ip:' || COALESCE(TRIM(CAST("id.orig_h" AS VARCHAR)), '')
+            END AS device_id,
+            
+            -- Domain inference
+            CASE 
+                WHEN LOWER(TRIM(CAST(dest_domain AS VARCHAR))) NOT IN ('', 'nan', 'none', '-', '(empty)', 'unknown') 
+                     AND dest_domain IS NOT NULL 
+                THEN LOWER(TRIM(CAST(dest_domain AS VARCHAR)))
+                ELSE LOWER(TRIM(CAST(COALESCE(destination, '') AS VARCHAR)))
+            END AS domain_clean,
+            
+            -- 5-Minute Time Bucketing Math
+            date_trunc('minute', ts) - INTERVAL (CAST(EXTRACT(minute FROM ts) AS INT) % {int(window_minutes)}) MINUTE AS time_window,
+            CAST(ts AS DATE) AS day_date,
+            
+            -- Safe Numerics
+            COALESCE(TRY_CAST(bytes_out AS DOUBLE), 0.0) AS num_bytes_out,
+            COALESCE(TRY_CAST(bytes_in AS DOUBLE), 0.0) AS num_bytes_in,
+            COALESCE(TRY_CAST(duration AS DOUBLE), 0.0) AS num_duration,
+            
+            -- Safe Booleans
+            COALESCE(TRY_CAST(http_any_share AS BOOLEAN), FALSE) AS bool_share,
+            COALESCE(TRY_CAST("Signature_Match" AS BOOLEAN), FALSE) AS bool_sig,
+            COALESCE(TRY_CAST("Allowed" AS BOOLEAN), FALSE) AS bool_allowed,
+            
+            LOWER(CAST(source_types AS VARCHAR)) AS st,
+            
+            -- Nullify empty text for arg_max filtering
+            NULLIF(TRIM(CAST(orig_l2_addr AS VARCHAR)), '') AS txt_mac,
+            NULLIF(TRIM(CAST(host_name AS VARCHAR)), '') AS txt_host,
+            NULLIF(TRIM(CAST("id.orig_h" AS VARCHAR)), '') AS txt_ip,
+            NULLIF(TRIM(CAST(destination AS VARCHAR)), '') AS txt_dest,
+            NULLIF(TRIM(CAST("Signature_Service" AS VARCHAR)), '') AS txt_sig_svc,
+            NULLIF(TRIM(CAST("Allow_Basis" AS VARCHAR)), '') AS txt_allow_basis,
+            NULLIF(TRIM(CAST("Action" AS VARCHAR)), '') AS txt_action,
+            NULLIF(TRIM(CAST("Action_Basis" AS VARCHAR)), '') AS txt_action_basis,
+            NULLIF(TRIM(CAST(method AS VARCHAR)), '') AS txt_method,
+            NULLIF(TRIM(CAST(uri AS VARCHAR)), '') AS txt_uri,
+            NULLIF(TRIM(CAST(user_agent AS VARCHAR)), '') AS txt_ua,
+            NULLIF(TRIM(CAST(file_names AS VARCHAR)), '') AS txt_file_names,
+            NULLIF(TRIM(CAST(file_mime_types AS VARCHAR)), '') AS txt_file_mime,
+            NULLIF(TRIM(CAST(uid AS VARCHAR)), '') AS txt_uid
 
-    agg_num = gb.agg(
-        first_ts=("ts", "min"),
-        last_ts=("ts", "max"),
-        bytes_out_total=("bytes_out", "sum"),
-        bytes_in_total=("bytes_in", "sum"),
-        total_duration=("duration", "sum"),
-        conn_count=("__uid_clean", "nunique"),
-        sig_match=("sig_match_b", "max"),
-        allowed=("allowed_b", "max"),
-        http_share=("http_share_evidence", "max"),
-        any_long=("is_long", "max"),
-        any_big_out=("is_big_out", "max"),
-        active_days=("active_days", "max"),
-        src_conn=("_src_conn", "max"),
-        src_http=("_src_http", "max"),
-        src_ssl=("_src_ssl", "max"),
-        src_dns=("_src_dns", "max"),
-        src_files=("_src_files", "max"),
-    ).reset_index()
-
-    # Fallback when uid is unavailable.
-    event_counts = gb.size().reset_index(name="event_count")
-    agg = agg_num.merge(event_counts, on=group_keys, how="left")
-    agg["conn_count"] = pd.to_numeric(agg.get("conn_count", 0), errors="coerce").fillna(0)
-    agg["event_count"] = pd.to_numeric(agg.get("event_count", 0), errors="coerce").fillna(0)
-    agg.loc[agg["conn_count"] <= 0, "conn_count"] = agg.loc[agg["conn_count"] <= 0, "event_count"]
-    agg["conn_count"] = agg["conn_count"].astype(int)
-    agg = agg.drop(columns=["event_count"], errors="ignore")
-
-    text_cols = [
-        "__mac",
-        "__host_name",
-        "__orig_ip",
-        "__destination",
-        "__sig_service",
-        "__allow_basis",
-        "__action",
-        "__action_basis",
-                "__method",
-        "__uri",
-        "__user_agent",
-        "__file_names",
-        "__file_mime_types",
-    ]
-    last_txt = gb[text_cols].last().reset_index()
-    agg = agg.merge(last_txt, on=group_keys, how="left")
-    agg = agg.rename(
-        columns={
-            "__mac": "mac",
-            "__host_name": "host_name",
-            "__orig_ip": "orig_ip",
-            "__destination": "destination",
-            "__sig_service": "sig_service",
-            "__allow_basis": "allow_basis",
-            "__action": "action",
-            "__action_basis": "action_basis",
-                        "__method": "method",
-            "__uri": "uri",
-            "__user_agent": "user_agent",
-            "__file_names": "file_names",
-            "__file_mime_types": "file_mime_types",
-        }
+        FROM flow_events
+    ),
+    active_days_calc AS (
+        SELECT device_id, domain_clean, COUNT(DISTINCT day_date) AS active_days
+        FROM cleaned 
+        GROUP BY 1, 2
+    ),
+    grouped AS (
+        SELECT 
+            c.device_id,
+            c.domain_clean AS domain,
+            c.time_window,
+            
+            MIN(c.ts) AS first_ts,
+            MAX(c.ts) AS last_ts,
+            SUM(c.num_bytes_out) AS bytes_out_total,
+            SUM(c.num_bytes_in) AS bytes_in_total,
+            SUM(c.num_duration) AS total_duration,
+            
+            COALESCE(NULLIF(COUNT(DISTINCT c.txt_uid), 0), COUNT(*)) AS conn_count,
+            
+            BOOL_OR(c.bool_share) AS http_share,
+            BOOL_OR(c.bool_sig) AS sig_match,
+            BOOL_OR(c.bool_allowed) AS allowed,
+            BOOL_OR(c.num_duration >= {LONG_DURATION_SEC}) AS any_long,
+            BOOL_OR(c.num_bytes_out >= {BIG_OUT_BYTES}) AS any_big_out,
+            
+            BOOL_OR(c.st LIKE '%conn%') AS src_conn,
+            BOOL_OR(c.st LIKE '%http%' OR c.txt_method IS NOT NULL OR c.txt_uri IS NOT NULL) AS src_http,
+            BOOL_OR(c.st LIKE '%ssl%') AS src_ssl,
+            BOOL_OR(c.st LIKE '%dns%') AS src_dns,
+            BOOL_OR(c.st LIKE '%files%' OR c.txt_file_names IS NOT NULL) AS src_files,
+            
+            -- Pull latest text fields per group just like Pandas .last()
+            arg_max(c.txt_mac, c.ts) FILTER (WHERE c.txt_mac IS NOT NULL) AS mac,
+            arg_max(c.txt_host, c.ts) FILTER (WHERE c.txt_host IS NOT NULL) AS host_name,
+            arg_max(c.txt_ip, c.ts) FILTER (WHERE c.txt_ip IS NOT NULL) AS orig_ip,
+            arg_max(c.txt_dest, c.ts) FILTER (WHERE c.txt_dest IS NOT NULL) AS destination,
+            arg_max(c.txt_sig_svc, c.ts) FILTER (WHERE c.txt_sig_svc IS NOT NULL) AS sig_service,
+            arg_max(c.txt_allow_basis, c.ts) FILTER (WHERE c.txt_allow_basis IS NOT NULL) AS allow_basis,
+            arg_max(c.txt_action, c.ts) FILTER (WHERE c.txt_action IS NOT NULL) AS action,
+            arg_max(c.txt_action_basis, c.ts) FILTER (WHERE c.txt_action_basis IS NOT NULL) AS action_basis,
+            arg_max(c.txt_method, c.ts) FILTER (WHERE c.txt_method IS NOT NULL) AS method,
+            arg_max(c.txt_uri, c.ts) FILTER (WHERE c.txt_uri IS NOT NULL) AS uri,
+            arg_max(c.txt_ua, c.ts) FILTER (WHERE c.txt_ua IS NOT NULL) AS user_agent,
+            arg_max(c.txt_file_names, c.ts) FILTER (WHERE c.txt_file_names IS NOT NULL) AS file_names,
+            arg_max(c.txt_file_mime, c.ts) FILTER (WHERE c.txt_file_mime IS NOT NULL) AS file_mime_types,
+            
+            arg_max(CASE WHEN c.bool_share THEN c.txt_method ELSE NULL END, c.ts) FILTER (WHERE c.bool_share AND c.txt_method IS NOT NULL) AS share_method,
+            arg_max(CASE WHEN c.bool_share THEN c.txt_uri ELSE NULL END, c.ts) FILTER (WHERE c.bool_share AND c.txt_uri IS NOT NULL) AS share_uri
+            
+        FROM cleaned c
+        GROUP BY 1, 2, 3
+    ),
+    final_calc AS (
+        SELECT 
+            g.*,
+            d.active_days,
+            (bytes_out_total / GREATEST(bytes_in_total, 1.0)) AS out_in_ratio_total,
+            
+            -- Pre-calculate conditions for the confidence score
+            COALESCE(sig_match, FALSE) AS cond_sig,
+            NOT COALESCE(allowed, FALSE) AS cond_not_allowed,
+            (bytes_out_total >= {BIG_OUT_BYTES} AND (bytes_out_total / GREATEST(bytes_in_total, 1.0)) >= {RATIO_HIGH}) AS cond_upload,
+            (conn_count >= {CHUNK_CONN_COUNT}) AS cond_chunking,
+            COALESCE(http_share, FALSE) AS cond_share,
+            (COALESCE(d.active_days, 0) >= 2 AND NOT COALESCE(allowed, FALSE)) AS cond_repeat,
+            
+            CONCAT_WS(', ', 
+                CASE WHEN src_conn THEN 'conn' END,
+                CASE WHEN src_http THEN 'http' END,
+                CASE WHEN src_ssl THEN 'ssl' END,
+                CASE WHEN src_dns THEN 'dns' END,
+                CASE WHEN src_files THEN 'files' END
+            ) AS raw_source_types,
+            
+            COALESCE(share_method, method, '') AS final_share_m,
+            COALESCE(share_uri, uri, '') AS final_share_u
+        FROM grouped g
+        LEFT JOIN active_days_calc d 
+            ON g.device_id = d.device_id AND g.domain = d.domain_clean
+        WHERE g.bytes_out_total > 0
+    ),
+    scored AS (
+        SELECT 
+            *,
+            COALESCE(NULLIF(raw_source_types, ''), 'conn') AS source_types,
+            
+            LEAST(100, 
+                (cond_sig::INT * 40) + 
+                (cond_not_allowed::INT * 30) + 
+                (cond_upload::INT * 30) + 
+                (cond_chunking::INT * 15) + 
+                (cond_share::INT * 40) + 
+                (cond_repeat::INT * 20)
+            ) AS confidence_score,
+            
+            CONCAT_WS('; ',
+                CASE WHEN cond_sig THEN 'signature: known sharing service' END,
+                CASE WHEN cond_not_allowed THEN 'policy: not allowlisted' END,
+                CASE WHEN cond_upload THEN 'upload: >=10MB and high out/in ratio' END,
+                CASE WHEN cond_chunking THEN 'chunking: many conns in window' END,
+                CASE WHEN cond_share THEN 
+                    'http_any_share evidence: ' || 
+                    CASE 
+                        WHEN LENGTH(TRIM(UPPER(final_share_m) || ' ' || final_share_u)) > 0 
+                        THEN SUBSTRING(TRIM(UPPER(final_share_m) || ' ' || final_share_u), 1, 217) || CASE WHEN LENGTH(TRIM(UPPER(final_share_m) || ' ' || final_share_u)) > 217 THEN '...' ELSE '' END
+                        ELSE 'http_any_share=True' 
+                    END
+                END,
+                CASE WHEN cond_repeat THEN 'repeat: seen across >=2 days' END
+            ) AS confidence_reasons,
+            
+            device_id || '|' || domain || '|' || CAST(time_window AS VARCHAR) AS incident_id
+        FROM final_calc
     )
-
-    # Capture an example HTTP share URI/method from rows where http_any_share was true in this window.
-    if "http_share_evidence" in df.columns:
-        share_rows = df[df["http_share_evidence"].fillna(False).astype(bool)].copy()
-        if not share_rows.empty:
-            share_txt = (
-                share_rows.groupby(group_keys, dropna=False)[["__method", "__uri"]]
-                .last()
-                .reset_index()
-                .rename(columns={"__method": "share_method", "__uri": "share_uri"})
-            )
-            agg = agg.merge(share_txt, on=group_keys, how="left")
-
-    src_cols = ["conn", "http", "ssl", "dns", "files"]
-    src_flags = ["src_conn", "src_http", "src_ssl", "src_dns", "src_files"]
-
-    def _compose_sources(row) -> str:
-        out: List[str] = []
-        for c_name, f_name in zip(src_cols, src_flags):
-            if bool(row.get(f_name, False)):
-                out.append(c_name)
-        return ", ".join(out) if out else "conn"
-
-    agg["source_types"] = agg.apply(_compose_sources, axis=1)
-    agg = agg.drop(columns=src_flags, errors="ignore")
-
-    agg["bytes_out_total"] = pd.to_numeric(agg.get("bytes_out_total", 0), errors="coerce").fillna(0)
-    agg["bytes_in_total"] = pd.to_numeric(agg.get("bytes_in_total", 0), errors="coerce").fillna(0)
-    agg = agg[agg["bytes_out_total"] > 0].copy()
-    if agg.empty:
+    SELECT 
+        *,
+        CASE 
+            WHEN confidence_score >= 80 THEN 'HIGH'
+            WHEN confidence_score >= 50 THEN 'PROBABLE'
+            ELSE 'WEAK'
+        END AS confidence,
+        (cond_sig AND cond_not_allowed AND confidence_score >= 50) AS is_shadow_sharing
+    FROM scored
+    """
+    
+    try:
+        incidents = duckdb.query(query).df()
+    except Exception as e:
+        print(f"Shadow sharing DuckDB rollup failed: {e}")
         return pd.DataFrame()
 
-    agg["out_in_ratio_total"] = (
-        agg["bytes_out_total"] / agg["bytes_in_total"].clip(lower=1)
-    ).replace([math.inf, -math.inf], 0).fillna(0).round(3)
-    cond_sig = agg["sig_match"].fillna(False).astype(bool)
-    cond_not_allowed = ~agg["allowed"].fillna(False).astype(bool)
-    cond_upload = (agg["bytes_out_total"] >= BIG_OUT_BYTES) & (agg["out_in_ratio_total"] >= RATIO_HIGH)
-    cond_chunking = agg["conn_count"] >= CHUNK_CONN_COUNT
-    cond_share = agg["http_share"].fillna(False).astype(bool)
-    cond_repeat = (pd.to_numeric(agg.get("active_days", 0), errors="coerce").fillna(0) >= 2) & cond_not_allowed
+    if incidents.empty:
+        return pd.DataFrame()
 
-    agg["confidence_score"] = (
-        cond_sig.astype(int) * 40
-        + cond_not_allowed.astype(int) * 30
-        + cond_upload.astype(int) * 30
-        + cond_chunking.astype(int) * 15
-        + cond_share.astype(int) * 40
-        + cond_repeat.astype(int) * 20
-    ).clip(upper=100).astype(int)
-    agg["confidence"] = agg["confidence_score"].apply(_confidence_label)
-    reason_chunks: List[pd.Series] = []
-    reason_chunks.append(pd.Series("signature: known sharing service; ", index=agg.index).where(cond_sig, ""))
-    reason_chunks.append(pd.Series("policy: not allowlisted; ", index=agg.index).where(cond_not_allowed, ""))
-    reason_chunks.append(pd.Series("upload: >=10MB and high out/in ratio; ", index=agg.index).where(cond_upload, ""))
-    reason_chunks.append(pd.Series("chunking: many conns in window; ", index=agg.index).where(cond_chunking, ""))
-    # HTTP share-link evidence details (derived from correlated http.log markers)
-    _m_share = agg.get("share_method", pd.Series("", index=agg.index)).astype(str).str.strip()
-    _u_share = agg.get("share_uri", pd.Series("", index=agg.index)).astype(str).str.strip()
-    _m_fallback = agg.get("method", pd.Series("", index=agg.index)).astype(str).str.strip()
-    _u_fallback = agg.get("uri", pd.Series("", index=agg.index)).astype(str).str.strip()
-    _m = _m_share.where(_m_share.ne(""), _m_fallback).str.upper()
-    _u = _u_share.where(_u_share.ne(""), _u_fallback)
-    _detail = (_m + " " + _u).str.strip()
-    _detail = _detail.where(_detail.ne(""), "http_any_share=True")
-    _detail = _detail.where(_detail.str.len() <= 220, _detail.str.slice(0, 217) + "...")
-    http_share_reason = ("http_any_share evidence: " + _detail + "; ")
-    reason_chunks.append(http_share_reason.where(cond_share, ""))
-    reason_chunks.append(pd.Series("repeat: seen across >=2 days; ", index=agg.index).where(cond_repeat, ""))
-    agg["confidence_reasons"] = pd.concat(reason_chunks, axis=1).sum(axis=1).str.rstrip("; ").str.strip()
-    agg["is_shadow_sharing"] = (agg["sig_match"] == True) & (agg["allowed"] == False) & (agg["confidence_score"] >= 50)  # noqa: E712
-    agg["incident_id"] = agg["device_id"].astype(str) + "|" + agg["domain"].astype(str) + "|" + agg["time_window"].astype(str)
-
-    cols = [
-        "incident_id",
-        "first_ts", "last_ts",
-        "mac", "host_name", "orig_ip",
-        "source_types",
-        "destination", "domain",
-        "action", "action_basis",
-        "sig_service",
-        "allowed", "allow_basis",
-        "bytes_out_total", "bytes_in_total", "out_in_ratio_total",
-        "conn_count", "total_duration",
-        "method", "uri", "user_agent",
-        "file_names", "file_mime_types",
-        "any_long", "any_big_out",
-        "active_days",
-        "confidence_score", "confidence", "confidence_reasons",
-        "is_shadow_sharing",
-    ]
-    cols = [c for c in cols if c in agg.columns]
-    out = agg[cols].drop_duplicates(subset=["incident_id"], keep="last")
-    return out.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
+    # Final cleanup dedupe to mirror Pandas behavior
+    incidents = incidents.drop_duplicates(subset=["incident_id"], keep="last")
+    return incidents.sort_values(["confidence_score", "bytes_out_total", "conn_count", "last_ts"], ascending=[False, False, False, False])
 
 @st.cache_resource(show_spinner=False)
 def _load_shadow_sharing_bundle_cached(

@@ -6,7 +6,7 @@
 INVALID_DEST_STRINGS = {"", "unknown", "nan", "none", "(empty)", "*"}
 INVALID_DEST_SET = set(INVALID_DEST_STRINGS)
 AUTO_UNIQUE_ID_COL = "::auto_unique_id::"
-FILTER_CACHE_VERSION = "ratio-precision-3dp-v3-mac-dest-day-table"
+FILTER_CACHE_VERSION = "ratio-precision-3dp-v3-mac-dest-day-tables"
 # ui/pages/shadow_sharings.py
 import hashlib
 import re
